@@ -1,0 +1,891 @@
+//! ## Auto Funding Strategy
+//! This strategy listens for channel state change events to check whether a channel has dropped below
+//! `min_stake_threshold` HOPR. If this happens, the strategy issues a **fund channel** transaction to re-stake the
+//! channel with `funding_amount` HOPR.
+//!
+//! Additionally, the strategy periodically scans all outgoing open channels on each tick and funds
+//! any that have fallen below the threshold. This catches channels opened with low balance and
+//! channels that were underfunded when the node started.
+//!
+//! ### In-flight tracking
+//! To prevent duplicate funding when multiple balance-decrease events arrive in quick succession,
+//! the strategy maintains a set of channel IDs currently being funded.
+//! A channel is added to the set when a funding tx is successfully enqueued, and removed when:
+//! - The spawned confirmation task observes a transaction failure,
+//! - A balance increase event is observed for that channel (indicating the funding confirmed), or
+//! - An `on_tick` scan finds the channel's balance has risen above the threshold.
+//!
+//! ### Metrics
+//! - `hopr_strategy_auto_funding_funding_count` — incremented when a funding tx is successfully enqueued
+//! - `hopr_strategy_auto_funding_failure_count` — incremented when a funding tx fails to enqueue or confirm
+//!
+//! For details on default parameters see [AutoFundingStrategyConfig].
+use std::{
+    fmt::{Debug, Display, Formatter},
+    sync::Arc,
+};
+
+use async_trait::async_trait;
+use dashmap::DashSet;
+use futures::StreamExt;
+use hopr_lib::{
+    ChannelChange, ChannelDirection, ChannelEntry, ChannelId, ChannelStatus, ChannelStatusDiscriminants, HoprBalance,
+    api::chain::{
+        ChainReadChannelOperations, ChainReadSafeOperations, ChainValues, ChainWriteChannelOperations, ChannelSelector,
+        SafeSelector,
+    },
+};
+use serde::{Deserialize, Serialize};
+use serde_with::{DisplayFromStr, serde_as};
+use tracing::{debug, info, warn};
+use validator::{Validate, ValidationError};
+
+use crate::{
+    Strategy,
+    errors::{StrategyError, StrategyError::CriteriaNotSatisfied},
+    strategy::SingularStrategy,
+};
+
+#[cfg(all(feature = "telemetry", not(test)))]
+lazy_static::lazy_static! {
+    static ref METRIC_COUNT_AUTO_FUNDINGS: hopr_metrics::SimpleCounter =
+        hopr_metrics::SimpleCounter::new("hopr_strategy_auto_funding_funding_count", "Count of initiated automatic fundings").unwrap();
+    static ref METRIC_COUNT_AUTO_FUNDING_FAILURES: hopr_metrics::SimpleCounter =
+        hopr_metrics::SimpleCounter::new("hopr_strategy_auto_funding_failure_count", "Count of failed automatic funding attempts").unwrap();
+}
+
+/// Validates that [`AutoFundingStrategyConfig::funding_amount`] is non-zero.
+fn validate_funding_amount(amount: &HoprBalance) -> std::result::Result<(), ValidationError> {
+    if amount.is_zero() {
+        return Err(ValidationError::new("funding_amount must be greater than zero"));
+    }
+    Ok(())
+}
+
+/// Configuration for `AutoFundingStrategy`
+#[serde_as]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, smart_default::SmartDefault, Validate, Serialize, Deserialize)]
+pub struct AutoFundingStrategyConfig {
+    /// Minimum stake that a channel's balance must not go below.
+    ///
+    /// Default is 1 wxHOPR
+    #[serde_as(as = "DisplayFromStr")]
+    #[default(HoprBalance::new_base(1))]
+    pub min_stake_threshold: HoprBalance,
+
+    /// Funding amount. Must be greater than zero.
+    ///
+    /// Defaults to 10 wxHOPR.
+    #[serde_as(as = "DisplayFromStr")]
+    #[default(HoprBalance::new_base(10))]
+    #[validate(custom(function = "validate_funding_amount"))]
+    pub funding_amount: HoprBalance,
+}
+
+/// The `AutoFundingStrategy` automatically funds a channel that
+/// dropped its staked balance below the configured threshold.
+///
+/// Tracks channels with in-flight funding transactions to prevent duplicate
+/// funding when multiple balance-decrease events arrive in quick succession.
+pub struct AutoFundingStrategy<A> {
+    hopr_chain_actions: Arc<A>,
+    cfg: AutoFundingStrategyConfig,
+    /// Channels with in-flight funding transactions. Entries are removed when:
+    /// - The spawned confirmation task observes a tx failure,
+    /// - A balance increase is observed via `on_own_channel_changed`, or
+    /// - `on_tick` finds the balance above threshold.
+    in_flight: Arc<DashSet<ChannelId>>,
+}
+
+impl<
+    A: ChainReadChannelOperations
+        + ChainReadSafeOperations
+        + ChainValues
+        + ChainWriteChannelOperations
+        + Send
+        + Sync
+        + 'static,
+> AutoFundingStrategy<A>
+{
+    pub fn new(cfg: AutoFundingStrategyConfig, hopr_chain_actions: A) -> Self {
+        if cfg.funding_amount.le(&cfg.min_stake_threshold) {
+            warn!(
+                funding_amount = %cfg.funding_amount,
+                min_stake_threshold = %cfg.min_stake_threshold,
+                "funding_amount is not greater than min_stake_threshold; \
+                 successful funding may re-trigger the threshold check"
+            );
+        }
+        Self {
+            cfg,
+            hopr_chain_actions: Arc::new(hopr_chain_actions),
+            in_flight: Arc::new(DashSet::new()),
+        }
+    }
+
+    /// Attempt to fund a channel if it is not already in-flight.
+    /// Returns `Ok(true)` if funding task was spawned and `Ok(false)` if the
+    /// channel was skipped because funding is already in-flight.
+    /// The actual `fund_channel` call happens inside the spawned task so the
+    /// confirmation future is `'static`.
+    async fn try_fund_channel(&self, channel: &ChannelEntry) -> crate::errors::Result<bool> {
+        let channel_id = *channel.get_id();
+
+        // Atomically check and mark as in-flight
+        if !self.in_flight.insert(channel_id) {
+            debug!(%channel, "skipping channel with in-flight funding");
+            return Ok(false);
+        }
+
+        info!(
+            %channel,
+            balance = %channel.balance,
+            threshold = %self.cfg.min_stake_threshold,
+            "stake on channel at or below threshold"
+        );
+
+        let chain_actions = Arc::clone(&self.hopr_chain_actions);
+        let funding_amount = self.cfg.funding_amount;
+        let in_flight = Arc::clone(&self.in_flight);
+
+        hopr_async_runtime::prelude::spawn(async move {
+            match chain_actions.fund_channel(&channel_id, funding_amount).await {
+                Ok(confirmation) => {
+                    #[cfg(all(feature = "telemetry", not(test)))]
+                    METRIC_COUNT_AUTO_FUNDINGS.increment();
+
+                    info!(%channel_id, %funding_amount, "issued re-staking of channel");
+
+                    if let Err(e) = confirmation.await {
+                        warn!(%channel_id, error = %e, "funding transaction failed");
+                        in_flight.remove(&channel_id);
+
+                        #[cfg(all(feature = "telemetry", not(test)))]
+                        METRIC_COUNT_AUTO_FUNDING_FAILURES.increment();
+                    }
+                    // On success: the ChannelBalanceIncreased event will clear the
+                    // in-flight entry via on_own_channel_changed.
+                }
+                Err(e) => {
+                    warn!(%channel_id, error = %e, "failed to enqueue funding transaction");
+                    in_flight.remove(&channel_id);
+
+                    #[cfg(all(feature = "telemetry", not(test)))]
+                    METRIC_COUNT_AUTO_FUNDING_FAILURES.increment();
+                }
+            }
+        });
+
+        Ok(true)
+    }
+
+    async fn safe_balance_budget(&self) -> crate::errors::Result<HoprBalance> {
+        let me = *self.hopr_chain_actions.me();
+        let safe = self
+            .hopr_chain_actions
+            .safe_info(SafeSelector::Owner(me))
+            .await
+            .map_err(|e| StrategyError::Other(e.into()))?;
+
+        let Some(safe) = safe else {
+            warn!(%me, "auto-funding on_tick skipped: safe is not registered. Should never happen.");
+            return Ok(HoprBalance::zero());
+        };
+
+        let safe_balance: HoprBalance = self
+            .hopr_chain_actions
+            .balance(safe.address)
+            .await
+            .map_err(|e| StrategyError::Other(e.into()))?;
+
+        Ok(safe_balance)
+    }
+}
+
+impl<A> Debug for AutoFundingStrategy<A> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", Strategy::AutoFunding(self.cfg))
+    }
+}
+
+impl<A> Display for AutoFundingStrategy<A> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", Strategy::AutoFunding(self.cfg))
+    }
+}
+
+#[async_trait]
+impl<
+    A: ChainReadChannelOperations
+        + ChainReadSafeOperations
+        + ChainValues
+        + ChainWriteChannelOperations
+        + Send
+        + Sync
+        + 'static,
+> SingularStrategy for AutoFundingStrategy<A>
+{
+    /// Periodically scans all outgoing open channels and funds any with balance at or below
+    /// the configured threshold. Skips channels that already have in-flight funding transactions.
+    ///
+    /// This handles two cases that event-driven funding misses:
+    /// - Channels opened with balance already below threshold (only a `ChannelOpened` event is emitted, which doesn't
+    ///   trigger balance-based funding)
+    /// - Channels that were underfunded when the node started or restarted (no events are replayed to the strategy at
+    ///   startup)
+    async fn on_tick(&self) -> crate::errors::Result<()> {
+        let mut safe_balance_budget = self.safe_balance_budget().await?;
+        if safe_balance_budget < self.cfg.funding_amount {
+            debug!(
+                %safe_balance_budget,
+                funding_amount = %self.cfg.funding_amount,
+                "auto-funding on_tick skipped: safe balance below funding amount"
+            );
+            return Ok(());
+        }
+
+        let mut channels = self
+            .hopr_chain_actions
+            .stream_channels(
+                ChannelSelector::default()
+                    .with_source(*self.hopr_chain_actions.me())
+                    .with_allowed_states(&[ChannelStatusDiscriminants::Open]),
+            )
+            .map_err(|e| StrategyError::Other(e.into()))?;
+
+        while let Some(channel) = channels.next().await {
+            if channel.balance.le(&self.cfg.min_stake_threshold) {
+                if safe_balance_budget < self.cfg.funding_amount {
+                    break;
+                }
+
+                match self.try_fund_channel(&channel).await {
+                    Ok(true) => safe_balance_budget -= self.cfg.funding_amount,
+                    Ok(false) => {}
+                    Err(e) => warn!(%channel, error = %e, "on_tick: failed to fund channel"),
+                }
+            } else {
+                // Channel is above threshold; clear any stale in-flight entry
+                self.in_flight.remove(channel.get_id());
+            }
+        }
+
+        debug!("auto-funding on_tick scan complete");
+        Ok(())
+    }
+
+    async fn on_own_channel_changed(
+        &self,
+        channel: &ChannelEntry,
+        direction: ChannelDirection,
+        change: ChannelChange,
+    ) -> crate::errors::Result<()> {
+        // Can only auto-fund outgoing channels
+        if direction != ChannelDirection::Outgoing {
+            return Ok(());
+        }
+
+        if let ChannelChange::Balance { left: old, right: new } = change {
+            // If balance increased, clear in-flight state for this channel
+            if new > old && self.in_flight.remove(channel.get_id()).is_some() {
+                debug!(%channel, "cleared in-flight funding state after balance increase");
+            }
+
+            if new.le(&self.cfg.min_stake_threshold) && channel.status == ChannelStatus::Open {
+                self.try_fund_channel(channel).await?;
+            }
+            Ok(())
+        } else {
+            Err(CriteriaNotSatisfied)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use futures::StreamExt;
+    use futures_time::future::FutureExt;
+    use hex_literal::hex;
+    use hopr_chain_connector::{create_trustful_hopr_blokli_connector, testing::BlokliTestStateBuilder};
+    use hopr_lib::{
+        Address, BytesRepresentable, ChainKeypair, Keypair, XDaiBalance,
+        api::chain::{ChainEvent, ChainEvents},
+    };
+
+    use super::*;
+    use crate::{
+        auto_funding::{AutoFundingStrategy, AutoFundingStrategyConfig},
+        strategy::SingularStrategy,
+    };
+
+    lazy_static::lazy_static! {
+        static ref BOB_KP: ChainKeypair = ChainKeypair::from_secret(&hex!(
+            "492057cf93e99b31d2a85bc5e98a9c3aa0021feec52c227cc8170e8f7d047775"
+        ))
+        .expect("lazy static keypair should be valid");
+
+        static ref ALICE: Address = hex!("18f8ae833c85c51fbeba29cef9fbfb53b3bad950").into();
+        static ref BOB: Address = BOB_KP.public().to_address();
+        static ref CHRIS: Address = hex!("b6021e0860dd9d96c9ff0a73e2e5ba3a466ba234").into();
+        static ref DAVE: Address = hex!("68499f50ff68d523385dc60686069935d17d762a").into();
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_auto_funding_strategy() -> anyhow::Result<()> {
+        let stake_limit = HoprBalance::from(7_u32);
+        let fund_amount = HoprBalance::from(5_u32);
+
+        let c1 = ChannelEntry::builder()
+            .between(*ALICE, *BOB)
+            .amount(10_u32)
+            .ticket_index(0)
+            .status(ChannelStatus::Open)
+            .epoch(0)
+            .build()?;
+
+        let c2 = ChannelEntry::builder()
+            .between(*BOB, *CHRIS)
+            .amount(5_u32)
+            .ticket_index(0_u32.into())
+            .status(ChannelStatus::Open)
+            .epoch(0)
+            .build()?;
+
+        let c3 = ChannelEntry::builder()
+            .between(*CHRIS, *DAVE)
+            .amount(5)
+            .ticket_index(0)
+            .status(ChannelStatus::PendingToClose(
+                chrono::DateTime::<chrono::Utc>::from_str("2025-11-10T00:00:00+00:00")?.into(),
+            ))
+            .epoch(0)
+            .build()?;
+
+        let blokli_sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &[&*ALICE, &*BOB, &*CHRIS, &*DAVE],
+                false,
+                XDaiBalance::new_base(1),
+                HoprBalance::new_base(1000),
+            )
+            .with_channels([c1, c2, c3])
+            .build_dynamic_client([1; Address::SIZE].into());
+
+        let snapshot = blokli_sim.snapshot();
+
+        let mut chain_connector =
+            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
+                .await?;
+        chain_connector.connect().await?;
+        let events = chain_connector.subscribe()?;
+
+        let cfg = AutoFundingStrategyConfig {
+            min_stake_threshold: stake_limit,
+            funding_amount: fund_amount,
+        };
+
+        let afs = AutoFundingStrategy::new(cfg, chain_connector);
+        afs.on_own_channel_changed(
+            &c1,
+            ChannelDirection::Outgoing,
+            ChannelChange::Balance {
+                left: HoprBalance::zero(),
+                right: c1.balance,
+            },
+        )
+        .await?;
+
+        afs.on_own_channel_changed(
+            &c2,
+            ChannelDirection::Outgoing,
+            ChannelChange::Balance {
+                left: HoprBalance::zero(),
+                right: c2.balance,
+            },
+        )
+        .await?;
+
+        afs.on_own_channel_changed(
+            &c3,
+            ChannelDirection::Outgoing,
+            ChannelChange::Balance {
+                left: HoprBalance::zero(),
+                right: c3.balance,
+            },
+        )
+        .await?;
+
+        events
+            .filter(|event| futures::future::ready(matches!(event, ChainEvent::ChannelBalanceIncreased(c, amount) if c.get_id() == c2.get_id() && amount == &fund_amount)))
+            .next()
+            .timeout(futures_time::time::Duration::from_secs(2))
+            .await?;
+
+        insta::assert_yaml_snapshot!(*snapshot.refresh());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_validation_rejects_zero_funding_amount() {
+        let cfg = AutoFundingStrategyConfig {
+            min_stake_threshold: HoprBalance::new_base(1),
+            funding_amount: HoprBalance::zero(),
+        };
+        assert!(
+            cfg.validate().is_err(),
+            "config with zero funding_amount should fail validation"
+        );
+    }
+
+    #[test]
+    fn test_config_validation_accepts_valid_config() {
+        let cfg = AutoFundingStrategyConfig {
+            min_stake_threshold: HoprBalance::new_base(1),
+            funding_amount: HoprBalance::new_base(10),
+        };
+        assert!(
+            cfg.validate().is_ok(),
+            "config with valid funding_amount should pass validation"
+        );
+    }
+
+    #[test]
+    fn test_default_config_passes_validation() {
+        let cfg = AutoFundingStrategyConfig::default();
+        assert!(cfg.validate().is_ok(), "default config should pass validation");
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_on_tick_funds_underfunded_channels() -> anyhow::Result<()> {
+        let stake_limit = HoprBalance::from(7_u32);
+        let fund_amount = HoprBalance::from(5_u32);
+
+        // BOB -> CHRIS channel with balance below threshold
+        let c1 = ChannelEntry::builder()
+            .between(*BOB, *CHRIS)
+            .amount(3)
+            .ticket_index(0)
+            .status(ChannelStatus::Open)
+            .epoch(0_u32)
+            .build()?;
+
+        // BOB -> DAVE channel with balance above threshold
+        let c2 = ChannelEntry::builder()
+            .between(*BOB, *DAVE)
+            .amount(10)
+            .ticket_index(0)
+            .status(ChannelStatus::Open)
+            .epoch(0_u32)
+            .build()?;
+        let blokli_sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &[&*ALICE, &*BOB, &*CHRIS, &*DAVE],
+                false,
+                XDaiBalance::new_base(1),
+                HoprBalance::new_base(1000),
+            )
+            .with_channels([c1, c2])
+            .build_dynamic_client([1; Address::SIZE].into());
+
+        let mut chain_connector =
+            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
+                .await?;
+        chain_connector.connect().await?;
+        let events = chain_connector.subscribe()?;
+
+        let cfg = AutoFundingStrategyConfig {
+            min_stake_threshold: stake_limit,
+            funding_amount: fund_amount,
+        };
+
+        let afs = AutoFundingStrategy::new(cfg, chain_connector);
+
+        // on_tick should scan channels and fund c1 (below threshold) but not c2 (above threshold)
+        afs.on_tick().await?;
+
+        // Expect a ChannelBalanceIncreased event for c1
+        events
+            .filter(|event| {
+                futures::future::ready(
+                    matches!(event, ChainEvent::ChannelBalanceIncreased(c, amount) if c.get_id() == c1.get_id() && amount == &fund_amount),
+                )
+            })
+            .next()
+            .timeout(futures_time::time::Duration::from_secs(2))
+            .await?;
+
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_on_tick_skips_when_safe_balance_below_funding_amount() -> anyhow::Result<()> {
+        let stake_limit = HoprBalance::from(7_u32);
+        let fund_amount = HoprBalance::from(5_u32);
+
+        let c1 = ChannelEntry::builder()
+            .between(*BOB, *CHRIS)
+            .amount(3)
+            .ticket_index(0)
+            .status(ChannelStatus::Open)
+            .epoch(0)
+            .build()?;
+
+        let blokli_sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &[&*ALICE, &*BOB, &*CHRIS, &*DAVE],
+                false,
+                XDaiBalance::new_base(1),
+                HoprBalance::from(1_u32),
+            )
+            .with_channels([c1])
+            .build_dynamic_client([1; Address::SIZE].into());
+
+        let mut chain_connector =
+            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
+                .await?;
+        chain_connector.connect().await?;
+        let events = chain_connector.subscribe()?;
+
+        let cfg = AutoFundingStrategyConfig {
+            min_stake_threshold: stake_limit,
+            funding_amount: fund_amount,
+        };
+
+        let afs = AutoFundingStrategy::new(cfg, chain_connector);
+
+        afs.on_tick().await?;
+
+        let no_funding_event = events
+            .filter(|event| {
+                futures::future::ready(
+                    matches!(event, ChainEvent::ChannelBalanceIncreased(c, amount) if c.get_id() == c1.get_id() && amount == &fund_amount),
+                )
+            })
+            .next()
+            .timeout(futures_time::time::Duration::from_secs(1))
+            .await;
+
+        assert!(
+            no_funding_event.is_err(),
+            "on_tick should skip funding when safe balance is below funding_amount"
+        );
+
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_on_tick_funds_only_channels_affordable_by_safe_balance() -> anyhow::Result<()> {
+        let stake_limit = HoprBalance::from(7_u32);
+        let fund_amount = HoprBalance::from(5_u32);
+
+        let c1 = ChannelEntry::builder()
+            .between(*BOB, *CHRIS)
+            .amount(3)
+            .ticket_index(0)
+            .status(ChannelStatus::Open)
+            .epoch(0_u32)
+            .build()?;
+        let c2 = ChannelEntry::builder()
+            .between(*BOB, *DAVE)
+            .amount(2)
+            .ticket_index(0)
+            .status(ChannelStatus::Open)
+            .epoch(0_u32)
+            .build()?;
+        let c3 = ChannelEntry::builder()
+            .between(*BOB, *ALICE)
+            .amount(1)
+            .ticket_index(0)
+            .status(ChannelStatus::Open)
+            .epoch(0_u32)
+            .build()?;
+        let tracked_channels = [*c1.get_id(), *c2.get_id(), *c3.get_id()];
+
+        let blokli_sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &[&*ALICE, &*BOB, &*CHRIS, &*DAVE],
+                false,
+                XDaiBalance::new_base(1),
+                HoprBalance::from(11_u32),
+            )
+            .with_channels([c1, c2, c3])
+            .build_dynamic_client([1; Address::SIZE].into());
+
+        let mut chain_connector =
+            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
+                .await?;
+        chain_connector.connect().await?;
+        let events = chain_connector.subscribe()?;
+
+        let cfg = AutoFundingStrategyConfig {
+            min_stake_threshold: stake_limit,
+            funding_amount: fund_amount,
+        };
+
+        let afs = AutoFundingStrategy::new(cfg, chain_connector);
+
+        afs.on_tick().await?;
+
+        let mut funding_events = events.filter(|event| {
+            futures::future::ready(matches!(
+                event,
+                ChainEvent::ChannelBalanceIncreased(c, amount)
+                    if tracked_channels.contains(c.get_id()) && amount == &fund_amount
+            ))
+        });
+
+        let first_two = funding_events
+            .by_ref()
+            .take(2)
+            .collect::<Vec<_>>()
+            .timeout(futures_time::time::Duration::from_secs(2))
+            .await?;
+        assert_eq!(
+            first_two.len(),
+            2,
+            "on_tick should fund exactly two channels with safe balance budget of 11 and funding amount 5"
+        );
+
+        let third = funding_events
+            .next()
+            .timeout(futures_time::time::Duration::from_secs(1))
+            .await;
+        assert!(
+            third.is_err(),
+            "on_tick should not fund a third channel once safe budget is depleted"
+        );
+
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_in_flight_prevents_duplicate_funding() -> anyhow::Result<()> {
+        let stake_limit = HoprBalance::from(7_u32);
+        let fund_amount = HoprBalance::from(5_u32);
+
+        let c1 = ChannelEntry::builder()
+            .between(*BOB, *CHRIS)
+            .amount(3)
+            .ticket_index(0)
+            .status(ChannelStatus::Open)
+            .epoch(0_u32)
+            .build()?;
+
+        let blokli_sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &[&*ALICE, &*BOB, &*CHRIS, &*DAVE],
+                false,
+                XDaiBalance::new_base(1),
+                HoprBalance::new_base(1000),
+            )
+            .with_channels([c1])
+            .build_dynamic_client([1; Address::SIZE].into());
+
+        let mut chain_connector =
+            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
+                .await?;
+        chain_connector.connect().await?;
+        let _events = chain_connector.subscribe()?;
+
+        let cfg = AutoFundingStrategyConfig {
+            min_stake_threshold: stake_limit,
+            funding_amount: fund_amount,
+        };
+
+        let afs = AutoFundingStrategy::new(cfg, chain_connector);
+
+        // First call should trigger funding
+        afs.on_own_channel_changed(
+            &c1,
+            ChannelDirection::Outgoing,
+            ChannelChange::Balance {
+                left: HoprBalance::from(10_u32),
+                right: c1.balance,
+            },
+        )
+        .await?;
+
+        // Verify the channel is in the in-flight set
+        assert!(
+            afs.in_flight.contains(c1.get_id()),
+            "channel should be in the in-flight set after funding"
+        );
+
+        // Second call with same balance should be skipped due to in-flight tracking.
+        // This returns Ok(()) rather than triggering another funding tx.
+        afs.on_own_channel_changed(
+            &c1,
+            ChannelDirection::Outgoing,
+            ChannelChange::Balance {
+                left: HoprBalance::from(10_u32),
+                right: c1.balance,
+            },
+        )
+        .await?;
+
+        // The in-flight set should still contain exactly one entry (unchanged)
+        assert_eq!(
+            afs.in_flight.len(),
+            1,
+            "in-flight set should still have exactly one entry"
+        );
+        assert!(
+            afs.in_flight.contains(c1.get_id()),
+            "channel should still be in the in-flight set"
+        );
+
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_balance_increase_clears_in_flight() -> anyhow::Result<()> {
+        let stake_limit = HoprBalance::from(7_u32);
+        let fund_amount = HoprBalance::from(5_u32);
+
+        let c1 = ChannelEntry::builder()
+            .between(*BOB, *CHRIS)
+            .amount(3)
+            .ticket_index(0)
+            .status(ChannelStatus::Open)
+            .epoch(0_u32)
+            .build()?;
+
+        let blokli_sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &[&*ALICE, &*BOB, &*CHRIS, &*DAVE],
+                false,
+                XDaiBalance::new_base(1),
+                HoprBalance::new_base(1000),
+            )
+            .with_channels([c1])
+            .build_dynamic_client([1; Address::SIZE].into());
+
+        let mut chain_connector =
+            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
+                .await?;
+        chain_connector.connect().await?;
+        let _events = chain_connector.subscribe()?;
+
+        let cfg = AutoFundingStrategyConfig {
+            min_stake_threshold: stake_limit,
+            funding_amount: fund_amount,
+        };
+
+        let afs = AutoFundingStrategy::new(cfg, chain_connector);
+
+        // Trigger funding (balance decrease below the threshold)
+        afs.on_own_channel_changed(
+            &c1,
+            ChannelDirection::Outgoing,
+            ChannelChange::Balance {
+                left: HoprBalance::from(10_u32),
+                right: c1.balance,
+            },
+        )
+        .await?;
+
+        // Verify channel is in-flight
+        assert!(afs.in_flight.contains(c1.get_id()));
+
+        // Simulate balance increase event (funding confirmed)
+        let funded_channel = ChannelEntry::builder()
+            .between(*BOB, *CHRIS)
+            .amount(3 + 5)
+            .ticket_index(0)
+            .status(ChannelStatus::Open)
+            .epoch(0)
+            .build()?;
+
+        afs.on_own_channel_changed(
+            &funded_channel,
+            ChannelDirection::Outgoing,
+            ChannelChange::Balance {
+                left: HoprBalance::from(3),
+                right: HoprBalance::from(8),
+            },
+        )
+        .await?;
+
+        // Verify channel is no longer in-flight
+        assert!(
+            !afs.in_flight.contains(c1.get_id()),
+            "channel should be cleared from in-flight after balance increase"
+        );
+
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_on_tick_skips_in_flight_channels() -> anyhow::Result<()> {
+        let stake_limit = HoprBalance::from(7_u32);
+        let fund_amount = HoprBalance::from(5_u32);
+
+        // BOB -> CHRIS channel with balance below threshold
+        let c1 = ChannelEntry::builder()
+            .between(*BOB, *CHRIS)
+            .amount(3)
+            .ticket_index(0)
+            .status(ChannelStatus::Open)
+            .epoch(0)
+            .build()?;
+
+        let blokli_sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &[&*ALICE, &*BOB, &*CHRIS, &*DAVE],
+                false,
+                XDaiBalance::new_base(1),
+                HoprBalance::new_base(1000),
+            )
+            .with_channels([c1])
+            .build_dynamic_client([1; Address::SIZE].into());
+
+        let mut chain_connector =
+            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
+                .await?;
+        chain_connector.connect().await?;
+        let _events = chain_connector.subscribe()?;
+
+        let cfg = AutoFundingStrategyConfig {
+            min_stake_threshold: stake_limit,
+            funding_amount: fund_amount,
+        };
+
+        let afs = AutoFundingStrategy::new(cfg, chain_connector);
+
+        // Fund via on_own_channel_changed to populate in-flight set
+        afs.on_own_channel_changed(
+            &c1,
+            ChannelDirection::Outgoing,
+            ChannelChange::Balance {
+                left: HoprBalance::from(10_u32),
+                right: c1.balance,
+            },
+        )
+        .await?;
+
+        // Verify the channel is in-flight
+        assert!(
+            afs.in_flight.contains(c1.get_id()),
+            "channel should be in the in-flight set after funding"
+        );
+
+        // on_tick should skip c1 because it is already in-flight
+        afs.on_tick().await?;
+
+        // Verify the in-flight set still has exactly one entry (channel was not re-funded)
+        assert_eq!(
+            afs.in_flight.len(),
+            1,
+            "in-flight set should still have exactly one entry"
+        );
+        assert!(
+            afs.in_flight.contains(c1.get_id()),
+            "channel should still be in the in-flight set"
+        );
+
+        Ok(())
+    }
+}
