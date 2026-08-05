@@ -124,7 +124,6 @@
 
           hoprImplsPackages = import ./nix/packages/hopr-impls.nix {
             inherit
-              lib
               builders
               sources
               rev
@@ -317,10 +316,20 @@
             };
           };
 
-          # Export packages
-          packages = packages // {
+          # Export packages. Platform library builds are only offered for the
+          # host OS: cross-compiling the Linux (musl) targets from Darwin would
+          # require bootstrapping a full cross toolchain, which is not feasible
+          # locally. On CI each target is built natively on its own runner.
+          packages = {
+            inherit (packages) lib-hopr-impls clippy pre-commit-check;
             # Set default package
             default = packages.lib-hopr-impls;
+          }
+          // lib.optionalAttrs pkgs.stdenv.isLinux {
+            inherit (packages) lib-hopr-impls-x86_64-linux lib-hopr-impls-aarch64-linux;
+          }
+          // lib.optionalAttrs pkgs.stdenv.isDarwin {
+            inherit (packages) lib-hopr-impls-x86_64-darwin lib-hopr-impls-aarch64-darwin;
           };
 
           # Export development shells

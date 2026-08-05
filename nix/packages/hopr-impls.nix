@@ -11,7 +11,6 @@
 # `--workspace` selector, mirroring the multi-crate sibling repos.
 
 {
-  lib,
   builders,
   sources,
   rev,
@@ -40,22 +39,12 @@ let
     depsSrc = sources.deps;
   };
 
-  mkHoprImplsPlatformPackages =
-    platform:
-    let
-      name = "lib-hopr-impls-${platform}";
-    in
-    {
-      "${name}" = builders.${platform}.callPackage nixLib.mkRustPackage localArgs;
-    }
-    // lib.optionalAttrs (lib.hasSuffix "-linux" platform) {
-      "${name}-dev" = builders.${platform}.callPackage nixLib.mkRustPackage (
-        localArgs // { CARGO_PROFILE = "dev"; }
-      );
-    };
+  mkHoprImplsPlatformPackage = platform: {
+    "lib-hopr-impls-${platform}" = builders.${platform}.callPackage nixLib.mkRustPackage localArgs;
+  };
 
   hoprImplsPlatformPackages = builtins.foldl' (a: b: a // b) { } (
-    map mkHoprImplsPlatformPackages [
+    map mkHoprImplsPlatformPackage [
       "x86_64-linux"
       "aarch64-linux"
       "x86_64-darwin"
