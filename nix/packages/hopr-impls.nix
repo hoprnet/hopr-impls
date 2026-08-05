@@ -1,29 +1,41 @@
 # hopr-impls.nix - hopr-impls workspace package definitions
 #
 # Defines all variants of the hopr-impls workspace for different platforms.
-# hopr-impls is a virtual Cargo workspace of Rust crates implementing the
-# hopr-lib API traits.
+# hopr-impls is a *virtual* Cargo workspace (the root manifest has no [package]
+# stanza) of Rust crates implementing the hopr-lib API traits.
+#
+# Because there is no root package, nix-lib's `mkRustLibrary` (which builds a
+# single `-p <pname> --lib`) cannot be used — it would resolve an empty pname
+# and fail with "no packages selected". Instead we build every workspace member
+# via `mkRustPackage` with `prependPackageName = false` and an explicit
+# `--workspace` selector, mirroring the multi-crate sibling repos.
 
 {
   lib,
   builders,
   sources,
-  hoprImplsCrateInfo,
   rev,
   nixLib,
 }:
 
 let
-  # Common build arguments for hopr-impls variants
-  mkHoprImplsBuildArgs =
+  cargoToml = ./../../Cargo.toml;
+
+  # Build the whole workspace rather than a single package.
+  mkWorkspaceBuildArgs =
     { src, depsSrc }:
     {
-      inherit src depsSrc rev;
-      inherit (hoprImplsCrateInfo) pname version;
-      cargoToml = ./../../Cargo.toml;
+      inherit
+        src
+        depsSrc
+        rev
+        cargoToml
+        ;
+      prependPackageName = false;
+      cargoExtraArgs = "--workspace";
     };
 
-  localArgs = mkHoprImplsBuildArgs {
+  localArgs = mkWorkspaceBuildArgs {
     src = sources.main;
     depsSrc = sources.deps;
   };
@@ -34,10 +46,10 @@ let
       name = "lib-hopr-impls-${platform}";
     in
     {
-      "${name}" = builders.${platform}.callPackage nixLib.mkRustLibrary localArgs;
+      "${name}" = builders.${platform}.callPackage nixLib.mkRustPackage localArgs;
     }
     // lib.optionalAttrs (lib.hasSuffix "-linux" platform) {
-      "${name}-dev" = builders.${platform}.callPackage nixLib.mkRustLibrary (
+      "${name}-dev" = builders.${platform}.callPackage nixLib.mkRustPackage (
         localArgs // { CARGO_PROFILE = "dev"; }
       );
     };
@@ -52,12 +64,13 @@ let
   );
 in
 {
-  lib-hopr-impls = builders.local.callPackage nixLib.mkRustLibrary localArgs;
+  lib-hopr-impls = builders.local.callPackage nixLib.mkRustPackage localArgs;
 
-  clippy = builders.local.callPackage nixLib.mkRustLibrary (
+  clippy = builders.local.callPackage nixLib.mkRustPackage (
     localArgs
     // {
       runClippy = true;
+      cargoExtraArgs = "--workspace --all-targets --all-features";
     }
   );
 }

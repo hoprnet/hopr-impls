@@ -99,17 +99,6 @@
           # Import nix-lib for this system
           nixLib = nix-lib.lib.${system};
 
-          # Crane library for Rust builds (for crate info extraction)
-          craneLib = (crane.mkLib pkgs).overrideToolchain (p: p.rust-bin.stable.latest.default);
-
-          # hopr-impls is a virtual Cargo workspace; the root manifest has no
-          # [package] stanza, so pin the pname/version explicitly rather than
-          # reading them from Cargo.toml.
-          hoprImplsCrateInfo = {
-            pname = "hopr-impls";
-            version = "0.1.0";
-          };
-
           # Create source trees for different build contexts using nix-lib
           sources = {
             main = nixLib.mkSrc {
@@ -138,7 +127,6 @@
               lib
               builders
               sources
-              hoprImplsCrateInfo
               rev
               nixLib
               ;
