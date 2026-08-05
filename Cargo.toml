@@ -28,12 +28,14 @@ blokli-client = "0.30.2"
 hopr-api      = "1.16.0"
 hopr-utils    = { package = "hopr-utilities", version = "0.5.1", default-features = false }
 
-# HOPR crates not yet published — sourced from the hoprnet monorepo at master.
-# rev pinned to the master tip the impls history was extracted from.
-hopr-crypto-packet     = { git = "https://github.com/hoprnet/hoprnet", rev = "22c8b82e54c7ae29d8cff61bcd86c862c7755370", default-features = false, features = ["ed25519"] }
-hopr-transport         = { git = "https://github.com/hoprnet/hoprnet", rev = "22c8b82e54c7ae29d8cff61bcd86c862c7755370", default-features = false }
-hopr-transport-probe   = { git = "https://github.com/hoprnet/hoprnet", rev = "22c8b82e54c7ae29d8cff61bcd86c862c7755370", default-features = false }
-hopr-transport-session = { git = "https://github.com/hoprnet/hoprnet", rev = "22c8b82e54c7ae29d8cff61bcd86c862c7755370", default-features = false }
+# HOPR crates not yet published to crates.io — sourced from the hoprnet monorepo
+# at master (rev pinned to the tip the impls history was extracted from). The
+# `version` is required so the published manifests are valid; cargo uses the git
+# source locally and the version constraint once these crates reach crates.io.
+hopr-crypto-packet     = { git = "https://github.com/hoprnet/hoprnet", rev = "22c8b82e54c7ae29d8cff61bcd86c862c7755370", version = "1.4.0", default-features = false, features = ["ed25519"] }
+hopr-transport         = { git = "https://github.com/hoprnet/hoprnet", rev = "22c8b82e54c7ae29d8cff61bcd86c862c7755370", version = "0.35.1", default-features = false }
+hopr-transport-probe   = { git = "https://github.com/hoprnet/hoprnet", rev = "22c8b82e54c7ae29d8cff61bcd86c862c7755370", version = "0.8.0", default-features = false }
+hopr-transport-session = { git = "https://github.com/hoprnet/hoprnet", rev = "22c8b82e54c7ae29d8cff61bcd86c862c7755370", version = "0.24.0", default-features = false }
 
 # Third-party dependencies (versions mirror hoprnet's workspace to preserve compatibility)
 ahash               = "0.8.12"
