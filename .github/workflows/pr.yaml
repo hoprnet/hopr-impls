@@ -87,9 +87,9 @@ jobs:
     uses: hoprnet/hopr-workflows/.github/workflows/checks.yaml@3ee95c480962bb3c1fc0061887da9ba735f537c7 # workflow-checks-v2.1.1
     with:
       source_branch: ${{ github.event.pull_request.head.ref || github.ref }}
-      lint_command: "nix develop --command just quick"
+      lint_command: "nix run -L .#check"
       audit_command: "nix run -L .#audit"
-      deps: true
+      deps: false
       runner_small: depot-ubuntu-24.04-2
       runner_large: depot-ubuntu-24.04-4
     secrets:
