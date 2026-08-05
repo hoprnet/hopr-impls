@@ -1,47 +1,47 @@
 [package]
-name = "hopr-ct-immediate"
-description = "Basic implementation of the CT Telemetry functionality as specified in the HOPR RFCs describing the 0-hop probing"
-version = "0.2.1"
-publish = false
-edition.workspace = true
-license.workspace = true
-readme = "README.md"
-keywords = ["hopr", "cover-traffic"]
-repository.workspace = true
-homepage.workspace = true
-categories = ["network-programming"]
-authors.workspace = true
+authors.workspace      = true
+categories             = ["network-programming"]
+description            = "Basic implementation of the CT Telemetry functionality as specified in the HOPR RFCs describing the 0-hop probing"
+edition.workspace      = true
+homepage.workspace     = true
+include                = ["Cargo.toml", "LICENSE", "README.md", "src/**/*.rs"]
+keywords               = ["cover-traffic", "hopr"]
+license.workspace      = true
+name                   = "hopr-ct-immediate"
+publish                = false
+readme                 = "README.md"
+repository.workspace   = true
 rust-version.workspace = true
-include = ["README.md", "src/**/*.rs", "Cargo.toml", "LICENSE"]
+version                = "0.2.1"
 
 [lib]
 crate-type = ["rlib"]
 
 [features]
 default = []
-serde = ["dep:serde", "dep:humantime-serde", "hopr-api/serde"]
+serde   = ["dep:humantime-serde", "dep:serde", "hopr-api/serde"]
 
 [dependencies]
-anyhow = { workspace = true }
-futures = { workspace = true }
-smart-default = { workspace = true }
-serde = { workspace = true, optional = true, features = ["derive"] }
+anyhow          = { workspace = true }
+futures         = { workspace = true }
 humantime-serde = { workspace = true, optional = true }
-validator = { workspace = true }
-moka = { workspace = true }
+moka            = { workspace = true }
+serde           = { workspace = true, optional = true, features = ["derive"] }
+smart-default   = { workspace = true }
+validator       = { workspace = true }
 
 hopr-api = { workspace = true, features = [
   "ct",
-  "network",
   "graph",
+  "network",
   "types-random",
 ] }
 hopr-utils = { workspace = true, features = ["runtime-tokio"] }
 
 [dev-dependencies]
-tokio = { workspace = true }
-lazy_static = { workspace = true }
 hopr-network-graph = { workspace = true, features = ["petgraph"] }
+lazy_static        = { workspace = true }
+tokio              = { workspace = true }
 
 [package.metadata.cargo-machete]
 ignored = ["humantime-serde"]

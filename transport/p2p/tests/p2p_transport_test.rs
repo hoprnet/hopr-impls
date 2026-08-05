@@ -69,10 +69,9 @@ pub(crate) type TestSwarm = HoprNetwork;
 /// raw libp2p streams from [`HoprNetwork`], exposed to the test as `(sender, receiver)`
 /// channels. This stands in for the production stream protocol.
 ///
-/// * Incoming: `accept()` yields per-peer substreams; each is drained frame-by-frame
-///   into the receiver channel.
-/// * Outgoing: the first message to a peer lazily `open()`s a stream and spawns a
-///   dedicated writer task fed by a per-peer channel; subsequent messages reuse it.
+/// * Incoming: `accept()` yields per-peer substreams; each is drained frame-by-frame into the receiver channel.
+/// * Outgoing: the first message to a peer lazily `open()`s a stream and spawns a dedicated writer task fed by a
+///   per-peer channel; subsequent messages reuse it.
 fn spawn_stream_protocol(network: HoprNetwork, channel_capacity: usize) -> anyhow::Result<(MsgSender, MsgReceiver)> {
     let (out_tx, mut out_rx) = futures::channel::mpsc::channel::<(PeerId, Bytes)>(channel_capacity);
     let (in_tx, in_rx) = futures::channel::mpsc::channel::<(PeerId, Bytes)>(channel_capacity);
