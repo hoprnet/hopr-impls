@@ -19,7 +19,7 @@ crate-type = ["rlib"]
 [features]
 default = []
 telemetry = ["dep:lazy_static", "hopr-api/types-telemetry"]
-runtime-tokio = ["libp2p/tokio", "hopr-transport-probe/runtime-tokio"]
+runtime-tokio = ["libp2p/tokio"]
 testing = []
 transport-quic = ["libp2p/quic", "dep:quinn-udp"]
 
@@ -65,11 +65,7 @@ tokio = { workspace = true }
 
 hopr-api = { workspace = true, features = ["network", "graph", "types-random"] }
 
-hopr-crypto-packet = { workspace = true }
-
 hopr-utils = { workspace = true, features = ["platform"] }
-hopr-transport-probe = { workspace = true }
-hopr-transport = { workspace = true }
 
 [package.metadata.cargo-shear]
 ignored = ["quinn-udp"]

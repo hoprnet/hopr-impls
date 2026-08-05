@@ -28,14 +28,6 @@ blokli-client = "0.30.2"
 hopr-api      = "1.19.0"
 hopr-utils    = { package = "hopr-utilities", version = "0.6.0", default-features = false }
 
-# HOPR crates not yet on crates.io — used only as dev-dependencies of transport/p2p,
-# sourced from the hoprnet monorepo (rev pinned to the tip the impls history was
-# extracted from). No `version` here: as dev-only deps they are stripped from the
-# published manifests, which keeps the crates publishable.
-hopr-crypto-packet     = { git = "https://github.com/hoprnet/hoprnet", rev = "22c8b82e54c7ae29d8cff61bcd86c862c7755370", default-features = false, features = ["ed25519"] }
-hopr-transport         = { git = "https://github.com/hoprnet/hoprnet", rev = "22c8b82e54c7ae29d8cff61bcd86c862c7755370", default-features = false }
-hopr-transport-probe   = { git = "https://github.com/hoprnet/hoprnet", rev = "22c8b82e54c7ae29d8cff61bcd86c862c7755370", default-features = false }
-
 # Third-party dependencies (versions mirror hoprnet's workspace to preserve compatibility)
 ahash               = "0.8.12"
 anyhow              = "1.0.104"
