@@ -10,6 +10,14 @@ members = [
 ]
 resolver = "3"
 
+[workspace.metadata.release]
+# All member crates are new on crates.io. Raise cargo-release's client-side
+# new-package check so the `--workspace` publish dry-run (CI "Library / Build")
+# verifies all crates instead of aborting. The crates.io server-side limit of
+# 5 new crates / 24h still applies to the actual `--execute` publish, which is
+# performed in batches during the initial release.
+rate-limit.new-packages = 10
+
 [workspace.package]
 authors      = ["HOPR Association <tech@hoprnet.org>"]
 edition      = "2024"

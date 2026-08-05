@@ -133,7 +133,10 @@ jobs:
       version_type: commit
       architecture: ${{ matrix.architecture }}
       build_file: Cargo.toml
-      package_name: hopr-impls
+      # Empty package_name makes the reusable workflow verify the whole virtual
+      # workspace (`cargo release publish --workspace`); a name would pass
+      # `--package hopr-impls`, which fails since there is no such crate.
+      package_name: ""
       runner: ${{ matrix.runner }}
       enabled: ${{ matrix.required_label == '' || contains(github.event.pull_request.labels.*.name, matrix.required_label) }}
     secrets:
