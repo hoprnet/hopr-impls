@@ -121,28 +121,27 @@ fn spawn_stream_protocol(network: HoprNetwork, channel_capacity: usize) -> anyho
                     };
                     let (peer_tx, mut peer_rx) = futures::channel::mpsc::channel::<Bytes>(channel_capacity);
                     spawn(async move {
-                        // Flush in batches rather than per-frame to keep throughput high while still
-                        // pushing data out promptly for the receiver.
-                        const FLUSH_EVERY: usize = 64;
                         let mut writer = Box::pin(stream);
-                        let mut since_flush = 0usize;
-                        'outer: while let Some(b) = peer_rx.next().await {
-                            // Length-delimited frame written as a single buffer (4-byte BE length + payload).
-                            let mut frame = Vec::with_capacity(4 + b.len());
-                            frame.extend_from_slice(&(b.len() as u32).to_be_bytes());
-                            frame.extend_from_slice(&b);
-                            if writer.write_all(&frame).await.is_err() {
-                                break;
-                            }
-                            since_flush += 1;
-                            if since_flush >= FLUSH_EVERY {
-                                since_flush = 0;
-                                if writer.flush().await.is_err() {
+                        // Coalesce each burst of already-queued frames into a single flush: write the
+                        // received frame plus any others waiting in the channel, then flush. Bulk sends
+                        // stay batched for throughput, while a lone priming frame is flushed immediately
+                        // instead of waiting for a fixed-size batch to fill.
+                        'outer: while let Some(first) = peer_rx.next().await {
+                            let mut next = Some(first);
+                            while let Some(b) = next {
+                                // Length-delimited frame written as a single buffer (4-byte BE length + payload).
+                                let mut frame = Vec::with_capacity(4 + b.len());
+                                frame.extend_from_slice(&(b.len() as u32).to_be_bytes());
+                                frame.extend_from_slice(&b);
+                                if writer.write_all(&frame).await.is_err() {
                                     break 'outer;
                                 }
+                                next = peer_rx.try_recv().ok();
+                            }
+                            if writer.flush().await.is_err() {
+                                break;
                             }
                         }
-                        let _ = writer.flush().await;
                         let _ = writer.close().await;
                     });
                     peers.entry(peer).or_insert(peer_tx)

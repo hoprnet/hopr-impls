@@ -32,7 +32,9 @@ jobs:
       version_type: pr
       architecture: ${{ matrix.architecture }}
       build_file: Cargo.toml
-      package_name: hopr-impls
+      # Empty so the reusable workflow verifies the whole virtual workspace
+      # (`--workspace`); "hopr-impls" is not a crate. See pr.yaml.
+      package_name: ""
       runner: ${{ matrix.runner }}
     secrets:
       cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
