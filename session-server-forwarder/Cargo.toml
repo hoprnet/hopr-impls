@@ -20,7 +20,6 @@ runtime-tokio = [
   "dep:tokio-retry",
   "hopr-utils/network-types-runtime-tokio",
   "hopr-utils/parallelize-runtime-tokio",
-  "hopr-transport-session/runtime-tokio",
 ]
 telemetry = ["hopr-api/types-telemetry", "dep:lazy_static"]
 
@@ -30,7 +29,6 @@ hopr-api = { workspace = true, features = [
   "node-session-server",
   "types-keypair",
 ] }
-hopr-transport-session = { workspace = true }
 hopr-utils = { workspace = true, features = [
   "network-types",
   "parallelize",
