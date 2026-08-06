@@ -1,5 +1,5 @@
 ---
-name: Close release hopr-impls
+name: Close release
 on:
   workflow_dispatch:
     inputs:
