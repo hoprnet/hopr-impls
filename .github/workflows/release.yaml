@@ -49,6 +49,12 @@ jobs:
           source_branch: ${{ github.ref_name }}
           file: Cargo.toml
           release_type: ${{ inputs.release_type }}
+          # This is a virtual workspace with independent per-crate versions, so there is no
+          # single repo version to bump. Disable the automatic post-release bump: the publish
+          # step (`cargo release publish --workspace`) already releases only crates whose
+          # version is not yet on crates.io, and each crate's version is bumped in the PR that
+          # changes it. This avoids re-versioning every crate on every release.
+          bump_version: false
           cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
           zulip_api_key: ${{ secrets.ZULIP_API_KEY }}
           zulip_email: ${{ secrets.ZULIP_EMAIL }}
