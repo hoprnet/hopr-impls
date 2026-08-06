@@ -1,6 +1,6 @@
 [package]
 authors.workspace      = true
-categories             = ["network-programming", "blockchain"]
+categories             = ["blockchain", "network-programming"]
 description            = "Implementation of HOPR Chain APIs using Blokli client"
 edition.workspace      = true
 homepage.workspace     = true
