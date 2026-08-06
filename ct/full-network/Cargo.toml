@@ -1,52 +1,52 @@
 [package]
-name = "hopr-ct-full-network"
-description = "Full implementation of the Telemetry functionality as specified in the HOPR RFCs along with optional noise (cover traffic) generation"
-version = "0.3.0"
-edition.workspace = true
-license.workspace = true
-readme = "README.md"
-keywords = ["hopr", "cover-traffic", "mixnet"]
-repository.workspace = true
-homepage.workspace = true
-categories = ["network-programming"]
-authors.workspace = true
+authors.workspace      = true
+categories             = ["network-programming"]
+description            = "Full implementation of the Telemetry functionality as specified in the HOPR RFCs along with optional noise (cover traffic) generation"
+edition.workspace      = true
+homepage.workspace     = true
+include                = ["Cargo.toml", "LICENSE", "README.md", "src/**/*.rs"]
+keywords               = ["cover-traffic", "hopr", "mixnet"]
+license.workspace      = true
+name                   = "hopr-ct-full-network"
+readme                 = "README.md"
+repository.workspace   = true
 rust-version.workspace = true
-include = ["README.md", "src/**/*.rs", "Cargo.toml", "LICENSE"]
+version                = "0.3.1"
 
 [lib]
 crate-type = ["rlib"]
 
 [features]
 default = []
-serde = ["dep:serde", "dep:humantime-serde", "hopr-api/serde"]
-noise = []
+noise   = []
+serde   = ["dep:humantime-serde", "dep:serde", "hopr-api/serde"]
 
 [dependencies]
-anyhow = { workspace = true }
-cfg-if = { workspace = true }
-futures = { workspace = true }
-futures-time = { workspace = true }
-tracing = { workspace = true }
-smart-default = { workspace = true }
-serde = { workspace = true, optional = true, features = ["derive"] }
+anyhow          = { workspace = true }
+cfg-if          = { workspace = true }
+futures         = { workspace = true }
+futures-time    = { workspace = true }
 humantime-serde = { workspace = true, optional = true }
-validator = { workspace = true }
+serde           = { workspace = true, optional = true, features = ["derive"] }
+smart-default   = { workspace = true }
+tracing         = { workspace = true }
+validator       = { workspace = true }
 
 hopr-api = { workspace = true, features = [
   "ct",
-  "network",
   "graph",
+  "network",
   "types-random",
 ] }
+hopr-network-graph = { workspace = true, features = ["petgraph"] }
 hopr-utils = { workspace = true, features = [
   "statistics-types",
   "statistics-types-weighted",
 ] }
-hopr-network-graph = { workspace = true, features = ["petgraph"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["time"] }
 lazy_static = { workspace = true }
+tokio       = { workspace = true, features = ["time"] }
 
 [package.metadata.cargo-machete]
 ignored = ["humantime-serde"]

@@ -1,0 +1,10 @@
+[advisories]
+ignore = [
+  "RUSTSEC-2024-0388", # derivative: unmaintained, but widely used transitive dependency
+  "RUSTSEC-2024-0436", # paste: unmaintained, but widely used transitive dependency
+  "RUSTSEC-2026-0173", # proc-macro-error2: unmaintained, used by aquamarine and alloy
+  # hickory-proto is pulled in transitively via libp2p-dns (pinned to ^0.25 by
+  # libp2p). Both advisories below can only be cleared by a major libp2p bump.
+  "RUSTSEC-2026-0118", # hickory-proto: NSEC3 unbounded loop — no fixed upstream release available
+  "RUSTSEC-2026-0119", # hickory-proto: O(n^2) name compression — fix (>=0.26.1) requires a libp2p major upgrade
+]

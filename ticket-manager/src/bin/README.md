@@ -1,6 +1,7 @@
 # Ticket Inspector
 
-`ticket-inspector` is a CLI tool designed to inspect and manipulate the HOPR redeemable tickets database. It allows users to list channel IDs, display tickets in specific queues, delete queues or individual tickets, and calculate the total value of tickets for a given channel.
+`ticket-inspector` is a CLI tool designed to inspect and manipulate the HOPR redeemable tickets database. It allows users to list channel
+IDs, display tickets in specific queues, delete queues or individual tickets, and calculate the total value of tickets for a given channel.
 
 ## Build and Installation
 
@@ -10,7 +11,8 @@ To build the `ticket-inspector` binary, use the following command from the proje
 cargo build -p hopr-ticket-manager --bin ticket-inspector --features redb,serde
 ```
 
-Note: The `redb` feature is required for the tool to work with the default database implementation. The `serde` feature enables JSON output formatting.
+Note: The `redb` feature is required for the tool to work with the default database implementation. The `serde` feature enables JSON output
+formatting.
 
 ## Usage
 
@@ -65,8 +67,8 @@ ticket-inspector --db-file /path/to/db total-value --channel-id <CHANNEL_ID>
 
 The tool supports two output formats:
 
-1.  **Plain (default)**: Human-readable text format.
-2.  **JSON**: Machine-readable JSON format. Requires the `serde` feature during compilation.
+1. **Plain (default)**: Human-readable text format.
+2. **JSON**: Machine-readable JSON format. Requires the `serde` feature during compilation.
 
 Example of JSON output:
 

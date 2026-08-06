@@ -457,6 +457,7 @@ fn print_network_info(network_info: NetworkInfo, event: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(feature = "testing", target_os = "android", target_os = "ios"))]
     use std::net::{IpAddr, Ipv4Addr};
 
     #[test]

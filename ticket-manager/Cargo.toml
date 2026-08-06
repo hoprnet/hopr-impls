@@ -1,47 +1,47 @@
 [package]
-name = "hopr-ticket-manager"
-description = "Manages outgoing ticket indices and incoming redeemable tickets"
-version = "0.5.1"
-edition.workspace = true
-license.workspace = true
-readme = "README.md"
-keywords = ["hopr", "tickets", "payment"]
-repository.workspace = true
-homepage.workspace = true
-categories = ["network-programming"]
 authors.workspace = true
-rust-version.workspace = true
+categories = ["network-programming"]
+description = "Manages outgoing ticket indices and incoming redeemable tickets"
+edition.workspace = true
+homepage.workspace = true
 include = [
-  "README.md",
-  "src/**/*.rs",
-  "benches/**/*.rs",
   "Cargo.toml",
   "LICENSE",
+  "README.md",
+  "benches/**/*.rs",
+  "src/**/*.rs",
 ]
+keywords = ["hopr", "payment", "tickets"]
+license.workspace = true
+name = "hopr-ticket-manager"
+readme = "README.md"
+repository.workspace = true
+rust-version.workspace = true
+version = "0.5.2"
 
 [features]
-default = ["redb", "cli"]
-redb = ["dep:postcard", "dep:redb", "hopr-api/serde"]
-cli = ["dep:clap", "dep:strum"]
-serde = ["dep:serde", "dep:serde_json", "hopr-api/serde"]
+cli     = ["dep:clap", "dep:strum"]
+default = ["cli", "redb"]
+redb    = ["dep:postcard", "dep:redb", "hopr-api/serde"]
+serde   = ["dep:serde", "dep:serde_json", "hopr-api/serde"]
 
 [dependencies]
-anyhow = { workspace = true }
-ahash = { workspace = true }
-clap = { workspace = true, optional = true }
-dashmap = { workspace = true, features = ["inline"] }
-hashbrown = { workspace = true, features = ["inline-more"] }
-futures = { workspace = true }
+ahash       = { workspace = true }
+anyhow      = { workspace = true }
+clap        = { workspace = true, optional = true }
+dashmap     = { workspace = true, features = ["inline"] }
+futures     = { workspace = true }
+hashbrown   = { workspace = true, features = ["inline-more"] }
 parking_lot = { workspace = true, features = ["arc_lock"] }
-redb = { workspace = true, optional = true }
-postcard = { workspace = true, optional = true, features = ["use-std"] }
-rand = { workspace = true, optional = true }
-serde = { workspace = true, optional = true }
-serde_json = { workspace = true, optional = true }
-strum = { workspace = true, optional = true }
-tempfile = { workspace = true }
-thiserror = { workspace = true }
-tracing = { workspace = true }
+postcard    = { workspace = true, optional = true, features = ["use-std"] }
+rand        = { workspace = true, optional = true }
+redb        = { workspace = true, optional = true }
+serde       = { workspace = true, optional = true }
+serde_json  = { workspace = true, optional = true }
+strum       = { workspace = true, optional = true }
+tempfile    = { workspace = true }
+thiserror   = { workspace = true }
+tracing     = { workspace = true }
 
 hopr-api = { workspace = true, features = [
   "chain",
@@ -53,22 +53,22 @@ hopr-utils = { workspace = true, features = ["platform"] }
 
 [dev-dependencies]
 criterion = { workspace = true }
-rand = { workspace = true }
-test-log = { workspace = true }
-tokio = { workspace = true }
+rand      = { workspace = true }
+test-log  = { workspace = true }
+tokio     = { workspace = true }
 
 hopr-chain-connector = { workspace = true, features = [
-  "testing",
   "runtime-tokio",
+  "testing",
 ] }
 
 [[bin]]
-name = "ticket-inspector"
-path = "src/bin/ticket_inspector.rs"
-required-features = ["redb", "cli"]
+name              = "ticket-inspector"
+path              = "src/bin/ticket_inspector.rs"
+required-features = ["cli", "redb"]
 
 [[bench]]
-name = "ticket_manager_bench"
 harness = false
+name    = "ticket_manager_bench"
 
 [lib]

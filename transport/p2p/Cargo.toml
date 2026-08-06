@@ -1,27 +1,27 @@
 [package]
-name = "hopr-transport-p2p"
-description = "rust-libp2p based p2p transport implementation"
-version = "0.9.4"
-edition.workspace = true
-license.workspace = true
-readme = "README.md"
-keywords = ["hopr", "transport", "libp2p", "p2p"]
-repository.workspace = true
-homepage.workspace = true
-categories = ["network-programming"]
-authors.workspace = true
+authors.workspace      = true
+categories             = ["network-programming"]
+description            = "rust-libp2p based p2p transport implementation"
+edition.workspace      = true
+homepage.workspace     = true
+include                = ["Cargo.toml", "LICENSE", "README.md", "src/**/*.rs", "tests/**/*.rs"]
+keywords               = ["hopr", "libp2p", "p2p", "transport"]
+license.workspace      = true
+name                   = "hopr-transport-p2p"
+readme                 = "README.md"
+repository.workspace   = true
 rust-version.workspace = true
-include = ["README.md", "src/**/*.rs", "tests/**/*.rs", "Cargo.toml", "LICENSE"]
+version                = "0.9.5"
 
 [lib]
 crate-type = ["rlib"]
 
 [features]
-default = []
-telemetry = ["dep:lazy_static", "hopr-api/types-telemetry"]
-runtime-tokio = ["libp2p/tokio", "hopr-transport-probe/runtime-tokio"]
-testing = []
-transport-quic = ["libp2p/quic", "dep:quinn-udp"]
+default        = []
+runtime-tokio  = ["libp2p/tokio"]
+telemetry      = ["dep:lazy_static", "hopr-api/types-telemetry"]
+testing        = []
+transport-quic = ["dep:quinn-udp", "libp2p/quic"]
 
 [dependencies]
 async-broadcast = { workspace = true }
@@ -30,11 +30,11 @@ backon = { workspace = true }
 futures = { workspace = true }
 lazy_static = { workspace = true, optional = true }
 libp2p = { workspace = true, features = [
-  "noise",
-  "macros",
   "autonat",
   "dns",
   "identify",
+  "macros",
+  "noise",
   "tcp",
   "yamux",
 ] }
@@ -44,10 +44,10 @@ quinn-udp = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
-dashmap = { workspace = true }
+dashmap     = { workspace = true }
 pin-project = { workspace = true }
 
-hopr-api = { workspace = true, features = ["ct", "network"] }
+hopr-api   = { workspace = true, features = ["ct", "network"] }
 hopr-utils = { workspace = true, features = ["network-types"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -56,20 +56,16 @@ quinn-udp = { workspace = true, optional = true, features = [
 ] }
 
 [dev-dependencies]
-anyhow = { workspace = true }
+anyhow           = { workspace = true }
 async_channel_io = { workspace = true }
-bytes = { workspace = true }
-lazy_static = { workspace = true }
-more-asserts = { workspace = true }
-tokio = { workspace = true }
+bytes            = { workspace = true }
+lazy_static      = { workspace = true }
+more-asserts     = { workspace = true }
+tokio            = { workspace = true }
 
-hopr-api = { workspace = true, features = ["network", "graph", "types-random"] }
-
-hopr-crypto-packet = { workspace = true }
+hopr-api = { workspace = true, features = ["graph", "network", "types-random"] }
 
 hopr-utils = { workspace = true, features = ["platform"] }
-hopr-transport-probe = { workspace = true }
-hopr-transport = { workspace = true }
 
 [package.metadata.cargo-shear]
 ignored = ["quinn-udp"]

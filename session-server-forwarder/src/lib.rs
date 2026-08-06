@@ -2,14 +2,14 @@
 
 pub mod config;
 
-use std::net::SocketAddr;
+use std::{marker::PhantomData, net::SocketAddr};
 
-use hopr_api::types::crypto::prelude::OffchainKeypair;
-use hopr_transport_session::{IncomingSession, ServiceId, SessionTarget, transfer_session};
+use hopr_api::{node::IncomingSession, types::crypto::prelude::OffchainKeypair};
 use hopr_utils::{
     network_types::{
-        prelude::ForeignDataMode,
+        prelude::{ForeignDataMode, IpOrHostExt, ServiceId, SessionTarget},
         udp::{ConnectedUdpStream, UdpStreamParallelism},
+        utils::transfer_session,
     },
     parallelize::cpu::spawn_blocking,
 };
@@ -49,15 +49,40 @@ impl ForwarderError {
 
 /// Implementation of `HoprSessionServer` that facilitates
 /// bridging of TCP or UDP sockets from the Session Exit node to a destination.
-#[derive(Debug, Clone)]
-pub struct HoprServerIpForwardingReactor {
+///
+/// Generic over the incoming session byte-stream `S`, which is supplied by the caller
+/// (e.g. hopr-lib) as `HoprSession`; this crate does not depend on the concrete type.
+pub struct HoprServerIpForwardingReactor<S> {
     keypair: OffchainKeypair,
     cfg: SessionIpForwardingConfig,
+    _marker: PhantomData<fn() -> S>,
 }
 
-impl HoprServerIpForwardingReactor {
+impl<S> Clone for HoprServerIpForwardingReactor<S> {
+    fn clone(&self) -> Self {
+        Self {
+            keypair: self.keypair.clone(),
+            cfg: self.cfg.clone(),
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<S> std::fmt::Debug for HoprServerIpForwardingReactor<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HoprServerIpForwardingReactor")
+            .field("cfg", &self.cfg)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<S> HoprServerIpForwardingReactor<S> {
     pub fn new(keypair: OffchainKeypair, cfg: SessionIpForwardingConfig) -> Self {
-        Self { keypair, cfg }
+        Self {
+            keypair,
+            cfg,
+            _marker: PhantomData,
+        }
     }
 
     fn all_ips_allowed(&self, addrs: &[SocketAddr]) -> bool {
@@ -77,13 +102,16 @@ impl HoprServerIpForwardingReactor {
 pub const SERVICE_ID_LOOPBACK: ServiceId = 0;
 
 #[async_trait::async_trait]
-impl hopr_api::node::HoprSessionServer for HoprServerIpForwardingReactor {
+impl<S> hopr_api::node::HoprSessionServer for HoprServerIpForwardingReactor<S>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
+{
     type Error = ForwarderError;
-    type Session = IncomingSession;
+    type Session = IncomingSession<S>;
 
     #[tracing::instrument(level = "debug", skip(self, session))]
-    async fn process(&self, mut session: IncomingSession) -> Result<(), ForwarderError> {
-        let session_id = *session.session.id();
+    async fn process(&self, mut session: IncomingSession<S>) -> Result<(), ForwarderError> {
+        let session_id = session.id;
         match session.target {
             SessionTarget::UdpStream(udp_target) => {
                 let kp = self.keypair.clone();
