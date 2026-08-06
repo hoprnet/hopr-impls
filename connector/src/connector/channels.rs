@@ -278,6 +278,17 @@ mod tests {
         let mut connector = create_connector(blokli_client)?;
         connector.connect().await?;
 
+        // `connect()`'s readiness threshold only accounts for `Open` channels, so the
+        // `PendingToClose` `channel_2` is indexed by the background sync task, which can
+        // lag under load (e.g. a busy CI runner). Wait for it to be indexed before
+        // asserting the exact channel state.
+        for _ in 0..250 {
+            if connector.channel_by_id(channel_2.get_id())?.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
         assert_eq!(Some(channel_1), connector.channel_by_id(channel_1.get_id())?);
         assert_eq!(
             Some(channel_1),
