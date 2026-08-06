@@ -11,7 +11,7 @@ name                   = "hopr-chain-connector"
 readme                 = "README.md"
 repository.workspace   = true
 rust-version.workspace = true
-version                = "0.22.1"
+version                = "0.22.2"
 
 [features]
 runtime-tokio = ["hopr-utils/runtime-tokio"]

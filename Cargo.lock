@@ -3769,7 +3769,7 @@ dependencies = [
 
 [[package]]
 name = "hopr-chain-connector"
-version = "0.22.1"
+version = "0.22.2"
 dependencies = [
  "ahash",
  "anyhow",
@@ -3804,7 +3804,7 @@ dependencies = [
 
 [[package]]
 name = "hopr-ct-full-network"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "cfg-if",
@@ -3842,7 +3842,7 @@ dependencies = [
 
 [[package]]
 name = "hopr-network-graph"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "assertables",
@@ -3866,7 +3866,7 @@ dependencies = [
 
 [[package]]
 name = "hopr-session-server-forwarder"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "hopr-api",
@@ -3884,7 +3884,7 @@ dependencies = [
 
 [[package]]
 name = "hopr-ticket-manager"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "ahash",
  "anyhow",
@@ -3912,7 +3912,7 @@ dependencies = [
 
 [[package]]
 name = "hopr-transport-p2p"
-version = "0.9.4"
+version = "0.9.5"
 dependencies = [
  "anyhow",
  "async-broadcast",
