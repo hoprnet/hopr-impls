@@ -51,7 +51,8 @@ impl ChannelGraph {
     ///
     /// * `me` – offchain public key of the local node (added as the first graph node).
     /// * `edge_penalty` – penalty multiplier for edges lacking probe-based quality observations.
-    /// * `min_ack_rate` – minimum acceptable message acknowledgment rate for path selection.
+    /// * `min_ack_rate` – minimum acknowledgment rate for **data** path selection; deliberately not applied to loopback
+    ///   probe generation.
     /// * `max_plausible_loopback_rtt` – upper bound on a loopback probe RTT considered plausible; measurements above it
     ///   are discarded during attribution.
     pub fn with_edge_params(
@@ -78,6 +79,19 @@ impl ChannelGraph {
     /// Returns the self-identity key of this graph.
     pub fn me(&self) -> &OffchainPublicKey {
         &self.me
+    }
+
+    /// Returns the configured penalty multiplier for edges lacking probe observations.
+    pub fn edge_penalty(&self) -> f64 {
+        self.edge_penalty
+    }
+
+    /// Returns the configured minimum acknowledgement rate for data path selection.
+    ///
+    /// Exposed so data-path callers apply the same threshold the graph was built with. Not applied
+    /// to loopback probe generation, which must reach edges data selection rejects.
+    pub fn min_ack_rate(&self) -> f64 {
+        self.min_ack_rate
     }
 }
 

@@ -15,6 +15,7 @@ use hopr_api::{
         },
     },
 };
+use hopr_network_graph::{MAX_LOOPBACK_HOPS, MIN_LOOPBACK_HOPS};
 use hopr_utils::statistics::WeightedCollection;
 
 use crate::{ProberConfig, priority::immediate_probe_priority};
@@ -60,7 +61,14 @@ fn loopback_routing(me: NodeId, path: Vec<OffchainPublicKey>) -> Option<Destinat
         })
 }
 
-/// Stream that cycles through 1-, 2-, and 3-hop loopback paths with weighted shuffle.
+/// Hop counts cycled through by loopback probing, in **intermediate relay hops** — not edges.
+///
+/// A loopback of `h` hops traverses `h + 1` edges. Every entry must lie within
+/// `MIN_LOOPBACK_HOPS..=MAX_LOOPBACK_HOPS`; outside it, candidates are built and then silently
+/// discarded when the routing options are constructed.
+const LOOPBACK_HOP_COUNTS: [usize; 2] = [MIN_LOOPBACK_HOPS, MAX_LOOPBACK_HOPS];
+
+/// Stream that cycles through 2- and 3-hop loopback paths with weighted shuffle.
 ///
 /// Shared by both cover traffic and intermediate probing — the caller wraps each
 /// emitted item into the appropriate outer type.
@@ -68,15 +76,14 @@ fn loopback_path_stream<U>(cfg: ProberConfig, graph: U) -> impl futures::Stream<
 where
     U: NetworkGraphTraverse<NodeId = OffchainPublicKey> + Clone + Send + Sync + 'static,
 {
-    // 2, 3, 4 edges → 1-, 2-, 3-hops in the HOPR protocol
     futures_time::stream::interval(futures_time::time::Duration::from(cfg.interval))
-        .flat_map(|_| futures::stream::iter([2usize, 3, 4]))
-        .filter_map(move |edge_count| futures::future::ready(std::num::NonZeroUsize::new(edge_count)))
-        .flat_map(move |edge_count| {
-            let paths = graph.simple_loopback_to_self(edge_count.get(), Some(100));
+        .flat_map(|_| futures::stream::iter(LOOPBACK_HOP_COUNTS))
+        .filter_map(move |hops| futures::future::ready(std::num::NonZeroUsize::new(hops)))
+        .flat_map(move |hops| {
+            let paths = graph.simple_loopback_to_self(hops.get(), Some(100));
 
             let count = paths.len();
-            tracing::debug!(edge_count = edge_count.get(), count, "loopback path candidates");
+            tracing::debug!(hops = hops.get(), count, "loopback path candidates");
             let weighted: Vec<((Vec<OffchainPublicKey>, PathId), f64)> = paths
                 .into_iter()
                 .map(|(path, path_id)| ((path, path_id), cfg.base_priority))
@@ -263,6 +270,26 @@ mod tests {
     use super::*;
 
     const TINY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(20);
+
+    #[test]
+    fn requested_loopback_hop_counts_must_all_be_routable() {
+        // Regression guard. These values are *hop* counts, but the parameter they feed used to be
+        // read as an edge count, so the set requested was {2,3,4} rather than {2,3}. A 4-hop path
+        // exceeds what the HOPR packet format can route: candidates were enumerated and then
+        // silently dropped when the routing options were built, wasting a third of every probe
+        // round. Any value outside the routable range must fail here rather than at runtime.
+        assert!(
+            !LOOPBACK_HOP_COUNTS.is_empty(),
+            "loopback probing requires at least one hop count"
+        );
+
+        for hops in LOOPBACK_HOP_COUNTS {
+            assert!(
+                (MIN_LOOPBACK_HOPS..=MAX_LOOPBACK_HOPS).contains(&hops),
+                "{hops} hops is outside the routable range {MIN_LOOPBACK_HOPS}..={MAX_LOOPBACK_HOPS}"
+            );
+        }
+    }
 
     fn fast_cfg() -> ProberConfig {
         ProberConfig {

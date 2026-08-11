@@ -10,7 +10,19 @@ use hopr_api::{
 };
 use petgraph::graph::NodeIndex;
 
-use crate::{ChannelGraph, algorithm::all_simple_paths_multi, graph::InnerGraph};
+use crate::{ChannelGraph, algorithm::all_simple_paths_multi, graph::InnerGraph, petgraph::path_id};
+
+/// Lowest number of intermediate relay hops used for loopback probing.
+///
+/// RFC-0010 §4.2.1.2 permits `n = 1`, but then the sole relay sees its predecessor and successor
+/// are the same node, identifying the loop and its originator. Excluding it is a local privacy
+/// decision, not an RFC requirement.
+pub const MIN_LOOPBACK_HOPS: usize = 2;
+
+/// Highest number of intermediate relay hops used for loopback probing.
+///
+/// Bounded by the packet format: RFC-0004 requires 0–3 hops.
+pub const MAX_LOOPBACK_HOPS: usize = hopr_api::types::internal::routing::RoutingOptions::MAX_INTERMEDIATE_HOPS;
 
 /// A shared cost function that computes a cumulative cost from edge observations.
 pub(crate) type SharedValueFn<C> = Arc<dyn Fn(C, &crate::Observations, usize) -> C + Send + Sync>;
@@ -49,13 +61,17 @@ where
         move |c, w, i| value_fn(c, w, i),
     )
     .filter_map(|(node_indices, final_cost)| {
-        // Build PathId from node indices along the path
+        // Build PathId from node indices along the path. Slots are written through
+        // `path_id::encode` so a node index never collides with the reserved padding
+        // value `0` (RFC-0010 §4.3.3).
         let mut path_id: PathId = [0u64; 5];
         for (i, &node_idx) in node_indices.iter().enumerate() {
             if i >= path_id.len() {
                 return None;
             }
-            path_id[i] = node_idx.index() as u64;
+            // Slots are key-derived, so a node removed mid-flight can never be confused with
+            // whichever node petgraph moves into its index.
+            path_id[i] = path_id::encode(inner.indices.get_by_right(&node_idx)?);
         }
 
         // Convert node indices to public keys; strip `source` (first element).
@@ -152,8 +168,14 @@ impl hopr_api::graph::NetworkGraphTraverse for ChannelGraph {
         )
     }
 
-    fn simple_loopback_to_self(&self, length: usize, take_count: Option<usize>) -> Vec<(Vec<Self::NodeId>, PathId)> {
-        if length > 1 {
+    /// Generates loopback paths of exactly `hops` intermediate relay nodes.
+    ///
+    /// NOTE: `hops` counts relay nodes, **not edges** — the closed loop has `hops + 1` edges, since
+    /// the closing edge is appended after path-finding.
+    ///
+    /// Requests outside [`MIN_LOOPBACK_HOPS`]`..=`[`MAX_LOOPBACK_HOPS`] yield no paths.
+    fn simple_loopback_to_self(&self, hops: usize, take_count: Option<usize>) -> Vec<(Vec<Self::NodeId>, PathId)> {
+        if (MIN_LOOPBACK_HOPS..=MAX_LOOPBACK_HOPS).contains(&hops) {
             let inner = self.inner.read();
 
             if let Some(me_idx) = inner.indices.get_by_left(&self.me) {
@@ -170,32 +192,48 @@ impl hopr_api::graph::NetworkGraphTraverse for ChannelGraph {
                     })
                     .collect::<HashSet<_>>();
 
-                let value_fn = EdgeValueFn::forward_without_self_loopback(self.edge_penalty, self.min_ack_rate);
+                // Deliberately more permissive than data path selection. RFC-0010 §4.2.1.4 wants
+                // low-scoring edges probed *more* urgently; applying the production `min_ack_rate`
+                // here would instead prune them, so they would stop being probed, never be
+                // resampled, and stay excluded permanently.
+                let value_fn = EdgeValueFn::forward_without_self_loopback(self.edge_penalty, 0.0);
 
                 return find_paths(
                     &inner,
                     *me_idx,
                     &connected_neighbors,
-                    length,
+                    hops,
                     take_count,
                     value_fn.initial_value(),
                     value_fn.min_value(),
                     value_fn.into_value_fn(),
                 )
                 .into_iter()
-                .map(|(mut a, mut b, _c)| {
+                .filter_map(|(mut a, mut b, _c)| {
                     // find_paths already strips the leading `me` (source), so `a` is
                     // [intermediates…, connected_neighbor]. Append `me` to close the loopback;
                     // this is the only sanctioned position where `me` appears as a "destination".
                     //
                     // b is filled by find_paths BEFORE skip(1), so b[0] = me_idx and
                     // b[1..=path_node_count] = path nodes. Closing me goes at b[path_node_count + 1].
+                    //
+                    // The hop range above guarantees the slot exists. Without the closing marker
+                    // the PathId cannot be resolved back to a loop, so drop rather than emit it.
                     let path_node_count = a.len();
-                    if path_node_count + 1 < b.len() {
-                        b[path_node_count + 1] = me_idx.index() as u64;
+                    debug_assert!(
+                        path_node_count + 1 < b.len(),
+                        "loopback of {path_node_count} hops has no PathId slot for the closing node"
+                    );
+                    if path_node_count + 1 >= b.len() {
+                        tracing::warn!(
+                            hops = path_node_count,
+                            "loopback path has no PathId slot for the closing node, dropping"
+                        );
+                        return None;
                     }
+                    b[path_node_count + 1] = path_id::encode(&self.me);
                     a.push(self.me);
-                    (a, b)
+                    Some((a, b))
                 })
                 .collect();
             };
@@ -761,9 +799,13 @@ mod tests {
         assert_eq!(routes.len(), 1);
 
         let (_path, path_id, _cost) = &routes[0];
-        assert_eq!(path_id[0], 0, "first node should be me (node index 0)");
-        assert_eq!(path_id[1], 1, "second node should be dest (node index 1)");
-        assert_eq!(path_id[2..], [0, 0, 0], "unused positions should be 0");
+        assert_eq!(path_id[0], path_id::encode(&me), "first slot should be me");
+        assert_eq!(path_id[1], path_id::encode(&dest), "second slot should be dest");
+        assert_eq!(path_id[2..], [0, 0, 0], "unused positions should be padding");
+        assert!(
+            path_id[..2].iter().all(|&slot| slot != 0),
+            "occupied slots must never hold the reserved padding value"
+        );
 
         Ok(())
     }
@@ -800,11 +842,18 @@ mod tests {
         assert_eq!(routes.len(), 1);
 
         let (_path, path_id, _cost) = &routes[0];
-        assert_eq!(path_id[0], 0, "me should be node index 0");
-        assert_eq!(path_id[1], 1, "a should be node index 1");
-        assert_eq!(path_id[2], 2, "b should be node index 2");
-        assert_eq!(path_id[3], 3, "dest should be node index 3");
-        assert_eq!(path_id[4], 0, "unused position should be 0");
+        for (slot, key) in [me, a, b, dest].iter().enumerate() {
+            assert_eq!(
+                path_id[slot],
+                path_id::encode(key),
+                "slot {slot} should encode its node"
+            );
+        }
+        assert_eq!(path_id[4], 0, "unused position should be padding");
+        assert!(
+            path_id[..4].iter().all(|&slot| slot != 0),
+            "occupied slots must never hold the reserved padding value"
+        );
 
         Ok(())
     }
@@ -848,12 +897,15 @@ mod tests {
         let path_ids: Vec<PathId> = routes.iter().map(|(_, pid, _)| *pid).collect();
         assert_ne!(path_ids[0], path_ids[1], "distinct paths should have different PathIds");
 
-        // Each path: [me(0), intermediate(1 or 2), dest(3), 0, 0]
+        // Each path: [me(0), intermediate(1 or 2), dest(3)] then padding
         for pid in &path_ids {
-            assert_eq!(pid[0], 0, "first node should be me (node index 0)");
-            assert!(pid[1] == 1 || pid[1] == 2, "second node should be a (1) or b (2)");
-            assert_eq!(pid[2], 3, "third node should be dest (node index 3)");
-            assert_eq!(pid[3..], [0, 0], "unused positions should be 0");
+            assert_eq!(pid[0], path_id::encode(&me), "first slot should be me");
+            assert!(
+                pid[1] == path_id::encode(&a) || pid[1] == path_id::encode(&b),
+                "second slot should be a or b"
+            );
+            assert_eq!(pid[2], path_id::encode(&dest), "third slot should be dest");
+            assert_eq!(pid[3..], [0, 0], "unused positions should be padding");
         }
 
         Ok(())
@@ -1063,14 +1115,14 @@ mod tests {
     }
 
     #[test]
-    fn loopback_returns_empty_for_length_zero() {
+    fn loopback_returns_empty_for_zero_hops() {
         let me = pubkey_from(&SECRET_0);
         let graph = ChannelGraph::new(me);
         assert!(graph.simple_loopback_to_self(0, None).is_empty());
     }
 
     #[test]
-    fn loopback_returns_empty_for_length_one() {
+    fn loopback_returns_empty_for_one_hop() {
         let me = pubkey_from(&SECRET_0);
         let a = pubkey_from(&SECRET_1);
         let graph = ChannelGraph::new(me);
@@ -1080,7 +1132,8 @@ mod tests {
 
         assert!(
             graph.simple_loopback_to_self(1, None).is_empty(),
-            "length=1 is below the minimum threshold"
+            "1 hop is below MIN_LOOPBACK_HOPS: the sole relay would see its predecessor and successor are the same \
+             node"
         );
     }
 
@@ -1177,7 +1230,7 @@ mod tests {
     }
 
     #[test]
-    fn loopback_two_edge_triangle() -> anyhow::Result<()> {
+    fn loopback_two_hop_triangle() -> anyhow::Result<()> {
         // Topology: me → a → b, me → b (connected)
         // Loopback path: me → a → b → me
         let me = pubkey_from(&SECRET_0);
@@ -1198,12 +1251,12 @@ mod tests {
         mark_edge_connected(&graph, &me, &b);
 
         let routes = graph.simple_loopback_to_self(2, None);
-        assert_eq!(routes.len(), 1, "should find exactly one 2-edge loopback");
+        assert_eq!(routes.len(), 1, "should find exactly one 2-hop loopback");
 
         let (path, _path_id) = &routes[0];
         // simple_loopback_to_self strips the leading `me` and keeps the closing `me`.
-        // For a 2-edge internal path (me → a → b), the result is [a, b, me].
-        assert_eq!(path.len(), 3, "loopback path: 2 internal nodes + closing me");
+        // For a 2-hop path (me → a → b → me, 3 edges), the result is [a, b, me].
+        assert_eq!(path.len(), 3, "loopback path: 2 intermediate hops + closing me");
         assert_eq!(path.last(), Some(&me), "path should end with me (closing loopback)");
         assert_eq!(path[0], a, "first intermediate should be a");
         assert_eq!(path[1], b, "destination (connected neighbor) should be b");
@@ -1212,7 +1265,7 @@ mod tests {
     }
 
     #[test]
-    fn loopback_three_edge_chain() -> anyhow::Result<()> {
+    fn loopback_three_hop_chain() -> anyhow::Result<()> {
         // Topology: me → a → b → c, me → c (connected)
         // Loopback path: me → a → b → c → me
         let me = pubkey_from(&SECRET_0);
@@ -1234,14 +1287,172 @@ mod tests {
         mark_edge_connected(&graph, &me, &c);
 
         let routes = graph.simple_loopback_to_self(3, None);
-        assert_eq!(routes.len(), 1, "should find exactly one 3-edge loopback");
+        assert_eq!(routes.len(), 1, "should find exactly one 3-hop loopback");
 
         let (path, _path_id) = &routes[0];
         // simple_loopback_to_self strips leading `me`, keeps closing `me`.
-        // For a 3-edge internal path (me → a → b → c), result is [a, b, c, me].
-        assert_eq!(path.len(), 4, "3-edge internal path + closing me = 4 nodes");
+        // For a 3-hop path (me → a → b → c → me, 4 edges), result is [a, b, c, me].
+        assert_eq!(path.len(), 4, "3 intermediate hops + closing me = 4 nodes");
         assert_eq!(path.last(), Some(&me), "ends with me");
         assert_eq!(&path[0..3], &[a, b, c], "interior nodes");
+
+        Ok(())
+    }
+
+    /// Builds `me → a → b → c → me` with every edge probe-ready, so loopbacks of 2 and 3 hops
+    /// both exist and the requested hop count decides which is returned.
+    fn chain_graph_for_hop_counts() -> anyhow::Result<ChannelGraph> {
+        let me = pubkey_from(&SECRET_0);
+        let a = pubkey_from(&SECRET_1);
+        let b = pubkey_from(&SECRET_2);
+        let c = pubkey_from(&SECRET_3);
+
+        let graph = ChannelGraph::new(me);
+        graph.add_node(a);
+        graph.add_node(b);
+        graph.add_node(c);
+        graph.add_edge(&me, &a)?;
+        graph.add_edge(&a, &b)?;
+        graph.add_edge(&b, &c)?;
+        graph.add_edge(&me, &b)?;
+        graph.add_edge(&me, &c)?;
+        mark_edge_loopback_ready(&graph, &me, &a);
+        mark_edge_with_capacity(&graph, &a, &b);
+        mark_edge_with_capacity(&graph, &b, &c);
+        mark_edge_connected(&graph, &me, &b);
+        mark_edge_connected(&graph, &me, &c);
+
+        Ok(graph)
+    }
+
+    #[test]
+    fn loopback_parameter_is_a_hop_count_not_an_edge_count() -> anyhow::Result<()> {
+        let me = pubkey_from(&SECRET_0);
+        let graph = chain_graph_for_hop_counts()?;
+
+        for hops in MIN_LOOPBACK_HOPS..=MAX_LOOPBACK_HOPS {
+            let routes = graph.simple_loopback_to_self(hops, None);
+            assert!(!routes.is_empty(), "{hops} hops should yield at least one loopback");
+
+            for (path, _) in &routes {
+                // The returned path is [intermediates…, closing me]: `hops` relays plus the
+                // closing node. The closed loop therefore has `hops + 1` edges.
+                assert_eq!(
+                    path.len(),
+                    hops + 1,
+                    "a {hops}-hop loopback must carry {hops} relays plus the closing node"
+                );
+                assert_eq!(path.last(), Some(&me), "the loop must close back at me");
+
+                let intermediates = &path[..path.len() - 1];
+                assert_eq!(
+                    intermediates.len(),
+                    hops,
+                    "intermediate relay count must equal the requested hop count"
+                );
+                assert!(
+                    !intermediates.contains(&me),
+                    "me must not appear as an intermediate relay"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn loopback_returns_empty_above_the_routable_hop_limit() -> anyhow::Result<()> {
+        let graph = chain_graph_for_hop_counts()?;
+
+        assert!(
+            graph.simple_loopback_to_self(MAX_LOOPBACK_HOPS + 1, None).is_empty(),
+            "the HOPR packet format cannot route more than {MAX_LOOPBACK_HOPS} hops, so such a request must yield \
+             nothing rather than paths that are discarded downstream"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn loopback_generation_should_ignore_min_ack_rate() -> anyhow::Result<()> {
+        // RFC-0010 §4.2.1.4: low-scoring edges must be probed *more* urgently. If probe path
+        // generation applied the data-path ack threshold, a neighbour that fell below it would
+        // stop being probed, its ack rate would never be resampled, and the exclusion would
+        // become permanent.
+        let me = pubkey_from(&SECRET_0);
+        let a = pubkey_from(&SECRET_1);
+        let b = pubkey_from(&SECRET_2);
+
+        let graph = ChannelGraph::with_edge_params(me, 0.5, 0.1, std::time::Duration::from_secs(30));
+        graph.add_node(a);
+        graph.add_node(b);
+        graph.add_edge(&me, &a)?;
+        graph.add_edge(&a, &b)?;
+        graph.add_edge(&me, &b)?;
+        mark_edge_loopback_ready(&graph, &me, &a);
+        mark_edge_with_capacity(&graph, &a, &b);
+        mark_edge_connected(&graph, &me, &b);
+
+        // The first hop acknowledges nothing: ack rate 0.0, far below the configured 0.1.
+        graph.upsert_edge(&me, &a, |obs| {
+            obs.record(EdgeWeightType::ImmediateProtocolConformance {
+                num_packets: 10,
+                num_acks: 0,
+            });
+        });
+
+        assert!(
+            !graph.simple_loopback_to_self(2, None).is_empty(),
+            "probe path generation must still reach an edge below min_ack_rate, otherwise the edge can never be \
+             re-measured"
+        );
+
+        // Contrast: data path selection with the same threshold does reject it.
+        let data_routes = graph.simple_paths(
+            &me,
+            &b,
+            2,
+            None,
+            EdgeValueFn::forward(std::num::NonZeroUsize::new(2).context("should be non-zero")?, 0.5, 0.1),
+        );
+        assert!(
+            data_routes.is_empty(),
+            "data path selection must still honour min_ack_rate"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn loopback_generation_should_still_reach_measured_dead_edges() -> anyhow::Result<()> {
+        // RFC-0010 §4.2.3: unreliable edges are "progressively starved rather than suddenly
+        // eliminated, and [have] their score continuously updated by the ongoing probe stream".
+        // A pruned edge receives no probes, so starvation must never reach zero candidates.
+        let me = pubkey_from(&SECRET_0);
+        let a = pubkey_from(&SECRET_1);
+        let b = pubkey_from(&SECRET_2);
+
+        let graph = ChannelGraph::new(me);
+        graph.add_node(a);
+        graph.add_node(b);
+        graph.add_edge(&me, &a)?;
+        graph.add_edge(&a, &b)?;
+        graph.add_edge(&me, &b)?;
+        mark_edge_loopback_ready(&graph, &me, &a);
+        mark_edge_with_capacity(&graph, &a, &b);
+        mark_edge_connected(&graph, &me, &b);
+
+        // Every loopback probe across a→b has failed since the first one.
+        graph.upsert_edge(&a, &b, |obs| {
+            for _ in 0..20 {
+                obs.record(EdgeWeightType::Intermediate(Err(())));
+            }
+        });
+
+        assert!(
+            !graph.simple_loopback_to_self(2, None).is_empty(),
+            "a measured-dead edge must remain probeable so it can recover"
+        );
 
         Ok(())
     }
@@ -1441,7 +1652,7 @@ mod tests {
     }
 
     #[test]
-    fn loopback_mismatched_length_returns_empty() -> anyhow::Result<()> {
+    fn loopback_mismatched_hops_returns_empty() -> anyhow::Result<()> {
         // Topology only supports 2-edge internal path, but we request 3
         // me → a → b, me → b (connected)
         let me = pubkey_from(&SECRET_0);

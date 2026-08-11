@@ -1,7 +1,7 @@
 use hopr_api::graph::{MeasurableEdge, MeasurableNode, NetworkGraphWrite, traits::EdgeObservableWrite};
 #[cfg(all(feature = "telemetry", not(test)))]
 use hopr_api::graph::{NetworkGraphView, traits::EdgeObservableRead};
-use petgraph::graph::{EdgeIndex, NodeIndex};
+use petgraph::graph::EdgeIndex;
 
 use crate::{ChannelGraph, Observations, graph::InnerGraph};
 
@@ -29,13 +29,17 @@ fn observe_neighbor_quality(graph: &ChannelGraph, peer: &hopr_api::OffchainPubli
 /// Resolves a loopback path from serialized node-index bytes into a validated chain of edge indices.
 ///
 /// The `path_bytes` encode a `PathId` where each `u64` is a [`NodeIndex`].
-/// The path is expected to start and end at `me_idx` (a closed loop).
+/// The path is expected to start and end at `me` (a closed loop).
 ///
 /// Walks consecutive node pairs, finding the connecting edge for each.
-/// Stops when the loop closes back to `me_idx` or when no edge exists
+/// Stops when the loop closes back to `me` or when no edge exists
 /// between a pair. Returns `None` if the path bytes have wrong length,
-/// the first node is not `me_idx`, or fewer than 2 edges can be resolved.
-fn resolve_loopback_edges(inner: &InnerGraph, me_idx: NodeIndex, path_bytes: &[u8]) -> Option<Vec<EdgeIndex>> {
+/// the first node is not `me`, or fewer than 2 edges can be resolved.
+fn resolve_loopback_edges(
+    inner: &InnerGraph,
+    me: &hopr_api::OffchainPublicKey,
+    path_bytes: &[u8],
+) -> Option<Vec<EdgeIndex>> {
     if path_bytes.len() != size_of::<hopr_api::ct::PathId>() {
         tracing::warn!(
             path_len = path_bytes.len(),
@@ -50,7 +54,7 @@ fn resolve_loopback_edges(inner: &InnerGraph, me_idx: NodeIndex, path_bytes: &[u
         path_id[i] = u64::from_le_bytes(chunk.try_into().expect("chunk is 8 bytes"));
     }
 
-    let me_val = me_idx.index() as u64;
+    let me_val = crate::petgraph::path_id::encode(me);
 
     // First node must be self
     if path_id[0] != me_val {
@@ -64,16 +68,39 @@ fn resolve_loopback_edges(inner: &InnerGraph, me_idx: NodeIndex, path_bytes: &[u
         return None;
     };
 
-    // Walk consecutive node pairs up to (and including) the closing node
-    let mut edges = Vec::new();
+    // Walk consecutive node pairs up to and including the closing node. Every pair must resolve:
+    // attribution targets `edges[len - 2]`, so a truncated chain would retarget the whole path's
+    // residual latency onto a different edge. Dropping the sample beats corrupting one.
+    let mut edges = Vec::with_capacity(end_pos);
 
     for pair in path_id[..=end_pos].windows(2) {
-        let from = NodeIndex::new(pair[0] as usize);
-        let to = NodeIndex::new(pair[1] as usize);
+        let (Some(from), Some(to)) = (
+            crate::petgraph::path_id::resolve(inner, pair[0]),
+            crate::petgraph::path_id::resolve(inner, pair[1]),
+        ) else {
+            // Padding mid-path, a node removed while the probe was in flight, or a slot no node
+            // claims. All three mean the sample cannot be attributed to a known edge.
+            tracing::warn!("loopback path slot does not resolve to a known node, cannot attribute");
+            return None;
+        };
         let Some(edge) = inner.graph.find_edge(from, to) else {
-            break;
+            tracing::warn!(
+                resolved = edges.len(),
+                expected = end_pos,
+                "loopback path edge missing from graph, cannot attribute"
+            );
+            return None;
         };
         edges.push(edge);
+    }
+
+    if edges.len() != end_pos {
+        tracing::warn!(
+            edge_count = edges.len(),
+            expected = end_pos,
+            "incomplete loopback path resolution"
+        );
+        return None;
     }
 
     if edges.len() < 2 {
@@ -221,11 +248,11 @@ impl hopr_api::graph::NetworkGraphUpdate for ChannelGraph {
                 tracing::trace!("loopback probe successful");
 
                 let mut inner = self.inner.write();
-                let Some(me_idx) = inner.indices.get_by_left(&self.me).copied() else {
+                let Some(_me_idx) = inner.indices.get_by_left(&self.me).copied() else {
                     tracing::debug!("failed to resolve index of myself for loopback probe attribution");
                     return;
                 };
-                let Some(edges) = resolve_loopback_edges(&inner, me_idx, telemetry.path()) else {
+                let Some(edges) = resolve_loopback_edges(&inner, &self.me, telemetry.path()) else {
                     tracing::debug!("failed to resolve loopback path for probe attribution");
                     return;
                 };
@@ -313,11 +340,11 @@ impl hopr_api::graph::NetworkGraphUpdate for ChannelGraph {
                 tracing::trace!("loopback probe failed");
 
                 let mut inner = self.inner.write();
-                let Some(me_idx) = inner.indices.get_by_left(&self.me).copied() else {
+                let Some(_me_idx) = inner.indices.get_by_left(&self.me).copied() else {
                     tracing::debug!("failed to resolve index of myself");
                     return;
                 };
-                let Some(edges) = resolve_loopback_edges(&inner, me_idx, telemetry.path()) else {
+                let Some(edges) = resolve_loopback_edges(&inner, &self.me, telemetry.path()) else {
                     tracing::debug!("failed to resolve loopback path for probe timeout, cannot attribute");
                     return;
                 };
@@ -907,7 +934,22 @@ mod tests {
     }
 
     impl LoopbackTestPath {
-        fn new(path_id: [u64; 5], timestamp_ms: u128) -> Self {
+        /// Builds telemetry from raw slot values, for payloads a correct encoder cannot produce.
+        fn from_slots(path_id: [u64; 5], timestamp_ms: u128) -> Self {
+            Self {
+                path_bytes: path_id.iter().flat_map(|v| v.to_le_bytes()).collect(),
+                timestamp_ms,
+            }
+        }
+
+        fn new(nodes: &[hopr_api::OffchainPublicKey], timestamp_ms: u128) -> Self {
+            assert!(nodes.len() <= 5, "a PathId holds at most 5 slots");
+
+            let mut path_id = [0u64; 5];
+            for (slot, key) in path_id.iter_mut().zip(nodes) {
+                *slot = crate::petgraph::path_id::encode(key);
+            }
+
             let path_bytes = path_id.iter().flat_map(|v| v.to_le_bytes()).collect();
             Self {
                 path_bytes,
@@ -942,25 +984,23 @@ mod tests {
     ///
     /// The telemetry timestamp is set `rtt_ms` in the past so the receiver
     /// computes an elapsed RTT of approximately `rtt_ms`.
-    fn send_loopback(graph: &ChannelGraph, path_id: [u64; 5], rtt_ms: u128) {
+    fn send_loopback(graph: &ChannelGraph, nodes: &[hopr_api::OffchainPublicKey], rtt_ms: u128) {
         let telemetry: Result<
             EdgeTransportTelemetry<TestNeighbor, LoopbackTestPath>,
             NetworkGraphError<LoopbackTestPath>,
         > = Ok(EdgeTransportTelemetry::Loopback(LoopbackTestPath::new(
-            path_id,
+            nodes,
             now_unix_ms() - rtt_ms,
         )));
         graph.record_edge(hopr_api::graph::MeasurableEdge::Probe(telemetry));
     }
 
     /// Helper to send a loopback timeout with the given path.
-    fn send_loopback_timeout(graph: &ChannelGraph, path_id: [u64; 5]) {
+    fn send_loopback_timeout(graph: &ChannelGraph, nodes: &[hopr_api::OffchainPublicKey]) {
         let telemetry: Result<
             EdgeTransportTelemetry<TestNeighbor, LoopbackTestPath>,
             NetworkGraphError<LoopbackTestPath>,
-        > = Err(NetworkGraphError::ProbeLoopbackTimeout(LoopbackTestPath::new(
-            path_id, 0,
-        )));
+        > = Err(NetworkGraphError::ProbeLoopbackTimeout(LoopbackTestPath::new(nodes, 0)));
         graph.record_edge(hopr_api::graph::MeasurableEdge::Probe(telemetry));
     }
 
@@ -981,7 +1021,7 @@ mod tests {
         graph.add_edge(&a, &b)?;
         graph.add_edge(&b, &me)?; // return edge
 
-        send_loopback(&graph, [0, 1, 2, 0, 0], 200);
+        send_loopback(&graph, &[me, a, b, me], 200);
 
         let obs = graph.edge(&a, &b).context("edge a→b should exist")?;
         let qos = obs
@@ -1020,7 +1060,7 @@ mod tests {
         graph.add_edge(&b, &c)?;
         graph.add_edge(&c, &me)?; // return edge
 
-        send_loopback(&graph, [0, 1, 2, 3, 0], 300);
+        send_loopback(&graph, &[me, a, b, c, me], 300);
 
         // Edge b→c (target) should have the intermediate QoS
         let obs = graph.edge(&b, &c).context("edge b→c should exist")?;
@@ -1077,7 +1117,7 @@ mod tests {
             )));
         });
 
-        send_loopback(&graph, [0, 1, 2, 3, 0], 300);
+        send_loopback(&graph, &[me, a, b, c, me], 300);
 
         let obs = graph.edge(&b, &c).context("edge b→c should exist")?;
         let qos = obs
@@ -1117,7 +1157,7 @@ mod tests {
             )));
         });
 
-        send_loopback(&graph, [0, 1, 2, 0, 0], 200);
+        send_loopback(&graph, &[me, a, b, me], 200);
 
         let obs = graph.edge(&a, &b).context("edge a→b should exist")?;
         let qos = obs
@@ -1178,7 +1218,7 @@ mod tests {
         graph.add_edge(&b, &me)?; // return edge
 
         // Probe withheld 90 s before replay: computed RTT far above the 30 s cap.
-        send_loopback(&graph, [0, 1, 2, 0, 0], 90_000);
+        send_loopback(&graph, &[me, a, b, me], 90_000);
 
         let obs = graph.edge(&a, &b).context("edge a→b should exist")?;
         assert!(
@@ -1209,7 +1249,7 @@ mod tests {
             EdgeTransportTelemetry<TestNeighbor, LoopbackTestPath>,
             NetworkGraphError<LoopbackTestPath>,
         > = Ok(EdgeTransportTelemetry::Loopback(LoopbackTestPath::new(
-            [0, 1, 2, 0, 0],
+            &[me, a, b, me],
             now_unix_ms() + 5_000, // timestamp 5 s in the future
         )));
         graph.record_edge(hopr_api::graph::MeasurableEdge::Probe(telemetry));
@@ -1237,7 +1277,7 @@ mod tests {
         graph.add_node(a);
         graph.add_edge(&me, &a)?;
 
-        send_loopback(&graph, [0, 1, 0, 0, 0], 100);
+        send_loopback(&graph, &[me, a, me], 100);
 
         let obs = graph.edge(&me, &a).context("edge should exist")?;
         assert!(
@@ -1271,7 +1311,7 @@ mod tests {
             )));
         });
 
-        send_loopback(&graph, [0, 1, 0, 0, 0], 100);
+        send_loopback(&graph, &[me, a, me], 100);
 
         let obs = graph.edge(&me, &a).context("edge me→a should exist")?;
         let qos = obs
@@ -1313,7 +1353,7 @@ mod tests {
         graph.add_edge(&me, &a)?;
         graph.add_edge(&b, &c)?; // b→c, NOT a→c
 
-        send_loopback(&graph, [0, 1, 3, 0, 0], 200);
+        send_loopback(&graph, &[me, a, c, me], 200);
 
         let obs_me_a = graph.edge(&me, &a).context("edge me→a should exist")?;
         assert!(
@@ -1325,16 +1365,184 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn loopback_wrong_start_node_should_be_ignored() -> anyhow::Result<()> {
-        // PathId starts with node 99 which is not me → early reject
+    async fn loopback_truncated_to_two_edges_should_not_attribute_to_the_first_edge() -> anyhow::Result<()> {
+        // Regression guard for misattribution by truncation.
+        //
+        // Probed path: me(0) → a(1) → b(2) → c(3) → me(0), i.e. 4 edges, whose penultimate edge
+        // is b→c. Edge b→c is absent from the graph, so resolution stops after me→a and a→b.
+        //
+        // A truncated chain of exactly two edges still satisfies a `len >= 2` check, and
+        // `target_idx = len - 2` then points at index 0 — so the residual latency computed for
+        // the *whole four-edge* path would be attributed to me→a. That corrupts the score of an
+        // edge the probe says nothing about. The sample must be discarded instead.
+        let me = pubkey_from(&SECRET_0);
+        let a = pubkey_from(&SECRET_1);
+        let b = pubkey_from(&SECRET_2);
+        let c = pubkey_from(&SECRET_3);
+
+        let graph = ChannelGraph::new(me);
+        graph.add_node(a);
+        graph.add_node(b);
+        graph.add_node(c);
+        graph.add_edge(&me, &a)?;
+        graph.add_edge(&a, &b)?;
+        // b→c deliberately absent, so the chain truncates to exactly two resolvable edges.
+        graph.add_edge(&c, &me)?;
+
+        send_loopback(&graph, &[me, a, b, c, me], 400);
+
+        let obs_me_a = graph.edge(&me, &a).context("edge me→a should exist")?;
+        assert!(
+            obs_me_a.intermediate_qos().is_none(),
+            "a truncated loopback must not attribute the whole path's residual to the first edge"
+        );
+
+        let obs_a_b = graph.edge(&a, &b).context("edge a→b should exist")?;
+        assert!(
+            obs_a_b.intermediate_qos().is_none(),
+            "a truncated loopback must not attribute to any edge"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn a_removed_nodes_slot_must_become_unclaimable() {
+        // The property that makes reuse impossible, asserted directly on the resolver.
+        //
+        // `remove_node` moves the last node into the vacated index, so a position-derived slot is
+        // handed straight to another node. A key-derived slot is not: once the node is gone nothing
+        // claims its slot, and resolution fails closed.
+        let me = pubkey_from(&SECRET_0);
+        let a = pubkey_from(&SECRET_1);
+        let b = pubkey_from(&SECRET_2);
+        let c = pubkey_from(&SECRET_3);
+
+        let graph = ChannelGraph::new(me);
+        for node in [a, b, c] {
+            graph.add_node(node);
+        }
+
+        let b_slot = crate::petgraph::path_id::encode(&b);
+        let index_of = |key: &hopr_api::OffchainPublicKey| {
+            let inner = graph.inner.read();
+            inner.indices.get_by_left(key).copied()
+        };
+        let c_index_before = index_of(&c).expect("c is in the graph");
+
+        graph.remove_node(&b);
+
+        // petgraph moved `c` into the index `b` vacated — the precondition for reuse.
+        assert_ne!(
+            index_of(&c),
+            Some(c_index_before),
+            "this test is only meaningful if removal actually shifts another node's index"
+        );
+
+        let inner = graph.inner.read();
+        assert_eq!(
+            crate::petgraph::path_id::resolve(&inner, b_slot),
+            None,
+            "the removed node's slot must resolve to nothing, not to whichever node took its index"
+        );
+        assert_eq!(
+            crate::petgraph::path_id::resolve(&inner, crate::petgraph::path_id::encode(&c)),
+            index_of(&c),
+            "a surviving node must still resolve, at its new index"
+        );
+    }
+
+    #[tokio::test]
+    async fn loopback_should_not_attribute_after_a_node_is_removed_mid_flight() -> anyhow::Result<()> {
+        // Regression guard for identifier reuse. `remove_node` moves the last node into the vacated
+        // index, so with position-derived slots an in-flight probe for `me → a → b → me` resolves on
+        // return to `me → a → c → me` once `b` is gone and `c` takes its index. The topology below
+        // makes that shifted chain resolve *completely*, so the residual latency would land on the
+        // a→c edge — an edge the probe never traversed. Key-derived slots leave the removed node's
+        // slot unclaimable, so the sample is dropped instead.
+        let me = pubkey_from(&SECRET_0);
+        let a = pubkey_from(&SECRET_1);
+        let b = pubkey_from(&SECRET_2);
+        let c = pubkey_from(&SECRET_3);
+
+        let graph = ChannelGraph::new(me);
+        for node in [a, b, c] {
+            graph.add_node(node);
+        }
+        // The traversed path.
+        graph.add_edge(&me, &a)?;
+        graph.add_edge(&a, &b)?;
+        graph.add_edge(&b, &me)?;
+        // The chain the shifted indices would resolve to, complete end to end.
+        graph.add_edge(&a, &c)?;
+        graph.add_edge(&c, &me)?;
+
+        graph.remove_node(&b);
+        assert!(
+            graph.has_edge(&a, &c) && graph.has_edge(&c, &me),
+            "the aliasing chain must be intact for this test to be meaningful"
+        );
+
+        send_loopback(&graph, &[me, a, b, me], 200);
+
+        let victim = graph.edge(&a, &c).context("edge a→c should exist")?;
+        assert!(
+            victim.intermediate_qos().is_none(),
+            "the edge that inherits the removed node's index must not absorb the measurement"
+        );
+        let first = graph.edge(&me, &a).context("edge me→a should exist")?;
+        assert!(first.intermediate_qos().is_none(), "nor may any other surviving edge");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn loopback_oversized_slot_should_not_alias_a_real_node() -> anyhow::Result<()> {
+        // Regression guard for narrowing. Resolving a slot arithmetically into `NodeIndex` would
+        // truncate to its `u32` index type, so a slot of `2^32 + n` could alias node `n`. Slots are
+        // now matched against the nodes actually present, which no oversized value can satisfy.
         let me = pubkey_from(&SECRET_0);
         let a = pubkey_from(&SECRET_1);
 
         let graph = ChannelGraph::new(me);
         graph.add_node(a);
         graph.add_edge(&me, &a)?;
+        graph.add_edge(&a, &me)?;
 
-        send_loopback(&graph, [99, 1, 0, 0, 0], 200);
+        let me_slot = crate::petgraph::path_id::encode(&me);
+        let a_slot = crate::petgraph::path_id::encode(&a);
+        let aliasing = a_slot.wrapping_add(1u64 << 32);
+
+        let telemetry: Result<
+            EdgeTransportTelemetry<TestNeighbor, LoopbackTestPath>,
+            NetworkGraphError<LoopbackTestPath>,
+        > = Ok(EdgeTransportTelemetry::Loopback(LoopbackTestPath::from_slots(
+            [me_slot, aliasing, me_slot, 0, 0],
+            now_unix_ms() - 100,
+        )));
+        graph.record_edge(hopr_api::graph::MeasurableEdge::Probe(telemetry));
+
+        let obs = graph.edge(&me, &a).context("edge me→a should exist")?;
+        assert!(
+            obs.intermediate_qos().is_none(),
+            "a slot differing from a real one only above bit 32 must not resolve to that node"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn loopback_wrong_start_node_should_be_ignored() -> anyhow::Result<()> {
+        // PathId starts with a node that is not me → early reject
+        let me = pubkey_from(&SECRET_0);
+        let a = pubkey_from(&SECRET_1);
+        let stranger = pubkey_from(&SECRET_3);
+
+        let graph = ChannelGraph::new(me);
+        graph.add_node(a);
+        graph.add_edge(&me, &a)?;
+
+        send_loopback(&graph, &[stranger, a, me], 200);
 
         let obs = graph.edge(&me, &a).context("edge should exist")?;
         assert!(
@@ -1364,7 +1572,7 @@ mod tests {
         // After each probe the target's intermediate QoS is subtracted from subsequent
         // attributions, so the attributed value converges rather than staying at 100ms.
         for _ in 0..5 {
-            send_loopback(&graph, [0, 1, 2, 0, 0], 100);
+            send_loopback(&graph, &[me, a, b, me], 100);
         }
 
         let obs = graph.edge(&a, &b).context("edge a→b should exist")?;
@@ -1410,7 +1618,7 @@ mod tests {
         });
 
         // Total RTT = 100ms, but preceding latency is 500ms → 100 - 500 saturates to 0
-        send_loopback(&graph, [0, 1, 2, 3, 0], 100);
+        send_loopback(&graph, &[me, a, b, c, me], 100);
 
         let obs = graph.edge(&b, &c).context("edge b→c should exist")?;
         let qos = obs.intermediate_qos().context("intermediate QoS should be present")?;
@@ -1441,7 +1649,7 @@ mod tests {
         graph.add_edge(&a, &b)?;
         graph.add_edge(&b, &me)?; // return edge
 
-        send_loopback_timeout(&graph, [0, 1, 2, 0, 0]);
+        send_loopback_timeout(&graph, &[me, a, b, me]);
 
         let obs = graph.edge(&a, &b).context("edge a→b should exist")?;
         let qos = obs
@@ -1475,7 +1683,7 @@ mod tests {
         graph.add_edge(&b, &c)?;
         graph.add_edge(&c, &me)?;
 
-        send_loopback_timeout(&graph, [0, 1, 2, 3, 0]);
+        send_loopback_timeout(&graph, &[me, a, b, c, me]);
 
         // Edge b→c (target) should have a failed intermediate record
         let obs = graph.edge(&b, &c).context("edge b→c should exist")?;
@@ -1529,7 +1737,7 @@ mod tests {
         graph.add_node(a);
         graph.add_edge(&me, &a)?;
 
-        send_loopback_timeout(&graph, [0, 1, 0, 0, 0]);
+        send_loopback_timeout(&graph, &[me, a, me]);
 
         let obs = graph.edge(&me, &a).context("edge should exist")?;
         assert!(
