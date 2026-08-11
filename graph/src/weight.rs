@@ -7,15 +7,37 @@ use hopr_api::graph::{
 };
 use hopr_utils::statistics::{ExponentialMovingAverage, WindowedRatio};
 
+/// Score for a stream that was measured but whose every probe failed.
+///
+/// RFC-0014 §4.2 distinguishes *lacks observations* (which §4.3 grants `edge_penalty`) from
+/// *measured unusable*. The value function separates the two on `score() > 0.0`, so reporting a
+/// bare `0.0` here would earn the `0.5` benefit of the doubt and rank a never-working relay above
+/// a partly-working one. Strictly positive so the edge is starved rather than pruned, which
+/// RFC-0010 §4.2.3 requires.
+///
+/// TODO: remove once `EdgeLinkObservable::score` returns `Option<f64>` upstream.
+const MEASURED_DEAD_SCORE: f64 = 1e-9;
+
 /// A representation of a individual neighbor link measurement
 #[derive(Debug, Copy, Clone, Default, PartialEq)]
 pub struct TransportLinkMeasurement {
     latency_average: ExponentialMovingAverage<3>,
     probe_success_rate: ExponentialMovingAverage<5>,
+    /// Recorded probe outcomes, successful or not. Neither EMA can express "no samples yet":
+    /// an all-failed stream holds exactly `0.0`, the same as its initial value.
+    samples: u64,
+}
+
+impl TransportLinkMeasurement {
+    /// Whether any probe outcome has been recorded for this stream.
+    pub fn has_observations(&self) -> bool {
+        self.samples > 0
+    }
 }
 
 impl EdgeLinkObservable for TransportLinkMeasurement {
     fn record(&mut self, measurement: EdgeTransportMeasurement) {
+        self.samples = self.samples.saturating_add(1);
         if let Ok(latency) = measurement {
             self.latency_average.update(latency.as_millis() as f64);
             self.probe_success_rate.update(1.0);
@@ -37,7 +59,14 @@ impl EdgeLinkObservable for TransportLinkMeasurement {
     }
 
     fn score(&self) -> f64 {
-        self.average_probe_rate() * latency_score(self.average_latency())
+        let score = self.average_probe_rate() * latency_score(self.average_latency());
+        if score > 0.0 {
+            score
+        } else if self.has_observations() {
+            MEASURED_DEAD_SCORE
+        } else {
+            0.0
+        }
     }
 }
 
@@ -87,19 +116,36 @@ impl EdgeObservableWrite for Observations {
             }
             EdgeWeightType::ImmediateProtocolConformance { num_packets, num_acks } => {
                 let imm = self.immediate_probe.get_or_insert_default();
-                imm.messages_sent += num_packets;
-                imm.acks_received += num_acks;
+                // Decay before accumulating; see ACK_DECAY.
+                imm.messages_sent = imm.messages_sent * ACK_DECAY + num_packets as f64;
+                imm.acks_received = imm.acks_received * ACK_DECAY + num_acks as f64;
             }
         }
     }
 }
 
+/// Fraction of the accumulated acknowledgement counts retained per conformance report.
+///
+/// The producer reports increments, so accumulating verbatim gives a *lifetime* ratio: a peer that
+/// behaved for a month then went dark stays admissible for as long again. Decaying bounds that
+/// memory. Decaying the two totals — rather than averaging per-report ratios — keeps the estimate
+/// weighted by traffic volume.
+const ACK_DECAY: f64 = 0.9;
+
+/// Minimum decayed packet volume before an acknowledgement rate is reported.
+///
+/// Below this the ratio is just the remnant of a handful of packets. Reporting `None` lets the
+/// value function apply its unobserved-edge penalty instead of acting on noise.
+const MIN_ACK_SAMPLE_VOLUME: f64 = 1.0;
+
 #[derive(Debug, Copy, Clone, Default, PartialEq)]
 pub struct TransportImmediates {
     link: TransportLinkMeasurement,
     is_connected: bool,
-    messages_sent: u64,
-    acks_received: u64,
+    /// Exponentially decayed count of packets sent to this peer.
+    messages_sent: f64,
+    /// Exponentially decayed count of acknowledgements received from this peer.
+    acks_received: f64,
 }
 
 impl EdgeNetworkObservableRead for TransportImmediates {
@@ -108,13 +154,17 @@ impl EdgeNetworkObservableRead for TransportImmediates {
     }
 }
 
+impl TransportImmediates {
+    /// Whether any immediate probe outcome has been recorded. Connectivity and acknowledgement
+    /// counters are excluded: they populate without a probe, and this gates the *link score*.
+    pub fn has_observations(&self) -> bool {
+        self.link.has_observations()
+    }
+}
+
 impl EdgeImmediateProtocolObservable for TransportImmediates {
     fn ack_rate(&self) -> Option<f64> {
-        if self.messages_sent == 0 {
-            None
-        } else {
-            Some(self.acks_received as f64 / self.messages_sent as f64)
-        }
+        (self.messages_sent >= MIN_ACK_SAMPLE_VOLUME).then(|| (self.acks_received / self.messages_sent).clamp(0.0, 1.0))
     }
 }
 
@@ -291,6 +341,14 @@ impl TransportIntermediates {
     }
 }
 
+impl TransportIntermediates {
+    /// Whether any loopback probe outcome has been recorded. Capacity is excluded: it arrives
+    /// from the chain indexer independently of probing, and this gates the *link score*.
+    pub fn has_observations(&self) -> bool {
+        self.link.has_observations()
+    }
+}
+
 impl EdgeProtocolObservable for TransportIntermediates {
     fn capacity(&self) -> Option<u128> {
         self.capacity
@@ -350,16 +408,25 @@ impl EdgeObservableRead for Observations {
         self.intermediate_probe.as_ref()
     }
 
-    /// The score combines immediate and intermediate observations:
-    /// - When both are present, average their scores (immediate neighbor probes prevent an empty intermediate from
-    ///   masking real measurements).
-    /// - When only intermediate is present, use it directly.
-    /// - When only immediate is present, use it directly.
+    /// Combines the two streams per RFC-0014 §4.2: average when both are present, else the single
+    /// present one, else `0.0`.
+    ///
+    /// "Present" means *has observations*, not *allocated* — a `Capacity` update creates the
+    /// intermediate stream and `Connected` the immediate one without recording a probe. Treating
+    /// allocation as presence averaged against a phantom zero, halving every edge only one stream
+    /// can observe: every edge incident to `me`, since immediate probes touch only those and
+    /// loopback attribution targets `edges[len - 2]`.
     fn score(&self) -> f64 {
-        match (&self.immediate_probe, &self.intermediate_probe) {
-            (Some(imm), Some(inter)) => (imm.score() + inter.score()) / 2.0,
-            (None, Some(inter)) => inter.score(),
-            (Some(imm), None) => imm.score(),
+        let immediate = self.immediate_probe.filter(|m| m.has_observations()).map(|m| m.score());
+        let intermediate = self
+            .intermediate_probe
+            .filter(|m| m.has_observations())
+            .map(|m| m.score());
+
+        match (immediate, intermediate) {
+            (Some(imm), Some(inter)) => (imm + inter) / 2.0,
+            (None, Some(inter)) => inter,
+            (Some(imm), None) => imm,
             (None, None) => 0.0,
         }
     }
@@ -470,7 +537,10 @@ mod tests {
     }
 
     #[test]
-    fn ack_rate_should_accumulate_across_multiple_records() -> anyhow::Result<()> {
+    fn ack_rate_should_weight_recent_reports_above_older_ones() -> anyhow::Result<()> {
+        // The producer reports increments per flush, so verbatim accumulation would give a
+        // lifetime ratio. Decaying first means an equal-sized bad window pulls the rate below the
+        // arithmetic mean of the two windows.
         let mut observation = Observations::default();
         observation.record(EdgeWeightType::ImmediateProtocolConformance {
             num_packets: 5,
@@ -483,7 +553,67 @@ mod tests {
 
         let imm = observation.immediate_qos().context("should have immediate QoS")?;
         let rate = imm.ack_rate().context("should have ack rate")?;
-        assert_in_delta!(rate, 0.5, 0.001);
+        assert_lt!(
+            rate,
+            0.5,
+            "the more recent all-failed window must outweigh the older all-acked one"
+        );
+        assert_gt!(rate, 0.4, "one bad window must not erase the history entirely");
+        Ok(())
+    }
+
+    #[test]
+    fn ack_rate_demotion_should_not_depend_on_how_long_the_peer_behaved() -> anyhow::Result<()> {
+        // Regression guard for the lifetime-ratio bug. Accumulating the producer's per-flush
+        // increments verbatim makes demotion proportional to history: a peer that acknowledged
+        // reliably for twice as long stays above the admission threshold for twice as long.
+        // Decaying first bounds it — the rate saturates, so the number of silent windows needed is
+        // the same no matter how much good history preceded them.
+        const DEFAULT_MIN_ACK_RATE: f64 = 0.1;
+
+        /// Reports `good_windows` fully-acked flushes, then counts how many silent flushes are
+        /// needed before the rate drops below the admission threshold.
+        fn windows_to_demote(good_windows: usize) -> anyhow::Result<usize> {
+            let mut observation = Observations::default();
+            for _ in 0..good_windows {
+                observation.record(EdgeWeightType::ImmediateProtocolConformance {
+                    num_packets: 50,
+                    num_acks: 50,
+                });
+            }
+
+            let rate = |obs: &Observations| -> anyhow::Result<f64> {
+                obs.immediate_qos()
+                    .context("should have immediate QoS")?
+                    .ack_rate()
+                    .context("should have ack rate")
+            };
+            assert_in_delta!(rate(&observation)?, 1.0, 0.001);
+
+            for silent in 1..500 {
+                observation.record(EdgeWeightType::ImmediateProtocolConformance {
+                    num_packets: 50,
+                    num_acks: 0,
+                });
+                if rate(&observation)? < DEFAULT_MIN_ACK_RATE {
+                    return Ok(silent);
+                }
+            }
+            anyhow::bail!("a silent peer never fell below the admission threshold")
+        }
+
+        let short_history = windows_to_demote(100)?;
+        let long_history = windows_to_demote(1_000)?;
+
+        assert_eq!(
+            short_history, long_history,
+            "demotion must be bounded by the decay, not by how long the peer behaved well"
+        );
+        assert_lt!(
+            short_history,
+            30,
+            "a silent peer must be demoted within a small number of reports, took {short_history}"
+        );
         Ok(())
     }
 
@@ -505,28 +635,94 @@ mod tests {
     }
 
     #[test]
-    fn score_should_average_immediate_and_intermediate_when_both_present() {
+    fn score_should_ignore_a_stream_allocated_without_observations() {
         let mut observation = Observations::default();
 
         // Record a successful immediate probe (simulates neighbor probe success)
         observation.record(EdgeWeightType::Immediate(Ok(std::time::Duration::from_millis(50))));
 
-        // Record on-chain capacity only (simulates channel existing but no loopback probes)
+        // Record on-chain capacity only. This allocates the intermediate stream without
+        // recording any loopback probe outcome, which is the permanent state of every edge
+        // incident to this node.
         observation.record(EdgeWeightType::Capacity(Some(100)));
 
-        let imm_score = observation.immediate_qos().unwrap().score();
-        let inter_score = observation.intermediate_qos().unwrap().score();
+        let imm = observation.immediate_qos().expect("immediate stream should exist");
+        let inter = observation
+            .intermediate_qos()
+            .expect("intermediate stream should exist");
 
-        assert_gt!(imm_score, 0.0, "immediate score should be positive");
-        assert_eq!(
-            inter_score, 0.0,
-            "intermediate score should be zero (no loopback probes)"
+        assert!(imm.has_observations(), "the immediate probe was recorded");
+        assert!(
+            !inter.has_observations(),
+            "capacity alone must not count as a probe observation"
         );
 
-        // The combined score should be the average, not zero
-        let combined = observation.score();
-        assert_gt!(combined, 0.0, "combined score must not be masked by empty intermediate");
-        assert_in_delta!(combined, imm_score / 2.0, 0.001);
+        // Only the immediate stream is *present* in the RFC-0014 §4.2 sense, so the edge score
+        // is that stream's score — not half of it.
+        assert_in_delta!(observation.score(), imm.score(), 0.001);
+    }
+
+    #[test]
+    fn score_should_average_only_when_both_streams_have_observations() {
+        let mut observation = Observations::default();
+        observation.record(EdgeWeightType::Immediate(Ok(std::time::Duration::from_millis(50))));
+        observation.record(EdgeWeightType::Intermediate(Ok(std::time::Duration::from_millis(150))));
+
+        let imm = observation.immediate_qos().expect("immediate stream should exist");
+        let inter = observation
+            .intermediate_qos()
+            .expect("intermediate stream should exist");
+        assert!(imm.has_observations() && inter.has_observations());
+
+        assert_in_delta!(observation.score(), (imm.score() + inter.score()) / 2.0, 0.001);
+    }
+
+    #[test]
+    fn measured_dead_stream_should_score_below_any_partially_working_one() {
+        // Never succeeded: every probe failed from the first one.
+        let mut dead = Observations::default();
+        for _ in 0..10 {
+            dead.record(EdgeWeightType::Intermediate(Err(())));
+        }
+
+        // Worst possible partial success: one success in the EMA window, slowest latency bucket.
+        let mut flaky = Observations::default();
+        for _ in 0..4 {
+            flaky.record(EdgeWeightType::Intermediate(Err(())));
+        }
+        flaky.record(EdgeWeightType::Intermediate(Ok(std::time::Duration::from_millis(500))));
+
+        let dead_score = dead.intermediate_qos().expect("stream exists").score();
+        let flaky_score = flaky.intermediate_qos().expect("stream exists").score();
+
+        assert_gt!(
+            dead_score,
+            0.0,
+            "a measured-dead stream must stay strictly positive so the edge is starved rather than pruned out of the \
+             probe candidate set"
+        );
+        assert_lt!(
+            dead_score,
+            flaky_score,
+            "a stream that never relayed anything must rank below one that sometimes does"
+        );
+    }
+
+    #[test]
+    fn unobserved_stream_should_score_zero_so_the_edge_penalty_applies() {
+        // Capacity alone: the stream exists but was never probed. Distinguishable from
+        // measured-dead so the value function can grant it the unprobed-edge penalty.
+        let mut observation = Observations::default();
+        observation.record(EdgeWeightType::Capacity(Some(100)));
+
+        let inter = observation.intermediate_qos().expect("stream exists");
+        assert!(!inter.has_observations());
+        assert_eq!(
+            inter.score(),
+            0.0,
+            "an unprobed stream must report exactly zero, which the value function reads as 'no observations' and \
+             answers with the edge penalty"
+        );
     }
 
     #[test]

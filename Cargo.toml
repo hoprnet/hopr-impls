@@ -29,7 +29,7 @@ rust-version = "1.97"
 [workspace.dependencies]
 # In-repo crates (path + version so they are publishable)
 hopr-chain-connector = { path = "connector", version = "0.22.2" }
-hopr-network-graph   = { path = "graph", version = "0.4.0", default-features = false }
+hopr-network-graph   = { path = "graph", version = "0.5.0", default-features = false }
 
 # HOPR crates published to crates.io
 blokli-client = "0.31.0"
