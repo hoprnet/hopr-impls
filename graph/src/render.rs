@@ -52,8 +52,10 @@ pub fn render_edges_as_dot(
         let dst_label = label_fn(dst);
 
         let mut attrs = Vec::new();
-        let score = obs.score();
-        attrs.push(format!("score={score:.2}"));
+        match obs.score() {
+            Some(score) => attrs.push(format!("score={score:.2}")),
+            None => attrs.push("score=unobserved".to_string()),
+        }
 
         if let Some(imm) = obs.immediate_qos()
             && let Some(latency) = imm.average_latency()
@@ -62,9 +64,9 @@ pub fn render_edges_as_dot(
         }
 
         if let Some(inter) = obs.intermediate_qos()
-            && let Some(cap) = inter.capacity()
+            && let Some(balance) = inter.balance()
         {
-            attrs.push(format!("cap={cap}"));
+            attrs.push(format!("bal={balance}"));
         }
 
         let label = attrs.join(" ");
@@ -155,12 +157,14 @@ mod tests {
         graph.upsert_edge(&me, &peer, |obs| {
             obs.record(EdgeWeightType::Connected(true));
             obs.record(EdgeWeightType::Immediate(Ok(std::time::Duration::from_millis(50))));
-            obs.record(EdgeWeightType::Capacity(Some(1000)));
+            obs.record(EdgeWeightType::Balance(Some(
+                hopr_api::graph::traits::ChannelBalance::from(1000u64),
+            )));
         });
 
         let dot = render_dot(&graph);
         assert!(dot.contains("lat=50ms"), "should contain latency: {dot}");
-        assert!(dot.contains("cap=1000"), "should contain capacity: {dot}");
+        assert!(dot.contains("bal=1000"), "should contain balance: {dot}");
         assert!(dot.contains("score="), "should contain score: {dot}");
     }
 
@@ -231,7 +235,9 @@ mod tests {
         graph.upsert_edge(&me, &peer, |obs| {
             obs.record(EdgeWeightType::Connected(true));
             obs.record(EdgeWeightType::Immediate(Ok(std::time::Duration::from_millis(120))));
-            obs.record(EdgeWeightType::Capacity(Some(500)));
+            obs.record(EdgeWeightType::Balance(Some(
+                hopr_api::graph::traits::ChannelBalance::from(500u64),
+            )));
         });
 
         let mut addr_map: HashMap<hopr_api::OffchainPublicKey, String> = HashMap::new();
@@ -241,7 +247,7 @@ mod tests {
         let dot = render_dot_with_labels(&graph, label_from_map(&addr_map));
 
         assert!(dot.contains("lat=120ms"), "latency should be preserved: {dot}");
-        assert!(dot.contains("cap=500"), "capacity should be preserved: {dot}");
+        assert!(dot.contains("bal=500"), "balance should be preserved: {dot}");
         assert!(dot.contains("score="), "score should be preserved: {dot}");
         assert!(
             dot.contains(

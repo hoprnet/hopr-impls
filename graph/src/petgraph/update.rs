@@ -21,8 +21,11 @@ lazy_static::lazy_static! {
 /// so the distribution tracks quality as it evolves per probe round.
 #[cfg(all(feature = "telemetry", not(test)))]
 fn observe_neighbor_quality(graph: &ChannelGraph, peer: &hopr_api::OffchainPublicKey) {
-    if let Some(obs) = graph.edge(graph.me(), peer) {
-        METRIC_PEERS_BY_QUALITY.observe(obs.score());
+    // Unobserved edges are skipped rather than recorded as a fabricated zero.
+    if let Some(obs) = graph.edge(graph.me(), peer)
+        && let Some(score) = obs.score()
+    {
+        METRIC_PEERS_BY_QUALITY.observe(score);
     }
 }
 
@@ -176,6 +179,10 @@ fn resolve_round_trip_edges(
 }
 
 impl hopr_api::graph::NetworkGraphUpdate for ChannelGraph {
+    fn set_ticket_face_value(&self, ticket_face_value: hopr_api::graph::traits::ChannelBalance) {
+        *self.ticket_face_value.write() = Some(ticket_face_value);
+    }
+
     #[tracing::instrument(level = "debug", skip(self, update))]
     fn record_edge<N, P>(&self, update: MeasurableEdge<N, P>)
     where
@@ -375,9 +382,9 @@ impl hopr_api::graph::NetworkGraphUpdate for ChannelGraph {
                     weight.record(EdgeWeightType::Intermediate(Err(())));
                 }
             }
-            MeasurableEdge::Capacity(update) => {
+            MeasurableEdge::Balance(update) => {
                 self.upsert_edge(&update.src, &update.dest, |obs: &mut Observations| {
-                    obs.record(EdgeWeightType::Capacity(update.capacity));
+                    obs.record(EdgeWeightType::Balance(update.balance));
                 });
             }
             MeasurableEdge::ConnectionStatus { peer, connected } => {
@@ -836,50 +843,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn capacity_update_should_set_edge_capacity() -> anyhow::Result<()> {
+    async fn balance_update_should_set_edge_capacity() -> anyhow::Result<()> {
         let me = pubkey_from(&SECRET_0);
         let peer = pubkey_from(&SECRET_1);
         let graph = ChannelGraph::new(me);
         graph.add_node(peer);
         graph.add_edge(&me, &peer)?;
 
-        let capacity_update = hopr_api::graph::EdgeCapacityUpdate {
+        let capacity_update = hopr_api::graph::EdgeBalanceUpdate {
             src: me,
             dest: peer,
-            capacity: Some(1000),
+            balance: Some(hopr_api::graph::traits::ChannelBalance::from(1000u64)),
         };
-        graph.record_edge::<TestNeighbor, TestPath>(hopr_api::graph::MeasurableEdge::Capacity(Box::new(
-            capacity_update,
-        )));
+        graph
+            .record_edge::<TestNeighbor, TestPath>(hopr_api::graph::MeasurableEdge::Balance(Box::new(capacity_update)));
 
         let obs = graph.edge(&me, &peer).context("edge should exist")?;
         let intermediate = obs
             .intermediate_qos()
             .context("intermediate QoS should be present after capacity update")?;
-        assert_eq!(intermediate.capacity(), Some(1000));
+        assert_eq!(
+            intermediate.balance(),
+            Some(hopr_api::graph::traits::ChannelBalance::from(1000u64))
+        );
         Ok(())
     }
 
     #[tokio::test]
-    async fn capacity_update_should_accept_none_value() -> anyhow::Result<()> {
+    async fn balance_update_should_accept_none_value() -> anyhow::Result<()> {
         let me = pubkey_from(&SECRET_0);
         let peer = pubkey_from(&SECRET_1);
         let graph = ChannelGraph::new(me);
         graph.add_node(peer);
         graph.add_edge(&me, &peer)?;
 
-        let capacity_update = hopr_api::graph::EdgeCapacityUpdate {
+        let capacity_update = hopr_api::graph::EdgeBalanceUpdate {
             src: me,
             dest: peer,
-            capacity: None,
+            balance: None,
         };
-        graph.record_edge::<TestNeighbor, TestPath>(hopr_api::graph::MeasurableEdge::Capacity(Box::new(
-            capacity_update,
-        )));
+        graph
+            .record_edge::<TestNeighbor, TestPath>(hopr_api::graph::MeasurableEdge::Balance(Box::new(capacity_update)));
 
         let obs = graph.edge(&me, &peer).context("edge should exist")?;
         let intermediate = obs.intermediate_qos().context("intermediate QoS should be present")?;
-        assert_eq!(intermediate.capacity(), None);
+        assert_eq!(intermediate.balance(), None);
         Ok(())
     }
 

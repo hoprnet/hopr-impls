@@ -204,7 +204,14 @@ impl hopr_api::graph::NetworkGraphTraverse for ChannelGraph {
                 // low-scoring edges probed *more* urgently; applying the production `min_ack_rate`
                 // here would instead prune them, so they would stop being probed, never be
                 // resampled, and stay excluded permanently.
-                let value_fn = EdgeValueFn::forward_without_self_loopback(self.edge_penalty, 0.0);
+                let value_fn = EdgeValueFn::forward_without_self_loopback(
+                    // The closing edge back to `me` is appended after path-finding.
+                    std::num::NonZeroUsize::new(hops + 1).expect("hop range is non-zero"),
+                    self.edge_penalty,
+                    0.0,
+                    // Whatever the producer last pushed; `None` until the first price is seen.
+                    hopr_api::graph::NetworkGraphView::ticket_face_value(self),
+                );
 
                 return find_paths(
                     &inner,
@@ -317,6 +324,7 @@ mod tests {
                 std::num::NonZeroUsize::new(1).context("should be non-zero")?,
                 TEST_EDGE_PENALTY,
                 TEST_MIN_ACK_RATE,
+                None,
             ),
         );
 
@@ -345,7 +353,7 @@ mod tests {
             &dest,
             2,
             None,
-            EdgeValueFn::forward(length, TEST_EDGE_PENALTY, TEST_MIN_ACK_RATE),
+            EdgeValueFn::forward(length, TEST_EDGE_PENALTY, TEST_MIN_ACK_RATE, None),
         );
 
         assert!(!routes.is_empty(), "should find at least one 2-edge route");
@@ -376,14 +384,14 @@ mod tests {
             &dest,
             2,
             None,
-            EdgeValueFn::forward(length, TEST_EDGE_PENALTY, TEST_MIN_ACK_RATE),
+            EdgeValueFn::forward(length, TEST_EDGE_PENALTY, TEST_MIN_ACK_RATE, None),
         );
         let routes_other = graph.simple_paths(
             &me,
             &dest,
             2,
             None,
-            EdgeValueFn::forward(length, 0.99, TEST_MIN_ACK_RATE),
+            EdgeValueFn::forward(length, 0.99, TEST_MIN_ACK_RATE, None),
         );
 
         assert_eq!(routes_test.len(), 1);
@@ -418,6 +426,7 @@ mod tests {
                 std::num::NonZeroUsize::new(1).context("should be non-zero")?,
                 TEST_EDGE_PENALTY,
                 TEST_MIN_ACK_RATE,
+                None,
             ),
         );
 
@@ -441,6 +450,7 @@ mod tests {
                 std::num::NonZeroUsize::new(1).context("should be non-zero")?,
                 TEST_EDGE_PENALTY,
                 TEST_MIN_ACK_RATE,
+                None,
             ),
         );
 
@@ -480,6 +490,7 @@ mod tests {
                 std::num::NonZeroUsize::new(2).context("should be non-zero")?,
                 TEST_EDGE_PENALTY,
                 TEST_MIN_ACK_RATE,
+                None,
             ),
         );
         assert_eq!(routes.len(), 2, "diamond topology should yield two 2-edge routes");
@@ -513,6 +524,7 @@ mod tests {
                 std::num::NonZeroUsize::new(3).context("should be non-zero")?,
                 TEST_EDGE_PENALTY,
                 TEST_MIN_ACK_RATE,
+                None,
             ),
         );
         assert_eq!(routes.len(), 1, "should find exactly one 3-edge route");
@@ -547,6 +559,7 @@ mod tests {
                 std::num::NonZeroUsize::new(3).context("should be non-zero")?,
                 TEST_EDGE_PENALTY,
                 TEST_MIN_ACK_RATE,
+                None,
             ),
         );
         assert_eq!(routes.len(), 1, "cycle should not produce extra paths");
@@ -571,6 +584,7 @@ mod tests {
                 std::num::NonZeroUsize::new(2).context("should be non-zero")?,
                 TEST_EDGE_PENALTY,
                 TEST_MIN_ACK_RATE,
+                None,
             ),
         );
         assert!(routes.is_empty(), "no 2-edge route should exist for a single edge");
@@ -593,6 +607,7 @@ mod tests {
                 std::num::NonZeroUsize::new(1).context("should be non-zero")?,
                 TEST_EDGE_PENALTY,
                 TEST_MIN_ACK_RATE,
+                None,
             ),
         );
         assert!(routes.is_empty(), "zero-edge path should find no routes");
@@ -621,6 +636,7 @@ mod tests {
                 std::num::NonZeroUsize::new(2).context("should be non-zero")?,
                 TEST_EDGE_PENALTY,
                 TEST_MIN_ACK_RATE,
+                None,
             ),
         );
         assert!(routes.is_empty(), "should not traverse edge in wrong direction");
@@ -707,6 +723,7 @@ mod tests {
                 std::num::NonZeroUsize::new(3).context("should be non-zero")?,
                 TEST_EDGE_PENALTY,
                 TEST_MIN_ACK_RATE,
+                None,
             ),
         );
         assert_eq!(routes_3.len(), 5, "should find exactly 5 three-edge paths");
@@ -734,6 +751,7 @@ mod tests {
                 std::num::NonZeroUsize::new(1).context("should be non-zero")?,
                 TEST_EDGE_PENALTY,
                 TEST_MIN_ACK_RATE,
+                None,
             ),
         );
         assert!(routes_1.is_empty(), "no direct edge from me to f");
@@ -772,6 +790,7 @@ mod tests {
                 std::num::NonZeroUsize::new(3).context("should be non-zero")?,
                 TEST_EDGE_PENALTY,
                 TEST_MIN_ACK_RATE,
+                None,
             ),
         );
         assert!(
@@ -802,6 +821,7 @@ mod tests {
                 std::num::NonZeroUsize::new(1).context("should be non-zero")?,
                 TEST_EDGE_PENALTY,
                 TEST_MIN_ACK_RATE,
+                None,
             ),
         );
         assert_eq!(routes.len(), 1);
@@ -845,6 +865,7 @@ mod tests {
                 std::num::NonZeroUsize::new(3).context("should be non-zero")?,
                 TEST_EDGE_PENALTY,
                 TEST_MIN_ACK_RATE,
+                None,
             ),
         );
         assert_eq!(routes.len(), 1);
@@ -898,6 +919,7 @@ mod tests {
                 std::num::NonZeroUsize::new(2).context("should be non-zero")?,
                 TEST_EDGE_PENALTY,
                 TEST_MIN_ACK_RATE,
+                None,
             ),
         );
         assert_eq!(routes.len(), 2, "diamond should yield two 2-edge routes");
@@ -943,6 +965,7 @@ mod tests {
                 std::num::NonZeroUsize::new(1).context("should be non-zero")?,
                 TEST_EDGE_PENALTY,
                 TEST_MIN_ACK_RATE,
+                None,
             ),
         );
 
@@ -978,6 +1001,7 @@ mod tests {
                 std::num::NonZeroUsize::new(2).context("should be non-zero")?,
                 TEST_EDGE_PENALTY,
                 TEST_MIN_ACK_RATE,
+                None,
             ),
         );
 
@@ -1011,6 +1035,7 @@ mod tests {
                 std::num::NonZeroUsize::new(2).context("should be non-zero")?,
                 TEST_EDGE_PENALTY,
                 TEST_MIN_ACK_RATE,
+                None,
             ),
         );
 
@@ -1047,6 +1072,7 @@ mod tests {
                 std::num::NonZeroUsize::new(2).context("should be non-zero")?,
                 TEST_EDGE_PENALTY,
                 TEST_MIN_ACK_RATE,
+                None,
             ),
         );
 
@@ -1089,6 +1115,7 @@ mod tests {
                 std::num::NonZeroUsize::new(2).context("should be non-zero")?,
                 TEST_EDGE_PENALTY,
                 TEST_MIN_ACK_RATE,
+                None,
             ),
         );
         assert_eq!(
@@ -1109,7 +1136,9 @@ mod tests {
             obs.record(EdgeWeightType::Connected(true));
             obs.record(EdgeWeightType::Immediate(Ok(std::time::Duration::from_millis(50))));
             obs.record(EdgeWeightType::Intermediate(Ok(std::time::Duration::from_millis(50))));
-            obs.record(EdgeWeightType::Capacity(Some(1000)));
+            obs.record(EdgeWeightType::Balance(Some(
+                hopr_api::graph::traits::ChannelBalance::from(1000u64),
+            )));
         });
     }
 
@@ -1118,7 +1147,9 @@ mod tests {
     fn mark_edge_with_capacity(graph: &ChannelGraph, src: &OffchainPublicKey, dest: &OffchainPublicKey) {
         graph.upsert_edge(src, dest, |obs| {
             obs.record(EdgeWeightType::Intermediate(Ok(std::time::Duration::from_millis(50))));
-            obs.record(EdgeWeightType::Capacity(Some(1000)));
+            obs.record(EdgeWeightType::Balance(Some(
+                hopr_api::graph::traits::ChannelBalance::from(1000u64),
+            )));
         });
     }
 
@@ -1486,7 +1517,12 @@ mod tests {
             &b,
             2,
             None,
-            EdgeValueFn::forward(std::num::NonZeroUsize::new(2).context("should be non-zero")?, 0.5, 0.1),
+            EdgeValueFn::forward(
+                std::num::NonZeroUsize::new(2).context("should be non-zero")?,
+                0.5,
+                0.1,
+                None,
+            ),
         );
         assert!(
             data_routes.is_empty(),

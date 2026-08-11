@@ -81,7 +81,9 @@ fn build_graph(node_count: usize, density: usize) -> (ChannelGraph, Vec<Offchain
                 obs.record(EdgeWeightType::Connected(true));
                 obs.record(EdgeWeightType::Immediate(Ok(Duration::from_millis(50))));
                 obs.record(EdgeWeightType::Intermediate(Ok(Duration::from_millis(50))));
-                obs.record(EdgeWeightType::Capacity(Some(1_000)));
+                obs.record(EdgeWeightType::Balance(Some(
+                    hopr_api::graph::traits::ChannelBalance::from(1_000u64),
+                )));
             });
         }
     }
@@ -143,6 +145,7 @@ fn bench_simple_paths(c: &mut Criterion) {
                         std::num::NonZeroUsize::new(2).expect("is greater than 1"),
                         BENCH_EDGE_PENALTY,
                         BENCH_MIN_ACK_RATE,
+                        None,
                     ),
                 ))
             });
@@ -159,6 +162,7 @@ fn bench_simple_paths(c: &mut Criterion) {
                         std::num::NonZeroUsize::new(3).expect("is greater than 1"),
                         BENCH_EDGE_PENALTY,
                         BENCH_MIN_ACK_RATE,
+                        None,
                     ),
                 ))
             });
@@ -175,6 +179,7 @@ fn bench_simple_paths(c: &mut Criterion) {
                         std::num::NonZeroUsize::new(4).expect("is greater than 1"),
                         BENCH_EDGE_PENALTY,
                         BENCH_MIN_ACK_RATE,
+                        None,
                     ),
                 ))
             });

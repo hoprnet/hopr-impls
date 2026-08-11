@@ -212,7 +212,14 @@ where
                                 }
                             }
                             let priority = match obs {
-                                Some(obs) => immediate_probe_priority(obs.score(), obs.last_update(), now, &cfg),
+                                Some(obs) => immediate_probe_priority(
+                                    // An unobserved edge scores as poorly as possible, which
+                                    // RFC-0010 §4.2.1.4 turns into maximum probing urgency.
+                                    obs.score().unwrap_or(0.0),
+                                    obs.last_update(),
+                                    now,
+                                    &cfg,
+                                ),
                                 None => immediate_probe_priority(0.0, std::time::Duration::ZERO, now, &cfg),
                             };
                             futures::future::ready(Some((peer, priority)))
@@ -507,7 +514,9 @@ mod tests {
         graph.upsert_edge(src, dst, |obs| {
             obs.record(EdgeWeightType::Connected(true));
             obs.record(EdgeWeightType::Immediate(Ok(std::time::Duration::from_millis(50))));
-            obs.record(EdgeWeightType::Capacity(Some(1000)));
+            obs.record(EdgeWeightType::Balance(Some(
+                hopr_api::graph::traits::ChannelBalance::from(1000u64),
+            )));
         });
     }
 

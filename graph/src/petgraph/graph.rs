@@ -60,6 +60,9 @@ pub struct ChannelGraph {
     pub(crate) edge_penalty: f64,
     pub(crate) min_ack_rate: f64,
     pub(crate) max_plausible_loopback_rtt: std::time::Duration,
+    /// Current single-hop ticket face value, pushed in whenever the price or winning probability
+    /// changes. Held once for the whole graph so a change costs one write, not an edge sweep.
+    pub(crate) ticket_face_value: Arc<RwLock<Option<hopr_api::graph::traits::ChannelBalance>>>,
     pub(crate) inner: Arc<RwLock<InnerGraph>>,
 }
 
@@ -106,6 +109,7 @@ impl ChannelGraph {
             edge_penalty,
             min_ack_rate,
             max_plausible_loopback_rtt,
+            ticket_face_value: Arc::new(RwLock::new(None)),
             inner: Arc::new(RwLock::new(InnerGraph { graph, indices, slots })),
         }
     }
@@ -132,6 +136,10 @@ impl ChannelGraph {
 impl hopr_api::graph::NetworkGraphView for ChannelGraph {
     type NodeId = OffchainPublicKey;
     type Observed = Observations;
+
+    fn ticket_face_value(&self) -> Option<hopr_api::graph::traits::ChannelBalance> {
+        *self.ticket_face_value.read()
+    }
 
     fn node_count(&self) -> usize {
         // The key mapping, not the vertex count: a removed node stays behind as an isolated vertex
