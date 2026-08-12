@@ -179,7 +179,7 @@ fn resolve_round_trip_edges(
 }
 
 impl hopr_api::graph::NetworkGraphUpdate for ChannelGraph {
-    fn set_ticket_face_value(&self, ticket_face_value: hopr_api::graph::traits::ChannelBalance) {
+    fn set_ticket_face_value(&self, ticket_face_value: hopr_api::graph::traits::Balance) {
         *self.ticket_face_value.write() = Some(ticket_face_value);
     }
 
@@ -853,7 +853,7 @@ mod tests {
         let capacity_update = hopr_api::graph::EdgeBalanceUpdate {
             src: me,
             dest: peer,
-            balance: Some(hopr_api::graph::traits::ChannelBalance::from(1000u64)),
+            balance: Some(hopr_api::graph::traits::Balance::from(1000u64)),
         };
         graph
             .record_edge::<TestNeighbor, TestPath>(hopr_api::graph::MeasurableEdge::Balance(Box::new(capacity_update)));
@@ -864,7 +864,7 @@ mod tests {
             .context("intermediate QoS should be present after capacity update")?;
         assert_eq!(
             intermediate.balance(),
-            Some(hopr_api::graph::traits::ChannelBalance::from(1000u64))
+            Some(hopr_api::graph::traits::Balance::from(1000u64))
         );
         Ok(())
     }

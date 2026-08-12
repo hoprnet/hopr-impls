@@ -62,7 +62,7 @@ pub struct ChannelGraph {
     pub(crate) max_plausible_loopback_rtt: std::time::Duration,
     /// Current single-hop ticket face value, pushed in whenever the price or winning probability
     /// changes. Held once for the whole graph so a change costs one write, not an edge sweep.
-    pub(crate) ticket_face_value: Arc<RwLock<Option<hopr_api::graph::traits::ChannelBalance>>>,
+    pub(crate) ticket_face_value: Arc<RwLock<Option<hopr_api::graph::traits::Balance>>>,
     pub(crate) inner: Arc<RwLock<InnerGraph>>,
 }
 
@@ -137,7 +137,7 @@ impl hopr_api::graph::NetworkGraphView for ChannelGraph {
     type NodeId = OffchainPublicKey;
     type Observed = Observations;
 
-    fn ticket_face_value(&self) -> Option<hopr_api::graph::traits::ChannelBalance> {
+    fn ticket_face_value(&self) -> Option<hopr_api::graph::traits::Balance> {
         *self.ticket_face_value.read()
     }
 

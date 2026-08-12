@@ -81,9 +81,9 @@ fn build_graph(node_count: usize, density: usize) -> (ChannelGraph, Vec<Offchain
                 obs.record(EdgeWeightType::Connected(true));
                 obs.record(EdgeWeightType::Immediate(Ok(Duration::from_millis(50))));
                 obs.record(EdgeWeightType::Intermediate(Ok(Duration::from_millis(50))));
-                obs.record(EdgeWeightType::Balance(Some(
-                    hopr_api::graph::traits::ChannelBalance::from(1_000u64),
-                )));
+                obs.record(EdgeWeightType::Balance(Some(hopr_api::graph::traits::Balance::from(
+                    1_000u64,
+                ))));
             });
         }
     }

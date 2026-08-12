@@ -1136,9 +1136,9 @@ mod tests {
             obs.record(EdgeWeightType::Connected(true));
             obs.record(EdgeWeightType::Immediate(Ok(std::time::Duration::from_millis(50))));
             obs.record(EdgeWeightType::Intermediate(Ok(std::time::Duration::from_millis(50))));
-            obs.record(EdgeWeightType::Balance(Some(
-                hopr_api::graph::traits::ChannelBalance::from(1000u64),
-            )));
+            obs.record(EdgeWeightType::Balance(Some(hopr_api::graph::traits::Balance::from(
+                1000u64,
+            ))));
         });
     }
 
@@ -1147,9 +1147,9 @@ mod tests {
     fn mark_edge_with_capacity(graph: &ChannelGraph, src: &OffchainPublicKey, dest: &OffchainPublicKey) {
         graph.upsert_edge(src, dest, |obs| {
             obs.record(EdgeWeightType::Intermediate(Ok(std::time::Duration::from_millis(50))));
-            obs.record(EdgeWeightType::Balance(Some(
-                hopr_api::graph::traits::ChannelBalance::from(1000u64),
-            )));
+            obs.record(EdgeWeightType::Balance(Some(hopr_api::graph::traits::Balance::from(
+                1000u64,
+            ))));
         });
     }
 
