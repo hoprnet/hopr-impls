@@ -13,7 +13,12 @@ use petgraph::prelude::DiGraphMap;
 
 use crate::{
     backend::Backend,
-    connector::{keys::HoprKeyMapper, sequencer::TransactionSequencer, values::CHAIN_INFO_CACHE_KEY},
+    connector::{
+        keys::HoprKeyMapper,
+        sequencer::TransactionSequencer,
+        services::{service_type_update_to_event, service_update_to_event},
+        values::CHAIN_INFO_CACHE_KEY,
+    },
     errors::ConnectorError,
     utils::{
         ParsedChainInfo, model_to_account_entry, model_to_graph_entry, model_to_ticket_params,
@@ -27,6 +32,7 @@ mod events;
 mod keys;
 mod safe;
 mod sequencer;
+mod services;
 mod tickets;
 mod values;
 
@@ -256,6 +262,12 @@ where
             Channel((ChannelEntry, Option<Vec<ChannelChange>>)),
             WinningProbability((WinningProbability, Option<WinningProbability>)),
             TicketPrice((HoprBalance, Option<HoprBalance>)),
+            /// A change of the service registry, already decoded into the event it stands for.
+            ///
+            /// Both registry subscriptions feed this variant: entry changes give the three
+            /// `ChainEvent::Service{Registered,Updated,Deregistered}` values, and configuration
+            /// changes give the remaining seven.
+            Service(ChainEvent),
         }
 
         let ticket_values = self.ticket_values.clone();
@@ -266,7 +278,24 @@ where
             let connections = client
                 .subscribe_accounts(blokli_client::api::AccountSelector::Any)
                 .and_then(|accounts| Ok((accounts, client.subscribe_graph()?)))
-                .and_then(|(accounts, channels)| Ok((accounts, channels, client.subscribe_ticket_params()?)));
+                .and_then(|(accounts, channels)| Ok((accounts, channels, client.subscribe_ticket_params()?)))
+                .and_then(|(accounts, channels, ticket_params)| {
+                    Ok((
+                        accounts,
+                        channels,
+                        ticket_params,
+                        client.subscribe_services(blokli_client::api::ServiceSelector::Any)?,
+                    ))
+                })
+                .and_then(|(accounts, channels, ticket_params, services)| {
+                    Ok((
+                        accounts,
+                        channels,
+                        ticket_params,
+                        services,
+                        client.subscribe_service_types(None)?,
+                    ))
+                });
 
             if let Err(error) = connections {
                 if let Some(connection_ready_tx) = connection_ready_tx.take() {
@@ -275,7 +304,8 @@ where
                 return;
             }
 
-            let (account_stream, channel_stream, ticket_params_stream) = connections.unwrap();
+            let (account_stream, channel_stream, ticket_params_stream, service_stream, service_type_stream) =
+                connections.unwrap();
 
             // Stream of Account events (Announcements)
             let graph_clone = graph.clone();
@@ -417,6 +447,22 @@ where
                 .try_flatten()
                 .fuse();
 
+            // Stream of service registry entry changes (registrations, updates, deregistrations)
+            let service_stream = service_stream
+                .map_err(ConnectorError::from)
+                .inspect_ok(|update| tracing::trace!(?update, "new service registry event"))
+                .and_then(|update| futures::future::ready(service_update_to_event(update)))
+                .map_ok(SubscribedEventType::Service)
+                .fuse();
+
+            // Stream of service type and registry-wide configuration changes
+            let service_type_stream = service_type_stream
+                .map_err(ConnectorError::from)
+                .inspect_ok(|update| tracing::trace!(?update, "new service type event"))
+                .and_then(|update| futures::future::ready(service_type_update_to_event(update)))
+                .map_ok(SubscribedEventType::Service)
+                .fuse();
+
             let mut account_counter = 0;
             let mut channel_counter = 0;
             if min_accounts == 0 && min_channels == 0 {
@@ -425,7 +471,14 @@ where
             }
 
             futures::stream::Abortable::new(
-                (account_stream, channel_stream, ticket_params_stream).merge(),
+                (
+                    account_stream,
+                    channel_stream,
+                    ticket_params_stream,
+                    service_stream,
+                    service_type_stream,
+                )
+                    .merge(),
                 abort_reg,
             )
             .inspect_ok(move |event_type| {
@@ -433,6 +486,8 @@ where
                     match event_type {
                         SubscribedEventType::Account(_) => account_counter += 1,
                         SubscribedEventType::Channel(_) => channel_counter += 1,
+                        // Service registry events deliberately do not count towards the connection
+                        // quota: a node with no services must still reach the Ready state.
                         _ => {}
                     }
 
@@ -510,6 +565,10 @@ where
                         Ok(SubscribedEventType::TicketPrice((new, old))) => {
                             tracing::debug!(%new, ?old, "ticket price changed");
                             let _ = event_tx.broadcast_direct(ChainEvent::TicketPriceChanged(new)).await;
+                        }
+                        Ok(SubscribedEventType::Service(event)) => {
+                            tracing::debug!(%event, "service registry changed");
+                            let _ = event_tx.broadcast_direct(event).await;
                         }
                         Err(error) => {
                             tracing::error!(%error, "error processing account/graph/ticket params subscription");
