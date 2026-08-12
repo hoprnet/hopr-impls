@@ -29,12 +29,12 @@ rust-version = "1.97"
 [workspace.dependencies]
 # In-repo crates (path + version so they are publishable)
 hopr-chain-connector = { path = "connector", version = "0.22.2" }
-hopr-network-graph   = { path = "graph", version = "0.3.2", default-features = false }
+hopr-network-graph   = { path = "graph", version = "0.3.3", default-features = false }
 
 # HOPR crates published to crates.io
 blokli-client = "0.30.2"
-hopr-api      = "1.19.0"
-hopr-utils    = { package = "hopr-utilities", version = "0.6.0", default-features = false }
+hopr-api      = "1.21.0"
+hopr-utils    = { package = "hopr-utilities", version = "0.7.0", default-features = false }
 
 # Third-party dependencies (versions mirror hoprnet's workspace to preserve compatibility)
 ahash = "0.8.12"
@@ -100,3 +100,9 @@ tokio = { version = "1.53.1", features = [
 tokio-retry = "0.3.2"
 tracing = { version = "0.1.44", features = ["release_max_level_debug"] }
 validator = { version = "0.21.0", features = ["derive"] }
+
+# Pinned to the unreleased upstream branches this depends on. Replace with plain crates.io
+# versions once hopr-api 1.21.0 and hopr-utilities 0.7.0 are published.
+[patch.crates-io]
+hopr-api = { git = "https://github.com/hoprnet/hopr-api", rev = "4a53ed13634a5080a63760b9ca84bd9fe7710114" }
+hopr-utilities = { git = "https://github.com/hoprnet/hopr-utilities", rev = "e17451a8db2fd72cecde273ac8ef87de96c8bac0" }

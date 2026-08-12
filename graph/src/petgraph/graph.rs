@@ -121,6 +121,12 @@ impl hopr_api::graph::NetworkGraphView for ChannelGraph {
     fn identity(&self) -> &OffchainPublicKey {
         &self.me
     }
+
+    fn path_slot(&self, key: &OffchainPublicKey) -> Option<u64> {
+        // The same node index a `PathId` from `simple_paths` is built out of, so ids assembled from
+        // keys and ids handed out by path selection resolve identically.
+        self.inner.read().indices.get_by_left(key).map(|i| i.index() as u64)
+    }
 }
 
 impl hopr_api::graph::NetworkGraphWrite for ChannelGraph {
@@ -276,7 +282,7 @@ mod tests {
     use hex_literal::hex;
     use hopr_api::{
         graph::{
-            EdgeLinkObservable, NetworkGraphConnectivity, NetworkGraphView, NetworkGraphWrite,
+            EdgeLinkObservable, NetworkGraphConnectivity, NetworkGraphTraverse, NetworkGraphView, NetworkGraphWrite,
             traits::{EdgeObservableRead, EdgeObservableWrite, EdgeWeightType},
         },
         types::crypto::prelude::{Keypair, OffchainKeypair},
@@ -304,6 +310,35 @@ mod tests {
         let graph = ChannelGraph::new(me);
         assert!(graph.contains_node(&me));
         assert_eq!(graph.node_count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn path_slot_should_be_none_for_a_node_the_graph_does_not_know() -> anyhow::Result<()> {
+        let graph = ChannelGraph::new(pubkey_from(&SECRET_0));
+
+        assert_eq!(None, graph.path_slot(&pubkey_from(&SECRET_1)));
+        Ok(())
+    }
+
+    #[test]
+    fn path_slot_should_number_nodes_the_way_path_ids_do() -> anyhow::Result<()> {
+        // Load-bearing: SURB round-trips assemble a `PathId` out of public keys, while path
+        // selection builds one out of node indices. `resolve_round_trip_edges` compares the two
+        // numbering schemes directly, so if they ever diverged a reported round-trip would credit
+        // whichever edges the wrong numbers happened to name.
+        let me = pubkey_from(&SECRET_0);
+        let graph = ChannelGraph::new(me);
+        let first = pubkey_from(&SECRET_1);
+        let second = pubkey_from(&SECRET_2);
+        graph.add_node(first);
+        graph.add_node(second);
+
+        // Self occupies the graph's first node, so it is slot 0 -- the value the round-trip
+        // resolver checks the forward leg starts at.
+        assert_eq!(Some(0), graph.path_slot(&me));
+        assert_eq!(Some(1), graph.path_slot(&first));
+        assert_eq!(Some(2), graph.path_slot(&second));
         Ok(())
     }
 

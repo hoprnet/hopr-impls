@@ -87,6 +87,53 @@ fn resolve_loopback_edges(inner: &InnerGraph, me_idx: NodeIndex, path_bytes: &[u
     Some(edges)
 }
 
+/// Resolves the edges a SURB round-trip traversed, across both of its legs.
+///
+/// The two legs overlap at the replier: the forward path ends where the return path begins. That
+/// shared node is what makes the join unambiguous — [`PathId`] pads unused slots with zero, and
+/// zero is also a legitimate node index, so trimming by "first zero" would truncate any path
+/// running through node 0. Locating the replier in the forward leg, and self in the return leg,
+/// uses real information instead of guessing at padding.
+///
+/// Returns `None` when the legs do not join, do not come home, or name an edge the graph no longer
+/// has — a `PathId` is a snapshot of node indices, so one built against an older generation of the
+/// graph must be discarded rather than attributed to whatever now sits at those indices.
+fn resolve_round_trip_edges(
+    inner: &InnerGraph,
+    me_idx: NodeIndex,
+    paths: &hopr_api::graph::ForwardAndReturnPath,
+) -> Option<Vec<EdgeIndex>> {
+    let me_val = me_idx.index() as u64;
+    let replier = paths.reply[0];
+
+    if paths.forward[0] != me_val {
+        tracing::warn!("surb round-trip forward leg does not start at self");
+        return None;
+    }
+
+    // The forward leg runs up to the replier; the return leg from the replier back to us.
+    let forward_end = paths.forward.iter().position(|&v| v == replier)?;
+    let reply_end = paths.reply[1..].iter().position(|&v| v == me_val).map(|p| p + 1)?;
+
+    let loop_nodes: Vec<u64> = paths.forward[..=forward_end]
+        .iter()
+        .chain(paths.reply[1..=reply_end].iter())
+        .copied()
+        .collect();
+
+    let mut edges = Vec::with_capacity(loop_nodes.len().saturating_sub(1));
+    for pair in loop_nodes.windows(2) {
+        let from = NodeIndex::new(pair[0] as usize);
+        let to = NodeIndex::new(pair[1] as usize);
+        // A missing edge means the indices are stale; attributing the rest would credit edges the
+        // round-trip may never have used.
+        let edge = inner.graph.find_edge(from, to)?;
+        edges.push(edge);
+    }
+
+    (!edges.is_empty()).then_some(edges)
+}
+
 impl hopr_api::graph::NetworkGraphUpdate for ChannelGraph {
     #[tracing::instrument(level = "debug", skip(self, update))]
     fn record_edge<N, P>(&self, update: MeasurableEdge<N, P>)
@@ -100,6 +147,36 @@ impl hopr_api::graph::NetworkGraphUpdate for ChannelGraph {
         };
 
         match update {
+            MeasurableEdge::Surb(telemetry) => {
+                let mut inner = self.inner.write();
+                let Some(&me_idx) = inner.indices.get_by_left(&self.me) else {
+                    tracing::warn!("self not present in the graph; dropping surb round-trip");
+                    return;
+                };
+                let Some(edges) = resolve_round_trip_edges(&inner, me_idx, &telemetry.paths) else {
+                    return;
+                };
+
+                // Every edge on the loop, unlike the loopback handler above which attributes to a
+                // single edge. That one is doing incremental latency tomography: it knows the rest
+                // of the loop already and subtracts to isolate one unknown. A round-trip has no
+                // unknown to isolate — it is direct evidence that the whole loop carried traffic,
+                // so crediting one edge would discard most of what was observed.
+                tracing::trace!(
+                    edge_count = edges.len(),
+                    expected = telemetry.expected,
+                    observed = telemetry.observed,
+                    "recording surb round-trips across the loop"
+                );
+                for edge in edges {
+                    if let Some(weight) = inner.graph.edge_weight_mut(edge) {
+                        weight.record(EdgeWeightType::SurbRoundTrips {
+                            expected: telemetry.expected,
+                            observed: telemetry.observed,
+                        });
+                    }
+                }
+            }
             MeasurableEdge::Probe(Ok(hopr_api::graph::EdgeTransportTelemetry::Neighbor(ref telemetry))) => {
                 tracing::trace!(
                     peer = %telemetry.peer(),
@@ -328,6 +405,133 @@ mod tests {
         fn timestamp(&self) -> u128 {
             0
         }
+    }
+
+    /// Builds the graph `me -> exit -> relay -> me` and returns the node keys plus their indices,
+    /// which is the shape a 0-hop-forward / 1-hop-return session produces.
+    fn round_trip_graph() -> anyhow::Result<(ChannelGraph, OffchainPublicKey, OffchainPublicKey, OffchainPublicKey)> {
+        let me = pubkey_from(&SECRET_0);
+        let exit = pubkey_from(&SECRET_1);
+        let relay = pubkey_from(&SECRET_2);
+
+        let graph = ChannelGraph::new(me);
+        graph.add_node(exit);
+        graph.add_node(relay);
+        graph.add_edge(&me, &exit)?;
+        graph.add_edge(&exit, &relay)?;
+        graph.add_edge(&relay, &me)?;
+        Ok((graph, exit, relay, me))
+    }
+
+    fn index_of(graph: &ChannelGraph, key: &OffchainPublicKey) -> u64 {
+        graph
+            .inner
+            .read()
+            .indices
+            .get_by_left(key)
+            .expect("node should be in the graph")
+            .index() as u64
+    }
+
+    fn surb(paths: hopr_api::graph::ForwardAndReturnPath, expected: u64, observed: u64) -> hopr_api::graph::SurbTelemetry {
+        hopr_api::graph::SurbTelemetry {
+            paths,
+            timestamp: 0,
+            expected,
+            observed,
+        }
+    }
+
+    #[tokio::test]
+    async fn surb_round_trip_should_credit_every_edge_on_both_legs() -> anyhow::Result<()> {
+        // The distinguishing property of this handler. A loopback probe attributes to one edge
+        // because it is isolating an unknown latency by subtraction; a round-trip has no unknown to
+        // isolate, so crediting a single edge would throw away most of what was observed.
+        let (graph, exit, relay, me) = round_trip_graph()?;
+        let (me_i, exit_i, relay_i) = (index_of(&graph, &me), index_of(&graph, &exit), index_of(&graph, &relay));
+
+        let paths = hopr_api::graph::ForwardAndReturnPath {
+            forward: [me_i, exit_i, 0, 0, 0],
+            reply: [exit_i, relay_i, me_i, 0, 0],
+        };
+        graph.record_edge::<TestNeighbor, TestPath>(hopr_api::graph::MeasurableEdge::Surb(surb(paths, 4, 3)));
+
+        for (src, dst) in [(me, exit), (exit, relay), (relay, me)] {
+            let obs = graph.edge(&src, &dst).context("edge should exist")?;
+            let rate = obs
+                .intermediate_qos()
+                .context("surb telemetry lands in the intermediate measurement")?
+                .surb_delivery_rate()
+                .context("window should hold the round-trips")?;
+            assert_in_delta!(rate, 0.75, 1e-9);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn surb_round_trip_should_leave_latency_untouched() -> anyhow::Result<()> {
+        // A round-trip carries no per-edge latency, so it must not invent one.
+        let (graph, exit, relay, me) = round_trip_graph()?;
+        let (me_i, exit_i, relay_i) = (index_of(&graph, &me), index_of(&graph, &exit), index_of(&graph, &relay));
+
+        let paths = hopr_api::graph::ForwardAndReturnPath {
+            forward: [me_i, exit_i, 0, 0, 0],
+            reply: [exit_i, relay_i, me_i, 0, 0],
+        };
+        graph.record_edge::<TestNeighbor, TestPath>(hopr_api::graph::MeasurableEdge::Surb(surb(paths, 1, 1)));
+
+        let obs = graph.edge(&exit, &relay).context("edge should exist")?;
+        assert!(
+            obs.intermediate_qos()
+                .context("intermediate present")?
+                .average_latency()
+                .is_none(),
+            "latency must stay unknown"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn surb_round_trip_should_be_dropped_when_the_legs_do_not_join() -> anyhow::Result<()> {
+        let (graph, exit, relay, me) = round_trip_graph()?;
+        let (me_i, exit_i, relay_i) = (index_of(&graph, &me), index_of(&graph, &exit), index_of(&graph, &relay));
+
+        // The reply leg starts at the relay, which never appears on the forward leg — so the two
+        // legs describe no single round-trip and attributing either would be a guess.
+        let paths = hopr_api::graph::ForwardAndReturnPath {
+            forward: [me_i, exit_i, 0, 0, 0],
+            reply: [relay_i, me_i, 0, 0, 0],
+        };
+        graph.record_edge::<TestNeighbor, TestPath>(hopr_api::graph::MeasurableEdge::Surb(surb(paths, 4, 0)));
+
+        let obs = graph.edge(&me, &exit).context("edge should exist")?;
+        assert!(
+            obs.intermediate_qos().is_none_or(|i| i.surb_delivery_rate().is_none()),
+            "a non-joining round-trip must not be attributed"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn surb_round_trip_should_be_dropped_when_an_index_is_stale() -> anyhow::Result<()> {
+        // A PathId is a snapshot of node indices; one built against an older generation of the
+        // graph must be discarded rather than credited to whoever now occupies those slots.
+        let (graph, exit, relay, me) = round_trip_graph()?;
+        let (me_i, exit_i) = (index_of(&graph, &me), index_of(&graph, &exit));
+        let _ = relay;
+
+        let paths = hopr_api::graph::ForwardAndReturnPath {
+            forward: [me_i, exit_i, 0, 0, 0],
+            reply: [exit_i, 999, me_i, 0, 0],
+        };
+        graph.record_edge::<TestNeighbor, TestPath>(hopr_api::graph::MeasurableEdge::Surb(surb(paths, 4, 4)));
+
+        let obs = graph.edge(&me, &exit).context("edge should exist")?;
+        assert!(
+            obs.intermediate_qos().is_none_or(|i| i.surb_delivery_rate().is_none()),
+            "a stale path must not be attributed"
+        );
+        Ok(())
     }
 
     #[tokio::test]

@@ -5,7 +5,7 @@ use hopr_api::graph::{
         EdgeTransportMeasurement, EdgeWeightType,
     },
 };
-use hopr_utils::statistics::ExponentialMovingAverage;
+use hopr_utils::statistics::{ExponentialMovingAverage, WindowedRatio};
 
 /// A representation of a individual neighbor link measurement
 #[derive(Debug, Copy, Clone, Default, PartialEq)]
@@ -80,6 +80,11 @@ impl EdgeObservableWrite for Observations {
             EdgeWeightType::Connected(is_connected) => {
                 self.immediate_probe.get_or_insert_default().is_connected = is_connected
             }
+            EdgeWeightType::SurbRoundTrips { expected, observed } => {
+                self.intermediate_probe
+                    .get_or_insert_default()
+                    .record_surb_round_trips(expected, observed);
+            }
             EdgeWeightType::ImmediateProtocolConformance { num_packets, num_acks } => {
                 let imm = self.immediate_probe.get_or_insert_default();
                 imm.messages_sent += num_packets;
@@ -131,10 +136,44 @@ impl EdgeLinkObservable for TransportImmediates {
     }
 }
 
-#[derive(Debug, Copy, Clone, Default, PartialEq)]
+/// Slice width and count for the SURB round-trip window.
+///
+/// One minute of history in five-second slices: short enough that a relay which stops delivering
+/// is reflected within seconds, long enough to be comfortably above any plausible round-trip so
+/// that a reply is nearly always counted in a slice still inside the window.
+const SURB_BUCKET_WIDTH: std::time::Duration = std::time::Duration::from_secs(5);
+const SURB_BUCKETS: usize = 12;
+
+#[derive(Debug, Copy, Clone, PartialEq)]
 pub struct TransportIntermediates {
     link: TransportLinkMeasurement,
     capacity: Option<u128>,
+    /// Delivery observed from real SURB traffic rather than from probes.
+    surb: WindowedRatio<SURB_BUCKETS>,
+}
+
+impl Default for TransportIntermediates {
+    fn default() -> Self {
+        Self {
+            link: TransportLinkMeasurement::default(),
+            capacity: None,
+            surb: WindowedRatio::new(SURB_BUCKET_WIDTH, std::time::Instant::now()),
+        }
+    }
+}
+
+impl TransportIntermediates {
+    /// Folds one reporting interval of SURB round-trips into the window.
+    pub(crate) fn record_surb_round_trips(&mut self, expected: u64, observed: u64) {
+        let now = std::time::Instant::now();
+        self.surb.record_expected(expected, now);
+        self.surb.record_observed(observed, now);
+    }
+
+    /// Delivery rate observed from SURB traffic, or `None` when the window holds none.
+    pub fn surb_delivery_rate(&self) -> Option<f64> {
+        self.surb.value(std::time::Instant::now())
+    }
 }
 
 impl EdgeProtocolObservable for TransportIntermediates {
@@ -152,12 +191,20 @@ impl EdgeLinkObservable for TransportIntermediates {
         self.link.average_latency()
     }
 
+    /// Real SURB traffic when the window has any, otherwise the probe rate.
+    ///
+    /// Round-trips are preferred not because probes are wrong but because they are scarce: probing
+    /// runs on an interval, while SURBs accrue at data rates, so the window reacts to a relay that
+    /// stops delivering far sooner. With no recent traffic there is nothing to prefer and the probe
+    /// rate stands.
     fn average_probe_rate(&self) -> f64 {
-        self.link.average_probe_rate()
+        self.surb_delivery_rate().unwrap_or_else(|| self.link.average_probe_rate())
     }
 
     fn score(&self) -> f64 {
-        self.link.score()
+        // Latency scoring is left to the link measurement untouched: a round-trip carries no
+        // per-edge latency to contribute.
+        self.average_probe_rate() * latency_score(self.average_latency())
     }
 }
 
