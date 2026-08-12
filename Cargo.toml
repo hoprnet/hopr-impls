@@ -31,10 +31,11 @@ rust-version = "1.97"
 hopr-chain-connector = { path = "connector", version = "0.23.0" }
 hopr-network-graph   = { path = "graph", version = "0.3.2", default-features = false }
 
-# HOPR crates published to crates.io
-blokli-client = "0.31.0"
-hopr-api      = "1.21.0"
-hopr-utils    = { package = "hopr-utilities", version = "0.7.0", default-features = false }
+# HOPR crates. TODO: revert to crates.io versions once the service-registry wave is published;
+# these revs are the `feat/service-registry` tips and exist only so the branch is testable.
+blokli-client = { git = "https://github.com/hoprnet/blokli-client", rev = "2b2d41a387f46d2d7adf4e0e66dd4dff520c0b92" }
+hopr-api      = { git = "https://github.com/hoprnet/hopr-api", rev = "7c26c0bee697d33529dc9412c271ce6c8d726fc1" }
+hopr-utils    = { package = "hopr-utilities", git = "https://github.com/hoprnet/hopr-utilities", rev = "a43495abdda0d2ee7f5516ccd451021eb0c3f31e", default-features = false }
 
 # Third-party dependencies (versions mirror hoprnet's workspace to preserve compatibility)
 ahash = "0.8.12"
@@ -100,18 +101,3 @@ tokio = { version = "1.53.1", features = [
 tokio-retry = "0.3.2"
 tracing = { version = "0.1.44", features = ["release_max_level_debug"] }
 validator = { version = "0.21.0", features = ["derive"] }
-
-# TODO: revert to crates.io versions once contracts publishes hopr-bindings 4.12.2, hopr-types
-# publishes 2.3.0, hopr-api publishes 1.21.0, blokli-client publishes 0.31.0 and hopr-utilities
-# publishes 0.7.0. Mirrors the TODO in hopr-types/Cargo.toml.
-[patch.crates-io]
-blokli-client  = { path = "../blokli-client/client" }
-hopr-api       = { path = "../hopr-api" }
-hopr-bindings  = { path = "../contracts/ethereum/bindings" }
-hopr-types     = { path = "../hopr-types" }
-hopr-utilities = { path = "../hopr-utilities" }
-
-# hopr-types pins hopr-bindings to a contracts git rev, so patching crates.io alone leaves two
-# copies of the crate in the graph and their alloy types stop unifying.
-[patch."https://github.com/hoprnet/contracts"]
-hopr-bindings = { path = "../contracts/ethereum/bindings" }
