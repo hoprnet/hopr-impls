@@ -463,8 +463,39 @@ mod tests {
                 .context("surb telemetry lands in the intermediate measurement")?
                 .surb_delivery_rate()
                 .context("window should hold the round-trips")?;
-            assert_in_delta!(rate, 0.75, 1e-9);
+            // Read relatively: the first report sets the edge's own peak, so a path that has only
+            // ever been seen delivering at one level reads as fully healthy whatever that level
+            // was. The absolute ratio is not a delivery rate -- it also measures how far the
+            // balancer over-mints -- so only movement away from the peak is meaningful.
+            assert_in_delta!(rate, 1.0, 1e-9);
         }
+        Ok(())
+    }
+
+    /// A leg that stops delivering must fall away from its own peak, which is the signal the score
+    /// is built on.
+    #[tokio::test]
+    async fn surb_round_trip_should_fall_when_delivery_drops_off_its_peak() -> anyhow::Result<()> {
+        let (graph, exit, relay, me) = round_trip_graph()?;
+        let (me_i, exit_i, relay_i) = (index_of(&graph, &me), index_of(&graph, &exit), index_of(&graph, &relay));
+        let paths = hopr_api::graph::ForwardAndReturnPath {
+            forward: [me_i, exit_i, 0, 0, 0],
+            reply: [exit_i, relay_i, me_i, 0, 0],
+        };
+
+        // Healthy: everything minted comes back, establishing the peak.
+        graph.record_edge::<TestNeighbor, TestPath>(hopr_api::graph::MeasurableEdge::Surb(surb(paths, 100, 100)));
+        // Then the return path breaks and nothing does.
+        graph.record_edge::<TestNeighbor, TestPath>(hopr_api::graph::MeasurableEdge::Surb(surb(paths, 100, 0)));
+
+        let obs = graph.edge(&exit, &relay).context("edge should exist")?;
+        let rate = obs
+            .intermediate_qos()
+            .context("surb telemetry lands in the intermediate measurement")?
+            .surb_delivery_rate()
+            .context("window should hold the round-trips")?;
+
+        assert!(rate < 0.6, "a leg that stopped delivering still reads {rate}");
         Ok(())
     }
 

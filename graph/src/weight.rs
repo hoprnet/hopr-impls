@@ -150,6 +150,15 @@ pub struct TransportIntermediates {
     capacity: Option<u128>,
     /// Delivery observed from real SURB traffic rather than from probes.
     surb: WindowedRatio<SURB_BUCKETS>,
+    /// Highest delivery ratio this edge has reached, used to read the window relatively.
+    ///
+    /// The absolute ratio is not a delivery rate: `expected` counts SURBs *minted*, and the
+    /// balancer mints far more than the counterparty spends, so a path carrying every reply
+    /// intact still measures well below 1. Measured on a cluster, a fully healthy path reads 0.36.
+    /// The surplus is a property of the balancer, not of the path, so it applies alike to every
+    /// candidate and cancels the moment the ratio is read against a baseline instead of an
+    /// absolute scale.
+    surb_peak: f64,
 }
 
 impl Default for TransportIntermediates {
@@ -158,6 +167,7 @@ impl Default for TransportIntermediates {
             link: TransportLinkMeasurement::default(),
             capacity: None,
             surb: WindowedRatio::new(SURB_BUCKET_WIDTH, std::time::Instant::now()),
+            surb_peak: 0.0,
         }
     }
 }
@@ -168,11 +178,22 @@ impl TransportIntermediates {
         let now = std::time::Instant::now();
         self.surb.record_expected(expected, now);
         self.surb.record_observed(observed, now);
+
+        if let Some(v) = self.surb.value(now) {
+            self.surb_peak = self.surb_peak.max(v);
+        }
     }
 
-    /// Delivery rate observed from SURB traffic, or `None` when the window holds none.
+    /// How this edge is delivering relative to its own best, or `None` without traffic.
+    ///
+    /// Relative, because the absolute ratio measures the balancer's surplus as much as the path
+    /// (see [`Self::surb_peak`]). Against its own peak a healthy edge reads ~1 whatever the
+    /// surplus, and one that stops delivering falls toward 0 -- which is the only thing this
+    /// signal is asked to say.
     pub fn surb_delivery_rate(&self) -> Option<f64> {
-        self.surb.value(std::time::Instant::now())
+        let value = self.surb.value(std::time::Instant::now())?;
+
+        (self.surb_peak > 0.0).then(|| (value / self.surb_peak).clamp(0.0, 1.0))
     }
 }
 
