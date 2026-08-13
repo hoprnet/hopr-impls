@@ -9,7 +9,10 @@ use std::{
     collections::{HashMap, hash_map::Entry},
     convert::Infallible,
     path::Path,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -112,15 +115,20 @@ pub struct CurvyWithdrawalOutcome<R> {
 #[async_trait::async_trait]
 pub trait CurvySdkAdapter: Send + Sync + 'static {
     type Error: std::error::Error + Send + Sync + 'static;
-    type Receipt: Send + Sync + 'static;
+    type Receipt: Default + Send + Sync + 'static;
 
     /// Deposits funds to one Curvy BJJ address.
-    async fn deposit(&self, dst: BjjPublicKey, amount: HoprBalance) -> Result<Self::Receipt, Self::Error>;
+    async fn deposit(
+        &self,
+        id: PixAddressId,
+        dst: BjjPublicKey,
+        amount: HoprBalance,
+    ) -> Result<Self::Receipt, Self::Error>;
 
     /// Deposits funds to several Curvy BJJ addresses using the SDK's native batch operation.
     async fn deposit_multiple(
         &self,
-        deposits: Vec<(BjjPublicKey, HoprBalance)>,
+        deposits: Vec<(PixAddressId, BjjPublicKey, HoprBalance)>,
     ) -> Result<Vec<Self::Receipt>, Self::Error>;
 
     /// Withdraws a Curvy note using the recovered PIX secret.
@@ -132,7 +140,8 @@ pub trait CurvySdkAdapter: Send + Sync + 'static {
         amount: Option<HoprBalance>,
     ) -> Result<CurvyWithdrawalOutcome<Self::Receipt>, Self::Error>;
 
-    /// Withdraws several Curvy notes to one Ethereum address using a native batch proof/transaction.
+    /// Withdraws several Curvy allocations to one Ethereum address. Implementations may
+    /// submit one native batch or preserve the logical result order through sequential calls.
     async fn withdraw_multiple(
         &self,
         withdrawals: Vec<CurvyWithdrawal>,
@@ -242,9 +251,8 @@ where
         };
         let ephemeral_x = parse_curvy_field(&ephemeral_x.0, "ephemeral key x")?;
         let ephemeral_y = parse_curvy_field(&ephemeral_y.0, "ephemeral key y")?;
-        let view_tag_value = u16::try_from(candidate.view_tag).map_err(|_| {
-            CurvyDetectionError::InvalidCandidate("view tag must fit into an unsigned 16-bit integer".to_owned())
-        })?;
+        let view_tag_value = u8::try_from(candidate.view_tag)
+            .map_err(|_| CurvyDetectionError::InvalidCandidate("view tag must fit into one byte".to_owned()))?;
         let view_tag = Bn254Fr::from_fr(curvy_core::Fr::from(u64::from(view_tag_value)));
         let announcement = format!("{}.{}", ephemeral_x.to_dec(), ephemeral_y.to_dec());
         let scan_tag = format!("{view_tag_value:02x}");
@@ -264,7 +272,7 @@ where
             // allocation addresses. Reused `Arc`s make that relationship explicit
             // and ensure each Blokli candidate is scanned/decrypted only once.
             let account_id = Arc::as_ptr(&account) as usize;
-            let scan_result = if let Some(scan_result) = scan_results.get(&account_id) {
+            let scan_result = if let Some((_, scan_result)) = scan_results.get(&account_id) {
                 *scan_result
             } else {
                 let matches = stealth::scan(
@@ -301,7 +309,9 @@ where
                 } else {
                     None
                 };
-                scan_results.insert(account_id, scan_result);
+                // Retain the Arc alongside the pointer-derived key so allocator pointer
+                // reuse cannot turn this per-candidate cache into an ABA collision.
+                scan_results.insert(account_id, (account, scan_result));
                 scan_result
             };
             let Some((shared_secret, amount, token)) = scan_result else {
@@ -859,6 +869,7 @@ struct CurvyLifecycleTracker<R, S> {
     detector: Arc<RsCoreCurvyNoteDetector<R>>,
     state: Arc<S>,
     waiters: parking_lot::Mutex<HashMap<PixAddressId, WatchedAllocation>>,
+    rescan_pending_history: AtomicBool,
 }
 
 impl<R, S> CurvyLifecycleTracker<R, S>
@@ -871,6 +882,7 @@ where
             detector,
             state,
             waiters: Default::default(),
+            rescan_pending_history: AtomicBool::new(false),
         }
     }
 
@@ -880,10 +892,6 @@ where
         address: BjjPublicKey,
         minimum: HoprBalance,
     ) -> Result<futures::channel::oneshot::Receiver<HoprBalance>, CurvyStateError> {
-        // TODO(curvy): anchor each SSA watch at its agreement-time cursor (or
-        // perform a bounded historical lookup). A single shared cursor can skip
-        // an allocation indexed just before this address is registered while
-        // another SSA watch is already advancing the stream.
         let (sender, receiver) = futures::channel::oneshot::channel();
         // Serialize the persisted-state check with completion notifications. This
         // prevents a completion from landing between the check and waiter insert.
@@ -908,6 +916,11 @@ where
                     });
                 }
             }
+            // A shared stream cursor may already have advanced past this address's
+            // allocation. Force one historical pass with the complete current watch
+            // set. An epoch-like boolean is sufficient: if registration races a pass,
+            // the worker observes it on the next outer iteration.
+            self.rescan_pending_history.store(true, Ordering::Release);
         }
         Ok(receiver)
     }
@@ -955,11 +968,23 @@ where
 
         let cursor = CurvyEventCursor::from(&candidate.position);
 
-        match self
-            .detector
-            .detect_owned_note(&candidate, &watched)
-            .map_err(CurvyLifecycleError::Detection)?
-        {
+        let detected = match self.detector.detect_owned_note(&candidate, &watched) {
+            Ok(detected) => detected,
+            Err(CurvyDetectionError::InvalidCandidate(error)) => {
+                tracing::error!(
+                    note_id = %candidate.note_id.0,
+                    %error,
+                    "quarantining malformed public Curvy pending-note event"
+                );
+                self.state.advance_cursor(CurvyEventKind::Pending, &cursor)?;
+                return Ok(true);
+            }
+            Err(error @ CurvyDetectionError::Resolver(_)) => {
+                return Err(CurvyLifecycleError::Detection(error));
+            }
+        };
+
+        match detected {
             Some(note) => {
                 self.state
                     .record_owned_candidate(&candidate.note_id.0, note, &cursor)
@@ -971,14 +996,28 @@ where
     }
 
     async fn process_completion(&self, completion: CurvyCommittedNote) -> Result<(), CurvyLifecycleError<R::Error>> {
-        // TODO(curvy): confirm that Blokli emits `Completed` only after the
-        // production finality threshold, or add explicit reorg handling here.
         let cursor = CurvyEventCursor::from(&completion.position);
-        let leaf_index = completion
-            .leaf_index
-            .0
-            .parse()
-            .map_err(|error| CurvyStateError::Corrupt(format!("invalid committed leaf index: {error}")))?;
+        let leaf_index = match completion.leaf_index.0.parse() {
+            Ok(leaf_index) => leaf_index,
+            Err(error) => {
+                tracing::error!(
+                    note_id = %completion.note_id.0,
+                    %error,
+                    "quarantining malformed public Curvy committed-note leaf index"
+                );
+                self.state.advance_cursor(CurvyEventKind::Committed, &cursor)?;
+                return Ok(());
+            }
+        };
+        if let Err(error) = note_id_key(&completion.note_id.0) {
+            tracing::error!(
+                note_id = %completion.note_id.0,
+                %error,
+                "quarantining malformed public Curvy committed-note ID"
+            );
+            self.state.advance_cursor(CurvyEventKind::Committed, &cursor)?;
+            return Ok(());
+        }
         if let Some(note) = self
             .state
             .record_completion(&completion.note_id.0, leaf_index, &cursor)?
@@ -1003,6 +1042,8 @@ pub enum CurvyDepositPoolError<E: std::error::Error + 'static> {
     InvalidBatchResult { expected: usize, actual: usize },
     #[error("Curvy deposit watcher stopped before the deposit was committed")]
     WatcherStopped,
+    #[error("Curvy indexer query failed: {0}")]
+    Indexer(String),
     #[error("timed out waiting for a Curvy deposit to be committed")]
     DepositTimeout,
     #[error(
@@ -1073,6 +1114,48 @@ where
             .map_err(|error| CurvyDepositPoolError::InvalidReconstructedSecret(error.to_string()))
     }
 
+    async fn reconcile_spent_notes(
+        &self,
+        id: &PixAddressId,
+        notes: Vec<CommittedCurvyNote>,
+    ) -> Result<Vec<CommittedCurvyNote>, CurvyDepositPoolError<A::Error>> {
+        let mut spent_ids = Vec::new();
+        let mut unspent = Vec::with_capacity(notes.len());
+        for note in notes {
+            let nullifier = U256::from_be_bytes(fr_to_be_32(&note.note.nullifier()));
+            if self
+                .client
+                .query_curvy_nullifier_spent(format!("{nullifier:#066x}"))
+                .await
+                .map_err(|error| CurvyDepositPoolError::Indexer(error.to_string()))?
+            {
+                let note_id = U256::from_be_bytes(fr_to_be_32(&note.note.id()));
+                spent_ids.push(format!("{note_id:#066x}"));
+            } else {
+                unspent.push(note);
+            }
+        }
+        if !spent_ids.is_empty() {
+            self.remove_spent_notes_retry(id, &spent_ids)?;
+        }
+        Ok(unspent)
+    }
+
+    fn remove_spent_notes_retry(
+        &self,
+        id: &PixAddressId,
+        note_ids: &[String],
+    ) -> Result<(), CurvyDepositPoolError<A::Error>> {
+        let mut last_error = None;
+        for _ in 0..3 {
+            match self.tracker.state.remove_spent_notes(id, note_ids) {
+                Ok(()) => return Ok(()),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.expect("at least one cleanup attempt was made").into())
+    }
+
     fn ensure_watcher(&self) {
         let mut watcher = self.watcher.lock();
         if watcher.as_ref().is_some_and(|handle| !handle.is_aborted()) {
@@ -1092,20 +1175,24 @@ where
 
                     // Catch pending notes up first. A committed note can then only
                     // correlate with an ownership decision that is already durable.
-                    // Both queries use exclusive cursors, so this never rescans the
-                    // complete note history after the first successful pass.
                     let catch_up = async {
-                        loop {
-                            let after = tracker
+                        let rescan_history = tracker.rescan_pending_history.swap(false, Ordering::AcqRel);
+                        let mut pending_after = if rescan_history {
+                            None
+                        } else {
+                            tracker
                                 .state
                                 .cursor(CurvyEventKind::Pending)
-                                .map_err(|error| error.to_string())?;
+                                .map_err(|error| error.to_string())?
+                        };
+                        loop {
                             let page = client
-                                .query_curvy_pending_notes(None, after, QUERY_PAGE_SIZE)
+                                .query_curvy_pending_notes(None, pending_after.clone(), QUERY_PAGE_SIZE)
                                 .await
                                 .map_err(|error| error.to_string())?;
                             let page_len = page.notes.len();
                             for note in page.notes {
+                                pending_after = Some(CurvyEventCursor::from(&note.position));
                                 if !tracker
                                     .process_candidate(note)
                                     .await
@@ -1119,6 +1206,12 @@ where
                             }
                         }
 
+                        let chain_info = client.query_chain_info().await.map_err(|error| error.to_string())?;
+                        let indexed_block = u64::try_from(chain_info.block_number)
+                            .map_err(|_| "Blokli returned a negative indexed block number".to_owned())?;
+                        let finality =
+                            cursor_component(&chain_info.finality, "finality").map_err(|error| error.to_string())?;
+                        let finalized_through = indexed_block.saturating_sub(finality);
                         loop {
                             let after = tracker
                                 .state
@@ -1129,13 +1222,20 @@ where
                                 .await
                                 .map_err(|error| error.to_string())?;
                             let page_len = page.notes.len();
+                            let mut reached_unfinalized = false;
                             for note in page.notes {
+                                let event_block = cursor_component(&note.position.block, "completion block")
+                                    .map_err(|error| error.to_string())?;
+                                if event_block > finalized_through {
+                                    reached_unfinalized = true;
+                                    break;
+                                }
                                 tracker
                                     .process_completion(note)
                                     .await
                                     .map_err(|error| error.to_string())?;
                             }
-                            if page_len < QUERY_PAGE_SIZE as usize {
+                            if reached_unfinalized || page_len < QUERY_PAGE_SIZE as usize {
                                 break;
                             }
                         }
@@ -1175,12 +1275,12 @@ where
 
     async fn deposit_funds_to(
         &self,
-        _id: PixAddressId,
+        id: PixAddressId,
         dst: BjjPublicKey,
         amount: HoprBalance,
     ) -> Result<Self::Receipt, Self::Error> {
         self.adapter
-            .deposit(dst, amount)
+            .deposit(id, dst, amount)
             .await
             .map_err(CurvyDepositPoolError::Adapter)
     }
@@ -1190,12 +1290,7 @@ where
         deposits: Vec<(PixAddressId, BjjPublicKey, HoprBalance)>,
     ) -> Result<Vec<Self::Receipt>, Self::Error> {
         self.adapter
-            .deposit_multiple(
-                deposits
-                    .into_iter()
-                    .map(|(_, address, amount)| (address, amount))
-                    .collect(),
-            )
+            .deposit_multiple(deposits)
             .await
             .map_err(CurvyDepositPoolError::Adapter)
     }
@@ -1229,13 +1324,18 @@ where
         amount: Option<HoprBalance>,
     ) -> Result<Self::Receipt, Self::Error> {
         let secret = Self::bjj_secret(key)?;
-        let notes = self.tracker.state.committed_notes(&id)?;
+        let notes = self
+            .reconcile_spent_notes(&id, self.tracker.state.committed_notes(&id)?)
+            .await?;
+        if notes.is_empty() {
+            return Ok(A::Receipt::default());
+        }
         let outcome = self
             .adapter
             .withdraw(&secret, notes, dst, amount)
             .await
             .map_err(CurvyDepositPoolError::Adapter)?;
-        self.tracker.state.remove_spent_notes(&id, &outcome.spent_note_ids)?;
+        self.remove_spent_notes_retry(&id, &outcome.spent_note_ids)?;
         Ok(outcome.receipt)
     }
 
@@ -1244,38 +1344,48 @@ where
         deposits: &[(PixAddressId, BjjKeypair)],
         dst: Address,
     ) -> Result<Vec<Result<(Address, Self::Receipt), Self::Error>>, Self::Error> {
-        let withdrawals = deposits
-            .iter()
-            .map(|(id, key)| {
-                Ok(CurvyWithdrawal {
+        let mut active = Vec::new();
+        let mut withdrawals = Vec::new();
+        let mut logical_results: Vec<Option<Result<(Address, A::Receipt), CurvyDepositPoolError<A::Error>>>> =
+            (0..deposits.len()).map(|_| None).collect();
+        for (index, (id, key)) in deposits.iter().enumerate() {
+            let notes = self
+                .reconcile_spent_notes(id, self.tracker.state.committed_notes(id)?)
+                .await?;
+            if notes.is_empty() {
+                logical_results[index] = Some(Ok((dst, A::Receipt::default())));
+            } else {
+                active.push((index, *id));
+                withdrawals.push(CurvyWithdrawal {
                     secret: Self::bjj_secret(key)?,
-                    notes: self.tracker.state.committed_notes(id)?,
-                })
-            })
-            .collect::<Result<Vec<_>, CurvyDepositPoolError<A::Error>>>()?;
-        self.adapter
+                    notes,
+                });
+            }
+        }
+        let results = self
+            .adapter
             .withdraw_multiple(withdrawals, dst)
             .await
-            .map_err(CurvyDepositPoolError::Adapter)
-            .and_then(|results| {
-                if results.len() != deposits.len() {
-                    return Err(CurvyDepositPoolError::InvalidBatchResult {
-                        expected: deposits.len(),
-                        actual: results.len(),
-                    });
+            .map_err(CurvyDepositPoolError::Adapter)?;
+        if results.len() != active.len() {
+            return Err(CurvyDepositPoolError::InvalidBatchResult {
+                expected: active.len(),
+                actual: results.len(),
+            });
+        }
+        for (result, (index, id)) in results.into_iter().zip(active) {
+            logical_results[index] = Some(match result {
+                Ok((address, outcome)) => {
+                    self.remove_spent_notes_retry(&id, &outcome.spent_note_ids)?;
+                    Ok((address, outcome.receipt))
                 }
-                results
-                    .into_iter()
-                    .zip(deposits)
-                    .map(|(result, (id, _))| match result {
-                        Ok((address, outcome)) => {
-                            self.tracker.state.remove_spent_notes(id, &outcome.spent_note_ids)?;
-                            Ok(Ok((address, outcome.receipt)))
-                        }
-                        Err(error) => Ok(Err(CurvyDepositPoolError::Adapter(error))),
-                    })
-                    .collect()
-            })
+                Err(error) => Err(CurvyDepositPoolError::Adapter(error)),
+            });
+        }
+        Ok(logical_results
+            .into_iter()
+            .map(|result| result.expect("every batch result slot is filled"))
+            .collect())
     }
 
     async fn pool_transfer(
@@ -1510,6 +1620,34 @@ mod tests {
 
         assert!(!tracker.process_candidate(fixture.note).await?);
         assert_eq!(state.cursor(CurvyEventKind::Pending)?, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tracker_quarantines_malformed_public_candidates() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = Arc::new(RedbCurvyDepositState::open(dir.path().join("curvy-pix.redb"))?);
+        let mut fixture = owned_candidate(4)?;
+        let tracker = CurvyLifecycleTracker::new(Arc::new(fixture.detector), state.clone());
+        let _receiver = tracker.watch(fixture.id, fixture.address, HoprBalance::from(U256::from(10u8)))?;
+        fixture.note.view_tag = 256;
+        let cursor = CurvyEventCursor::from(&fixture.note.position);
+
+        assert!(tracker.process_candidate(fixture.note).await?);
+        assert_eq!(state.cursor(CurvyEventKind::Pending)?, Some(cursor));
+        Ok(())
+    }
+
+    #[test]
+    fn registering_an_address_requests_a_historical_pending_pass() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = Arc::new(RedbCurvyDepositState::open(dir.path().join("curvy-pix.redb"))?);
+        let fixture = owned_candidate(1)?;
+        let tracker = CurvyLifecycleTracker::new(Arc::new(fixture.detector), state);
+
+        let _receiver = tracker.watch(fixture.id, fixture.address, HoprBalance::from(U256::from(10u8)))?;
+
+        assert!(tracker.rescan_pending_history.load(Ordering::Acquire));
         Ok(())
     }
 

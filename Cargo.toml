@@ -107,4 +107,4 @@ tracing = { version = "0.1.44", features = ["release_max_level_debug"] }
 validator = { version = "0.21.0", features = ["derive"] }
 
 [patch.crates-io]
-blokli-client = { git = "https://github.com/hoprnet/blokli-client", branch = "feat/pix-curvy-note-events" }
+blokli-client = { git = "https://github.com/hoprnet/blokli-client", rev = "d5c75a6e0c2ea0cf8d4b933b869139e85456b114" }

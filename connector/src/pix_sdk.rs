@@ -11,6 +11,7 @@ use curvy_core::{
 use curvy_sdk::{Account, CurvyClient, Identity, OwnedNote, PreparedDeposit, Route, TxLedger};
 use hopr_api::types::{
     crypto::prelude::BjjPublicKey,
+    network::PixAddressId,
     primitive::prelude::{Address, HoprBalance},
 };
 use redb::{ReadableDatabase, TableDefinition};
@@ -23,6 +24,7 @@ const SDK_STATE_KEY: u8 = 0;
 const MAX_ALLOCATIONS_PER_PROOF: usize = 7;
 const MAX_COMMITMENTS_PER_PROOF: usize = 5;
 const MAX_WITHDRAWAL_INPUTS: usize = 10;
+const MAX_ALLOCATION_INPUTS: usize = 2;
 
 /// Runtime configuration for the rs-sdk allocation and withdrawal bridge.
 pub struct RsSdkCurvyAdapterConfig {
@@ -64,6 +66,12 @@ pub enum RsSdkCurvyAdapterError {
     NoFunding { required: u128 },
     #[error("the requested withdrawal is {requested}, but only {available} is stored")]
     InsufficientNotes { requested: u128, available: u128 },
+    #[error(
+        "the requested withdrawal is {requested}, but the selected whole notes total {selected}; Curvy cannot produce change"
+    )]
+    InexactWithdrawal { requested: u128, selected: u128 },
+    #[error("PIX allocation ID was reused with a different address or amount")]
+    ConflictingAllocation,
     #[error("an earlier Curvy allocation has an ambiguous outcome and must be reconciled")]
     AmbiguousAllocation,
     #[error("a different Curvy shield deposit is already in progress")]
@@ -136,6 +144,38 @@ struct StoredShield {
     stage: StoredShieldStage,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+enum StoredAllocationStage {
+    Prepared,
+    Completed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct StoredAllocation {
+    id: [u8; PixAddressId::SIZE],
+    address: [u8; 32],
+    amount: String,
+    stage: StoredAllocationStage,
+}
+
+impl StoredAllocation {
+    fn new(id: PixAddressId, address: &BjjPublicKey, amount: HoprBalance) -> Result<Self, RsSdkCurvyAdapterError> {
+        Ok(Self {
+            id: id.to_bytes(),
+            address: address
+                .as_ref()
+                .try_into()
+                .map_err(|_| RsSdkCurvyAdapterError::InvalidValue("BJJ address must be 32 bytes".to_owned()))?,
+            amount: amount.amount().to_string(),
+            stage: StoredAllocationStage::Prepared,
+        })
+    }
+
+    fn matches(&self, address: &BjjPublicKey, amount: HoprBalance) -> bool {
+        self.address.as_slice() == address.as_ref() && self.amount == amount.amount().to_string()
+    }
+}
+
 impl StoredShield {
     fn prepared(&self) -> Result<PreparedDeposit, RsSdkCurvyAdapterError> {
         let gross = self
@@ -161,11 +201,17 @@ struct SdkState {
     #[serde(default)]
     ambiguous_input: Option<StoredNote>,
     #[serde(default)]
+    ambiguous_inputs: Vec<StoredNote>,
+    #[serde(default)]
     ambiguous_change: Option<StoredNote>,
     #[serde(default)]
     ambiguous_emitted: Vec<StoredNote>,
     #[serde(default)]
     shield_in_flight: Option<StoredShield>,
+    #[serde(default)]
+    allocations: Vec<StoredAllocation>,
+    #[serde(default)]
+    ambiguous_allocation_ids: Vec<[u8; PixAddressId::SIZE]>,
 }
 
 struct RedbCurvySdkStore {
@@ -242,7 +288,11 @@ impl RsSdkCurvyAdapter {
     ) -> Result<Vec<TxLedger>, RsSdkCurvyAdapterError> {
         let _chain = self.chain.lock().await;
         self.recover_pending().await?;
-        if !self.state.lock().funding.is_empty() {
+        let already_funded = {
+            let state = self.state.lock();
+            !state.funding.is_empty() && state.shield_in_flight.is_none()
+        };
+        if already_funded {
             return Ok(Vec::new());
         }
         let mut shield = if let Some(shield) = self.state.lock().shield_in_flight.clone() {
@@ -301,11 +351,14 @@ impl RsSdkCurvyAdapter {
                 let mut state = self.state.lock();
                 let stored = StoredNote::from(&prepared.note);
                 let prepared_id = note_id(&prepared.note);
-                if !state
+                let already_funding = state
                     .funding
                     .iter()
-                    .any(|note| OwnedNote::try_from(note).is_ok_and(|note| note_id(&note) == prepared_id))
-                {
+                    .map(OwnedNote::try_from)
+                    .collect::<Result<Vec<_>, _>>()?
+                    .iter()
+                    .any(|note| note_id(note) == prepared_id);
+                if !already_funding {
                     state.funding.push(stored.clone());
                 }
                 if observed_status != 2 && !state.pending.iter().any(|note| note == &stored) {
@@ -320,15 +373,29 @@ impl RsSdkCurvyAdapter {
     }
 
     pub fn available_funding(&self) -> Result<u128, RsSdkCurvyAdapterError> {
-        self.state.lock().funding.iter().try_fold(0_u128, |total, note| {
-            let note = OwnedNote::try_from(note)?;
-            let amount: u128 = fr_to_biguint(&note.amount)
-                .try_into()
-                .map_err(|_| RsSdkCurvyAdapterError::InvalidValue("funding amount does not fit u128".to_owned()))?;
-            total
-                .checked_add(amount)
-                .ok_or_else(|| RsSdkCurvyAdapterError::InvalidValue("funding total overflows u128".to_owned()))
-        })
+        let mut amounts = self
+            .state
+            .lock()
+            .funding
+            .iter()
+            .map(OwnedNote::try_from)
+            .map(|note| {
+                note.and_then(|note| {
+                    fr_to_biguint(&note.amount).try_into().map_err(|_| {
+                        RsSdkCurvyAdapterError::InvalidValue("funding amount does not fit u128".to_owned())
+                    })
+                })
+            })
+            .collect::<Result<Vec<u128>, _>>()?;
+        amounts.sort_unstable_by(|left, right| right.cmp(left));
+        amounts
+            .into_iter()
+            .take(MAX_ALLOCATION_INPUTS)
+            .try_fold(0_u128, |total, amount| {
+                total
+                    .checked_add(amount)
+                    .ok_or_else(|| RsSdkCurvyAdapterError::InvalidValue("funding total overflows u128".to_owned()))
+            })
     }
 
     /// Reconciles an ambiguous aggregation after Blokli has indexed at least one output.
@@ -337,18 +404,29 @@ impl RsSdkCurvyAdapter {
     /// cannot distinguish a rejected transaction from one that has not been indexed yet.
     pub async fn reconcile_ambiguous_allocation(&self) -> Result<bool, RsSdkCurvyAdapterError> {
         let _chain = self.chain.lock().await;
-        let (input, change, emitted) = {
+        let (inputs, change, emitted, allocation_ids) = {
             let state = self.state.lock();
             if !state.ambiguous_allocation {
                 return Ok(true);
             }
-            let Some(input) = state.ambiguous_input.clone() else {
+            let mut inputs = state.ambiguous_inputs.clone();
+            if inputs.is_empty()
+                && let Some(input) = state.ambiguous_input.clone()
+            {
+                inputs.push(input);
+            }
+            if inputs.is_empty() {
                 return Ok(false);
-            };
+            }
             let Some(change) = state.ambiguous_change.clone() else {
                 return Ok(false);
             };
-            (input, change, state.ambiguous_emitted.clone())
+            (
+                inputs,
+                change,
+                state.ambiguous_emitted.clone(),
+                state.ambiguous_allocation_ids.clone(),
+            )
         };
         let emitted_notes = emitted.iter().map(OwnedNote::try_from).collect::<Result<Vec<_>, _>>()?;
         let mut observed = false;
@@ -361,18 +439,22 @@ impl RsSdkCurvyAdapter {
         if !observed {
             return Ok(false);
         }
-        let input_id = note_id(&OwnedNote::try_from(&input)?);
         {
             let mut state = self.state.lock();
-            state
-                .funding
-                .retain(|note| OwnedNote::try_from(note).is_ok_and(|note| note_id(&note) != input_id));
+            state.funding.retain(|note| !inputs.contains(note));
             state.funding.push(change);
             state.pending.extend(emitted);
             state.ambiguous_allocation = false;
             state.ambiguous_input = None;
+            state.ambiguous_inputs.clear();
             state.ambiguous_change = None;
             state.ambiguous_emitted.clear();
+            for allocation in &mut state.allocations {
+                if allocation_ids.contains(&allocation.id) {
+                    allocation.stage = StoredAllocationStage::Completed;
+                }
+            }
+            state.ambiguous_allocation_ids.clear();
             self.store.save(&state)?;
         }
         self.recover_pending().await?;
@@ -434,18 +516,41 @@ impl RsSdkCurvyAdapter {
 
     async fn allocate(
         &self,
-        deposits: &[(BjjPublicKey, HoprBalance)],
-    ) -> Result<Vec<Vec<TxLedger>>, RsSdkCurvyAdapterError> {
+        deposits: &[(PixAddressId, BjjPublicKey, HoprBalance)],
+    ) -> Result<Vec<TxLedger>, RsSdkCurvyAdapterError> {
         let _chain = self.chain.lock().await;
         if self.state.lock().ambiguous_allocation {
             return Err(RsSdkCurvyAdapterError::AmbiguousAllocation);
         }
-        let mut receipts = vec![Vec::new(); deposits.len()];
+        let deposits = {
+            let state = self.state.lock();
+            let mut pending = Vec::new();
+            for (id, address, amount) in deposits {
+                if let Some(existing) = state
+                    .allocations
+                    .iter()
+                    .find(|allocation| allocation.id == id.to_bytes())
+                {
+                    if !existing.matches(address, *amount) {
+                        return Err(RsSdkCurvyAdapterError::ConflictingAllocation);
+                    }
+                    match existing.stage {
+                        StoredAllocationStage::Completed => continue,
+                        StoredAllocationStage::Prepared => {
+                            return Err(RsSdkCurvyAdapterError::AmbiguousAllocation);
+                        }
+                    }
+                }
+                pending.push((*id, *address, *amount));
+            }
+            pending
+        };
+        let mut receipts = Vec::new();
         self.recover_pending().await?;
-        for (chunk_index, chunk) in deposits.chunks(MAX_ALLOCATIONS_PER_PROOF).enumerate() {
+        for chunk in deposits.chunks(MAX_ALLOCATIONS_PER_PROOF) {
             let allocations = chunk
                 .iter()
-                .map(|(address, amount)| {
+                .map(|(_, address, amount)| {
                     let amount = amount.amount().try_into().map_err(|_| {
                         RsSdkCurvyAdapterError::InvalidValue("allocation amount does not fit u128".to_owned())
                     })?;
@@ -463,24 +568,48 @@ impl RsSdkCurvyAdapter {
                 .await?;
             let funding = {
                 let state = self.state.lock();
-                state
+                let mut candidates = state
                     .funding
                     .iter()
-                    .map(OwnedNote::try_from)
-                    .collect::<Result<Vec<_>, _>>()?
-                    .into_iter()
-                    .find(|note| {
-                        fr_to_biguint(&note.amount)
-                            .try_into()
-                            .is_ok_and(|amount: u128| amount >= minimum)
+                    .map(|stored| {
+                        let note = OwnedNote::try_from(stored)?;
+                        let amount = fr_to_biguint(&note.amount).try_into().map_err(|_| {
+                            RsSdkCurvyAdapterError::InvalidValue("funding amount does not fit u128".to_owned())
+                        })?;
+                        Ok((stored.clone(), note, amount))
                     })
-                    .ok_or(RsSdkCurvyAdapterError::NoFunding { required: minimum })?
+                    .collect::<Result<Vec<(_, _, u128)>, RsSdkCurvyAdapterError>>()?;
+                candidates.sort_unstable_by_key(|candidate| std::cmp::Reverse(candidate.2));
+                if let Some(single) = candidates.iter().find(|candidate| candidate.2 >= minimum) {
+                    vec![single.clone()]
+                } else {
+                    let selected = candidates.into_iter().take(MAX_ALLOCATION_INPUTS).collect::<Vec<_>>();
+                    let available = selected.iter().try_fold(0_u128, |total, candidate| {
+                        total.checked_add(candidate.2).ok_or_else(|| {
+                            RsSdkCurvyAdapterError::InvalidValue("funding total overflows u128".to_owned())
+                        })
+                    })?;
+                    if available < minimum {
+                        return Err(RsSdkCurvyAdapterError::NoFunding { required: minimum });
+                    }
+                    selected
+                }
             };
+            let allocation_records = chunk
+                .iter()
+                .map(|(id, address, amount)| StoredAllocation::new(*id, address, *amount))
+                .collect::<Result<Vec<_>, _>>()?;
+            {
+                let mut state = self.state.lock();
+                state.allocations.extend(allocation_records.clone());
+                self.store.save(&state)?;
+            }
+            let funding_notes = funding.iter().map(|(_, note, _)| note.clone()).collect::<Vec<_>>();
             let aggregated = self
                 .client
                 .aggregate_pix_allocations(
                     &self.config.spender,
-                    std::slice::from_ref(&funding),
+                    &funding_notes,
                     &allocations,
                     None,
                     self.config.fee_recipient.as_ref(),
@@ -494,7 +623,7 @@ impl RsSdkCurvyAdapter {
                     if let Some(ambiguous) = curvy_sdk::ambiguous_pix_aggregation(&error) {
                         let mut state = self.state.lock();
                         state.ambiguous_allocation = true;
-                        state.ambiguous_input = Some(StoredNote::from(&funding));
+                        state.ambiguous_inputs = funding.iter().map(|(stored, _, _)| stored.clone()).collect();
                         state.ambiguous_change = Some(StoredNote::from(&ambiguous.result.change));
                         state.ambiguous_emitted = ambiguous
                             .result
@@ -503,10 +632,18 @@ impl RsSdkCurvyAdapter {
                             .filter(|note| note.amount != Fr::from(0_u8))
                             .map(StoredNote::from)
                             .collect();
+                        state.ambiguous_allocation_ids = allocation_records.iter().map(|record| record.id).collect();
                         self.store.save(&state)?;
                     } else if curvy_sdk::ambiguous_submission(&error).is_some() {
                         let mut state = self.state.lock();
                         state.ambiguous_allocation = true;
+                        state.ambiguous_allocation_ids = allocation_records.iter().map(|record| record.id).collect();
+                        self.store.save(&state)?;
+                    } else {
+                        let mut state = self.state.lock();
+                        state
+                            .allocations
+                            .retain(|allocation| !allocation_records.iter().any(|record| record.id == allocation.id));
                         self.store.save(&state)?;
                     }
                     return Err(error.into());
@@ -514,10 +651,9 @@ impl RsSdkCurvyAdapter {
             };
             {
                 let mut state = self.state.lock();
-                let funding_id = note_id(&funding);
                 state
                     .funding
-                    .retain(|note| OwnedNote::try_from(note).is_ok_and(|note| note_id(&note) != funding_id));
+                    .retain(|note| !funding.iter().any(|(stored, _, _)| stored == note));
                 state.funding.push(StoredNote::from(&result.change));
                 state.pending.extend(
                     result
@@ -526,25 +662,29 @@ impl RsSdkCurvyAdapter {
                         .filter(|note| note.amount != Fr::from(0_u8))
                         .map(StoredNote::from),
                 );
+                for allocation in &mut state.allocations {
+                    if allocation_records.iter().any(|record| record.id == allocation.id) {
+                        allocation.stage = StoredAllocationStage::Completed;
+                    }
+                }
                 self.store.save(&state)?;
             }
             let mut ledger = result.ledger;
             ledger.extend(self.recover_pending().await?);
-            let last = chunk_index * MAX_ALLOCATIONS_PER_PROOF + chunk.len() - 1;
-            receipts[last] = ledger;
+            receipts.extend(ledger);
         }
         Ok(receipts)
     }
 
     fn owned_note(note: &CommittedCurvyNote) -> Result<OwnedNote, RsSdkCurvyAdapterError> {
-        let view_tag = fr_to_biguint(&note.note.view_tag)
+        let view_tag: u8 = fr_to_biguint(&note.note.view_tag)
             .try_into()
-            .map_err(|_| RsSdkCurvyAdapterError::InvalidValue("note view tag does not fit u16".to_owned()))?;
+            .map_err(|_| RsSdkCurvyAdapterError::InvalidValue("note view tag does not fit one byte".to_owned()))?;
         Ok(OwnedNote {
             owner_pub: note.note.owner_pub,
             shared_secret: note.note.shared_secret,
             ephemeral_key: note.note.ephemeral_key,
-            view_tag,
+            view_tag: view_tag.into(),
             amount: note.note.amount,
             token: note.note.token,
         })
@@ -581,6 +721,12 @@ impl RsSdkCurvyAdapter {
             return Err(RsSdkCurvyAdapterError::InsufficientNotes {
                 requested: target,
                 available: total,
+            });
+        }
+        if total != target {
+            return Err(RsSdkCurvyAdapterError::InexactWithdrawal {
+                requested: target,
+                selected: total,
             });
         }
         Ok(selected)
@@ -621,15 +767,22 @@ impl CurvySdkAdapter for RsSdkCurvyAdapter {
     type Error = RsSdkCurvyAdapterError;
     type Receipt = Vec<TxLedger>;
 
-    async fn deposit(&self, dst: BjjPublicKey, amount: HoprBalance) -> Result<Self::Receipt, Self::Error> {
-        Ok(self.allocate(&[(dst, amount)]).await?.pop().unwrap_or_default())
+    async fn deposit(
+        &self,
+        id: PixAddressId,
+        dst: BjjPublicKey,
+        amount: HoprBalance,
+    ) -> Result<Self::Receipt, Self::Error> {
+        self.allocate(&[(id, dst, amount)]).await
     }
 
     async fn deposit_multiple(
         &self,
-        deposits: Vec<(BjjPublicKey, HoprBalance)>,
+        deposits: Vec<(PixAddressId, BjjPublicKey, HoprBalance)>,
     ) -> Result<Vec<Self::Receipt>, Self::Error> {
-        self.allocate(&deposits).await
+        self.allocate(&deposits)
+            .await
+            .map(|receipt| if receipt.is_empty() { Vec::new() } else { vec![receipt] })
     }
 
     async fn withdraw(
@@ -719,10 +872,50 @@ mod tests {
     }
 
     #[test]
-    fn partial_withdrawal_selects_enough_whole_notes() -> anyhow::Result<()> {
-        let selected = RsSdkCurvyAdapter::select_notes(
+    fn sdk_note_conversion_rejects_a_non_byte_view_tag() {
+        let mut committed = fixture(7);
+        committed.note.view_tag = Fr::from(256_u64);
+
+        assert!(matches!(
+            RsSdkCurvyAdapter::owned_note(&committed),
+            Err(RsSdkCurvyAdapterError::InvalidValue(_))
+        ));
+    }
+
+    #[test]
+    fn stored_allocation_binds_id_address_and_amount() -> anyhow::Result<()> {
+        let committed = fixture(7);
+        let allocation = StoredAllocation::new(
+            committed.deposit.id,
+            &committed.deposit.address,
+            committed.deposit.amount,
+        )?;
+
+        assert!(allocation.matches(&committed.deposit.address, committed.deposit.amount));
+        assert!(!allocation.matches(&committed.deposit.address, HoprBalance::from(U256::from(8_u8))));
+        Ok(())
+    }
+
+    #[test]
+    fn partial_withdrawal_rejects_an_inexact_whole_note_total() {
+        let result = RsSdkCurvyAdapter::select_notes(
             vec![fixture(3), fixture(8), fixture(5)],
             Some(HoprBalance::from(U256::from(10_u8))),
+        );
+        assert!(matches!(
+            result,
+            Err(RsSdkCurvyAdapterError::InexactWithdrawal {
+                requested: 10,
+                selected: 13
+            })
+        ));
+    }
+
+    #[test]
+    fn partial_withdrawal_accepts_an_exact_whole_note_total() -> anyhow::Result<()> {
+        let selected = RsSdkCurvyAdapter::select_notes(
+            vec![fixture(3), fixture(8), fixture(5)],
+            Some(HoprBalance::from(U256::from(13_u8))),
         )?;
         let total = selected
             .iter()

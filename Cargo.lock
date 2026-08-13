@@ -2233,7 +2233,7 @@ dependencies = [
 [[package]]
 name = "blokli-client"
 version = "0.30.3"
-source = "git+https://github.com/hoprnet/blokli-client?branch=feat%2Fpix-curvy-note-events#d5c75a6e0c2ea0cf8d4b933b869139e85456b114"
+source = "git+https://github.com/hoprnet/blokli-client?rev=d5c75a6e0c2ea0cf8d4b933b869139e85456b114#d5c75a6e0c2ea0cf8d4b933b869139e85456b114"
 dependencies = [
  "anyhow",
  "async-broadcast",
