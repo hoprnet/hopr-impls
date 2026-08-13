@@ -1,6 +1,10 @@
 mod backend;
 mod connector;
 pub mod errors;
+#[cfg(feature = "pix-curvy")]
+pub mod pix;
+#[cfg(feature = "pix-curvy-sdk")]
+pub mod pix_sdk;
 mod reader;
 #[cfg(any(test, feature = "testing"))]
 pub use hopr_utils::testing::blokli as testing;

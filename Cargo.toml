@@ -32,8 +32,8 @@ hopr-chain-connector = { path = "connector", version = "0.22.2" }
 hopr-network-graph   = { path = "graph", version = "0.3.2", default-features = false }
 
 # HOPR crates published to crates.io
-blokli-client = "0.30.2"
-hopr-api      = "1.19.0"
+blokli-client = "0.30.3"
+hopr-api      = "1.20.1"
 hopr-utils    = { package = "hopr-utilities", version = "0.6.0", default-features = false }
 
 # Third-party dependencies (versions mirror hoprnet's workspace to preserve compatibility)
@@ -44,6 +44,7 @@ async-broadcast = "0.7.2"
 async-trait = "0.1.91"
 async_channel_io = "0.3.0"
 atomic_enum = "0.3.0"
+babyjubjub-ec = { version = "0.4.0", features = ["arithmetic"] }
 backon = { version = "1.6.0", default-features = false }
 bimap = "0.6.3"
 bytes = "1.12.1"
@@ -54,6 +55,10 @@ criterion = { version = "0.8.2", default-features = false, features = [
   "async_tokio",
   "cargo_bench_support",
 ] }
+curvy-core = "=0.1.0-rc.3"
+curvy-chain-blokli = { git = "https://github.com/0xCurvy/rs-sdk", rev = "fb6794eec236bb97a1e8bf683f1a1576d3c863bc" }
+curvy-sdk = { git = "https://github.com/0xCurvy/rs-sdk", rev = "fb6794eec236bb97a1e8bf683f1a1576d3c863bc" }
+getrandom = "0.3.4"
 dashmap = { version = "6.2.1", features = ["inline"] }
 futures = { version = "0.3.33", default-features = false, features = [
   "async-await",
@@ -100,3 +105,6 @@ tokio = { version = "1.53.1", features = [
 tokio-retry = "0.3.2"
 tracing = { version = "0.1.44", features = ["release_max_level_debug"] }
 validator = { version = "0.21.0", features = ["derive"] }
+
+[patch.crates-io]
+blokli-client = { git = "https://github.com/hoprnet/blokli-client", rev = "d5c75a6e0c2ea0cf8d4b933b869139e85456b114" }
