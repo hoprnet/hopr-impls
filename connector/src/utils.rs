@@ -4,7 +4,7 @@ use std::{
 };
 
 use hopr_api::{
-    chain::{ChainInfo, DeployedSafe, DomainSeparators, RedemptionStats, ServiceTypeConfig},
+    chain::{ChainInfo, DeployedSafe, DomainSeparators, RedemptionStats, ServiceRegistryConfig, ServiceTypeConfig},
     types::{
         chain::{chain_events::ChainEvent, payload::GasEstimation},
         crypto::types::Hash,
@@ -262,10 +262,12 @@ fn model_to_service_metadata(rendered: &str) -> Result<ServiceMetadata, Connecto
 }
 
 /// Converts a Unix timestamp in seconds, as the Blokli API represents registry timestamps.
-fn model_to_timestamp(seconds: i32) -> Result<SystemTime, ConnectorError> {
-    u64::try_from(seconds)
+fn model_to_timestamp(seconds: blokli_client::api::types::Uint64) -> Result<SystemTime, ConnectorError> {
+    seconds
+        .0
+        .parse::<u64>()
         .map(|seconds| UNIX_EPOCH + Duration::from_secs(seconds))
-        .map_err(|_| ConnectorError::TypeConversion(format!("service timestamp {seconds} precedes the Unix epoch")))
+        .map_err(|e| ConnectorError::TypeConversion(format!("invalid service timestamp {}: {e}", seconds.0)))
 }
 
 /// Parses a service registry burn.
@@ -300,6 +302,15 @@ pub(crate) fn model_to_service_type_config(
         requirement: model.requirement.as_deref().map(Address::from_hex).transpose()?,
         registration_burn: service_burn_to_hopr_balance(&model.registration_burn)?,
         update_burn: service_burn_to_hopr_balance(&model.update_burn)?,
+    })
+}
+
+pub(crate) fn model_to_service_registry_config(
+    model: blokli_client::api::types::ServiceRegistryConfig,
+) -> Result<ServiceRegistryConfig, ConnectorError> {
+    Ok(ServiceRegistryConfig {
+        type_registration_fee: service_burn_to_hopr_balance(&model.type_registration_fee)?,
+        node_safe_registry: Address::from_hex(&model.node_safe_registry)?,
     })
 }
 

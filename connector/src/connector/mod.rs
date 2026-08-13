@@ -16,13 +16,13 @@ use crate::{
     connector::{
         keys::HoprKeyMapper,
         sequencer::TransactionSequencer,
-        services::{service_type_update_to_event, service_update_to_event},
+        services::{service_registry_config_to_events, service_type_update_to_event, service_update_to_event},
         values::CHAIN_INFO_CACHE_KEY,
     },
     errors::ConnectorError,
     utils::{
-        ParsedChainInfo, model_to_account_entry, model_to_graph_entry, model_to_ticket_params,
-        process_channel_changes_into_events,
+        ParsedChainInfo, model_to_account_entry, model_to_graph_entry, model_to_service_registry_config,
+        model_to_ticket_params, process_channel_changes_into_events,
     },
 };
 
@@ -295,6 +295,16 @@ where
                         services,
                         client.subscribe_service_types(None)?,
                     ))
+                })
+                .and_then(|(accounts, channels, ticket_params, services, service_types)| {
+                    Ok((
+                        accounts,
+                        channels,
+                        ticket_params,
+                        services,
+                        service_types,
+                        client.subscribe_service_registry_config()?,
+                    ))
                 });
 
             if let Err(error) = connections {
@@ -304,8 +314,14 @@ where
                 return;
             }
 
-            let (account_stream, channel_stream, ticket_params_stream, service_stream, service_type_stream) =
-                connections.unwrap();
+            let (
+                account_stream,
+                channel_stream,
+                ticket_params_stream,
+                service_stream,
+                service_type_stream,
+                service_registry_config_stream,
+            ) = connections.unwrap();
 
             // Stream of Account events (Announcements)
             let graph_clone = graph.clone();
@@ -459,8 +475,35 @@ where
             let service_type_stream = service_type_stream
                 .map_err(ConnectorError::from)
                 .inspect_ok(|update| tracing::trace!(?update, "new service type event"))
+                // Registry-wide changes are consumed from the dedicated complete-state stream.
+                .try_filter(|update| futures::future::ready(update.registry_config.is_none()))
                 .and_then(|update| futures::future::ready(service_type_update_to_event(update)))
                 .map_ok(SubscribedEventType::Service)
+                .fuse();
+
+            // The first configuration initializes both registry-wide values. Later complete-state
+            // items are diffed locally so unchanged fields do not create duplicate ChainEvents.
+            let service_registry_config_stream = service_registry_config_stream
+                .map_err(ConnectorError::from)
+                .and_then(|config| futures::future::ready(model_to_service_registry_config(config)))
+                .scan((None, true), |(previous, initial), config| {
+                    let events = config.map(|current| {
+                        let events = if *initial {
+                            Vec::new()
+                        } else {
+                            service_registry_config_to_events(current, previous.as_ref())
+                                .into_iter()
+                                .map(SubscribedEventType::Service)
+                                .collect::<Vec<_>>()
+                        };
+                        *previous = Some(current);
+                        *initial = false;
+                        events
+                    });
+                    futures::future::ready(Some(events))
+                })
+                .map_ok(|events| futures::stream::iter(events).map(Ok::<_, ConnectorError>))
+                .try_flatten()
                 .fuse();
 
             let mut account_counter = 0;
@@ -477,6 +520,7 @@ where
                     ticket_params_stream,
                     service_stream,
                     service_type_stream,
+                    service_registry_config_stream,
                 )
                     .merge(),
                 abort_reg,

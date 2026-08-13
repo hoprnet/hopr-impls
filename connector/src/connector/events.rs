@@ -1,15 +1,23 @@
 use ahash::HashSet;
+use blokli_client::api::BlokliSubscriptionClient;
 use futures::StreamExt;
+use futures_concurrency::stream::Merge;
 use hopr_api::{
-    chain::{AccountSelector, ChainEvent, ChannelSelector, StateSyncOptions},
+    chain::{AccountSelector, ChainEvent, ChannelSelector, ServiceRegistryConfig, StateSyncOptions},
     types::internal::channels::ChannelStatusDiscriminants,
 };
 
-use crate::{Backend, connector::HoprBlockchainConnector, errors::ConnectorError};
+use crate::{
+    Backend,
+    connector::{HoprBlockchainConnector, services::service_registry_config_to_events},
+    errors::ConnectorError,
+    utils::model_to_service_registry_config,
+};
 
 impl<B, C, P, R> hopr_api::chain::ChainEvents for HoprBlockchainConnector<C, B, P, R>
 where
     B: Backend + Send + Sync + 'static,
+    C: BlokliSubscriptionClient + Send + Sync + 'static,
 {
     type Error = ConnectorError;
 
@@ -45,7 +53,48 @@ where
             state_stream.insert(stream.boxed());
         }
 
-        Ok(state_stream.chain(self.events.1.activate_cloned()))
+        let include_registry_config = options.contains(&StateSyncOptions::ServiceRegistryConfig);
+        let live_events = self.events.1.activate_cloned().filter(move |event| {
+            futures::future::ready(
+                !include_registry_config
+                    || !matches!(
+                        event,
+                        ChainEvent::ServiceTypeRegistrationFeeChanged(_) | ChainEvent::ServiceRegistryPointerChanged(_)
+                    ),
+            )
+        });
+        let state_and_live = state_stream.chain(live_events).boxed();
+
+        if include_registry_config {
+            let registry_config_stream = self
+                .client
+                .subscribe_service_registry_config()?
+                .scan(None::<ServiceRegistryConfig>, |previous, config| {
+                    let events = config
+                        .map_err(ConnectorError::from)
+                        .and_then(model_to_service_registry_config)
+                        .map(|current| {
+                            let events = service_registry_config_to_events(current, previous.as_ref());
+                            *previous = Some(current);
+                            events
+                        });
+                    futures::future::ready(Some(events))
+                })
+                .filter_map(|events| async move {
+                    match events {
+                        Ok(events) => Some(futures::stream::iter(events)),
+                        Err(error) => {
+                            tracing::error!(%error, "registry configuration subscription failed");
+                            None
+                        }
+                    }
+                })
+                .flatten();
+
+            Ok((state_and_live, registry_config_stream.boxed()).merge().boxed())
+        } else {
+            Ok(state_and_live)
+        }
     }
 }
 
@@ -54,7 +103,7 @@ mod tests {
     use std::time::Duration;
 
     use blokli_client::{
-        api::BlokliTransactionClient,
+        api::{BlokliTransactionClient, types::ServiceRegistryConfig as BlokliServiceRegistryConfig},
         errors::{BlokliClientError, ErrorKind},
     };
     use futures::StreamExt;
@@ -91,8 +140,8 @@ mod tests {
             node: const_hex::encode(SERVICE_NODE),
             safe: const_hex::encode(SERVICE_SAFE),
             metadata: metadata.into(),
-            registered_at: REGISTERED_AT,
-            updated_at,
+            registered_at: blokli_client::api::types::Uint64(REGISTERED_AT.to_string()),
+            updated_at: blokli_client::api::types::Uint64(updated_at.to_string()),
         }
     }
 
@@ -312,6 +361,33 @@ mod tests {
             .await;
         assert!(matches!(&channels[0], ChainEvent::ChannelOpened(ch) if ch == &channel_1));
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registry_config_state_sync_starts_with_both_current_values() -> anyhow::Result<()> {
+        let mut state = BlokliTestState::default();
+        state.service_registry_config = BlokliServiceRegistryConfig {
+            type_registration_fee: "5 wxHOPR".into(),
+            node_safe_registry: const_hex::encode(TYPE_REQUIREMENT),
+        };
+        let mut connector = create_connector(BlokliTestStateBuilder::from(state).build_static_client())?;
+        connector.connect().await?;
+
+        let events = connector
+            .subscribe_with_state_sync([StateSyncOptions::ServiceRegistryConfig])?
+            .take(2)
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(matches!(
+            &events[0],
+            ChainEvent::ServiceTypeRegistrationFeeChanged(fee) if *fee == HoprBalance::new_base(5)
+        ));
+        assert!(matches!(
+            &events[1],
+            ChainEvent::ServiceRegistryPointerChanged(pointer) if *pointer == TYPE_REQUIREMENT.into()
+        ));
         Ok(())
     }
 

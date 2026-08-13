@@ -5,7 +5,8 @@ use futures::{StreamExt, TryStreamExt, stream::BoxStream};
 use futures_time::future::FutureExt as FuturesTimeExt;
 use hopr_api::{
     chain::{
-        ChainInfo, DeployedSafe, DomainSeparators, RedemptionStats, SafeSelector, ServiceSelector, ServiceTypeConfig,
+        ChainInfo, DeployedSafe, DomainSeparators, RedemptionStats, SafeSelector, ServiceRegistryConfig,
+        ServiceSelector, ServiceTypeConfig,
     },
     types::{internal::prelude::*, primitive::prelude::*},
 };
@@ -14,7 +15,7 @@ use crate::{
     errors::ConnectorError,
     utils::{
         model_to_chain_info, model_to_deployed_safe, model_to_redeemed_stats, model_to_service_entry,
-        model_to_service_type_config,
+        model_to_service_registry_config, model_to_service_type_config,
     },
 };
 
@@ -49,8 +50,8 @@ impl<C> Clone for HoprBlockchainReader<C> {
 
 /// Maps the [`ServiceSelector`] of the HOPR Chain API onto the one of the Blokli client.
 ///
-/// An unfiltered selector becomes [`blokli_client::api::ServiceSelector::Any`], which only
-/// [`BlokliQueryClient::count_services`] accepts.
+/// An unfiltered selector becomes [`blokli_client::api::ServiceSelector::Any`]; the client walks
+/// the server's stable cursor pages for registry-wide enumeration.
 fn to_blokli_service_selector(selector: &ServiceSelector) -> blokli_client::api::ServiceSelector {
     match (selector.service_type, selector.node) {
         (Some(service_type), Some(node)) => blokli_client::api::ServiceSelector::ServiceTypeAndNode {
@@ -63,31 +64,15 @@ fn to_blokli_service_selector(selector: &ServiceSelector) -> blokli_client::api:
     }
 }
 
-/// Resolves `nodeToSafe(node) != 0` on the node-Safe registry that the service registry resolves
-/// its bindings against.
-async fn node_has_safe_binding<C>(client: &C, node: &Address) -> Result<bool, ConnectorError>
-where
-    C: BlokliQueryClient + Send + Sync,
-{
-    Ok(!client
-        .query_safe(blokli_client::api::SafeSelector::RegisteredNode((*node).into()))
-        .await?
-        .is_empty())
-}
-
 /// Converts the queried entries and applies the `selector` to each of them.
 ///
 /// An entry that fails to convert, or whose Safe binding cannot be resolved for a `live_only`
 /// selector, is dropped with a log: the stream carries plain entries and has nowhere to report an
 /// error, and a live-only read must not admit an entry whose liveness could not be established.
-async fn select_service_entries<C>(
-    client: &C,
+fn select_service_entries(
     models: Vec<blokli_client::api::types::ServiceEntry>,
     selector: ServiceSelector,
-) -> Vec<ServiceEntry>
-where
-    C: BlokliQueryClient + Send + Sync,
-{
+) -> Vec<ServiceEntry> {
     let mut entries = Vec::with_capacity(models.len());
 
     for model in models {
@@ -99,21 +84,9 @@ where
             }
         };
 
-        // The Safe binding is resolved only when the selector asks for it; the value is ignored
-        // otherwise, see `ServiceSelector::satisfies`.
-        let node_is_live = if selector.live_only {
-            match node_has_safe_binding(client, &entry.node).await {
-                Ok(node_is_live) => node_is_live,
-                Err(error) => {
-                    tracing::error!(%error, node = %entry.node, "skipping an entry whose Safe binding is unknown");
-                    continue;
-                }
-            }
-        } else {
-            false
-        };
-
-        if selector.satisfies(&entry, node_is_live) {
+        // A live-only query was already checked against the exact NodeSafeRegistry pointer by
+        // Blokli. For ordinary queries the liveness argument is ignored by `satisfies`.
+        if selector.satisfies(&entry, selector.live_only) {
             entries.push(entry);
         }
     }
@@ -135,19 +108,15 @@ where
         selector: ServiceSelector,
     ) -> Result<BoxStream<'static, ServiceEntry>, ConnectorError> {
         let query = to_blokli_service_selector(&selector);
-        if matches!(query, blokli_client::api::ServiceSelector::Any) {
-            // Blokli does not enumerate the registry, which is permissionless and can be grown by
-            // anyone. Failing here names the filters that are missing, which the server-side
-            // rejection does not.
-            return Err(ConnectorError::InvalidArguments(
-                "service selector must set a service type, a node, or both",
-            ));
-        }
-
         let client = self.0.clone();
         Ok(futures::stream::once(async move {
-            futures::stream::iter(match client.query_services(query).await {
-                Ok(models) => select_service_entries(client.as_ref(), models, selector).await,
+            let response = if selector.live_only {
+                client.query_live_services(query).await
+            } else {
+                client.query_services(query).await
+            };
+            futures::stream::iter(match response {
+                Ok(models) => select_service_entries(models, selector),
                 Err(error) => {
                     tracing::error!(%error, ?query, "failed to query the service registry");
                     Vec::new()
@@ -191,6 +160,14 @@ where
             .next()
             .map(model_to_service_type_config)
             .transpose()
+    }
+
+    async fn get_service_registry_config(&self) -> Result<ServiceRegistryConfig, Self::Error> {
+        self.0
+            .query_service_registry_config()
+            .await
+            .map_err(ConnectorError::from)
+            .and_then(model_to_service_registry_config)
     }
 }
 

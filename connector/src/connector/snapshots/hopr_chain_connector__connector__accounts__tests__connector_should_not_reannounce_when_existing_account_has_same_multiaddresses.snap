@@ -42,6 +42,9 @@ tx_counts: {}
 channels: {}
 services: {}
 service_types: {}
+service_registry_config:
+  type_registration_fee: 0 wxHOPR
+  node_safe_registry: "0x0000000000000000000000000000000000000000"
 chain_info:
   channel_closure_grace_period: "300"
   channel_dst: "0000000000000000000000000000000000000000000000000000000000000000"

@@ -12,35 +12,33 @@
 //! for exit nodes, say - skip building the whole channel graph first. The same implementation is
 //! therefore available on [`HoprBlockchainReader`], and this one delegates to it.
 //!
-//! # No `StateSyncOptions::Services`
+//! # State synchronization
 //!
-//! [`subscribe_with_state_sync`](hopr_api::chain::ChainEvents::subscribe_with_state_sync) can
-//! replay the current accounts and channels as events, but deliberately cannot replay the service
-//! registry. This is a decision, not an oversight:
-//!
-//! - The snapshot streams are built from the in-process graph and the local `Backend`, never from Blokli, so a registry
-//!   snapshot would require persisting entries in the `Backend` - the breaking change avoided above.
-//! - Nothing routes on service data, so replaying the set as events buys nothing that a
-//!   [`stream_services`](hopr_api::chain::ChainReadServiceOperations::stream_services) call does not already give, and
-//!   that call works without connecting.
-//!
-//! Live registry changes are still broadcast as the ten `ChainEvent::Service*` variants, from the
-//! two subscriptions merged by the connector's subscription task.
+//! Blokli's service-entry and service-type subscriptions are snapshot-first: they register their
+//! live receivers at an indexer watermark, emit the complete matching state at that watermark, and
+//! then continue with later changes. The connector maps both phases onto the same
+//! [`ChainEvent`] variants, so consumers cannot miss the interval between a separate query and a
+//! subscription. Registry-wide configuration uses the same state-first contract.
 
 use blokli_client::api::{
-    BlokliQueryClient,
+    BlokliQueryClient, BlokliTransactionClient,
     types::{ServiceTypeUpdate, ServiceTypeUpdateKind, ServiceUpdate, ServiceUpdateKind},
 };
-use futures::stream::BoxStream;
+use futures::{FutureExt, future::BoxFuture, stream::BoxStream};
 use hopr_api::{
-    chain::{ServiceEntry, ServiceSelector, ServiceTypeConfig},
+    chain::{
+        ChainReadServiceOperations, ServiceEntry, ServiceMetadata, ServiceRegistryConfig, ServiceSelector,
+        ServiceTypeConfig,
+    },
     types::{chain::chain_events::ChainEvent, internal::prelude::ServiceType, primitive::prelude::*},
 };
 
 use crate::{
     Backend, HoprBlockchainConnector, HoprBlockchainReader,
     errors::ConnectorError,
-    utils::{model_to_service_entry, model_to_service_type, model_to_service_type_config, service_burn_to_hopr_balance},
+    utils::{
+        model_to_service_entry, model_to_service_type, model_to_service_type_config, service_burn_to_hopr_balance,
+    },
 };
 
 #[async_trait::async_trait]
@@ -74,6 +72,65 @@ where
         HoprBlockchainReader(self.client.clone())
             .get_service_type_config(service_type)
             .await
+    }
+
+    #[inline]
+    async fn get_service_registry_config(&self) -> Result<ServiceRegistryConfig, Self::Error> {
+        HoprBlockchainReader(self.client.clone())
+            .get_service_registry_config()
+            .await
+    }
+}
+
+#[async_trait::async_trait]
+impl<B, C, P> hopr_api::chain::ChainWriteServiceOperations for HoprBlockchainConnector<C, B, P, P::TxRequest>
+where
+    B: Send + Sync + 'static,
+    C: BlokliQueryClient + BlokliTransactionClient + Send + Sync + 'static,
+    P: hopr_api::types::chain::payload::PayloadGenerator + Send + Sync + 'static,
+    P::TxRequest: Send + Sync + 'static,
+{
+    type Error = ConnectorError;
+
+    async fn register_service<'a>(
+        &'a self,
+        service_type: ServiceType,
+        metadata: ServiceMetadata,
+    ) -> Result<BoxFuture<'a, Result<hopr_api::chain::ChainReceipt, Self::Error>>, Self::Error> {
+        self.check_connection_state()?;
+        let config = HoprBlockchainReader(self.client.clone())
+            .get_service_type_config(service_type)
+            .await?
+            .ok_or(ConnectorError::InvalidState("service type is not registered"))?;
+        let tx_req = self
+            .payload_generator
+            .register_service(service_type, metadata, config.registration_burn)?;
+        Ok(self.send_tx(tx_req, None, None).await?.boxed())
+    }
+
+    async fn update_service<'a>(
+        &'a self,
+        service_type: ServiceType,
+        metadata: ServiceMetadata,
+    ) -> Result<BoxFuture<'a, Result<hopr_api::chain::ChainReceipt, Self::Error>>, Self::Error> {
+        self.check_connection_state()?;
+        let config = HoprBlockchainReader(self.client.clone())
+            .get_service_type_config(service_type)
+            .await?
+            .ok_or(ConnectorError::InvalidState("service type is not registered"))?;
+        let tx_req = self
+            .payload_generator
+            .update_service(service_type, metadata, config.update_burn)?;
+        Ok(self.send_tx(tx_req, None, None).await?.boxed())
+    }
+
+    async fn deregister_service<'a>(
+        &'a self,
+        service_type: ServiceType,
+    ) -> Result<BoxFuture<'a, Result<hopr_api::chain::ChainReceipt, Self::Error>>, Self::Error> {
+        self.check_connection_state()?;
+        let tx_req = self.payload_generator.deregister_service(service_type)?;
+        Ok(self.send_tx(tx_req, None, None).await?.boxed())
     }
 }
 
@@ -162,16 +219,34 @@ pub(crate) fn service_type_update_to_event(update: ServiceTypeUpdate) -> Result<
     })
 }
 
+/// Converts a complete registry configuration into the events required to initialize or update
+/// consumers. The first value emits both fields; later values emit only fields that changed.
+pub(crate) fn service_registry_config_to_events(
+    current: ServiceRegistryConfig,
+    previous: Option<&ServiceRegistryConfig>,
+) -> Vec<ChainEvent> {
+    let mut events = Vec::with_capacity(2);
+    if previous.is_none_or(|old| old.type_registration_fee != current.type_registration_fee) {
+        events.push(ChainEvent::ServiceTypeRegistrationFeeChanged(
+            current.type_registration_fee,
+        ));
+    }
+    if previous.is_none_or(|old| old.node_safe_registry != current.node_safe_registry) {
+        events.push(ChainEvent::ServiceRegistryPointerChanged(current.node_safe_registry));
+    }
+    events
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
-    use blokli_client::api::types::{ServiceRegistryConfig, ServiceTypeInfo};
+    use blokli_client::api::types::{ServiceRegistryConfig as BlokliServiceRegistryConfig, ServiceTypeInfo};
     use futures::StreamExt;
     use hopr_api::{
         chain::{
-            ChainReadServiceOperations, ChainValues, DeployedSafe, ServiceEntry, ServiceMetadata, ServiceSelector,
-            ServiceType, ServiceTypeConfig,
+            ChainReadServiceOperations, ChainValues, DeployedSafe, ServiceEntry, ServiceMetadata,
+            ServiceRegistryConfig, ServiceSelector, ServiceType, ServiceTypeConfig,
         },
         types::{
             chain::chain_events::ChainEvent,
@@ -181,8 +256,8 @@ mod tests {
     };
 
     use super::{
-        ServiceTypeUpdate, ServiceTypeUpdateKind, ServiceUpdate, ServiceUpdateKind, service_type_update_to_event,
-        service_update_to_event,
+        ServiceTypeUpdate, ServiceTypeUpdateKind, ServiceUpdate, ServiceUpdateKind, service_registry_config_to_events,
+        service_type_update_to_event, service_update_to_event,
     };
     use crate::{
         HoprBlockchainReader,
@@ -325,23 +400,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connector_should_reject_an_unfiltered_service_stream() -> anyhow::Result<()> {
+    async fn connector_should_enumerate_an_unfiltered_service_stream() -> anyhow::Result<()> {
         let blokli_client = BlokliTestStateBuilder::default()
             .with_services([entry(ServiceType::GVPN_EXIT, NODE)?])
             .build_static_client();
 
         let connector = create_connector(blokli_client)?;
 
-        let error = connector
-            .stream_services(ServiceSelector::default())
-            .err()
-            .expect("an unfiltered selector must be rejected");
-
-        // The error must name the filters that are missing, because the server-side rejection does
-        // not, and the caller cannot otherwise tell what to add.
-        let message = error.to_string();
-        assert!(message.contains("service type"), "{message}");
-        assert!(message.contains("node"), "{message}");
+        let entries = connector
+            .stream_services(ServiceSelector::default())?
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(1, entries.len());
 
         Ok(())
     }
@@ -415,20 +485,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connector_should_reject_an_unfiltered_live_only_count() -> anyhow::Result<()> {
+    async fn connector_should_count_unfiltered_live_services() -> anyhow::Result<()> {
         let blokli_client = BlokliTestStateBuilder::default()
             .with_services([entry(ServiceType::GVPN_EXIT, NODE)?])
             .build_static_client();
 
         let connector = create_connector(blokli_client)?;
 
-        // Liveness cannot be counted server-side, so a live-only count needs the entries, and
-        // fetching those needs a filter.
-        assert!(
+        assert_eq!(
+            0,
             connector
                 .count_services(ServiceSelector::default().with_live_only(true))
-                .await
-                .is_err()
+                .await?
         );
 
         Ok(())
@@ -475,6 +543,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connector_should_read_registry_wide_configuration() -> anyhow::Result<()> {
+        let mut state = BlokliTestState::default();
+        state.service_registry_config = BlokliServiceRegistryConfig {
+            type_registration_fee: "5 wxHOPR".into(),
+            node_safe_registry: const_hex::encode(REQUIREMENT),
+        };
+        let connector = create_connector(BlokliTestStateBuilder::from(state).build_static_client())?;
+
+        assert_eq!(
+            ServiceRegistryConfig {
+                type_registration_fee: HoprBalance::new_base(5),
+                node_safe_registry: REQUIREMENT.into(),
+            },
+            connector.get_service_registry_config().await?
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn connector_should_stream_services_of_a_type_rendered_as_hex() -> anyhow::Result<()> {
         // The registry does not enforce the printable-ASCII convention on type ids, and Blokli
         // renders an id that does not follow it as hexadecimal instead of as a name.
@@ -501,7 +589,7 @@ mod tests {
     /// configuration only, so their mapping is pinned on the conversion itself.
     #[test]
     fn registry_wide_updates_convert_into_the_registry_events() -> anyhow::Result<()> {
-        let registry_config = ServiceRegistryConfig {
+        let registry_config = BlokliServiceRegistryConfig {
             type_registration_fee: "5 wxHOPR".into(),
             node_safe_registry: const_hex::encode(REQUIREMENT),
         };
@@ -527,6 +615,35 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn registry_config_snapshot_initializes_both_fields_then_emits_only_changes() {
+        let initial = ServiceRegistryConfig {
+            type_registration_fee: HoprBalance::new_base(5),
+            node_safe_registry: REQUIREMENT.into(),
+        };
+        let initial_events = service_registry_config_to_events(initial, None);
+        assert_eq!(initial_events.len(), 2);
+        assert!(matches!(
+            &initial_events[0],
+            ChainEvent::ServiceTypeRegistrationFeeChanged(fee) if *fee == HoprBalance::new_base(5)
+        ));
+        assert!(matches!(
+            &initial_events[1],
+            ChainEvent::ServiceRegistryPointerChanged(pointer) if *pointer == REQUIREMENT.into()
+        ));
+
+        let updated = ServiceRegistryConfig {
+            type_registration_fee: HoprBalance::new_base(7),
+            ..initial
+        };
+        let update_events = service_registry_config_to_events(updated, Some(&initial));
+        assert_eq!(update_events.len(), 1);
+        assert!(matches!(
+            &update_events[0],
+            ChainEvent::ServiceTypeRegistrationFeeChanged(fee) if *fee == HoprBalance::new_base(7)
+        ));
     }
 
     #[test]
