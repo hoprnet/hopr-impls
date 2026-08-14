@@ -319,10 +319,8 @@ impl TransportIntermediates {
     }
 }
 
-}
-
 impl EdgeProtocolObservable for TransportIntermediates {
-    fn balance(&self) -> Option<hopr_api::graph::traits::ChannelBalance> {
+    fn balance(&self) -> Option<hopr_api::graph::traits::Balance> {
         self.balance
     }
 }
@@ -620,9 +618,9 @@ mod tests {
         // Record on-chain capacity only. This allocates the intermediate stream without
         // recording any loopback probe outcome, which is the permanent state of every edge
         // incident to this node.
-        observation.record(EdgeWeightType::Balance(Some(
-            hopr_api::graph::traits::ChannelBalance::from(100u64),
-        )));
+        observation.record(EdgeWeightType::Balance(Some(hopr_api::graph::traits::Balance::from(
+            100u64,
+        ))));
 
         let imm = observation.immediate_qos().expect("immediate stream should exist");
         let inter = observation
@@ -691,9 +689,9 @@ mod tests {
     fn unobserved_stream_should_report_no_score_at_all() {
         // A balance update alone: the stream exists but was never probed.
         let mut observation = Observations::default();
-        observation.record(EdgeWeightType::Balance(Some(
-            hopr_api::graph::traits::ChannelBalance::from(100u64),
-        )));
+        observation.record(EdgeWeightType::Balance(Some(hopr_api::graph::traits::Balance::from(
+            100u64,
+        ))));
 
         let inter = observation.intermediate_qos().expect("stream exists");
         assert!(!inter.has_observations());
@@ -711,9 +709,9 @@ mod tests {
         let mut observation = Observations::default();
         // Record a successful intermediate probe (no immediate probe recorded)
         observation.record(EdgeWeightType::Intermediate(Ok(std::time::Duration::from_millis(80))));
-        observation.record(EdgeWeightType::Balance(Some(
-            hopr_api::graph::traits::ChannelBalance::from(500u64),
-        )));
+        observation.record(EdgeWeightType::Balance(Some(hopr_api::graph::traits::Balance::from(
+            500u64,
+        ))));
 
         assert!(observation.immediate_qos().is_none());
         let inter_score = observation.intermediate_qos().unwrap().score();
@@ -770,7 +768,7 @@ mod tests {
     fn fast_slices(epoch: std::time::Instant) -> TransportIntermediates {
         TransportIntermediates {
             link: TransportLinkMeasurement::default(),
-            capacity: None,
+            balance: None,
             surb: WindowedRatio::new(TEST_SLICE, epoch),
             surb_peak: 0.0,
             surb_peak_at: epoch,
@@ -1001,13 +999,17 @@ mod tests {
             .expect("silent edge has SURB history");
         assert_lt!(s_rate, d_rate, "the SURB window itself must separate the two edges");
 
+        // Both edges carry SURB evidence, so both must be scored rather than reported unobserved —
+        // asserting that first keeps a `None`-vs-`None` comparison from passing this vacuously.
+        let (silent_score, delivering_score) = (
+            silent.score().expect("a silent edge is measured, not unobserved"),
+            delivering.score().expect("a delivering edge is measured"),
+        );
         assert_lt!(
-            silent.score(),
-            delivering.score(),
-            "a relay that stopped returning SURBs must score below one still delivering: silent={} delivering={} \
-             (surb rates {s_rate} vs {d_rate})",
-            silent.score(),
-            delivering.score()
+            silent_score,
+            delivering_score,
+            "a relay that stopped returning SURBs must score below one still delivering: silent={silent_score} \
+             delivering={delivering_score} (surb rates {s_rate} vs {d_rate})"
         );
     }
 
