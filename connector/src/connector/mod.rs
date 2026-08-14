@@ -751,7 +751,7 @@ pub(crate) mod tests {
             InMemoryBackend::default(),
             SafePayloadGenerator::new(
                 &ckp,
-                contract_addresses_for_network("rotsee").unwrap().1,
+                contract_addresses_for_network("piz-palu-staging").unwrap().1,
                 MODULE_ADDR.into(),
             ),
         ))
@@ -828,7 +828,7 @@ pub(crate) mod tests {
                 (account_2, HoprBalance::new_base(100), XDaiBalance::new_base(1)),
             ])
             .with_channels([channel_1])
-            .with_hopr_network_chain_info("rotsee")
+            .with_hopr_network_chain_info("piz-palu-staging")
             .build_dynamic_client_with_mutator(ChainMutator::new(
                 move |_: &[u8], state: &mut BlokliTestState| -> Result<(), blokli_client::errors::BlokliClientError> {
                     // Update the channel ticket index, without the client noticing the change

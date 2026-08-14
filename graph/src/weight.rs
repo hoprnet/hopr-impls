@@ -5,7 +5,7 @@ use hopr_api::graph::{
         EdgeTransportMeasurement, EdgeWeightType,
     },
 };
-use hopr_utils::statistics::ExponentialMovingAverage;
+use hopr_utils::statistics::{ExponentialMovingAverage, WindowedRatio};
 
 /// A representation of a individual neighbor link measurement
 #[derive(Debug, Copy, Clone, Default, PartialEq)]
@@ -80,6 +80,11 @@ impl EdgeObservableWrite for Observations {
             EdgeWeightType::Connected(is_connected) => {
                 self.immediate_probe.get_or_insert_default().is_connected = is_connected
             }
+            EdgeWeightType::SurbRoundTrips { expected, observed } => {
+                self.intermediate_probe
+                    .get_or_insert_default()
+                    .record_surb_round_trips(expected, observed);
+            }
             EdgeWeightType::ImmediateProtocolConformance { num_packets, num_acks } => {
                 let imm = self.immediate_probe.get_or_insert_default();
                 imm.messages_sent += num_packets;
@@ -131,10 +136,159 @@ impl EdgeLinkObservable for TransportImmediates {
     }
 }
 
-#[derive(Debug, Copy, Clone, Default, PartialEq)]
+/// Slice width and count for the SURB round-trip window.
+///
+/// 24 s of history in two-second slices. Still far above any plausible round-trip, so a reply is
+/// nearly always counted in a slice that is still inside the window.
+///
+/// Narrowed from five-second slices rather than widened to more of them: the recent window has to
+/// register a collapse inside the recovery budget, and adding slices grows a `Copy` type that is
+/// read per edge during path search (30 slices measured 752 B against 320). Narrowing keeps the
+/// footprint identical and preserves the contrast ratio exactly -- the recent window was 1/6 of
+/// the baseline at 10 s of 60 s, and is 1/6 of it at 4 s of 24 s -- while reacting 2.5x sooner.
+const SURB_BUCKET_WIDTH: std::time::Duration = std::time::Duration::from_secs(2);
+const SURB_BUCKETS: usize = 12;
+
+/// Span the SURB window covers, i.e. how far back delivery evidence is still counted.
+pub(crate) const fn surb_window() -> std::time::Duration {
+    std::time::Duration::from_secs(SURB_BUCKET_WIDTH.as_secs() * SURB_BUCKETS as u64)
+}
+
+/// Slices read as "lately" when looking for a sudden change: 4 s against the 24 s window.
+///
+/// Two rather than one so a single slice that happens to straddle a lull cannot, on its own, brand
+/// a working relay as gone.
+const SURB_RECENT_SLICES: usize = 2;
+
+/// How far the recent slices must fall below the full window before it counts as a collapse.
+///
+/// A ratio, not an absolute level, so it is unaffected by the balancer surplus that makes the
+/// absolute figure meaningless. At 0.5 the last 4 s must be delivering at less than half the rate
+/// the whole window did before anything is inferred -- ordinary variance stays well inside that.
+const SURB_TREND_FLOOR: f64 = 0.5;
+
+#[derive(Debug, Copy, Clone, PartialEq)]
 pub struct TransportIntermediates {
     link: TransportLinkMeasurement,
     capacity: Option<u128>,
+    /// Delivery observed from real SURB traffic rather than from probes.
+    surb: WindowedRatio<SURB_BUCKETS>,
+    /// Highest delivery ratio this edge has reached, used to read the window relatively.
+    ///
+    /// The absolute ratio is not a delivery rate: `expected` counts SURBs *minted*, and the
+    /// balancer mints far more than the counterparty spends, so a path carrying every reply
+    /// intact still measures well below 1. Measured on a cluster, a fully healthy path reads 0.36.
+    /// The surplus is a property of the balancer, not of the path, so it applies alike to every
+    /// candidate and cancels the moment the ratio is read against a baseline instead of an
+    /// absolute scale.
+    ///
+    /// Decays rather than latching: see [`Self::peak_at`].
+    surb_peak: f64,
+    /// When [`Self::surb_peak`] was last raised, which is what the decay is measured from.
+    surb_peak_at: std::time::Instant,
+    /// Whether this edge has ever been probed, i.e. whether the probe rate carries any evidence.
+    ///
+    /// The probe rate is an exponential average that starts at zero and exposes no sample count, so
+    /// "never probed" and "every probe failed" are the same number. Without this flag the two
+    /// cannot be told apart, and a never-probed edge carrying healthy SURB traffic would be scored
+    /// as if every probe had failed.
+    probed: bool,
+}
+
+impl Default for TransportIntermediates {
+    fn default() -> Self {
+        let now = std::time::Instant::now();
+
+        Self {
+            link: TransportLinkMeasurement::default(),
+            capacity: None,
+            surb: WindowedRatio::new(SURB_BUCKET_WIDTH, now),
+            surb_peak: 0.0,
+            surb_peak_at: now,
+            probed: false,
+        }
+    }
+}
+
+impl TransportIntermediates {
+    /// Folds one reporting interval of SURB round-trips into the window.
+    pub(crate) fn record_surb_round_trips(&mut self, expected: u64, observed: u64) {
+        self.record_surb_round_trips_at(expected, observed, std::time::Instant::now())
+    }
+
+    /// [`Self::record_surb_round_trips`] against a caller-supplied clock.
+    pub(crate) fn record_surb_round_trips_at(&mut self, expected: u64, observed: u64, now: std::time::Instant) {
+        self.surb.record_expected(expected, now);
+        self.surb.record_observed(observed, now);
+
+        if let Some(v) = self.surb.value(now) {
+            self.surb_peak = self.peak_at(now).max(v);
+            self.surb_peak_at = now;
+        }
+    }
+
+    /// The baseline as it stands at `now`, having decayed since it was last raised.
+    ///
+    /// The peak has to forget. `expected` counts SURBs *minted*, and the balancer's surplus over
+    /// what the counterparty spends is not constant; when it is briefly small the absolute ratio
+    /// spikes. A peak that only ever rose would latch onto that spike, and from then on every
+    /// ordinary interval would be divided by a level the edge cannot reach again -- an edge
+    /// delivering every reply would read well below 1 forever, and would lose to edges whose peak
+    /// happened to be set under worse minting conditions. That is a comparison between each path
+    /// and its luckiest interval rather than between paths.
+    ///
+    /// The half-life is the window itself, so the baseline forgets a lucky interval at the same
+    /// rate the window forgets the traffic that produced it. A steadily delivering edge re-raises
+    /// the peak to its own value on every report, so decay costs it nothing.
+    fn peak_at(&self, now: std::time::Instant) -> f64 {
+        let half_lives =
+            now.saturating_duration_since(self.surb_peak_at).as_secs_f64() / self.surb.window().as_secs_f64();
+
+        self.surb_peak * 0.5f64.powf(half_lives)
+    }
+
+    /// How the most recent slices compare with the full window, or `None` without evidence in both.
+    ///
+    /// Below 1 means delivery has fallen off lately. The comparison is what makes this usable: the
+    /// full window alone dilutes a fresh collapse across the whole window of healthy history, and
+    /// the recent slices alone rest on too little evidence to accuse a relay by themselves.
+    pub fn surb_trend(&self) -> Option<f64> {
+        self.surb_trend_at(std::time::Instant::now())
+    }
+
+    /// [`Self::surb_trend`] against a caller-supplied clock.
+    pub(crate) fn surb_trend_at(&self, now: std::time::Instant) -> Option<f64> {
+        let full = self.surb.value(now)?;
+        let recent = self.surb.recent_value(SURB_RECENT_SLICES, now)?;
+
+        (full > 0.0).then(|| (recent / full).clamp(0.0, 1.0))
+    }
+
+    /// How this edge is delivering relative to its own best, or `None` without traffic.
+    ///
+    /// Relative, because the absolute ratio measures the balancer's surplus as much as the path
+    /// (see [`Self::surb_peak`]). Against its own peak a healthy edge reads ~1 whatever the
+    /// surplus, and one that stops delivering falls toward 0 -- which is the only thing this
+    /// signal is asked to say.
+    pub fn surb_delivery_rate(&self) -> Option<f64> {
+        self.surb_delivery_rate_at(std::time::Instant::now())
+    }
+
+    /// [`Self::surb_delivery_rate`] against a caller-supplied clock.
+    pub(crate) fn surb_delivery_rate_at(&self, now: std::time::Instant) -> Option<f64> {
+        let value = self.surb.value(now)?;
+        let peak = self.peak_at(now);
+        let against_peak = (peak > 0.0).then(|| (value / peak).clamp(0.0, 1.0))?;
+
+        // A relay that has just stopped delivering still reads well against its peak for most of
+        // the window, because eleven healthy slices outvote the one bad one. Folding the trend in
+        // makes that visible within a slice or two -- deliberately as a soft discount rather than a
+        // gate, so a relay is displaced by better-scoring peers rather than excluded outright.
+        Some(match self.surb_trend_at(now) {
+            Some(trend) if trend < SURB_TREND_FLOOR => against_peak * trend,
+            _ => against_peak,
+        })
+    }
 }
 
 impl EdgeProtocolObservable for TransportIntermediates {
@@ -145,6 +299,7 @@ impl EdgeProtocolObservable for TransportIntermediates {
 
 impl EdgeLinkObservable for TransportIntermediates {
     fn record(&mut self, measurement: EdgeTransportMeasurement) {
+        self.probed = true;
         self.link.record(measurement);
     }
 
@@ -152,12 +307,29 @@ impl EdgeLinkObservable for TransportIntermediates {
         self.link.average_latency()
     }
 
+    /// The more pessimistic of the two delivery signals, over whichever of them carry evidence.
+    ///
+    /// SURB round-trips react sooner -- probing runs on an interval, while SURBs accrue at data
+    /// rates -- but sooner is not the same as instead of. The two measure different things: the
+    /// probe rate reports reachability of this hop, the SURB rate peak-relative delivery of the
+    /// whole loop, and a failing probe is real evidence even while SURBs keep arriving. Taking the
+    /// worse of the two lets either signal condemn an edge and neither mask the other.
+    ///
+    /// Evidence, not merely a number: an unprobed edge's probe rate reads 0.0 exactly as a wholly
+    /// failing one does (see [`Self::probed`]), so combining them unconditionally would score every
+    /// SURB-only edge as dead.
     fn average_probe_rate(&self) -> f64 {
-        self.link.average_probe_rate()
+        match (self.surb_delivery_rate(), self.probed) {
+            (Some(surb), true) => surb.min(self.link.average_probe_rate()),
+            (Some(surb), false) => surb,
+            (None, _) => self.link.average_probe_rate(),
+        }
     }
 
     fn score(&self) -> f64 {
-        self.link.score()
+        // Latency scoring is left to the link measurement untouched: a round-trip carries no
+        // per-edge latency to contribute.
+        self.average_probe_rate() * latency_score(self.average_latency())
     }
 }
 
@@ -368,6 +540,292 @@ mod tests {
         let inter_score = observation.intermediate_qos().unwrap().score();
         assert_gt!(inter_score, 0.0, "intermediate score should be positive");
         assert_in_delta!(observation.score(), inter_score, 0.001);
+    }
+
+    /// The window has to react inside the recovery budget, and still have a baseline to react
+    /// *against*.
+    ///
+    /// Both halves matter. Too wide a recent window and a dead relay is not discounted until the
+    /// budget is spent; too short a full window and there is nothing to compare it with, since the
+    /// signal is comparative -- the absolute SURB ratio measures the balancer surplus as much as
+    /// the path, and a fully healthy path reads 0.36.
+    #[test]
+    fn the_surb_window_geometry_should_react_inside_the_recovery_budget() {
+        let recent = SURB_BUCKET_WIDTH * SURB_RECENT_SLICES as u32;
+        let full = SURB_BUCKET_WIDTH * SURB_BUCKETS as u32;
+
+        // Detection costs ~5s on its own, against a 20s test boundary. A recent window longer than
+        // this leaves no budget to refill in once the discount finally lands.
+        assert!(
+            recent <= std::time::Duration::from_secs(5),
+            "the recent window ({recent:?}) must register a collapse inside the recovery budget"
+        );
+        assert!(
+            full >= recent * 4,
+            "the baseline ({full:?}) must be materially longer than the recent window ({recent:?}), otherwise the \
+             comparison has nothing to say"
+        );
+    }
+
+    /// The ring is `Copy` inside a `Copy` observation, read per edge during path search.
+    #[test]
+    fn the_surb_window_should_stay_cheap_to_copy() {
+        let size = std::mem::size_of::<WindowedRatio<SURB_BUCKETS>>();
+        assert!(
+            size <= 512,
+            "WindowedRatio<{SURB_BUCKETS}> is {size} B; widening the ring rather than narrowing the slice makes every \
+             edge read more expensive (30 buckets measured 752 B against 320)"
+        );
+    }
+
+    /// A window whose slice boundaries the test crosses by moving the clock, not by sleeping.
+    ///
+    /// The *shape* under test is "recent slices against the whole window", which is independent of
+    /// the wall-clock scale. Sleeping would bind these assertions to the scheduler instead: an
+    /// overrun on a loaded runner puts a record in the wrong slice and changes the trend, so the
+    /// tests would be measuring the machine rather than the window.
+    fn fast_slices(epoch: std::time::Instant) -> TransportIntermediates {
+        TransportIntermediates {
+            link: TransportLinkMeasurement::default(),
+            capacity: None,
+            surb: WindowedRatio::new(TEST_SLICE, epoch),
+            surb_peak: 0.0,
+            surb_peak_at: epoch,
+            probed: false,
+        }
+    }
+
+    /// One slice of the test window; only its ratio to the ring matters, never its real duration.
+    const TEST_SLICE: std::time::Duration = std::time::Duration::from_millis(20);
+
+    /// Records `rounds` intervals, one per slice from `from`, and returns the last one's instant.
+    ///
+    /// Ends *on* a record: the readers take the same instant, so stopping a slice later would leave
+    /// "now" in an empty slice and read `None` instead of the value just recorded.
+    fn record_slices(
+        m: &mut TransportIntermediates,
+        from: std::time::Instant,
+        rounds: usize,
+        expected: u64,
+        observed: u64,
+    ) -> std::time::Instant {
+        let mut at = from;
+        for i in 0..rounds {
+            if i > 0 {
+                at += TEST_SLICE;
+            }
+            m.record_surb_round_trips_at(expected, observed, at);
+        }
+        at
+    }
+
+    /// Fills the window with healthy round-trips spread across several slices.
+    fn deliver_healthily(m: &mut TransportIntermediates, from: std::time::Instant) -> std::time::Instant {
+        record_slices(m, from, 8, 100, 100)
+    }
+
+    /// A relay that stops delivering must be discounted long before the full window notices.
+    #[test]
+    fn an_edge_whose_delivery_just_collapsed_should_be_discounted_against_a_steady_one() {
+        let epoch = std::time::Instant::now();
+        let mut collapsed = fast_slices(epoch);
+        let mut steady = fast_slices(epoch);
+        deliver_healthily(&mut collapsed, epoch);
+        let mut now = deliver_healthily(&mut steady, epoch) + TEST_SLICE;
+
+        // The recent slices diverge: one keeps answering, the other stops dead.
+        for i in 0..2 {
+            if i > 0 {
+                now += TEST_SLICE;
+            }
+            collapsed.record_surb_round_trips_at(100, 0, now);
+            steady.record_surb_round_trips_at(100, 100, now);
+        }
+
+        // Vacuity guards: the discount can only be attributed to the trend if the trend actually
+        // crossed the floor for one edge and not the other.
+        let collapsed_trend = collapsed.surb_trend_at(now).expect("both windows hold evidence");
+        let steady_trend = steady.surb_trend_at(now).expect("both windows hold evidence");
+        assert!(
+            collapsed_trend < SURB_TREND_FLOOR,
+            "the collapsed edge must trip the floor, trend={collapsed_trend}"
+        );
+        assert!(
+            steady_trend >= SURB_TREND_FLOOR,
+            "the steady edge must not trip the floor, trend={steady_trend}"
+        );
+
+        let collapsed_rate = collapsed.surb_delivery_rate_at(now).expect("has traffic");
+        let steady_rate = steady.surb_delivery_rate_at(now).expect("has traffic");
+        assert!(
+            collapsed_rate < steady_rate,
+            "a relay that just stopped delivering must be discounted below one that has not: \
+             collapsed={collapsed_rate} steady={steady_rate}"
+        );
+
+        // The comparison above is not enough on its own: the full-window value already differs
+        // between the two, so it passes with the trend removed entirely. What must be shown is that
+        // the *discount* moved the number -- i.e. the rate sits below the plain peak-relative value.
+        let undiscounted = (collapsed.surb.value(now).expect("has traffic") / collapsed.peak_at(now)).clamp(0.0, 1.0);
+        assert!(
+            collapsed_rate < undiscounted,
+            "the trend must discount below the peak-relative value, otherwise it is inert: rate={collapsed_rate} \
+             undiscounted={undiscounted}"
+        );
+    }
+
+    /// The discount must be soft and self-clearing, not a latch.
+    #[test]
+    fn an_edge_should_recover_its_rate_once_the_recent_slices_climb_back() {
+        let epoch = std::time::Instant::now();
+        let mut m = fast_slices(epoch);
+        let now = deliver_healthily(&mut m, epoch);
+
+        let now = record_slices(&mut m, now + TEST_SLICE, 2, 100, 0);
+        let during = m.surb_delivery_rate_at(now).expect("has traffic");
+
+        // Deliveries resume; the recent slices are what move first.
+        let now = record_slices(&mut m, now + TEST_SLICE, 3, 100, 100);
+        let after = m.surb_delivery_rate_at(now).expect("has traffic");
+
+        assert!(
+            after > during,
+            "the discount must clear on its own once deliveries resume: during={during} after={after}"
+        );
+    }
+
+    /// A steady edge must be untouched: the trend is a discount for change, not a standing tax.
+    #[test]
+    fn a_steadily_delivering_edge_should_not_be_discounted_at_all() {
+        let epoch = std::time::Instant::now();
+        let mut m = fast_slices(epoch);
+        let now = deliver_healthily(&mut m, epoch);
+
+        let trend = m.surb_trend_at(now).expect("window holds evidence");
+        assert!(
+            trend >= SURB_TREND_FLOOR,
+            "steady delivery must not read as a downward trend, got {trend}"
+        );
+        assert_in_delta!(m.surb_delivery_rate_at(now).expect("has traffic"), 1.0, 0.001);
+    }
+
+    /// A lucky interval must not tax the edge forever, which is what a peak that only rose did.
+    #[test]
+    fn a_peak_set_by_one_favourable_interval_should_decay_back_to_steady_behaviour() {
+        let epoch = std::time::Instant::now();
+        let mut m = fast_slices(epoch);
+
+        // One interval where the balancer happens to mint barely more than is spent: the absolute
+        // ratio spikes, and with it the peak. Nothing about the path changed.
+        let now = record_slices(&mut m, epoch, 1, 10, 10);
+        // Then a long stretch of ordinary, perfectly healthy delivery at the usual surplus.
+        let now = record_slices(&mut m, now + TEST_SLICE, 8, 100, 30);
+
+        let penalised = m.surb_delivery_rate_at(now).expect("has traffic");
+        assert!(
+            penalised < 0.9,
+            "the spike must still be the baseline while it is fresh, got {penalised}"
+        );
+
+        // Kept delivering at exactly the same rate, a window later. The spike has aged out of the
+        // ring, and the baseline must have followed it rather than latching.
+        let now = record_slices(&mut m, now + TEST_SLICE, 12, 100, 30);
+        let recovered = m.surb_delivery_rate_at(now).expect("has traffic");
+
+        assert!(
+            recovered > 0.95,
+            "an edge delivering steadily must not be discounted against its luckiest interval forever: was \
+             {penalised}, still {recovered} a full window later"
+        );
+    }
+
+    /// Neither delivery signal may hide the other; an unprobed edge must not be read as a dead one.
+    #[test]
+    fn a_failing_probe_should_not_be_masked_by_healthy_surb_traffic() {
+        let epoch = std::time::Instant::now();
+
+        let mut surbs_only = fast_slices(epoch);
+        deliver_healthily(&mut surbs_only, epoch);
+        assert_in_delta!(surbs_only.average_probe_rate(), 1.0, 0.001);
+
+        // Same healthy SURB window, but every probe of this hop failed. The probe rate is evidence
+        // too, and taking the SURB rate alone would discard it.
+        let mut probes_failing = fast_slices(epoch);
+        deliver_healthily(&mut probes_failing, epoch);
+        for _ in 0..5 {
+            probes_failing.record(Err(()));
+        }
+
+        assert!(
+            probes_failing.average_probe_rate() < surbs_only.average_probe_rate(),
+            "a hop whose probes all fail must not score as well as one whose probes were never run: failing={} \
+             unprobed={}",
+            probes_failing.average_probe_rate(),
+            surbs_only.average_probe_rate()
+        );
+    }
+
+    /// A relay that stops returning SURBs must score below one that keeps delivering.
+    ///
+    /// Regression: `TransportIntermediates::average_probe_rate` correctly prefers the SURB window,
+    /// but `score()` delegated to `link.score()`, which recomputes from the raw probe EMA -- so the
+    /// SURB evidence reached a diagnostic accessor and nothing else. Path selection weights come
+    /// from `score()`, which meant real return-path traffic could never influence a route.
+    #[test]
+    fn a_relay_that_stops_returning_surbs_should_score_below_one_that_keeps_delivering() {
+        // Identical probe history: same latency, same probe successes. The only difference is what
+        // the SURB round-trips say, so any score difference is attributable to them alone.
+        let probe_history = |o: &mut Observations| {
+            for _ in 0..10 {
+                o.record(EdgeWeightType::Intermediate(Ok(std::time::Duration::from_millis(50))));
+            }
+        };
+
+        let mut delivering = Observations::default();
+        probe_history(&mut delivering);
+        let mut silent = Observations::default();
+        probe_history(&mut silent);
+
+        // Both establish the same healthy peak, so the relative ratio starts equal.
+        delivering.record(EdgeWeightType::SurbRoundTrips {
+            expected: 1_000,
+            observed: 900,
+        });
+        silent.record(EdgeWeightType::SurbRoundTrips {
+            expected: 1_000,
+            observed: 900,
+        });
+
+        // Then one keeps delivering and the other goes silent.
+        delivering.record(EdgeWeightType::SurbRoundTrips {
+            expected: 1_000,
+            observed: 900,
+        });
+        silent.record(EdgeWeightType::SurbRoundTrips {
+            expected: 1_000,
+            observed: 0,
+        });
+
+        // Guard against a vacuous comparison: the accessor must actually separate them, otherwise
+        // the score assertion below proves nothing about `score()`.
+        let d_rate = delivering
+            .intermediate_qos()
+            .and_then(|m| m.surb_delivery_rate())
+            .expect("delivering edge has SURB history");
+        let s_rate = silent
+            .intermediate_qos()
+            .and_then(|m| m.surb_delivery_rate())
+            .expect("silent edge has SURB history");
+        assert_lt!(s_rate, d_rate, "the SURB window itself must separate the two edges");
+
+        assert_lt!(
+            silent.score(),
+            delivering.score(),
+            "a relay that stopped returning SURBs must score below one still delivering: silent={} delivering={} \
+             (surb rates {s_rate} vs {d_rate})",
+            silent.score(),
+            delivering.score()
+        );
     }
 
     #[test]

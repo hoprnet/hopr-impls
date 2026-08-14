@@ -29,12 +29,12 @@ rust-version = "1.97"
 [workspace.dependencies]
 # In-repo crates (path + version so they are publishable)
 hopr-chain-connector = { path = "connector", version = "0.22.2" }
-hopr-network-graph   = { path = "graph", version = "0.3.2", default-features = false }
+hopr-network-graph   = { path = "graph", version = "0.3.4", default-features = false }
 
 # HOPR crates published to crates.io
-blokli-client = "0.30.2"
-hopr-api      = "1.19.0"
-hopr-utils    = { package = "hopr-utilities", version = "0.6.0", default-features = false }
+blokli-client = "0.31.0"
+hopr-api      = "1.22.0"
+hopr-utils    = { package = "hopr-utilities", version = "0.8.0", default-features = false }
 
 # Third-party dependencies (versions mirror hoprnet's workspace to preserve compatibility)
 ahash = "0.8.12"
@@ -76,6 +76,7 @@ parking_lot = "0.12.5"
 petgraph = { version = "0.8.3", default-features = false, features = [
   "rayon",
   "serde-1",
+  "stable_graph",
   "std",
 ] }
 pin-project = "1.1.13"

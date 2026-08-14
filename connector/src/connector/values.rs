@@ -141,7 +141,7 @@ mod tests {
     #[tokio::test]
     async fn connector_should_query_chain_info() -> anyhow::Result<()> {
         let blokli_client = BlokliTestStateBuilder::default()
-            .with_hopr_network_chain_info("rotsee")
+            .with_hopr_network_chain_info("piz-palu-staging")
             .build_static_client();
 
         let mut connector = create_connector(blokli_client)?;
@@ -150,7 +150,7 @@ mod tests {
         let chain_info = connector.chain_info().await?;
 
         assert_eq!(100, chain_info.chain_id);
-        assert_eq!("rotsee", &chain_info.hopr_network_name);
+        assert_eq!("piz-palu-staging", &chain_info.hopr_network_name);
 
         assert_eq!(Duration::from_mins(5), connector.channel_closure_notice_period().await?);
         assert_eq!(Hash::default(), connector.domain_separators().await?.channel);
@@ -165,7 +165,7 @@ mod tests {
     #[tokio::test]
     async fn connector_should_query_chain_info_without_calling_connect_first() -> anyhow::Result<()> {
         let blokli_client = BlokliTestStateBuilder::default()
-            .with_hopr_network_chain_info("rotsee")
+            .with_hopr_network_chain_info("piz-palu-staging")
             .build_static_client();
 
         let connector = create_connector(blokli_client)?;
@@ -173,7 +173,7 @@ mod tests {
         let chain_info = connector.chain_info().await?;
 
         assert_eq!(100, chain_info.chain_id);
-        assert_eq!("rotsee", &chain_info.hopr_network_name);
+        assert_eq!("piz-palu-staging", &chain_info.hopr_network_name);
 
         assert_eq!(Duration::from_mins(5), connector.channel_closure_notice_period().await?);
         assert_eq!(Hash::default(), connector.domain_separators().await?.channel);
@@ -195,7 +195,7 @@ mod tests {
                 registered_nodes: vec![],
                 deployer: [2u8; Address::SIZE].into(),
             }])
-            .with_hopr_network_chain_info("rotsee")
+            .with_hopr_network_chain_info("piz-palu-staging")
             .build_static_client();
 
         let connector = create_connector(blokli_client)?;

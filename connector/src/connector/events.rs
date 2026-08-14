@@ -97,7 +97,7 @@ mod tests {
                 registered_nodes: vec![],
                 deployer: deployer_addr,
             }])
-            .with_hopr_network_chain_info("rotsee")
+            .with_hopr_network_chain_info("piz-palu-staging")
             .build_dynamic_client(MODULE_ADDR.into())
             .with_tx_simulation_delay(Duration::from_millis(100));
 
@@ -185,7 +185,7 @@ mod tests {
                 (account_2.clone(), HoprBalance::new_base(100), XDaiBalance::new_base(1)),
             ])
             .with_channels([channel_1, channel_2])
-            .with_hopr_network_chain_info("rotsee")
+            .with_hopr_network_chain_info("piz-palu-staging")
             .build_static_client();
 
         let mut connector = create_connector(blokli_client)?;

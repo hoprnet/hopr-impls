@@ -1096,7 +1096,7 @@ mod tests {
                 ),
             ])
             .with_channels([*channel])
-            .with_hopr_network_chain_info("rotsee")
+            .with_hopr_network_chain_info("piz-palu-staging")
             .build_dynamic_client(module_addr.into())
             .with_tx_simulation_delay(tx_sim_delay.unwrap_or(std::time::Duration::from_millis(500)));
 
@@ -1107,7 +1107,7 @@ mod tests {
             InMemoryBackend::default(),
             SafePayloadGenerator::new(
                 private_key,
-                contract_addresses_for_network("rotsee").unwrap().1,
+                contract_addresses_for_network("piz-palu-staging").unwrap().1,
                 module_addr.into(),
             ),
         );
