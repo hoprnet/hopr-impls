@@ -17,7 +17,7 @@ name = "hopr-network-graph"
 readme = "README.md"
 repository.workspace = true
 rust-version.workspace = true
-version = "0.3.3"
+version = "0.3.4"
 
 [lib]
 crate-type = ["rlib"]
