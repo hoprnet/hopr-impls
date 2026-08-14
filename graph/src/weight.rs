@@ -472,6 +472,128 @@ mod tests {
         assert_in_delta!(observation.score(), inter_score, 0.001);
     }
 
+    /// Slices short enough that a test can cross bucket boundaries without sleeping for seconds.
+    ///
+    /// The production window is 12 x 5 s; the *shape* under test is "recent slices against the
+    /// whole window", which is independent of the wall-clock scale.
+    fn fast_slices() -> TransportIntermediates {
+        TransportIntermediates {
+            link: TransportLinkMeasurement::default(),
+            capacity: None,
+            surb: WindowedRatio::new(TEST_SLICE, std::time::Instant::now()),
+            surb_peak: 0.0,
+        }
+    }
+
+    /// Wide enough that ordinary scheduler jitter cannot push a record into the wrong slice.
+    const TEST_SLICE: std::time::Duration = std::time::Duration::from_millis(20);
+
+    /// Records `rounds` intervals, one per slice, **ending on a record**.
+    ///
+    /// Never sleeps after the last one: the reader uses `Instant::now()`, so a trailing sleep
+    /// leaves "now" in an empty slice and the recent window reads `None` instead of the value
+    /// just recorded.
+    fn record_slices(m: &mut TransportIntermediates, rounds: usize, expected: u64, observed: u64) {
+        for i in 0..rounds {
+            if i > 0 {
+                std::thread::sleep(TEST_SLICE);
+            }
+            m.record_surb_round_trips(expected, observed);
+        }
+    }
+
+    /// Fills the window with healthy round-trips spread across several slices.
+    fn deliver_healthily(m: &mut TransportIntermediates) {
+        record_slices(m, 8, 100, 100);
+    }
+
+    /// A relay that stops delivering must be discounted long before the full window notices.
+    #[test]
+    fn an_edge_whose_delivery_just_collapsed_should_be_discounted_against_a_steady_one() {
+        let mut collapsed = fast_slices();
+        let mut steady = fast_slices();
+        deliver_healthily(&mut collapsed);
+        deliver_healthily(&mut steady);
+        std::thread::sleep(TEST_SLICE);
+
+        // The recent slices diverge: one keeps answering, the other stops dead.
+        for i in 0..2 {
+            if i > 0 {
+                std::thread::sleep(TEST_SLICE);
+            }
+            collapsed.record_surb_round_trips(100, 0);
+            steady.record_surb_round_trips(100, 100);
+        }
+
+        // Vacuity guards: the discount can only be attributed to the trend if the trend actually
+        // crossed the floor for one edge and not the other.
+        let collapsed_trend = collapsed.surb_trend().expect("both windows hold evidence");
+        let steady_trend = steady.surb_trend().expect("both windows hold evidence");
+        assert!(
+            collapsed_trend < SURB_TREND_FLOOR,
+            "the collapsed edge must trip the floor, trend={collapsed_trend}"
+        );
+        assert!(
+            steady_trend >= SURB_TREND_FLOOR,
+            "the steady edge must not trip the floor, trend={steady_trend}"
+        );
+
+        let collapsed_rate = collapsed.surb_delivery_rate().expect("has traffic");
+        let steady_rate = steady.surb_delivery_rate().expect("has traffic");
+        assert!(
+            collapsed_rate < steady_rate,
+            "a relay that just stopped delivering must be discounted below one that has not: \
+             collapsed={collapsed_rate} steady={steady_rate}"
+        );
+
+        // The comparison above is not enough on its own: the full-window value already differs
+        // between the two, so it passes with the trend removed entirely. What must be shown is that
+        // the *discount* moved the number -- i.e. the rate sits below the plain peak-relative value.
+        let undiscounted = (collapsed.surb.value(std::time::Instant::now()).expect("has traffic")
+            / collapsed.surb_peak)
+            .clamp(0.0, 1.0);
+        assert!(
+            collapsed_rate < undiscounted,
+            "the trend must discount below the peak-relative value, otherwise it is inert: \
+             rate={collapsed_rate} undiscounted={undiscounted}"
+        );
+    }
+
+    /// The discount must be soft and self-clearing, not a latch.
+    #[test]
+    fn an_edge_should_recover_its_rate_once_the_recent_slices_climb_back() {
+        let mut m = fast_slices();
+        deliver_healthily(&mut m);
+
+        std::thread::sleep(TEST_SLICE);
+        record_slices(&mut m, 2, 100, 0);
+        let during = m.surb_delivery_rate().expect("has traffic");
+
+        // Deliveries resume; the recent slices are what move first.
+        std::thread::sleep(TEST_SLICE);
+        record_slices(&mut m, 3, 100, 100);
+        let after = m.surb_delivery_rate().expect("has traffic");
+
+        assert!(
+            after > during,
+            "the discount must clear on its own once deliveries resume: during={during} after={after}"
+        );
+    }
+
+    /// A steady edge must be untouched: the trend is a discount for change, not a standing tax.
+    #[test]
+    fn a_steadily_delivering_edge_should_not_be_discounted_at_all() {
+        let mut m = fast_slices();
+        deliver_healthily(&mut m);
+
+        let trend = m.surb_trend().expect("window holds evidence");
+        assert!(
+            trend >= SURB_TREND_FLOOR,
+            "steady delivery must not read as a downward trend, got {trend}"
+        );
+        assert_in_delta!(m.surb_delivery_rate().expect("has traffic"), 1.0, 0.001);
+    }
+
     /// A relay that stops returning SURBs must score below one that keeps delivering.
     ///
     /// Regression: `TransportIntermediates::average_probe_rate` correctly prefers the SURB window,
