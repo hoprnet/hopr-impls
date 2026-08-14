@@ -138,10 +138,15 @@ impl EdgeLinkObservable for TransportImmediates {
 
 /// Slice width and count for the SURB round-trip window.
 ///
-/// One minute of history in five-second slices: short enough that a relay which stops delivering
-/// is reflected within seconds, long enough to be comfortably above any plausible round-trip so
-/// that a reply is nearly always counted in a slice still inside the window.
-const SURB_BUCKET_WIDTH: std::time::Duration = std::time::Duration::from_secs(5);
+/// 24 s of history in two-second slices. Still far above any plausible round-trip, so a reply is
+/// nearly always counted in a slice that is still inside the window.
+///
+/// Narrowed from five-second slices rather than widened to more of them: the recent window has to
+/// register a collapse inside the recovery budget, and adding slices grows a `Copy` type that is
+/// read per edge during path search (30 slices measured 752 B against 320). Narrowing keeps the
+/// footprint identical and preserves the contrast ratio exactly -- the recent window was 1/6 of
+/// the baseline at 10 s of 60 s, and is 1/6 of it at 4 s of 24 s -- while reacting 2.5x sooner.
+const SURB_BUCKET_WIDTH: std::time::Duration = std::time::Duration::from_secs(2);
 const SURB_BUCKETS: usize = 12;
 
 /// Slices read as "lately" when looking for a sudden change: 10 s against the 60 s window.
@@ -470,6 +475,42 @@ mod tests {
         let inter_score = observation.intermediate_qos().unwrap().score();
         assert_gt!(inter_score, 0.0, "intermediate score should be positive");
         assert_in_delta!(observation.score(), inter_score, 0.001);
+    }
+
+    /// The window has to react inside the recovery budget, and still have a baseline to react
+    /// *against*.
+    ///
+    /// Both halves matter. Too wide a recent window and a dead relay is not discounted until the
+    /// budget is spent; too short a full window and there is nothing to compare it with, since the
+    /// signal is comparative -- the absolute SURB ratio measures the balancer surplus as much as
+    /// the path, and a fully healthy path reads 0.36.
+    #[test]
+    fn the_surb_window_geometry_should_react_inside_the_recovery_budget() {
+        let recent = SURB_BUCKET_WIDTH * SURB_RECENT_SLICES as u32;
+        let full = SURB_BUCKET_WIDTH * SURB_BUCKETS as u32;
+
+        // Detection costs ~5s on its own, against a 20s test boundary. A recent window longer than
+        // this leaves no budget to refill in once the discount finally lands.
+        assert!(
+            recent <= std::time::Duration::from_secs(5),
+            "the recent window ({recent:?}) must register a collapse inside the recovery budget"
+        );
+        assert!(
+            full >= recent * 4,
+            "the baseline ({full:?}) must be materially longer than the recent window ({recent:?}), \
+             otherwise the comparison has nothing to say"
+        );
+    }
+
+    /// The ring is `Copy` inside a `Copy` observation, read per edge during path search.
+    #[test]
+    fn the_surb_window_should_stay_cheap_to_copy() {
+        let size = std::mem::size_of::<WindowedRatio<SURB_BUCKETS>>();
+        assert!(
+            size <= 512,
+            "WindowedRatio<{SURB_BUCKETS}> is {size} B; widening the ring rather than narrowing the \
+             slice makes every edge read more expensive (30 buckets measured 752 B against 320)"
+        );
     }
 
     /// Slices short enough that a test can cross bucket boundaries without sleeping for seconds.
