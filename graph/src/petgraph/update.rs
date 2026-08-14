@@ -68,6 +68,14 @@ fn resolve_loopback_edges(
         return None;
     };
 
+    // The closing node must be the last one. `find_paths` zero-fills the unused tail, so anything
+    // else is a payload the local producer could not have emitted. Accepting it would let
+    // `[me, a, me, b, 0]` attribute a longer path's residual latency to `me → a`.
+    if path_id[end_pos + 1..].iter().any(|&slot| slot != 0) {
+        tracing::warn!("loopback path has non-padding slots after the closing node");
+        return None;
+    }
+
     // Walk consecutive node pairs up to and including the closing node. Every pair must resolve:
     // attribution targets `edges[len - 2]`, so a truncated chain would retarget the whole path's
     // residual latency onto a different edge. Dropping the sample beats corrupting one.
@@ -1526,6 +1534,45 @@ mod tests {
         assert!(
             obs.intermediate_qos().is_none(),
             "a slot differing from a real one only above bit 32 must not resolve to that node"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn loopback_slots_after_the_closing_node_must_be_padding() -> anyhow::Result<()> {
+        // `[me, a, me, b, 0]` closes at slot 2 but keeps going. Taking the first reoccurrence of
+        // `me` as the end would attribute a longer path's residual latency to `me → a`.
+        let me = pubkey_from(&SECRET_0);
+        let a = pubkey_from(&SECRET_1);
+        let b = pubkey_from(&SECRET_2);
+
+        let graph = ChannelGraph::new(me);
+        graph.add_node(a);
+        graph.add_node(b);
+        graph.add_edge(&me, &a)?;
+        graph.add_edge(&a, &me)?;
+        graph.add_edge(&me, &b)?;
+
+        let telemetry: Result<
+            EdgeTransportTelemetry<TestNeighbor, LoopbackTestPath>,
+            NetworkGraphError<LoopbackTestPath>,
+        > = Ok(EdgeTransportTelemetry::Loopback(LoopbackTestPath::from_slots(
+            [
+                crate::petgraph::path_id::encode(&me),
+                crate::petgraph::path_id::encode(&a),
+                crate::petgraph::path_id::encode(&me),
+                crate::petgraph::path_id::encode(&b),
+                0,
+            ],
+            now_unix_ms() - 100,
+        )));
+        graph.record_edge(hopr_api::graph::MeasurableEdge::Probe(telemetry));
+
+        let obs = graph.edge(&me, &a).context("edge me→a should exist")?;
+        assert!(
+            obs.intermediate_qos().is_none(),
+            "a payload that does not end at the closing node must be rejected, not truncated"
         );
 
         Ok(())

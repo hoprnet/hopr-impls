@@ -26,6 +26,12 @@ pub(crate) mod path_id {
     ///
     /// The leading 8 bytes of the public key, big-endian. Keys are uniformly distributed, so this is
     /// a sound truncation; `0` is mapped away from the reserved padding value.
+    ///
+    /// RFC-0010 §4.3.3 fixes the slot at 64 bits, so no encoding can rule out two keys sharing one.
+    /// [`resolve`] refuses a slot claimed by more than one node in the graph, which covers the case
+    /// while both are present; a collision where one node was removed mid-probe would misattribute a
+    /// single latency sample. At 2^-64 per pair that is accepted rather than carried in per-slot
+    /// tombstones, which would have to persist across restarts to be worth anything.
     pub(crate) fn encode(key: &OffchainPublicKey) -> u64 {
         let bytes = key.as_ref();
         let mut leading = [0u8; 8];
