@@ -125,20 +125,19 @@ fn resolve_loopback_edges(
 /// Resolves the edges a SURB round-trip traversed, across both of its legs.
 ///
 /// The two legs overlap at the replier: the forward path ends where the return path begins. That
-/// shared node is what makes the join unambiguous — [`PathId`] pads unused slots with zero, and
-/// zero is also a legitimate node index, so trimming by "first zero" would truncate any path
-/// running through node 0. Locating the replier in the forward leg, and self in the return leg,
-/// uses real information instead of guessing at padding.
+/// shared node is what makes the join unambiguous, so the trim uses real information rather than
+/// guessing at where the padding starts.
 ///
-/// Returns `None` when the legs do not join, do not come home, or name an edge the graph no longer
-/// has — a `PathId` is a snapshot of node indices, so one built against an older generation of the
-/// graph must be discarded rather than attributed to whatever now sits at those indices.
+/// Slots are key-derived (see [`path_id`](crate::petgraph::path_id)), so `0` is unambiguously
+/// padding and a slot is never handed to a different node. Returns `None` when the legs do not join,
+/// do not come home, or name a node or edge the graph no longer has — attributing a stale round-trip
+/// would credit edges it never used.
 fn resolve_round_trip_edges(
     inner: &InnerGraph,
-    me_idx: NodeIndex,
+    me: &hopr_api::OffchainPublicKey,
     paths: &hopr_api::graph::ForwardAndReturnPath,
 ) -> Option<Vec<EdgeIndex>> {
-    let me_val = me_idx.index() as u64;
+    let me_val = crate::petgraph::path_id::encode(me);
     let replier = paths.reply[0];
 
     if paths.forward[0] != me_val {
@@ -158,9 +157,16 @@ fn resolve_round_trip_edges(
 
     let mut edges = Vec::with_capacity(loop_nodes.len().saturating_sub(1));
     for pair in loop_nodes.windows(2) {
-        let from = NodeIndex::new(pair[0] as usize);
-        let to = NodeIndex::new(pair[1] as usize);
-        // A missing edge means the indices are stale; attributing the rest would credit edges the
+        // Resolved against the nodes actually present, so a slot belonging to a node that has since
+        // been removed cannot alias whichever node now occupies its old index.
+        let (Some(from), Some(to)) = (
+            crate::petgraph::path_id::resolve(inner, pair[0]),
+            crate::petgraph::path_id::resolve(inner, pair[1]),
+        ) else {
+            tracing::warn!("surb round-trip slot does not resolve to a known node, cannot attribute");
+            return None;
+        };
+        // A missing edge means the path is stale; attributing the rest would credit edges the
         // round-trip may never have used.
         let edge = inner.graph.find_edge(from, to)?;
         edges.push(edge);
@@ -203,11 +209,11 @@ impl hopr_api::graph::NetworkGraphUpdate for ChannelGraph {
                 }
 
                 let mut inner = self.inner.write();
-                let Some(&me_idx) = inner.indices.get_by_left(&self.me) else {
+                if !inner.indices.contains_left(&self.me) {
                     tracing::warn!("self not present in the graph; dropping surb round-trip");
                     return;
-                };
-                let Some(edges) = resolve_round_trip_edges(&inner, me_idx, &telemetry.paths) else {
+                }
+                let Some(edges) = resolve_round_trip_edges(&inner, &self.me, &telemetry.paths) else {
                     return;
                 };
 
@@ -477,14 +483,16 @@ mod tests {
         Ok((graph, exit, relay, me))
     }
 
-    fn index_of(graph: &ChannelGraph, key: &OffchainPublicKey) -> u64 {
-        graph
-            .inner
-            .read()
-            .indices
-            .get_by_left(key)
-            .expect("node should be in the graph")
-            .index() as u64
+    /// The `PathId` slot a node occupies.
+    ///
+    /// Key-derived, not the petgraph index: RFC-0010 §4.3.3 reserves `0` for padding and forbids it
+    /// as an identifier, which a zero-based index cannot honour.
+    fn slot_of(graph: &ChannelGraph, key: &OffchainPublicKey) -> u64 {
+        assert!(
+            graph.inner.read().indices.contains_left(key),
+            "node should be in the graph"
+        );
+        crate::petgraph::path_id::encode(key)
     }
 
     fn now_ms() -> u128 {
@@ -522,7 +530,7 @@ mod tests {
         // because it is isolating an unknown latency by subtraction; a round-trip has no unknown to
         // isolate, so crediting a single edge would throw away most of what was observed.
         let (graph, exit, relay, me) = round_trip_graph()?;
-        let (me_i, exit_i, relay_i) = (index_of(&graph, &me), index_of(&graph, &exit), index_of(&graph, &relay));
+        let (me_i, exit_i, relay_i) = (slot_of(&graph, &me), slot_of(&graph, &exit), slot_of(&graph, &relay));
 
         let paths = hopr_api::graph::ForwardAndReturnPath {
             forward: [me_i, exit_i, 0, 0, 0],
@@ -552,7 +560,7 @@ mod tests {
         // batch delayed past the window would be counted as current traffic and could move the
         // trend on its own. Same treatment as an implausible loopback RTT: discard, do not misfile.
         let (graph, exit, relay, me) = round_trip_graph()?;
-        let (me_i, exit_i, relay_i) = (index_of(&graph, &me), index_of(&graph, &exit), index_of(&graph, &relay));
+        let (me_i, exit_i, relay_i) = (slot_of(&graph, &me), slot_of(&graph, &exit), slot_of(&graph, &relay));
         let paths = hopr_api::graph::ForwardAndReturnPath {
             forward: [me_i, exit_i, 0, 0, 0],
             reply: [exit_i, relay_i, me_i, 0, 0],
@@ -583,7 +591,7 @@ mod tests {
         // those slots: `remove_node` retires the slot instead of freeing it, so the stale id finds
         // an isolated vertex, the loop fails to resolve, and nothing is credited.
         let (graph, exit, relay, me) = round_trip_graph()?;
-        let (me_i, exit_i, relay_i) = (index_of(&graph, &me), index_of(&graph, &exit), index_of(&graph, &relay));
+        let (me_i, exit_i, relay_i) = (slot_of(&graph, &me), slot_of(&graph, &exit), slot_of(&graph, &relay));
         let paths = hopr_api::graph::ForwardAndReturnPath {
             forward: [me_i, exit_i, 0, 0, 0],
             reply: [exit_i, relay_i, me_i, 0, 0],
@@ -614,7 +622,7 @@ mod tests {
     #[tokio::test]
     async fn surb_round_trip_should_fall_when_delivery_drops_off_its_peak() -> anyhow::Result<()> {
         let (graph, exit, relay, me) = round_trip_graph()?;
-        let (me_i, exit_i, relay_i) = (index_of(&graph, &me), index_of(&graph, &exit), index_of(&graph, &relay));
+        let (me_i, exit_i, relay_i) = (slot_of(&graph, &me), slot_of(&graph, &exit), slot_of(&graph, &relay));
         let paths = hopr_api::graph::ForwardAndReturnPath {
             forward: [me_i, exit_i, 0, 0, 0],
             reply: [exit_i, relay_i, me_i, 0, 0],
@@ -640,7 +648,7 @@ mod tests {
     async fn surb_round_trip_should_leave_latency_untouched() -> anyhow::Result<()> {
         // A round-trip carries no per-edge latency, so it must not invent one.
         let (graph, exit, relay, me) = round_trip_graph()?;
-        let (me_i, exit_i, relay_i) = (index_of(&graph, &me), index_of(&graph, &exit), index_of(&graph, &relay));
+        let (me_i, exit_i, relay_i) = (slot_of(&graph, &me), slot_of(&graph, &exit), slot_of(&graph, &relay));
 
         let paths = hopr_api::graph::ForwardAndReturnPath {
             forward: [me_i, exit_i, 0, 0, 0],
@@ -662,7 +670,7 @@ mod tests {
     #[tokio::test]
     async fn surb_round_trip_should_be_dropped_when_the_legs_do_not_join() -> anyhow::Result<()> {
         let (graph, exit, relay, me) = round_trip_graph()?;
-        let (me_i, exit_i, relay_i) = (index_of(&graph, &me), index_of(&graph, &exit), index_of(&graph, &relay));
+        let (me_i, exit_i, relay_i) = (slot_of(&graph, &me), slot_of(&graph, &exit), slot_of(&graph, &relay));
 
         // The reply leg starts at the relay, which never appears on the forward leg — so the two
         // legs describe no single round-trip and attributing either would be a guess.
@@ -685,7 +693,7 @@ mod tests {
         // A PathId is a snapshot of node indices; one built against an older generation of the
         // graph must be discarded rather than credited to whoever now occupies those slots.
         let (graph, exit, relay, me) = round_trip_graph()?;
-        let (me_i, exit_i) = (index_of(&graph, &me), index_of(&graph, &exit));
+        let (me_i, exit_i) = (slot_of(&graph, &me), slot_of(&graph, &exit));
         let _ = relay;
 
         let paths = hopr_api::graph::ForwardAndReturnPath {
@@ -1416,11 +1424,12 @@ mod tests {
 
     #[test]
     fn a_removed_nodes_slot_must_become_unclaimable() {
-        // The property that makes reuse impossible, asserted directly on the resolver.
+        // The property that makes reuse impossible, asserted directly on the resolver: once a node is
+        // gone nothing claims its slot, and resolution fails closed.
         //
-        // `remove_node` moves the last node into the vacated index, so a position-derived slot is
-        // handed straight to another node. A key-derived slot is not: once the node is gone nothing
-        // claims its slot, and resolution fails closed.
+        // `remove_node` retains the petgraph node, so indices are not reissued and reuse is
+        // unreachable through that path. This asserts the resolver's own guarantee rather than that
+        // mechanism, so the two remain independent.
         let me = pubkey_from(&SECRET_0);
         let a = pubkey_from(&SECRET_1);
         let b = pubkey_from(&SECRET_2);
@@ -1436,27 +1445,25 @@ mod tests {
             let inner = graph.inner.read();
             inner.indices.get_by_left(key).copied()
         };
-        let c_index_before = index_of(&c).expect("c is in the graph");
+        let b_index = index_of(&b).expect("b is in the graph");
 
         graph.remove_node(&b);
-
-        // petgraph moved `c` into the index `b` vacated — the precondition for reuse.
-        assert_ne!(
-            index_of(&c),
-            Some(c_index_before),
-            "this test is only meaningful if removal actually shifts another node's index"
-        );
 
         let inner = graph.inner.read();
         assert_eq!(
             crate::petgraph::path_id::resolve(&inner, b_slot),
             None,
-            "the removed node's slot must resolve to nothing, not to whichever node took its index"
+            "the removed node's slot must resolve to nothing"
+        );
+        // The index b held is still a live petgraph index; the point is that no slot maps onto it.
+        assert!(
+            inner.indices.get_by_right(&b_index).is_none(),
+            "the vacated index must be claimed by no key"
         );
         assert_eq!(
             crate::petgraph::path_id::resolve(&inner, crate::petgraph::path_id::encode(&c)),
             index_of(&c),
-            "a surviving node must still resolve, at its new index"
+            "a surviving node must still resolve"
         );
     }
 

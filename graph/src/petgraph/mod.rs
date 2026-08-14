@@ -11,11 +11,13 @@ pub use graph::ChannelGraph;
 /// padding, and forbids it as an identifier. The slot is therefore derived from the node's public
 /// key rather than from its position in the graph.
 ///
-/// A `petgraph` index would satisfy neither requirement. Indices are zero-based, and `remove_node`
-/// moves the last node into the vacated slot — so an index is *reused*, and a loopback probe still
-/// in flight when a node is removed would resolve to a different node on return and attribute its
-/// latency to the wrong edge. A key-derived slot is stable for the lifetime of the key and is never
-/// handed to a different node.
+/// A `petgraph` index would satisfy neither requirement: indices are zero-based, so node 0 is
+/// indistinguishable from padding.
+///
+/// It also decouples the slot from the graph's internal bookkeeping. `remove_node` retains the
+/// petgraph node so an index is never reissued, which the node set being append-only makes cheap.
+/// A key-derived slot needs no such coupling: it is stable for the lifetime of the key and is never
+/// handed to a different node, whichever way removal is implemented.
 pub(crate) mod path_id {
     use hopr_api::OffchainPublicKey;
     use petgraph::graph::NodeIndex;
