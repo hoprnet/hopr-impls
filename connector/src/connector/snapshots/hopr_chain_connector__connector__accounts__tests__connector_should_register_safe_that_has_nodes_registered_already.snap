@@ -1,5 +1,5 @@
 ---
-source: impls/connector/src/connector/accounts.rs
+source: connector/src/connector/accounts.rs
 expression: "*connector.client.snapshot()"
 ---
 accounts: {}
@@ -37,8 +37,8 @@ chain_info:
   key_binding_fee: 0.01 wxHOPR
   safe_registry_dst: "0000000000000000000000000000000000000000000000000000000000000000"
   ticket_price: 1 wxHOPR
-  network: rotsee
-  contract_addresses: "{\"announcements\":\"0x078B2D5C9b13e256699902704D1f9Beb79Fc51A2\",\"channels\":\"0xD8C91008c68cd87E7C52Ea1a2C6f6dC6A5236008\",\"module_implementation\":\"0x300Cb87f686c4FF5d975951c225969af4433ADf5\",\"node_safe_migration\":\"0x04e079e7FC8E445b58d048200847206c692Deb48\",\"node_safe_registry\":\"0x1267F2Ad0a70C975Cb4e2C810C4F2b42a455Cc09\",\"node_stake_factory\":\"0x607b6559FE4c2bB5d97de65F0CEC5DB444824634\",\"ticket_price_oracle\":\"0x9cd65f0b11B3028EadA50dE57E46C12848608fAB\",\"token\":\"0xD4fdec44DB9D44B8f2b6d529620f9C0C7066A2c1\",\"winning_probability_oracle\":\"0x9344093c5ac613BDBAC939E33fF760C9e6dF9F1f\",\"xhopr_token\":\"0xD057604A14982FE8D88c5fC25Aac3267eA142a08\"}"
+  network: piz-palu-staging
+  contract_addresses: "{\"announcements\":\"0x41Af691c89AC93D86d0f252408379813C783F70C\",\"channels\":\"0x3480Caf9Bc8874F4c7E3Fc4A62EaB681b643B137\",\"module_implementation\":\"0x654283E373D5B22206B067Ae8eaB5F29ea0f59D9\",\"node_safe_migration\":\"0x6bA165DEAC728d23699C99a26B374b91e5aBB9fF\",\"node_safe_registry\":\"0x1d016fc4cFb19669B69716aAcc5325CD880bb13c\",\"node_stake_factory\":\"0x5b16003552BAFC1be2aaA21d961Fb90B1DA23f17\",\"ticket_price_oracle\":\"0x4a2108aE32A3348f46489f50a0053F256C599B01\",\"token\":\"0xD4fdec44DB9D44B8f2b6d529620f9C0C7066A2c1\",\"winning_probability_oracle\":\"0x359378D7c63E4f99c6574D87F992911b4df7BCDe\",\"xhopr_token\":\"0xD057604A14982FE8D88c5fC25Aac3267eA142a08\"}"
   expected_block_time: "5"
   finality: "3"
 version: "1"

@@ -148,6 +148,25 @@ impl hopr_api::graph::NetworkGraphUpdate for ChannelGraph {
 
         match update {
             MeasurableEdge::Surb(telemetry) => {
+                // The window buckets this report at `Instant::now()`, so a report that was produced
+                // several window widths ago would be counted as current traffic and could set or
+                // clear the trend on its own. `timestamp` is the interval's reporting time (unix
+                // epoch millis); a report from the future (backward clock drift) or from further
+                // back than the window can still hold is discarded rather than misfiled, the same
+                // way the loopback branch below discards an implausible RTT.
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis();
+                let Some(age_ms) = now_ms.checked_sub(telemetry.timestamp) else {
+                    tracing::debug!("surb round-trip timestamp in the future, dropping the report");
+                    return;
+                };
+                if age_ms > crate::weight::surb_window().as_millis() {
+                    tracing::debug!(age_ms, "surb round-trip report older than the window, dropping it");
+                    return;
+                }
+
                 let mut inner = self.inner.write();
                 let Some(&me_idx) = inner.indices.get_by_left(&self.me) else {
                     tracing::warn!("self not present in the graph; dropping surb round-trip");
@@ -433,10 +452,30 @@ mod tests {
             .index() as u64
     }
 
-    fn surb(paths: hopr_api::graph::ForwardAndReturnPath, expected: u64, observed: u64) -> hopr_api::graph::SurbTelemetry {
+    fn now_ms() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    }
+
+    fn surb(
+        paths: hopr_api::graph::ForwardAndReturnPath,
+        expected: u64,
+        observed: u64,
+    ) -> hopr_api::graph::SurbTelemetry {
+        surb_stamped(paths, expected, observed, now_ms())
+    }
+
+    fn surb_stamped(
+        paths: hopr_api::graph::ForwardAndReturnPath,
+        expected: u64,
+        observed: u64,
+        timestamp: u128,
+    ) -> hopr_api::graph::SurbTelemetry {
         hopr_api::graph::SurbTelemetry {
             paths,
-            timestamp: 0,
+            timestamp,
             expected,
             observed,
         }
@@ -468,6 +507,69 @@ mod tests {
             // was. The absolute ratio is not a delivery rate -- it also measures how far the
             // balancer over-mints -- so only movement away from the peak is meaningful.
             assert_in_delta!(rate, 1.0, 1e-9);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_round_trip_report_from_outside_the_window_should_be_dropped() -> anyhow::Result<()> {
+        // The window buckets a report at `Instant::now()` regardless of when it was produced, so a
+        // batch delayed past the window would be counted as current traffic and could move the
+        // trend on its own. Same treatment as an implausible loopback RTT: discard, do not misfile.
+        let (graph, exit, relay, me) = round_trip_graph()?;
+        let (me_i, exit_i, relay_i) = (index_of(&graph, &me), index_of(&graph, &exit), index_of(&graph, &relay));
+        let paths = hopr_api::graph::ForwardAndReturnPath {
+            forward: [me_i, exit_i, 0, 0, 0],
+            reply: [exit_i, relay_i, me_i, 0, 0],
+        };
+
+        let window_ms = crate::weight::surb_window().as_millis();
+        for (label, stamp) in [
+            ("older than the window", now_ms() - window_ms - 1_000),
+            ("from the future", now_ms() + 60_000),
+        ] {
+            graph.record_edge::<TestNeighbor, TestPath>(hopr_api::graph::MeasurableEdge::Surb(surb_stamped(
+                paths, 4, 3, stamp,
+            )));
+
+            let obs = graph.edge(&me, &exit).context("edge should exist")?;
+            assert!(
+                obs.intermediate_qos().and_then(|q| q.surb_delivery_rate()).is_none(),
+                "a report {label} must not be counted as current traffic"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_round_trip_reported_after_its_relay_was_removed_should_credit_nothing() -> anyhow::Result<()> {
+        // Slots are resolved when a SURB is minted and reported an interval later, so a removal can
+        // land in between. What must not happen is the report being applied to whatever now sits at
+        // those slots: `remove_node` retires the slot instead of freeing it, so the stale id finds
+        // an isolated vertex, the loop fails to resolve, and nothing is credited.
+        let (graph, exit, relay, me) = round_trip_graph()?;
+        let (me_i, exit_i, relay_i) = (index_of(&graph, &me), index_of(&graph, &exit), index_of(&graph, &relay));
+        let paths = hopr_api::graph::ForwardAndReturnPath {
+            forward: [me_i, exit_i, 0, 0, 0],
+            reply: [exit_i, relay_i, me_i, 0, 0],
+        };
+
+        graph.remove_node(&relay);
+        // A newcomer must not inherit the retired slot, which is what would make the stale id
+        // resolve to a live node.
+        let newcomer = pubkey_from(&SECRET_3);
+        graph.add_node(newcomer);
+        graph.add_edge(&exit, &newcomer)?;
+        graph.add_edge(&newcomer, &me)?;
+
+        graph.record_edge::<TestNeighbor, TestPath>(hopr_api::graph::MeasurableEdge::Surb(surb(paths, 4, 3)));
+
+        for (src, dst) in [(me, exit), (exit, newcomer), (newcomer, me)] {
+            let obs = graph.edge(&src, &dst).context("edge should exist")?;
+            assert!(
+                obs.intermediate_qos().and_then(|q| q.surb_delivery_rate()).is_none(),
+                "a surviving edge must not be credited with a round-trip it never carried: {src} -> {dst}"
+            );
         }
         Ok(())
     }

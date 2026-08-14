@@ -159,7 +159,7 @@ mod tests {
         let blokli_client = BlokliTestStateBuilder::default()
             .with_balances([(me, XDaiBalance::new_base(10))])
             .with_deployed_safes([safe.clone()])
-            .with_hopr_network_chain_info("rotsee")
+            .with_hopr_network_chain_info("piz-palu-staging")
             .build_dynamic_client(MODULE_ADDR.into());
 
         let connector = create_connector(blokli_client)?;
@@ -184,7 +184,7 @@ mod tests {
         let me = ChainKeypair::from_secret(&PRIVATE_KEY_1)?.public().to_address();
         let safe_addr = [1u8; Address::SIZE].into();
         let blokli_client = BlokliTestStateBuilder::default()
-            .with_hopr_network_chain_info("rotsee")
+            .with_hopr_network_chain_info("piz-palu-staging")
             .build_dynamic_client(MODULE_ADDR.into());
 
         let connector = create_connector(blokli_client)?;

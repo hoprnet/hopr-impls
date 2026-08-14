@@ -3,14 +3,14 @@ use std::sync::Arc;
 use bimap::BiHashMap;
 use hopr_api::OffchainPublicKey;
 use parking_lot::RwLock;
-use petgraph::graph::{DiGraph, NodeIndex};
+use petgraph::{graph::NodeIndex, stable_graph::StableDiGraph};
 
 use crate::{Observations, errors::ChannelGraphError};
 
 /// Internal mutable state of a [`ChannelGraph`], protected by a lock.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct InnerGraph {
-    pub(crate) graph: DiGraph<OffchainPublicKey, Observations>,
+    pub(crate) graph: StableDiGraph<OffchainPublicKey, Observations>,
     pub(crate) indices: BiHashMap<OffchainPublicKey, NodeIndex>,
 }
 
@@ -60,7 +60,7 @@ impl ChannelGraph {
         min_ack_rate: f64,
         max_plausible_loopback_rtt: std::time::Duration,
     ) -> Self {
-        let mut graph = DiGraph::new();
+        let mut graph = StableDiGraph::new();
         let mut indices = BiHashMap::new();
 
         let idx = graph.add_node(me);
@@ -86,7 +86,9 @@ impl hopr_api::graph::NetworkGraphView for ChannelGraph {
     type Observed = Observations;
 
     fn node_count(&self) -> usize {
-        self.inner.read().graph.node_count()
+        // The key mapping, not the vertex count: a removed node stays behind as an isolated vertex
+        // so its slot is never reissued (see `remove_node`), and those must not be counted.
+        self.inner.read().indices.len()
     }
 
     fn contains_node(&self, key: &OffchainPublicKey) -> bool {
@@ -142,16 +144,37 @@ impl hopr_api::graph::NetworkGraphWrite for ChannelGraph {
         }
     }
 
+    /// Removes a node, retiring its slot rather than freeing it.
+    ///
+    /// A [`StableDiGraph`] keeps every other node's index where it is, but it also keeps a free
+    /// list, so a genuinely removed node's index is handed to the next node added. Both halves
+    /// matter here: a [`PathId`](hopr_api::types::internal::routing::PathId) names nodes by slot,
+    /// and SURB telemetry resolves slots when a round-trip is minted but reports them an interval
+    /// later. A slot that came to mean a different node in between would credit edges the
+    /// round-trip never traversed, and would look entirely ordinary while doing it -- the legs
+    /// would join and the edges would exist.
+    ///
+    /// So the node is emptied instead of deleted: every incident edge goes, and it is dropped from
+    /// the key mapping, which is what every lookup and every traversal reads. What is left behind
+    /// is an isolated, unreachable vertex whose only job is to hold its index out of circulation.
+    /// A stale id that lands on it finds no edges and the report is discarded, which is the correct
+    /// outcome for evidence about a node that is gone.
     fn remove_node(&self, key: &OffchainPublicKey) {
         let mut inner = self.inner.write();
         if let Some((_, idx)) = inner.indices.remove_by_left(key) {
-            inner.graph.remove_node(idx);
+            let incident: Vec<_> = {
+                use petgraph::visit::EdgeRef;
 
-            // petgraph swaps the last node into the removed slot,
-            // so we need to update the index mapping for the swapped node.
-            if let Some(swapped_key) = inner.graph.node_weight(idx) {
-                let swapped_key = *swapped_key;
-                inner.indices.insert(swapped_key, idx);
+                inner
+                    .graph
+                    .edges_directed(idx, petgraph::Direction::Outgoing)
+                    .chain(inner.graph.edges_directed(idx, petgraph::Direction::Incoming))
+                    .map(|e| e.id())
+                    .collect()
+            };
+
+            for edge in incident {
+                inner.graph.remove_edge(edge);
             }
         }
     }
@@ -282,7 +305,7 @@ mod tests {
     use hex_literal::hex;
     use hopr_api::{
         graph::{
-            EdgeLinkObservable, NetworkGraphConnectivity, NetworkGraphTraverse, NetworkGraphView, NetworkGraphWrite,
+            EdgeLinkObservable, NetworkGraphConnectivity, NetworkGraphView, NetworkGraphWrite,
             traits::{EdgeObservableRead, EdgeObservableWrite, EdgeWeightType},
         },
         types::crypto::prelude::{Keypair, OffchainKeypair},
@@ -339,6 +362,41 @@ mod tests {
         assert_eq!(Some(0), graph.path_slot(&me));
         assert_eq!(Some(1), graph.path_slot(&first));
         assert_eq!(Some(2), graph.path_slot(&second));
+        Ok(())
+    }
+
+    #[test]
+    fn a_removal_should_neither_move_another_node_nor_hand_its_slot_on() -> anyhow::Result<()> {
+        // The property SURB attribution rests on. Slots are resolved when a round-trip is minted
+        // and reported an interval later, so a slot that came to mean a different node in between
+        // would credit edges the round-trip never traversed -- and would look entirely ordinary
+        // while doing it. A vacated slot must therefore stay vacant.
+        let me = pubkey_from(&SECRET_0);
+        let graph = ChannelGraph::new(me);
+        let middle = pubkey_from(&SECRET_1);
+        let last = pubkey_from(&SECRET_2);
+        graph.add_node(middle);
+        graph.add_node(last);
+        assert_eq!(Some(2), graph.path_slot(&last));
+
+        graph.remove_node(&middle);
+
+        assert_eq!(None, graph.path_slot(&middle), "the removed node resolves to nothing");
+        assert_eq!(Some(0), graph.path_slot(&me), "self must not move");
+        assert_eq!(
+            Some(2),
+            graph.path_slot(&last),
+            "the last node must not be swapped into the freed slot"
+        );
+
+        // Nor may a newcomer inherit it, which is what would make a stale id resolve to a live node.
+        let newcomer = pubkey_from(&SECRET_3);
+        graph.add_node(newcomer);
+        assert_ne!(
+            Some(1),
+            graph.path_slot(&newcomer),
+            "a freed slot must not be handed to a different node"
+        );
         Ok(())
     }
 

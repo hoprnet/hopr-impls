@@ -363,7 +363,7 @@ mod tests {
                 ChainKeypair::from_secret(&PRIVATE_KEY_1)?.public().to_address(),
                 XDaiBalance::new_base(1),
             )])
-            .with_hopr_network_chain_info("rotsee")
+            .with_hopr_network_chain_info("piz-palu-staging")
             .build_dynamic_client(MODULE_ADDR.into());
 
         let mut connector = create_connector(blokli_client)?;
@@ -395,7 +395,7 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn connector_should_announce_new_account_without_multiaddresses() -> anyhow::Result<()> {
         let blokli_client = BlokliTestStateBuilder::default()
-            .with_hopr_network_chain_info("rotsee")
+            .with_hopr_network_chain_info("piz-palu-staging")
             .with_balances([(
                 ChainKeypair::from_secret(&PRIVATE_KEY_1)?.public().to_address(),
                 XDaiBalance::new_base(1),
@@ -440,7 +440,7 @@ mod tests {
 
         let blokli_client = BlokliTestStateBuilder::default()
             .with_accounts([(account.clone(), HoprBalance::new_base(100), XDaiBalance::new_base(1))])
-            .with_hopr_network_chain_info("rotsee")
+            .with_hopr_network_chain_info("piz-palu-staging")
             .build_dynamic_client(MODULE_ADDR.into());
 
         let mut connector = create_connector(blokli_client)?;
@@ -477,7 +477,7 @@ mod tests {
 
         let blokli_client = BlokliTestStateBuilder::default()
             .with_accounts([(account.clone(), HoprBalance::new_base(100), XDaiBalance::new_base(1))])
-            .with_hopr_network_chain_info("rotsee")
+            .with_hopr_network_chain_info("piz-palu-staging")
             .build_dynamic_client(MODULE_ADDR.into());
 
         let mut connector = create_connector(blokli_client)?;
@@ -519,7 +519,7 @@ mod tests {
                 ChainKeypair::from_secret(&PRIVATE_KEY_1)?.public().to_address(),
                 HoprBalance::new_base(1000),
             )])
-            .with_hopr_network_chain_info("rotsee")
+            .with_hopr_network_chain_info("piz-palu-staging")
             .build_dynamic_client(MODULE_ADDR.into());
 
         let mut connector = create_connector(blokli_client)?;
@@ -560,7 +560,7 @@ mod tests {
                 ChainKeypair::from_secret(&PRIVATE_KEY_2)?.public().to_address(),
                 HoprBalance::new_base(1000),
             )])
-            .with_hopr_network_chain_info("rotsee")
+            .with_hopr_network_chain_info("piz-palu-staging")
             .build_dynamic_client(MODULE_ADDR.into());
 
         let mut connector = create_connector(blokli_client)?;
@@ -597,7 +597,7 @@ mod tests {
                 registered_nodes: vec![],
                 deployer: deployer_addr,
             }])
-            .with_hopr_network_chain_info("rotsee")
+            .with_hopr_network_chain_info("piz-palu-staging")
             .build_dynamic_client(MODULE_ADDR.into());
 
         let mut connector = create_connector(blokli_client)?;
@@ -628,7 +628,7 @@ mod tests {
                 registered_nodes: vec![other_registered_node],
                 deployer: deployer_addr,
             }])
-            .with_hopr_network_chain_info("rotsee")
+            .with_hopr_network_chain_info("piz-palu-staging")
             .build_dynamic_client(MODULE_ADDR.into());
 
         let mut connector = create_connector(blokli_client)?;
@@ -650,7 +650,7 @@ mod tests {
                 ChainKeypair::from_secret(&PRIVATE_KEY_1)?.public().to_address(),
                 XDaiBalance::new_base(10),
             )])
-            .with_hopr_network_chain_info("rotsee")
+            .with_hopr_network_chain_info("piz-palu-staging")
             .build_dynamic_client(MODULE_ADDR.into());
 
         let mut connector = create_connector(blokli_client)?;
@@ -687,7 +687,7 @@ mod tests {
                     deployer: deployer_addr,
                 },
             ])
-            .with_hopr_network_chain_info("rotsee")
+            .with_hopr_network_chain_info("piz-palu-staging")
             .build_dynamic_client(MODULE_ADDR.into());
 
         let mut connector = create_connector(blokli_client)?;

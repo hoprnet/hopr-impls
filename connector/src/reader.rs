@@ -218,7 +218,7 @@ mod tests {
                 registered_nodes: vec![],
                 deployer: [2u8; Address::SIZE].into(),
             }])
-            .with_hopr_network_chain_info("rotsee")
+            .with_hopr_network_chain_info("piz-palu-staging")
             .build_static_client();
 
         let reader = HoprBlockchainReader::new(blokli_client);
