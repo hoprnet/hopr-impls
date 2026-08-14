@@ -15,39 +15,40 @@ pub struct TransportLinkMeasurement {
     /// Recorded probe outcomes, successful or not. Neither EMA can express "no samples yet":
     /// an all-failed stream holds exactly `0.0`, the same as its initial value.
     samples: u64,
+    /// Successful outcomes only. A failed probe records no latency, so `samples` cannot stand in.
+    latency_samples: u64,
 }
 
 impl EdgeLinkObservable for TransportLinkMeasurement {
     fn record(&mut self, measurement: EdgeTransportMeasurement) {
         self.samples = self.samples.saturating_add(1);
         if let Ok(latency) = measurement {
-            self.latency_average.update(latency.as_millis() as f64);
+            // Sub-millisecond resolution: the intermediate latency is a `saturating_sub` residual
+            // that legitimately lands at or near zero, and truncating it to whole milliseconds
+            // would store `0` — read back as "never measured" and scored as such.
+            self.latency_average.update(latency.as_secs_f64() * 1000.0);
+            self.latency_samples = self.latency_samples.saturating_add(1);
             self.probe_success_rate.update(1.0);
         } else {
             self.probe_success_rate.update(0.0);
         }
     }
 
+    /// `None` until a probe has succeeded. Presence, not magnitude: a measured zero is a real
+    /// latency and must not read as an absent one.
     fn average_latency(&self) -> Option<std::time::Duration> {
-        if self.latency_average.get() <= 0.0 {
-            None
-        } else {
-            Some(std::time::Duration::from_millis(self.latency_average.get() as u64))
-        }
+        (self.latency_samples > 0)
+            .then(|| std::time::Duration::from_secs_f64(self.latency_average.get().max(0.0) / 1000.0))
     }
 
-    fn average_probe_rate(&self) -> f64 {
-        self.probe_success_rate.get()
-    }
-
-    fn has_observations(&self) -> bool {
-        self.samples > 0
+    fn average_probe_rate(&self) -> Option<f64> {
+        (self.samples > 0).then(|| self.probe_success_rate.get())
     }
 
     /// `None` until a probe has been recorded; `Some(0.0)` once measured and found unusable.
     fn score(&self) -> Option<f64> {
-        self.has_observations()
-            .then(|| self.average_probe_rate() * latency_score(self.average_latency()))
+        self.average_probe_rate()
+            .map(|rate| rate * latency_score(self.average_latency()))
     }
 }
 
@@ -88,7 +89,7 @@ impl EdgeObservableWrite for Observations {
             EdgeWeightType::Intermediate(result) => self.intermediate_probe.get_or_insert_default().record(result),
             EdgeWeightType::Balance(balance) => self.intermediate_probe.get_or_insert_default().balance = balance,
             EdgeWeightType::Connected(is_connected) => {
-                self.immediate_probe.get_or_insert_default().is_connected = is_connected
+                self.immediate_probe.get_or_insert_default().is_connected = Some(is_connected)
             }
             EdgeWeightType::SurbRoundTrips { expected, observed } => {
                 self.intermediate_probe
@@ -122,7 +123,9 @@ const MIN_ACK_SAMPLE_VOLUME: f64 = 1.0;
 #[derive(Debug, Copy, Clone, Default, PartialEq)]
 pub struct TransportImmediates {
     link: TransportLinkMeasurement,
-    is_connected: bool,
+    /// `None` until connectivity is actually observed: an ack-conformance report creates this
+    /// stream without saying anything about reachability.
+    is_connected: Option<bool>,
     /// Exponentially decayed count of packets sent to this peer.
     messages_sent: f64,
     /// Exponentially decayed count of acknowledgements received from this peer.
@@ -130,7 +133,7 @@ pub struct TransportImmediates {
 }
 
 impl EdgeNetworkObservableRead for TransportImmediates {
-    fn is_connected(&self) -> bool {
+    fn is_connected(&self) -> Option<bool> {
         self.is_connected
     }
 }
@@ -150,12 +153,8 @@ impl EdgeLinkObservable for TransportImmediates {
         self.link.average_latency()
     }
 
-    fn average_probe_rate(&self) -> f64 {
+    fn average_probe_rate(&self) -> Option<f64> {
         self.link.average_probe_rate()
-    }
-
-    fn has_observations(&self) -> bool {
-        self.link.has_observations()
     }
 
     fn score(&self) -> Option<f64> {
@@ -201,7 +200,7 @@ pub struct TransportIntermediates {
     balance: Option<hopr_api::graph::traits::Balance>,
     /// Delivery observed from real SURB traffic rather than from probes.
     surb: WindowedRatio<SURB_BUCKETS>,
-    /// Highest delivery ratio this edge has reached, used to read the window relatively.
+    /// Highest delivery ratio this edge has reached, and when it was last raised.
     ///
     /// The absolute ratio is not a delivery rate: `expected` counts SURBs *minted*, and the
     /// balancer mints far more than the counterparty spends, so a path carrying every reply
@@ -210,17 +209,16 @@ pub struct TransportIntermediates {
     /// candidate and cancels the moment the ratio is read against a baseline instead of an
     /// absolute scale.
     ///
-    /// Decays rather than latching: see [`Self::peak_at`].
-    surb_peak: f64,
-    /// When [`Self::surb_peak`] was last raised, which is what the decay is measured from.
-    surb_peak_at: std::time::Instant,
-    /// Whether this edge has ever been probed, i.e. whether the probe rate carries any evidence.
-    ///
-    /// The probe rate is an exponential average that starts at zero and exposes no sample count, so
-    /// "never probed" and "every probe failed" are the same number. Without this flag the two
-    /// cannot be told apart, and a never-probed edge carrying healthy SURB traffic would be scored
-    /// as if every probe had failed.
-    probed: bool,
+    /// One `Option` rather than a value plus a timestamp, because the timestamp means nothing
+    /// without a peak to date it. Decays rather than latching: see [`Self::peak_at`].
+    surb_peak: Option<SurbPeak>,
+}
+
+/// A delivery-ratio peak and the instant it was set, which the decay is measured from.
+#[derive(Debug, Copy, Clone, PartialEq)]
+struct SurbPeak {
+    value: f64,
+    at: std::time::Instant,
 }
 
 impl Default for TransportIntermediates {
@@ -231,9 +229,7 @@ impl Default for TransportIntermediates {
             link: TransportLinkMeasurement::default(),
             balance: None,
             surb: WindowedRatio::new(SURB_BUCKET_WIDTH, now),
-            surb_peak: 0.0,
-            surb_peak_at: now,
-            probed: false,
+            surb_peak: None,
         }
     }
 }
@@ -250,8 +246,10 @@ impl TransportIntermediates {
         self.surb.record_observed(observed, now);
 
         if let Some(v) = self.surb.value(now) {
-            self.surb_peak = self.peak_at(now).max(v);
-            self.surb_peak_at = now;
+            self.surb_peak = Some(SurbPeak {
+                value: self.peak_at(now).unwrap_or(0.0).max(v),
+                at: now,
+            });
         }
     }
 
@@ -268,11 +266,11 @@ impl TransportIntermediates {
     /// The half-life is the window itself, so the baseline forgets a lucky interval at the same
     /// rate the window forgets the traffic that produced it. A steadily delivering edge re-raises
     /// the peak to its own value on every report, so decay costs it nothing.
-    fn peak_at(&self, now: std::time::Instant) -> f64 {
-        let half_lives =
-            now.saturating_duration_since(self.surb_peak_at).as_secs_f64() / self.surb.window().as_secs_f64();
+    fn peak_at(&self, now: std::time::Instant) -> Option<f64> {
+        let peak = self.surb_peak?;
+        let half_lives = now.saturating_duration_since(peak.at).as_secs_f64() / self.surb.window().as_secs_f64();
 
-        self.surb_peak * 0.5f64.powf(half_lives)
+        Some(peak.value * 0.5f64.powf(half_lives))
     }
 
     /// How the most recent slices compare with the full window, or `None` without evidence in both.
@@ -305,7 +303,7 @@ impl TransportIntermediates {
     /// [`Self::surb_delivery_rate`] against a caller-supplied clock.
     pub(crate) fn surb_delivery_rate_at(&self, now: std::time::Instant) -> Option<f64> {
         let value = self.surb.value(now)?;
-        let peak = self.peak_at(now);
+        let peak = self.peak_at(now)?;
         let against_peak = (peak > 0.0).then(|| (value / peak).clamp(0.0, 1.0))?;
 
         // A relay that has just stopped delivering still reads well against its peak for most of
@@ -327,7 +325,6 @@ impl EdgeProtocolObservable for TransportIntermediates {
 
 impl EdgeLinkObservable for TransportIntermediates {
     fn record(&mut self, measurement: EdgeTransportMeasurement) {
-        self.probed = true;
         self.link.record(measurement);
     }
 
@@ -346,26 +343,19 @@ impl EdgeLinkObservable for TransportIntermediates {
     /// Evidence, not merely a number: an unprobed edge's probe rate reads 0.0 exactly as a wholly
     /// failing one does (see [`Self::probed`]), so combining them unconditionally would score every
     /// SURB-only edge as dead.
-    fn average_probe_rate(&self) -> f64 {
-        match (self.surb_delivery_rate(), self.probed) {
-            (Some(surb), true) => surb.min(self.link.average_probe_rate()),
-            (Some(surb), false) => surb,
-            (None, _) => self.link.average_probe_rate(),
+    fn average_probe_rate(&self) -> Option<f64> {
+        match (self.surb_delivery_rate(), self.link.average_probe_rate()) {
+            (Some(surb), Some(probe)) => Some(surb.min(probe)),
+            (surb, probe) => surb.or(probe),
         }
-    }
-
-    /// Evidence from *either* signal counts. A SURB-only edge is measured, not unobserved, so
-    /// reporting it as unobserved would hand it the exploration penalty instead of its real score.
-    fn has_observations(&self) -> bool {
-        self.link.has_observations() || self.surb_delivery_rate().is_some()
     }
 
     fn score(&self) -> Option<f64> {
         // `average_probe_rate` already takes the worse of the probe and SURB signals over whichever
-        // carry evidence; latency scoring is left to the link measurement untouched, since a
-        // round-trip carries no per-edge latency to contribute.
-        self.has_observations()
-            .then(|| self.average_probe_rate() * latency_score(self.average_latency()))
+        // carry evidence, and reports `None` when neither does; latency scoring is left to the link
+        // measurement untouched, since a round-trip carries no per-edge latency to contribute.
+        self.average_probe_rate()
+            .map(|rate| rate * latency_score(self.average_latency()))
     }
 }
 
@@ -770,9 +760,7 @@ mod tests {
             link: TransportLinkMeasurement::default(),
             balance: None,
             surb: WindowedRatio::new(TEST_SLICE, epoch),
-            surb_peak: 0.0,
-            surb_peak_at: epoch,
-            probed: false,
+            surb_peak: None,
         }
     }
 
@@ -847,7 +835,9 @@ mod tests {
         // The comparison above is not enough on its own: the full-window value already differs
         // between the two, so it passes with the trend removed entirely. What must be shown is that
         // the *discount* moved the number -- i.e. the rate sits below the plain peak-relative value.
-        let undiscounted = (collapsed.surb.value(now).expect("has traffic") / collapsed.peak_at(now)).clamp(0.0, 1.0);
+        let undiscounted = (collapsed.surb.value(now).expect("has traffic")
+            / collapsed.peak_at(now).expect("has a peak"))
+        .clamp(0.0, 1.0);
         assert!(
             collapsed_rate < undiscounted,
             "the trend must discount below the peak-relative value, otherwise it is inert: rate={collapsed_rate} \
@@ -927,7 +917,10 @@ mod tests {
 
         let mut surbs_only = fast_slices(epoch);
         deliver_healthily(&mut surbs_only, epoch);
-        assert_in_delta!(surbs_only.average_probe_rate(), 1.0, 0.001);
+        let surbs_only_rate = surbs_only
+            .average_probe_rate()
+            .expect("SURB traffic alone is evidence, so the rate must be present");
+        assert_in_delta!(surbs_only_rate, 1.0, 0.001);
 
         // Same healthy SURB window, but every probe of this hop failed. The probe rate is evidence
         // too, and taking the SURB rate alone would discard it.
@@ -937,12 +930,11 @@ mod tests {
             probes_failing.record(Err(()));
         }
 
+        let failing_rate = probes_failing.average_probe_rate().expect("probed and delivering");
         assert!(
-            probes_failing.average_probe_rate() < surbs_only.average_probe_rate(),
-            "a hop whose probes all fail must not score as well as one whose probes were never run: failing={} \
-             unprobed={}",
-            probes_failing.average_probe_rate(),
-            surbs_only.average_probe_rate()
+            failing_rate < surbs_only_rate,
+            "a hop whose probes all fail must not score as well as one whose probes were never run: \
+             failing={failing_rate} unprobed={surbs_only_rate}"
         );
     }
 
@@ -1010,6 +1002,34 @@ mod tests {
             delivering_score,
             "a relay that stopped returning SURBs must score below one still delivering: silent={silent_score} \
              delivering={delivering_score} (surb rates {s_rate} vs {d_rate})"
+        );
+    }
+
+    #[test]
+    fn a_sub_millisecond_latency_must_not_read_as_unmeasured() {
+        // The intermediate latency is a `saturating_sub` residual, so a value at or below a
+        // millisecond is ordinary rather than exotic. Truncating it to `0` used to make
+        // `average_latency` report `None`, which `latency_score` treats as the *worst* case (0.05)
+        // — so the fastest edges scored twenty times below the slowest measured ones.
+        let mut fast = TransportLinkMeasurement::default();
+        fast.record(Ok(std::time::Duration::from_micros(400)));
+
+        assert!(
+            fast.average_latency().is_some(),
+            "a measured sub-millisecond latency is a measurement, not an absence"
+        );
+        assert_eq!(
+            fast.score(),
+            Some(1.0),
+            "a fast edge must earn the top latency band, not the unmeasured penalty"
+        );
+
+        // And a genuinely unmeasured link still reports absence.
+        let mut failed = TransportLinkMeasurement::default();
+        failed.record(Err(()));
+        assert!(
+            failed.average_latency().is_none(),
+            "a failed probe records no latency, so there is none to report"
         );
     }
 

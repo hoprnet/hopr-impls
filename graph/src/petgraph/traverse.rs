@@ -195,8 +195,12 @@ impl hopr_api::graph::NetworkGraphTraverse for ChannelGraph {
                             .graph
                             .edges_connecting(*neighbor, *me_idx)
                             .next()
-                            .and_then(|e| e.weight().immediate_qos().map(|e| e.is_connected()))
-                            .unwrap_or(false)
+                            // The closing edge must exist; its connectivity must merely not be known
+                            // to be down. Excluding an unchecked neighbour would stop it being
+                            // probed, which is what would keep it unchecked.
+                            .is_some_and(|e| {
+                                e.weight().immediate_qos().and_then(|imm| imm.is_connected()) != Some(false)
+                            })
                     })
                     .collect::<HashSet<_>>();
 
@@ -302,6 +306,13 @@ mod tests {
         graph.upsert_edge(src, dest, |obs| {
             obs.record(EdgeWeightType::Connected(true));
             obs.record(EdgeWeightType::Immediate(Ok(std::time::Duration::from_millis(50))));
+        });
+    }
+
+    /// Connectivity observed and found absent — distinct from never having looked.
+    fn mark_edge_disconnected(graph: &ChannelGraph, src: &OffchainPublicKey, dest: &OffchainPublicKey) {
+        graph.upsert_edge(src, dest, |obs| {
+            obs.record(EdgeWeightType::Connected(false));
         });
     }
 
@@ -1187,8 +1198,8 @@ mod tests {
     }
 
     #[test]
-    fn loopback_returns_empty_without_connected_neighbors() -> anyhow::Result<()> {
-        // me → a → b, b → me exists but is NOT connected
+    fn loopback_returns_empty_when_the_closing_edge_is_known_down() -> anyhow::Result<()> {
+        // me → a → b, b → me observed and found disconnected
         let me = pubkey_from(&SECRET_0);
         let a = pubkey_from(&SECRET_1);
         let b = pubkey_from(&SECRET_2);
@@ -1199,7 +1210,8 @@ mod tests {
         graph.add_edge(&me, &a)?;
         graph.add_edge(&a, &b)?;
         graph.add_edge(&b, &me)?;
-        // b→me is NOT marked connected, so b is not in connected_neighbors
+        // b→me observed down, so b cannot close a loop
+        mark_edge_disconnected(&graph, &b, &me);
         mark_edge_loopback_ready(&graph, &me, &a);
         mark_edge_with_capacity(&graph, &a, &b);
 
@@ -1678,7 +1690,8 @@ mod tests {
         mark_edge_with_capacity(&graph, &a, &c);
         // b→me: connected (b IS a loopback destination)
         mark_edge_connected(&graph, &b, &me);
-        // c→me: NOT connected (c is NOT a loopback destination)
+        // c→me: observed down, so c is not a loopback destination
+        mark_edge_disconnected(&graph, &c, &me);
 
         let routes = graph.simple_loopback_to_self(2, None);
         assert_eq!(

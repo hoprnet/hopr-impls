@@ -797,7 +797,7 @@ mod tests {
             "failed probe should not set latency"
         );
         assert!(
-            imm_fwd.average_probe_rate() < 1.0,
+            imm_fwd.average_probe_rate().expect("probed") < 1.0,
             "failed probe should lower success rate"
         );
 
@@ -811,7 +811,7 @@ mod tests {
             "failed probe should not set latency on reverse"
         );
         assert!(
-            imm_rev.average_probe_rate() < 1.0,
+            imm_rev.average_probe_rate().expect("probed") < 1.0,
             "failed probe should lower success rate on reverse"
         );
 
@@ -838,7 +838,7 @@ mod tests {
             .immediate_qos()
             .context("immediate QoS should be present after failed probe")?;
         assert!(immediate.average_latency().is_none());
-        assert!(immediate.average_probe_rate() < 1.0);
+        assert!(immediate.average_probe_rate().expect("probed") < 1.0);
         Ok(())
     }
 
@@ -945,7 +945,7 @@ mod tests {
             qos.average_latency().context("latency should be set")?,
             std::time::Duration::from_millis(30), // rtt / 2 = 30ms
         );
-        assert!(qos.average_probe_rate() > 0.9, "all probes succeeded");
+        assert!(qos.average_probe_rate().expect("probed") > 0.9, "all probes succeeded");
         Ok(())
     }
 
@@ -1644,7 +1644,7 @@ mod tests {
             "latency should be set after multiple probes"
         );
         assert!(
-            qos.average_probe_rate() > 0.9,
+            qos.average_probe_rate().expect("probed") > 0.9,
             "all probes succeeded, rate should be high"
         );
 
@@ -1688,7 +1688,7 @@ mod tests {
         // which the EMA may not report as Some(0) but rather None if <= 0
         // Let's check the probe rate instead — it should be recorded
         assert!(
-            qos.average_probe_rate() > 0.0,
+            qos.average_probe_rate().expect("probed") > 0.0,
             "probe should still be recorded even with saturated duration"
         );
 
@@ -1718,7 +1718,10 @@ mod tests {
             .intermediate_qos()
             .context("intermediate QoS should be present on a→b after timeout")?;
         assert!(qos.average_latency().is_none(), "failed probe should not set latency");
-        assert!(qos.average_probe_rate() < 1.0, "failed probe should lower success rate");
+        assert!(
+            qos.average_probe_rate().expect("probed") < 1.0,
+            "failed probe should lower success rate"
+        );
 
         // me→a should NOT have intermediate QoS
         let obs_me_a = graph.edge(&me, &a).context("edge me→a should exist")?;
@@ -1753,7 +1756,7 @@ mod tests {
             .intermediate_qos()
             .context("intermediate QoS should be present on b→c")?;
         assert!(qos.average_latency().is_none());
-        assert!(qos.average_probe_rate() < 1.0);
+        assert!(qos.average_probe_rate().expect("probed") < 1.0);
 
         // Earlier edges should NOT have intermediate QoS
         let obs_me_a = graph.edge(&me, &a).context("edge me→a should exist")?;
