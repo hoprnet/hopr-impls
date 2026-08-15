@@ -19,12 +19,16 @@ const LINE: &str = r#"{
     { "from": "me", "to": "r1",   "connected": true, "latency_ms": 20, "balance": 100000, "relayed_ms": 30, "packets": 10, "acks": 10 },
     { "from": "r1", "to": "r2",   "connected": true, "latency_ms": 20, "balance": 100000, "relayed_ms": 30, "packets": 10, "acks": 10 },
     { "from": "r2", "to": "r3",   "connected": true, "latency_ms": 20, "balance": 100000, "relayed_ms": 30, "packets": 10, "acks": 10 },
+    { "from": "r3", "to": "r4",   "connected": true, "latency_ms": 20, "balance": 100000, "relayed_ms": 30, "packets": 10, "acks": 10 },
+    { "from": "r4", "to": "exit", "connected": true, "latency_ms": 20, "balance": 100000, "relayed_ms": 30, "packets": 10, "acks": 10 },
     { "from": "r3", "to": "exit", "connected": true, "latency_ms": 20, "balance": 100000, "relayed_ms": 30, "packets": 10, "acks": 10 },
     { "from": "me", "to": "r2",   "connected": true, "latency_ms": 20, "balance": 100000, "relayed_ms": 30, "packets": 10, "acks": 10 },
     { "from": "me", "to": "r3",   "connected": true, "latency_ms": 20, "balance": 100000, "relayed_ms": 30, "packets": 10, "acks": 10 },
     { "from": "me", "to": "exit", "connected": true, "latency_ms": 20, "balance": 100000, "relayed_ms": 30, "packets": 10, "acks": 10 },
     { "from": "r1", "to": "exit", "connected": true, "latency_ms": 20, "balance": 100000, "relayed_ms": 30, "packets": 10, "acks": 10 },
-    { "from": "r2", "to": "exit", "connected": true, "latency_ms": 20, "balance": 100000, "relayed_ms": 30, "packets": 10, "acks": 10 }
+    { "from": "r2", "to": "exit", "connected": true, "latency_ms": 20, "balance": 100000, "relayed_ms": 30, "packets": 10, "acks": 10 },
+    { "from": "r2", "to": "me",   "connected": true, "latency_ms": 20, "balance": 100000, "relayed_ms": 30, "packets": 10, "acks": 10 },
+    { "from": "r2", "to": "r1",   "connected": true, "latency_ms": 20, "balance": 100000, "relayed_ms": 30, "packets": 10, "acks": 10 }
   ]
 }"#;
 
@@ -97,18 +101,30 @@ fn three_hop_should_route_through_the_maximum_relays() -> anyhow::Result<()> {
 
     assert_eq!(
         routes.names(),
-        vec![vec!["r1", "r2", "r3"]],
-        "only one 3-relay chain exists in this topology"
+        vec![vec!["r1", "r2", "r3"], vec!["r2", "r3", "r4"]],
+        "both 3-relay chains the topology admits are offered"
+    );
+    assert!(
+        routes
+            .0
+            .iter()
+            .all(|(hops, _)| hops.len() == RoutingOptions::MAX_INTERMEDIATE_HOPS),
+        "every path at the limit carries exactly that many relays"
     );
     Ok(())
 }
 
 #[test]
 fn beyond_the_routable_hop_limit_should_yield_nothing() -> anyhow::Result<()> {
-    // The packet format carries at most `MAX_INTERMEDIATE_HOPS` relays; asking for more must yield
-    // nothing rather than paths that are built and then discarded downstream.
+    // The packet format carries at most `MAX_INTERMEDIATE_HOPS` relays. `LINE` holds more relays
+    // than that on purpose: were it exactly the limit, the emptiness below would come from running
+    // out of nodes and the test would pass with the limit removed entirely.
     let net = Net::from_json(LINE)?;
 
+    assert!(
+        !net.forward("exit", RoutingOptions::MAX_INTERMEDIATE_HOPS).is_empty(),
+        "the topology must be able to supply a path at the limit, or the contrast proves nothing"
+    );
     assert!(
         net.forward("exit", RoutingOptions::MAX_INTERMEDIATE_HOPS + 1)
             .is_empty(),
@@ -120,11 +136,15 @@ fn beyond_the_routable_hop_limit_should_yield_nothing() -> anyhow::Result<()> {
 #[test]
 fn a_path_must_never_repeat_a_node() -> anyhow::Result<()> {
     // Simple paths only: a repeated relay would both waste a hop and let one node correlate the
-    // packet with itself.
+    // packet with itself. `LINE` carries back-edges (`r2→me`, `r2→r1`) so that a traversal willing
+    // to revisit would have somewhere to go — without them these assertions hold for any
+    // implementation whatsoever.
     let net = Net::from_json(LINE)?;
 
+    let mut inspected = 0;
     for hops in 0..=RoutingOptions::MAX_INTERMEDIATE_HOPS {
         for (path, _) in net.forward("exit", hops).0 {
+            inspected += 1;
             let mut unique = path.clone();
             unique.sort();
             unique.dedup();
@@ -139,6 +159,10 @@ fn a_path_must_never_repeat_a_node() -> anyhow::Result<()> {
             );
         }
     }
+    assert!(
+        inspected > 0,
+        "no paths were inspected, so nothing above was actually checked"
+    );
     Ok(())
 }
 
@@ -286,6 +310,29 @@ fn channels_are_directional_so_a_forward_path_does_not_imply_a_return_one() -> a
     assert!(
         net.returning("exit", 1).is_empty(),
         "the reverse direction has no channels, so no return path exists"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_return_path_over_an_unchecked_closing_edge_is_rejected() -> anyhow::Result<()> {
+    // The mirror of `an_unchecked_closing_edge_still_permits_the_loop`: a probe loop is deliberately
+    // permissive about a closing edge nobody has checked, because probing is how it becomes checked.
+    // Committing a reply to one is a different matter, and the two policies must not be conflated.
+    let net = Net::from_json(
+        r#"{
+      "me": "me",
+      "ticket_face_value": 100,
+      "edges": [
+        { "from": "exit", "to": "r1", "connected": true, "latency_ms": 20, "balance": 100000, "relayed_ms": 30 },
+        { "from": "r1",   "to": "me", "balance": 100000 }
+      ]
+    }"#,
+    )?;
+
+    assert!(
+        net.returning("exit", 1).is_empty(),
+        "a reply cannot be committed to an edge we have never shown reachable"
     );
     Ok(())
 }

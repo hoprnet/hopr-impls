@@ -281,10 +281,9 @@ impl hopr_api::graph::NetworkGraphUpdate for ChannelGraph {
 
                 let target_idx = edges.len() - 2;
 
-                // Attributed duration = total RTT - sum of all known edge latencies.
-                // For each edge (including the target), use intermediate QoS if available,
-                // otherwise fall back to immediate QoS. The residual is attributed to the
-                // target edge as its new intermediate measurement.
+                // Attributed duration = total RTT - the latencies of the *other* edges on the
+                // loop, each taken from its intermediate QoS where available and its immediate QoS
+                // otherwise. What remains is the target edge's own latency.
                 //
                 // `timestamp()` is the probe's creation time (unix epoch millis), so the
                 // RTT is the elapsed time until now. A timestamp in the future (backward
@@ -307,9 +306,16 @@ impl hopr_api::graph::NetworkGraphUpdate for ChannelGraph {
                     );
                     return;
                 }
+                // Everything *except* the target: the residual is meant to be the target's own
+                // latency, so subtracting our current estimate of it too would yield the error in
+                // that estimate rather than a new measurement — and would drive the residual to
+                // zero exactly when the estimates are good.
                 let mut known_latency = std::time::Duration::ZERO;
 
-                for &edge in &edges {
+                for (i, &edge) in edges.iter().enumerate() {
+                    if i == target_idx {
+                        continue;
+                    }
                     if let Some(weight) = inner.graph.edge_weight(edge) {
                         let lat = weight
                             .intermediate_qos()
@@ -323,7 +329,19 @@ impl hopr_api::graph::NetworkGraphUpdate for ChannelGraph {
                     }
                 }
 
-                let attributed_duration = total_rtt.saturating_sub(known_latency);
+                // A saturating subtraction would turn "the known latencies already account for the
+                // whole round trip" into a measured zero — and a zero latency scores in the *fastest*
+                // band, so a clamp would be read as the best possible link. The residual is only a
+                // measurement while it stays positive; otherwise this probe tells us nothing about
+                // the target's speed and no latency is recorded for it.
+                let Some(attributed_duration) = total_rtt.checked_sub(known_latency) else {
+                    tracing::debug!(
+                        total_rtt_ms = total_rtt.as_millis(),
+                        known_ms = known_latency.as_millis(),
+                        "known latencies already exceed the loopback RTT, no latency to attribute"
+                    );
+                    return;
+                };
 
                 tracing::trace!(
                     target_edge = edges[target_idx].index(),
@@ -1342,11 +1360,15 @@ mod tests {
         let qos = obs
             .intermediate_qos()
             .context("intermediate QoS should be present on me→a")?;
+        // The whole round trip, because the only *other* edge on the loop has no known latency.
+        // The target's own prior estimate is deliberately not subtracted: doing so would measure the
+        // error in that estimate rather than the edge, and would drive the residual to zero exactly
+        // when the estimate was good.
         assert_in_delta!(
             qos.average_latency().context("latency should be set")?.as_millis(),
-            50,
+            100,
             25
-        ); // 100ms total - 50ms (me→a immediate) = 50ms attributed to me→a
+        );
 
         // Immediate QoS should still be intact
         let imm = obs
@@ -1654,8 +1676,8 @@ mod tests {
 
     // This is handled by the moving average object, but the expectation test can stay here.
     #[tokio::test]
-    async fn loopback_saturating_sub_should_not_underflow() -> anyhow::Result<()> {
-        // If preceding edge latencies exceed total RTT, duration should saturate at 0
+    async fn loopback_should_not_attribute_when_other_edges_account_for_the_whole_rtt() -> anyhow::Result<()> {
+        // If the other edges already account for the whole RTT there is no residual to attribute.
         // Loopback: me(0) → a(1) → b(2) → c(3) → me(0). Target = b→c.
         // Preceding = [me→a, a→b] with me→a = 500ms
         let me = pubkey_from(&SECRET_0);
@@ -1683,14 +1705,14 @@ mod tests {
         // Total RTT = 100ms, but preceding latency is 500ms → 100 - 500 saturates to 0
         send_loopback(&graph, &[me, a, b, c, me], 100);
 
-        let obs = graph.edge(&b, &c).context("edge b→c should exist")?;
-        let qos = obs.intermediate_qos().context("intermediate QoS should be present")?;
-        // Duration::ZERO means latency_average gets updated with 0ms
-        // which the EMA may not report as Some(0) but rather None if <= 0
-        // Let's check the probe rate instead — it should be recorded
+        // Nothing is attributed. A clamp is not a measurement: recording the saturated zero would
+        // put this edge in the *fastest* latency band on the strength of knowing nothing about it.
         assert!(
-            qos.average_probe_rate().expect("probed") > 0.0,
-            "probe should still be recorded even with saturated duration"
+            graph
+                .edge(&b, &c)
+                .and_then(|obs| obs.intermediate_qos().cloned())
+                .is_none(),
+            "a round trip already accounted for by the other edges says nothing about the target"
         );
 
         Ok(())
