@@ -352,10 +352,19 @@ impl EdgeLinkObservable for TransportIntermediates {
 
     fn score(&self) -> Option<f64> {
         // `average_probe_rate` already takes the worse of the probe and SURB signals over whichever
-        // carry evidence, and reports `None` when neither does; latency scoring is left to the link
-        // measurement untouched, since a round-trip carries no per-edge latency to contribute.
-        self.average_probe_rate()
-            .map(|rate| rate * latency_score(self.average_latency()))
+        // carry evidence, and reports `None` when neither does.
+        //
+        // Latency modulates that rate only where it was measured. A round-trip proves the loop was
+        // traversed but carries no per-edge latency, so an edge known solely from SURB delivery has
+        // a rate and no latency. Scoring the missing latency as [`latency_score`] does — 0.05, the
+        // no-data floor — would multiply real delivery evidence by a twentieth and rank the edge
+        // below one nothing at all is known about, inverting the very ordering the score exists to
+        // express.
+        let rate = self.average_probe_rate()?;
+        Some(match self.average_latency() {
+            Some(latency) => rate * latency_score(Some(latency)),
+            None => rate,
+        })
     }
 }
 

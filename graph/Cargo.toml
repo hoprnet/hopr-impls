@@ -50,10 +50,13 @@ hopr-utils = { workspace = true, features = [
 ] }
 
 [dev-dependencies]
+anyhow      = { workspace = true }
 assertables = { workspace = true }
 criterion   = { workspace = true }
 hex-literal = { workspace = true }
 insta       = { workspace = true, features = ["yaml"] }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
 tokio       = { workspace = true }
 
 [[bench]]
