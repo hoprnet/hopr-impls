@@ -41,8 +41,8 @@ blokli-client = "0.31.0"
 # `version` alongside `git` is the "multiple locations" form: the git source wins locally, while
 # packaging keeps the version requirement and drops the git specification. Without it cargo refuses
 # to normalise the manifest at all, which fails the publish dry-run before it reaches any crate.
-hopr-api   = { version = "2.0.0", git = "https://github.com/hoprnet/hopr-api", rev = "4739d419926904f609ebc8ef8d71e7d35e2bd967" }
-hopr-utils = { package = "hopr-utilities", version = "0.9.0", git = "https://github.com/hoprnet/hopr-utilities", rev = "1d3693356538025710791ea1f8797b8f5ecd5380", default-features = false }
+hopr-api   = { version = "2.0.0", git = "https://github.com/hoprnet/hopr-api", rev = "ee65b340cf09fd6031735477cc1171d7610694a3" }
+hopr-utils = { package = "hopr-utilities", version = "0.9.0", git = "https://github.com/hoprnet/hopr-utilities", rev = "68e648be4aa9f1442c75df4006a53db414932f7e", default-features = false }
 
 # Third-party dependencies (versions mirror hoprnet's workspace to preserve compatibility)
 ahash = "0.8.12"
