@@ -334,13 +334,33 @@ impl hopr_api::graph::NetworkGraphUpdate for ChannelGraph {
                 // band, so a clamp would be read as the best possible link. The residual is only a
                 // measurement while it stays positive; otherwise this probe tells us nothing about
                 // the target's speed and no latency is recorded for it.
-                let Some(attributed_duration) = total_rtt.checked_sub(known_latency) else {
-                    tracing::debug!(
-                        total_rtt_ms = total_rtt.as_millis(),
-                        known_ms = known_latency.as_millis(),
-                        "known latencies already exceed the loopback RTT, no latency to attribute"
-                    );
-                    return;
+                // A saturating subtraction would turn "the other edges already account for the whole
+                // round trip" into a measured zero — and zero scores in the *fastest* latency band,
+                // so a clamp would read as the best possible link.
+                //
+                // The probe still succeeded, though, and the timeout branch below records failures
+                // unconditionally. Dropping the success here too would let an edge whose neighbours
+                // over-account accrue failures only and decay to looking dead. So the success is
+                // credited with the latency the edge already carries, leaving its average untouched
+                // while the probe rate still counts. With nothing carried yet there is no honest
+                // figure to record and the sample is skipped.
+                let attributed_duration = match total_rtt.checked_sub(known_latency) {
+                    Some(residual) => residual,
+                    None => {
+                        let carried = inner
+                            .graph
+                            .edge_weight(edges[target_idx])
+                            .and_then(|w| w.intermediate_qos().and_then(|q| q.average_latency()));
+                        tracing::debug!(
+                            total_rtt_ms = total_rtt.as_millis(),
+                            known_ms = known_latency.as_millis(),
+                            "known latencies already account for the loopback RTT, no new latency to attribute"
+                        );
+                        match carried {
+                            Some(latency) => latency,
+                            None => return,
+                        }
+                    }
                 };
 
                 tracing::trace!(

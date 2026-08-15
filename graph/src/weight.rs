@@ -294,7 +294,7 @@ impl TransportIntermediates {
     /// How this edge is delivering relative to its own best, or `None` without traffic.
     ///
     /// Relative, because the absolute ratio measures the balancer's surplus as much as the path
-    /// (see [`Self::surb_peak`]). Against its own peak a healthy edge reads ~1 whatever the
+    /// (see the peak this is read against). Against its own peak a healthy edge reads ~1 whatever the
     /// surplus, and one that stops delivering falls toward 0 -- which is the only thing this
     /// signal is asked to say.
     pub fn surb_delivery_rate(&self) -> Option<f64> {
@@ -342,8 +342,8 @@ impl EdgeLinkObservable for TransportIntermediates {
     /// worse of the two lets either signal condemn an edge and neither mask the other.
     ///
     /// Evidence, not merely a number: an unprobed edge's probe rate reads 0.0 exactly as a wholly
-    /// failing one does (see [`Self::probed`]), so combining them unconditionally would score every
-    /// SURB-only edge as dead.
+    /// failing one does (an unprobed stream reports `None` rather than a rate), so combining them unconditionally would
+    /// score every SURB-only edge as dead.
     fn average_probe_rate(&self) -> Option<f64> {
         match (self.surb_delivery_rate(), self.link.average_probe_rate()) {
             (Some(surb), Some(probe)) => Some(surb.min(probe)),
