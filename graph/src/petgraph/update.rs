@@ -31,7 +31,8 @@ fn observe_neighbor_quality(graph: &ChannelGraph, peer: &hopr_api::OffchainPubli
 
 /// Resolves a loopback path from serialized node-index bytes into a validated chain of edge indices.
 ///
-/// The `path_bytes` encode a `PathId` where each `u64` is a [`NodeIndex`].
+/// The `path_bytes` encode a `PathId` whose slots are key-derived (see
+/// [`path_id`](crate::petgraph::path_id)), not node indices.
 /// The path is expected to start and end at `me` (a closed loop).
 ///
 /// Walks consecutive node pairs, finding the connecting edge for each.
@@ -696,9 +697,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn surb_round_trip_should_be_dropped_when_an_index_is_stale() -> anyhow::Result<()> {
-        // A PathId is a snapshot of node indices; one built against an older generation of the
-        // graph must be discarded rather than credited to whoever now occupies those slots.
+    async fn surb_round_trip_should_be_dropped_when_a_slot_is_stale() -> anyhow::Result<()> {
+        // A PathId names keys, not positions, so a slot whose node has left the graph resolves to
+        // nothing — the report is discarded rather than credited to some surviving edge.
         let (graph, exit, relay, me) = round_trip_graph()?;
         let (me_i, exit_i) = (slot_of(&graph, &me), slot_of(&graph, &exit));
         let _ = relay;

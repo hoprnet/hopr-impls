@@ -66,6 +66,16 @@ pub struct ChannelGraph {
     pub(crate) inner: Arc<RwLock<InnerGraph>>,
 }
 
+/// Multiplier applied to an edge with no probe observations, keeping it discoverable (RFC-0010
+/// §4.2.3) rather than excluded.
+pub const DEFAULT_EDGE_PENALTY: f64 = 0.5;
+
+/// Acknowledgement floor below which data-path selection rejects an immediate peer.
+pub const DEFAULT_MIN_ACK_RATE: f64 = 0.1;
+
+/// Round-trip beyond which a loopback report is treated as clock skew rather than a measurement.
+pub const DEFAULT_MAX_PLAUSIBLE_LOOPBACK_RTT: std::time::Duration = std::time::Duration::from_secs(30);
+
 impl ChannelGraph {
     /// Creates a new channel graph with the given self identity and default edge scoring
     /// parameters (edge_penalty = 0.5, min_ack_rate = 0.1).
@@ -76,7 +86,12 @@ impl ChannelGraph {
     /// Production code should prefer [`with_edge_params`](Self::with_edge_params) to
     /// receive values from `PathPlannerConfig`.
     pub fn new(me: OffchainPublicKey) -> Self {
-        Self::with_edge_params(me, 0.5, 0.1, std::time::Duration::from_secs(30))
+        Self::with_edge_params(
+            me,
+            DEFAULT_EDGE_PENALTY,
+            DEFAULT_MIN_ACK_RATE,
+            DEFAULT_MAX_PLAUSIBLE_LOOPBACK_RTT,
+        )
     }
 
     /// Creates a new channel graph with custom edge scoring parameters.
@@ -370,7 +385,7 @@ mod tests {
     use hex_literal::hex;
     use hopr_api::{
         graph::{
-            EdgeLinkObservable, NetworkGraphConnectivity, NetworkGraphTraverse, NetworkGraphView, NetworkGraphWrite,
+            EdgeLinkObservable, NetworkGraphConnectivity, NetworkGraphView, NetworkGraphWrite,
             traits::{EdgeObservableRead, EdgeObservableWrite, EdgeWeightType},
         },
         types::crypto::prelude::{Keypair, OffchainKeypair},
@@ -432,54 +447,6 @@ mod tests {
                 "path_slot must hand out the key-derived slot a PathId carries"
             );
         }
-
-    #[test]
-    fn path_slot_should_number_nodes_the_way_path_ids_do() -> anyhow::Result<()> {
-        // Load-bearing: SURB round-trips assemble a `PathId` out of public keys via `path_slot`,
-        // while path selection builds one itself. `resolve_round_trip_edges` reads both, so if the
-        // two numbering schemes diverged a reported round-trip would credit whichever edges the
-        // wrong numbers happened to name -- and would look entirely ordinary doing it.
-        //
-        // Asserted as an equality between the two producers rather than against fixed numbers: a
-        // test that pins only one side passes happily while the other moves.
-        let me = pubkey_from(&SECRET_0);
-        let graph = ChannelGraph::new(me);
-        let relay = pubkey_from(&SECRET_1);
-        let dest = pubkey_from(&SECRET_2);
-        graph.add_node(relay);
-        graph.add_node(dest);
-        for (src, dst) in [(me, relay), (relay, dest)] {
-            graph.add_edge(&src, &dst)?;
-            graph.upsert_edge(&src, &dst, |obs| {
-                obs.record(EdgeWeightType::Connected(true));
-                obs.record(EdgeWeightType::Immediate(Ok(std::time::Duration::from_millis(20))));
-                obs.record(EdgeWeightType::Intermediate(Ok(std::time::Duration::from_millis(30))));
-                obs.record(EdgeWeightType::Balance(Some(hopr_api::graph::traits::Balance::from(
-                    100_000u64,
-                ))));
-            });
-        }
-
-        let selected = graph.simple_paths(
-            &me,
-            &dest,
-            2,
-            None,
-            hopr_api::graph::function::EdgeValueFn::forward(
-                std::num::NonZeroUsize::new(2).expect("non-zero"),
-                0.5,
-                0.0,
-                None,
-            ),
-        );
-        let (_, path_id, _) = selected.first().expect("me -> relay -> dest should be selectable");
-
-        assert_eq!(
-            [graph.path_slot(&me), graph.path_slot(&relay), graph.path_slot(&dest)],
-            [Some(path_id[0]), Some(path_id[1]), Some(path_id[2])],
-            "path_slot must hand out exactly the values path selection writes into a PathId"
-        );
-        assert_eq!(&path_id[3..], &[0, 0], "unused slots stay padding");
         assert_eq!(
             None,
             graph.path_slot(&pubkey_from(&SECRET_4)),

@@ -106,6 +106,19 @@ fn a_loop_requires_the_closing_edge_back_to_me() -> anyhow::Result<()> {
         net.loopback(2).is_empty(),
         "an outbound edge to the last relay does not let the loop close"
     );
+
+    // The closing edge is the only thing missing: adding it to the same topology makes the loop
+    // available, so the exclusion above is attributable to it and not to some other gap.
+    net.observe("b", "me", |obs| {
+        use hopr_api::graph::traits::{EdgeObservableWrite, EdgeWeightType};
+        obs.record(EdgeWeightType::Connected(true));
+        obs.record(EdgeWeightType::Immediate(Ok(std::time::Duration::from_millis(20))));
+    });
+    assert_eq!(
+        net.loopback(2),
+        vec![vec!["a", "b", "me"]],
+        "with the closing edge present the same topology yields the loop"
+    );
     Ok(())
 }
 
@@ -254,7 +267,7 @@ fn a_three_hop_loop_fills_every_slot() -> anyhow::Result<()> {
 }
 
 #[test]
-fn a_node_absent_from_the_graph_has_no_slot() -> anyhow::Result<()> {
+fn a_node_with_no_edges_still_has_a_slot() -> anyhow::Result<()> {
     let net = Net::from_json(r#"{ "me": "me", "nodes": ["known"], "edges": [] }"#)?;
 
     assert!(net.slot("known").is_some(), "a known node has a slot");

@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::Net;
+use common::{HEALTHY_FIRST, HEALTHY_LAST, Net, relayed};
 use hopr_api::types::internal::routing::RoutingOptions;
 
 /// A linear network `me → r1 → r2 → r3 → exit`, every edge funded and probed.
@@ -148,16 +148,10 @@ fn a_path_must_never_repeat_a_node() -> anyhow::Result<()> {
 fn a_relayed_path_requires_a_funded_first_edge() -> anyhow::Result<()> {
     // Unlike the 0-hop case, the first edge of a relayed path is not final: the relay issues a
     // ticket on it, so it needs a channel with enough balance for the hops that remain.
-    let net = Net::from_json(
-        r#"{
-      "me": "me",
-      "ticket_face_value": 100,
-      "edges": [
-        { "from": "me", "to": "r1",   "connected": true, "latency_ms": 20, "relayed_ms": 30 },
-        { "from": "r1", "to": "exit", "connected": true, "latency_ms": 20, "balance": 100000, "relayed_ms": 30 }
-      ]
-    }"#,
-    )?;
+    let net = Net::from_json(&relayed(
+        r#"{ "from": "me", "to": "r1", "connected": true, "latency_ms": 20, "relayed_ms": 30 }"#,
+        HEALTHY_LAST,
+    ))?;
 
     assert!(
         net.forward("exit", 1).is_empty(),
@@ -168,16 +162,10 @@ fn a_relayed_path_requires_a_funded_first_edge() -> anyhow::Result<()> {
 
 #[test]
 fn a_relayed_path_requires_a_reachable_first_edge() -> anyhow::Result<()> {
-    let net = Net::from_json(
-        r#"{
-      "me": "me",
-      "ticket_face_value": 100,
-      "edges": [
-        { "from": "me", "to": "r1",   "connected": false, "balance": 100000, "relayed_ms": 30 },
-        { "from": "r1", "to": "exit", "connected": true, "latency_ms": 20, "balance": 100000, "relayed_ms": 30 }
-      ]
-    }"#,
-    )?;
+    let net = Net::from_json(&relayed(
+        r#"{ "from": "me", "to": "r1", "connected": false, "balance": 100000, "relayed_ms": 30 }"#,
+        HEALTHY_LAST,
+    ))?;
 
     assert!(
         net.forward("exit", 1).is_empty(),
@@ -193,16 +181,10 @@ fn an_unchecked_first_edge_stays_selectable() -> anyhow::Result<()> {
     //
     // The immediate stream here exists because packets were acknowledged over it, not because it
     // was probed — which is precisely how connectivity comes to be unknown on a live edge.
-    let net = Net::from_json(
-        r#"{
-      "me": "me",
-      "ticket_face_value": 100,
-      "edges": [
-        { "from": "me", "to": "r1",   "balance": 100000, "packets": 10, "acks": 10 },
-        { "from": "r1", "to": "exit", "connected": true, "latency_ms": 20, "balance": 100000, "relayed_ms": 30 }
-      ]
-    }"#,
-    )?;
+    let net = Net::from_json(&relayed(
+        r#"{ "from": "me", "to": "r1", "balance": 100000, "packets": 10, "acks": 10 }"#,
+        HEALTHY_LAST,
+    ))?;
 
     assert_eq!(
         net.forward("exit", 1).len(),
@@ -218,16 +200,10 @@ fn a_wholly_unobserved_first_edge_is_not_a_data_path_candidate() -> anyhow::Resu
     // immediate stream at all and is not selectable. That is not a starvation trap: the neighbour
     // prober walks every node in the graph rather than only nodes on selected paths, so such an
     // edge is measured regardless of whether data paths pick it (summary §6.2).
-    let net = Net::from_json(
-        r#"{
-      "me": "me",
-      "ticket_face_value": 100,
-      "edges": [
-        { "from": "me", "to": "r1",   "balance": 100000 },
-        { "from": "r1", "to": "exit", "connected": true, "latency_ms": 20, "balance": 100000, "relayed_ms": 30 }
-      ]
-    }"#,
-    )?;
+    let net = Net::from_json(&relayed(
+        r#"{ "from": "me", "to": "r1", "balance": 100000 }"#,
+        HEALTHY_LAST,
+    ))?;
 
     assert!(
         net.forward("exit", 1).is_empty(),
@@ -242,16 +218,10 @@ fn a_wholly_unobserved_first_edge_is_not_a_data_path_candidate() -> anyhow::Resu
 fn the_last_edge_of_a_relayed_path_needs_no_channel() -> anyhow::Result<()> {
     // Same rule as the 0-hop case, one position along: `r1 → exit` is final, so the absence of a
     // balance there must not disqualify the path.
-    let net = Net::from_json(
-        r#"{
-      "me": "me",
-      "ticket_face_value": 100,
-      "edges": [
-        { "from": "me", "to": "r1",   "connected": true, "latency_ms": 20, "balance": 100000, "relayed_ms": 30 },
-        { "from": "r1", "to": "exit", "connected": true, "latency_ms": 20, "relayed_ms": 30 }
-      ]
-    }"#,
-    )?;
+    let net = Net::from_json(&relayed(
+        HEALTHY_FIRST,
+        r#"{ "from": "r1", "to": "exit", "connected": true, "latency_ms": 20, "relayed_ms": 30 }"#,
+    ))?;
 
     assert_eq!(
         net.forward("exit", 1).len(),
@@ -310,16 +280,7 @@ fn a_return_path_over_an_unreachable_closing_edge_is_rejected() -> anyhow::Resul
 fn channels_are_directional_so_a_forward_path_does_not_imply_a_return_one() -> anyhow::Result<()> {
     // Summary §3.1: `a→b` and `b→a` are separate channels. A network wired only outbound must
     // support forward paths and no return paths at all.
-    let net = Net::from_json(
-        r#"{
-      "me": "me",
-      "ticket_face_value": 100,
-      "edges": [
-        { "from": "me", "to": "r1",   "connected": true, "latency_ms": 20, "balance": 100000, "relayed_ms": 30 },
-        { "from": "r1", "to": "exit", "connected": true, "latency_ms": 20, "balance": 100000, "relayed_ms": 30 }
-      ]
-    }"#,
-    )?;
+    let net = Net::from_json(&relayed(HEALTHY_FIRST, HEALTHY_LAST))?;
 
     assert_eq!(net.forward("exit", 1).len(), 1, "the outbound direction is wired");
     assert!(

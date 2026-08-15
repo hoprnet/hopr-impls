@@ -48,26 +48,27 @@ impl EdgeLinkObservable for TransportLinkMeasurement {
     /// `None` until a probe has been recorded; `Some(0.0)` once measured and found unusable.
     fn score(&self) -> Option<f64> {
         self.average_probe_rate()
-            .map(|rate| rate * latency_score(self.average_latency()))
+            .map(|rate| rate * self.average_latency().map_or(NO_LATENCY_DATA_FLOOR, latency_score))
     }
 }
 
-/// Aid in calculation of the overall transport link score.
+/// What a *measured* latency is worth. The lower the latency, the more useful the link.
 ///
-/// The smaller the latency over the channel, the more useful the link might
-/// be for routing complext traffic.
-fn latency_score(latency: Option<std::time::Duration>) -> f64 {
-    if let Some(latency) = latency {
-        match latency.as_millis() {
-            0..=75 => 1.0,
-            76..=125 => 0.7,
-            126..=200 => 0.3,
-            _ => 0.15,
-        }
-    } else {
-        0.05
+/// Takes a `Duration` rather than an `Option` deliberately. What the absence of a latency costs is
+/// the caller's decision, not this function's: a link that was probed and never answered has earned
+/// [`NO_LATENCY_DATA_FLOOR`], while an edge known only from SURB round-trips has no latency to
+/// report *by construction* and must not be charged for it.
+fn latency_score(latency: std::time::Duration) -> f64 {
+    match latency.as_millis() {
+        0..=75 => 1.0,
+        76..=125 => 0.7,
+        126..=200 => 0.3,
+        _ => 0.15,
     }
 }
+
+/// Latency factor for a link whose probes produced no timing at all.
+const NO_LATENCY_DATA_FLOOR: f64 = 0.05;
 
 /// Observations related to a specific peer in the network.
 #[derive(Debug, Copy, Clone, Default, PartialEq)]
@@ -361,10 +362,10 @@ impl EdgeLinkObservable for TransportIntermediates {
         // below one nothing at all is known about, inverting the very ordering the score exists to
         // express.
         let rate = self.average_probe_rate()?;
-        Some(match self.average_latency() {
-            Some(latency) => rate * latency_score(Some(latency)),
-            None => rate,
-        })
+        Some(
+            self.average_latency()
+                .map_or(rate, |latency| rate * latency_score(latency)),
+        )
     }
 }
 

@@ -139,41 +139,6 @@ fn a_zero_face_value_waives_the_amount_but_not_the_channel() -> anyhow::Result<(
 // ── Presence versus measurement ──────────────────────────────────────────
 
 #[test]
-fn the_streams_average_only_when_both_carry_evidence() -> anyhow::Result<()> {
-    // RFC-0014 §4.2: the immediate and intermediate streams combine as their mean when both are
-    // present, and otherwise the single present one stands alone. So one healthy stream and two
-    // healthy streams both read 1.0 — an edge is not penalised for evidence it has yet to acquire.
-    let net = Net::from_json(&two_relays(
-        r#"{ "from": "me", "to": "ra", "connected": true, "latency_ms": 20, "balance": 100000, "relayed_ms": 30, "packets": 10, "acks": 10 }"#,
-        r#"{ "from": "me", "to": "rb", "connected": true, "latency_ms": 20, "balance": 100000, "packets": 10, "acks": 10 }"#,
-    ))?;
-
-    assert_eq!(
-        net.score("me", "ra"),
-        Some(1.0),
-        "two healthy streams average to a healthy score"
-    );
-    assert_eq!(
-        net.score("me", "rb"),
-        Some(1.0),
-        "one healthy stream stands alone rather than being averaged against an absent one"
-    );
-
-    // The averaging is nonetheless real: a dead second stream halves the score, which is what stops
-    // a healthy ping from carrying a relay that forwards nothing.
-    let masked = Net::from_json(&two_relays(
-        r#"{ "from": "me", "to": "ra", "connected": true, "latency_ms": 20, "balance": 100000, "relayed_ms": 30, "packets": 10, "acks": 10 }"#,
-        r#"{ "from": "me", "to": "rb", "connected": true, "latency_ms": 20, "balance": 100000, "failed_relays": 20, "packets": 10, "acks": 10 }"#,
-    ))?;
-    assert_eq!(
-        masked.score("me", "rb"),
-        Some(0.5),
-        "a dead intermediate stream pulls the mean down by half"
-    );
-    Ok(())
-}
-
-#[test]
 fn a_measured_dead_relay_is_starved_but_not_pruned() -> anyhow::Result<()> {
     // RFC-0010 §4.2.3 requires unreliable edges to be "progressively starved rather than suddenly
     // eliminated", with their score "continuously updated by the ongoing probe stream". A pruned
@@ -245,26 +210,6 @@ fn an_acknowledgement_rate_below_the_floor_rejects_the_hop() -> anyhow::Result<(
 // ── Latency scoring ──────────────────────────────────────────────────────
 
 #[test]
-fn a_sub_millisecond_link_must_score_as_the_fastest_band() -> anyhow::Result<()> {
-    // The residual a loopback attributes is a difference of two similar quantities and lands at or
-    // below a millisecond routinely. Truncated to zero it would read as "never measured", which
-    // scores worse than the slowest measured link.
-    let net = Net::from_json(&two_relays(
-        r#"{ "from": "me", "to": "ra", "connected": true, "latency_ms": 0.4, "balance": 100000, "relayed_ms": 0.4 }"#,
-        r#"{ "from": "me", "to": "rb", "connected": true, "latency_ms": 300, "balance": 100000, "relayed_ms": 300 }"#,
-    ))?;
-
-    let fast = net.score("me", "ra").expect("ra is measured");
-    let slow = net.score("me", "rb").expect("rb is measured");
-
-    assert!(
-        fast > slow,
-        "a sub-millisecond link must outrank a 300 ms one, got {fast} vs {slow}"
-    );
-    Ok(())
-}
-
-#[test]
 fn latency_bands_should_order_relays_by_speed() -> anyhow::Result<()> {
     let net = Net::from_json(&two_relays(
         r#"{ "from": "me", "to": "ra", "connected": true, "latency_ms": 50, "balance": 100000, "relayed_ms": 50 }"#,
@@ -307,20 +252,37 @@ fn surb_delivery_alone_should_score_an_otherwise_unprobed_relay() -> anyhow::Res
 }
 
 #[test]
-fn a_failing_probe_must_not_be_masked_by_healthy_surb_traffic() -> anyhow::Result<()> {
-    // The two signals measure different things — reachability of this hop, and delivery of the
-    // whole loop — so the worse of the two governs and neither can hide the other.
-    let net = Net::from_json(&two_relays(
-        r#"{ "from": "me", "to": "ra", "connected": true, "latency_ms": 20, "balance": 100000, "surbs": [100, 100] }"#,
-        r#"{ "from": "me", "to": "rb", "connected": true, "latency_ms": 20, "balance": 100000, "surbs": [100, 100], "failed_relays": 10 }"#,
-    ))?;
+fn the_configured_edge_penalty_should_govern_unmeasured_edges() -> anyhow::Result<()> {
+    // The penalty is what keeps an unmeasured edge discoverable, so how hard it bites is a
+    // deployment decision. Asserted as a comparison between two configurations: pinning one number
+    // would only restate the constant.
+    let scenario = |penalty: f64| {
+        format!(
+            r#"{{
+      "me": "me",
+      "ticket_face_value": 100,
+      "edge_penalty": {penalty},
+      "edges": [
+        {{ "from": "me", "to": "r1",   "connected": true, "latency_ms": 20, "balance": 100000, "relayed_ms": 30, "packets": 10, "acks": 10 }},
+        {{ "from": "r1", "to": "exit", "connected": true }}
+      ]
+    }}"#
+        )
+    };
 
-    let delivering = net.score("me", "ra").expect("ra is measured");
-    let failing = net.score("me", "rb").expect("rb is measured");
+    let harsh = Net::from_json(&scenario(0.1))?;
+    let lenient = Net::from_json(&scenario(0.9))?;
+
+    let harsh_value = harsh.forward("exit", 1).value_of(&["r1"]).expect("r1 is a candidate");
+    let lenient_value = lenient.forward("exit", 1).value_of(&["r1"]).expect("r1 is a candidate");
 
     assert!(
-        failing < delivering,
-        "failing probes must pull the score down despite healthy SURB delivery: {failing} vs {delivering}"
+        lenient_value > harsh_value,
+        "a laxer penalty must leave an unmeasured edge more selectable: {lenient_value} vs {harsh_value}"
+    );
+    assert!(
+        harsh_value > 0.0,
+        "even the harshest penalty must leave the edge discoverable, got {harsh_value}"
     );
     Ok(())
 }

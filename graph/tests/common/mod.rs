@@ -32,12 +32,9 @@ use hopr_api::{
     },
     types::crypto::prelude::{Keypair, OffchainKeypair},
 };
-use hopr_network_graph::{ChannelGraph, Observations};
-
-/// Defaults matching RFC-0010 §4.2.3 / RFC-0014 §4.3, used when the scenario omits them.
-const DEFAULT_EDGE_PENALTY: f64 = 0.5;
-const DEFAULT_MIN_ACK_RATE: f64 = 0.1;
-const DEFAULT_MAX_LOOPBACK_RTT: std::time::Duration = std::time::Duration::from_secs(30);
+use hopr_network_graph::{
+    ChannelGraph, DEFAULT_EDGE_PENALTY, DEFAULT_MAX_PLAUSIBLE_LOOPBACK_RTT, DEFAULT_MIN_ACK_RATE, Observations,
+};
 
 /// A whole network, as one JSON object.
 #[derive(Debug, serde::Deserialize)]
@@ -106,7 +103,7 @@ pub struct Net {
 }
 
 /// Routes as names, with the value the selector assigned each.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug)]
 pub struct Routes(pub Vec<(Vec<String>, f64)>);
 
 impl Routes {
@@ -134,10 +131,26 @@ impl Routes {
     }
 }
 
+/// The canonical relayed shape `me → r1 → exit`, with each edge's JSON supplied by the caller.
+///
+/// Most scenarios vary exactly one field on one edge; spelling the whole topology out each time
+/// buries that difference in boilerplate.
+pub fn relayed(first: &str, last: &str) -> String {
+    format!(r#"{{ "me": "me", "ticket_face_value": 100, "edges": [ {first}, {last} ] }}"#)
+}
+
+/// The fully healthy `me → r1` first edge, for scenarios that vary only the last one.
+pub const HEALTHY_FIRST: &str =
+    r#"{ "from": "me", "to": "r1", "connected": true, "latency_ms": 20, "balance": 100000, "relayed_ms": 30 }"#;
+
+/// The fully healthy `r1 → exit` last edge, for scenarios that vary only the first one.
+pub const HEALTHY_LAST: &str =
+    r#"{ "from": "r1", "to": "exit", "connected": true, "latency_ms": 20, "balance": 100000, "relayed_ms": 30 }"#;
+
 /// Derives a stable key from a node name, so a scenario always builds the same graph.
 ///
 /// Reproducibility matters beyond convenience: `PathId` slots are derived from the key, so a random
-/// key would make slot assertions and any collision behaviour differ run to run.
+/// key would make slot assertions differ run to run.
 fn key_for(name: &str) -> OffchainPublicKey {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in name.as_bytes() {
@@ -145,20 +158,14 @@ fn key_for(name: &str) -> OffchainPublicKey {
         hash = hash.wrapping_mul(0x100_0000_01b3);
     }
 
-    // Not every 32-byte string is a valid scalar, so walk until one is. Deterministic in `name`.
-    for attempt in 0u64..1024 {
-        let mut secret = [0u8; 32];
-        for (i, chunk) in secret.chunks_mut(8).enumerate() {
-            let word = hash
-                .wrapping_add(attempt.wrapping_mul(0x9e37_79b9_7f4a_7c15))
-                .wrapping_add(i as u64);
-            chunk.copy_from_slice(&word.to_be_bytes());
-        }
-        if let Ok(keypair) = OffchainKeypair::from_secret(&secret) {
-            return *keypair.public();
-        }
+    let mut secret = [0u8; 32];
+    for (i, chunk) in secret.chunks_mut(8).enumerate() {
+        chunk.copy_from_slice(&hash.wrapping_add(i as u64).to_be_bytes());
     }
-    panic!("no valid off-chain key could be derived for node {name:?}")
+    // Off-chain keys are ed25519, which clamps rather than rejecting, so any 32 bytes are a secret.
+    *OffchainKeypair::from_secret(&secret)
+        .expect("32 bytes is always a valid ed25519 secret")
+        .public()
 }
 
 impl Net {
@@ -173,26 +180,25 @@ impl Net {
         let min_ack_rate = scenario.min_ack_rate.unwrap_or(DEFAULT_MIN_ACK_RATE);
 
         let me_key = key_for(&scenario.me);
-        let graph = ChannelGraph::with_edge_params(me_key, edge_penalty, min_ack_rate, DEFAULT_MAX_LOOPBACK_RTT);
+        let graph =
+            ChannelGraph::with_edge_params(me_key, edge_penalty, min_ack_rate, DEFAULT_MAX_PLAUSIBLE_LOOPBACK_RTT);
 
-        let mut by_name = HashMap::new();
-        let mut by_key = HashMap::new();
-        let mut register = |name: &str, by_name: &mut HashMap<_, _>, by_key: &mut HashMap<_, _>| {
+        let mut by_name: HashMap<String, OffchainPublicKey> = HashMap::new();
+        let mut by_key: HashMap<OffchainPublicKey, String> = HashMap::new();
+        let mut register = |name: &str| {
             let key = key_for(name);
             by_name.insert(name.to_string(), key);
             by_key.insert(key, name.to_string());
             key
         };
 
-        register(&scenario.me, &mut by_name, &mut by_key);
-        for name in &scenario.nodes {
-            graph.add_node(register(name, &mut by_name, &mut by_key));
-        }
-        for edge in &scenario.edges {
-            for name in [&edge.from, &edge.to] {
-                let key = register(name, &mut by_name, &mut by_key);
-                graph.add_node(key);
-            }
+        register(&scenario.me);
+        for name in scenario
+            .nodes
+            .iter()
+            .chain(scenario.edges.iter().flat_map(|edge| [&edge.from, &edge.to]))
+        {
+            graph.add_node(register(name));
         }
 
         if let Some(value) = scenario.ticket_face_value {
@@ -277,23 +283,21 @@ impl Net {
 
     /// Loopback probe paths of exactly `hops` intermediate relays, closing back at `me`.
     pub fn loopback(&self, hops: usize) -> Vec<Vec<String>> {
-        let mut out: Vec<Vec<String>> = self
-            .graph
-            .simple_loopback_to_self(hops, None)
-            .into_iter()
-            .map(|(nodes, _)| nodes.iter().map(|key| self.name(key)).collect())
-            .collect();
-        out.sort();
-        out
+        self.loopback_raw(hops).into_iter().map(|(names, _)| names).collect()
     }
 
-    /// The `PathId` slots a loopback would carry, for conformance assertions.
+    /// The `PathId` slots those same loops carry, for conformance assertions.
     pub fn loopback_slots(&self, hops: usize) -> Vec<[u64; 5]> {
-        let mut out: Vec<[u64; 5]> = self
+        self.loopback_raw(hops).into_iter().map(|(_, slots)| slots).collect()
+    }
+
+    /// Loops as (names, slots), sorted so assertions do not depend on sampling order.
+    fn loopback_raw(&self, hops: usize) -> Vec<(Vec<String>, [u64; 5])> {
+        let mut out: Vec<(Vec<String>, [u64; 5])> = self
             .graph
             .simple_loopback_to_self(hops, None)
             .into_iter()
-            .map(|(_, path_id)| path_id)
+            .map(|(nodes, path_id)| (nodes.iter().map(|key| self.name(key)).collect(), path_id))
             .collect();
         out.sort();
         out
@@ -337,10 +341,10 @@ fn apply(obs: &mut Observations, edge: &Edge) {
     for _ in 0..edge.failed_relays {
         obs.record(EdgeWeightType::Intermediate(Err(())));
     }
-    // Recorded unconditionally: `None` is a meaningful state (unknown balance) and differs from
-    // `Some(0)` (open but drained), so the scenario must be able to express both.
-    if edge.balance.is_some() {
-        obs.record(EdgeWeightType::Balance(edge.balance.map(Balance::from)));
+    // An absent balance is left unrecorded rather than recorded as `None`: the graph reports an
+    // untouched channel as unknown anyway, and `Some(0)` — open but drained — stays expressible.
+    if let Some(balance) = edge.balance {
+        obs.record(EdgeWeightType::Balance(Some(Balance::from(balance))));
     }
     if edge.packets > 0 {
         obs.record(EdgeWeightType::ImmediateProtocolConformance {
