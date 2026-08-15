@@ -51,27 +51,24 @@ pub(crate) mod path_id {
     /// Rejecting rather than guessing is deliberate: a wrong answer here silently attributes a
     /// measurement to an unrelated edge.
     ///
-    /// Membership is checked against the graph rather than computed arithmetically, so an oversized
-    /// slot cannot alias a real node by narrowing to `NodeIndex`'s `u32` index type.
+    /// Membership is looked up in the graph's slot index rather than computed arithmetically, so an
+    /// oversized slot cannot alias a real node by narrowing to `NodeIndex`'s `u32` index type.
     pub(crate) fn resolve(inner: &InnerGraph, slot: u64) -> Option<NodeIndex> {
         if slot == 0 {
             return None;
         }
 
-        let mut found = None;
-        for (key, idx) in inner.indices.iter() {
-            if encode(key) == slot {
-                if found.is_some() {
-                    tracing::warn!(
-                        slot,
-                        "two nodes claim the same path identifier slot, refusing to resolve"
-                    );
-                    return None;
-                }
-                found = Some(*idx);
+        match inner.slots.get(&slot).map(Vec::as_slice) {
+            Some([only]) => Some(*only),
+            Some(_) => {
+                tracing::warn!(
+                    slot,
+                    "two nodes claim the same path identifier slot, refusing to resolve"
+                );
+                None
             }
+            _ => None,
         }
-        found
     }
 
     #[cfg(test)]
@@ -86,6 +83,25 @@ pub(crate) mod path_id {
                 let key = *OffchainKeypair::random().public();
                 assert_ne!(encode(&key), 0, "a key must not encode to the reserved padding value");
             }
+        }
+
+        #[test]
+        fn encode_should_take_the_leading_eight_bytes_big_endian() {
+            // The wire contract. Every other test here uses a random key and so asserts only that
+            // `encode` agrees with itself — they would all pass if the offset, the slice length or
+            // the byte order changed, while every peer stopped resolving our path identifiers.
+            let key = *OffchainKeypair::from_secret(&hex_literal::hex!(
+                "60741b83b99e36aa0c1331578156e16b8e21166d01834abb6c64b103f885734d"
+            ))
+            .expect("valid secret key")
+            .public();
+
+            let leading: [u8; 8] = key.as_ref()[..8].try_into().expect("a key is longer than 8 bytes");
+            assert_eq!(
+                encode(&key),
+                u64::from_be_bytes(leading),
+                "a slot is the leading 8 bytes of the key, big-endian"
+            );
         }
 
         #[test]

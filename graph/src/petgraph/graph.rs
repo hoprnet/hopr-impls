@@ -12,6 +12,35 @@ use crate::{Observations, errors::ChannelGraphError};
 pub(crate) struct InnerGraph {
     pub(crate) graph: StableDiGraph<OffchainPublicKey, Observations>,
     pub(crate) indices: BiHashMap<OffchainPublicKey, NodeIndex>,
+    /// Reverse of [`path_id::encode`](crate::petgraph::path_id::encode), maintained beside `indices`.
+    ///
+    /// Resolution runs per node pair while a telemetry report holds the write lock, so scanning
+    /// every node and re-encoding its key made one report cost time proportional to the size of the
+    /// network. Slots are 64 bits wide and derived from keys we do not choose, so one can in
+    /// principle be claimed twice; the entry keeps every claimant rather than the first, which is
+    /// what lets resolution keep failing closed on an ambiguous slot instead of guessing.
+    pub(crate) slots: std::collections::HashMap<u64, Vec<NodeIndex>>,
+}
+
+impl InnerGraph {
+    /// Registers a node's slot claim. Idempotent for a key already registered at that index.
+    pub(crate) fn claim_slot(&mut self, key: &OffchainPublicKey, idx: NodeIndex) {
+        let claimants = self.slots.entry(crate::petgraph::path_id::encode(key)).or_default();
+        if !claimants.contains(&idx) {
+            claimants.push(idx);
+        }
+    }
+
+    /// Releases a node's slot claim, dropping the entry once nothing claims it.
+    pub(crate) fn release_slot(&mut self, key: &OffchainPublicKey, idx: NodeIndex) {
+        let slot = crate::petgraph::path_id::encode(key);
+        if let Some(claimants) = self.slots.get_mut(&slot) {
+            claimants.retain(|held| *held != idx);
+            if claimants.is_empty() {
+                self.slots.remove(&slot);
+            }
+        }
+    }
 }
 
 /// A directed graph representing logical channels between nodes.
@@ -66,13 +95,18 @@ impl ChannelGraph {
 
         let idx = graph.add_node(me);
         indices.insert(me, idx);
+        let mut slots: std::collections::HashMap<u64, Vec<NodeIndex>> = std::collections::HashMap::new();
+        slots
+            .entry(crate::petgraph::path_id::encode(&me))
+            .or_default()
+            .push(idx);
 
         Self {
             me,
             edge_penalty,
             min_ack_rate,
             max_plausible_loopback_rtt,
-            inner: Arc::new(RwLock::new(InnerGraph { graph, indices })),
+            inner: Arc::new(RwLock::new(InnerGraph { graph, indices, slots })),
         }
     }
 
@@ -155,6 +189,7 @@ impl hopr_api::graph::NetworkGraphWrite for ChannelGraph {
         if !inner.indices.contains_left(&key) {
             let idx = inner.graph.add_node(key);
             inner.indices.insert(key, idx);
+            inner.claim_slot(&key, idx);
         }
     }
 
@@ -176,6 +211,7 @@ impl hopr_api::graph::NetworkGraphWrite for ChannelGraph {
     fn remove_node(&self, key: &OffchainPublicKey) {
         let mut inner = self.inner.write();
         if let Some((_, idx)) = inner.indices.remove_by_left(key) {
+            inner.release_slot(key, idx);
             let incident: Vec<_> = {
                 use petgraph::visit::EdgeRef;
 
@@ -242,6 +278,7 @@ impl hopr_api::graph::NetworkGraphWrite for ChannelGraph {
             // src node missing, add it
             let idx = inner.graph.add_node(*src);
             inner.indices.insert(*src, idx);
+            inner.claim_slot(src, idx);
             idx
         };
 
@@ -251,6 +288,7 @@ impl hopr_api::graph::NetworkGraphWrite for ChannelGraph {
             // dest node missing, add it
             let idx = inner.graph.add_node(*dest);
             inner.indices.insert(*dest, idx);
+            inner.claim_slot(dest, idx);
             idx
         };
 
