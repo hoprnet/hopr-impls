@@ -64,7 +64,8 @@ where
         // Build PathId from node indices along the path. Slots are written through
         // `path_id::encode` so a node index never collides with the reserved padding
         // value `0` (RFC-0010 §4.3.3).
-        let mut path_id: PathId = [0u64; 5];
+        // Length from the type, not restated here: `PathId`'s width is fixed by RFC-0010 §4.3.3.
+        let mut path_id: PathId = Default::default();
         for (i, &node_idx) in node_indices.iter().enumerate() {
             if i >= path_id.len() {
                 return None;
