@@ -10,13 +10,14 @@ use hopr_utils::statistics::{ExponentialMovingAverage, WindowedRatio};
 /// A representation of a individual neighbor link measurement
 #[derive(Debug, Copy, Clone, Default, PartialEq)]
 pub struct TransportLinkMeasurement {
-    latency_average: ExponentialMovingAverage<3>,
+    /// `None` until a probe has succeeded. The average cannot express "no samples yet" on its own —
+    /// an untouched EMA reads `0.0`, which is also a legitimate measured latency — so absence is
+    /// carried by the `Option` rather than by a parallel counter that could disagree with it.
+    latency_average: Option<ExponentialMovingAverage<3>>,
     probe_success_rate: ExponentialMovingAverage<5>,
-    /// Recorded probe outcomes, successful or not. Neither EMA can express "no samples yet":
+    /// Recorded probe outcomes, successful or not. The EMA cannot express "no samples yet":
     /// an all-failed stream holds exactly `0.0`, the same as its initial value.
     samples: u64,
-    /// Successful outcomes only. A failed probe records no latency, so `samples` cannot stand in.
-    latency_samples: u64,
 }
 
 impl EdgeLinkObservable for TransportLinkMeasurement {
@@ -26,8 +27,9 @@ impl EdgeLinkObservable for TransportLinkMeasurement {
             // Sub-millisecond resolution: the intermediate latency is a `saturating_sub` residual
             // that legitimately lands at or near zero, and truncating it to whole milliseconds
             // would store `0` — read back as "never measured" and scored as such.
-            self.latency_average.update(latency.as_secs_f64() * 1000.0);
-            self.latency_samples = self.latency_samples.saturating_add(1);
+            self.latency_average
+                .get_or_insert_default()
+                .update(latency.as_secs_f64() * 1000.0);
             self.probe_success_rate.update(1.0);
         } else {
             self.probe_success_rate.update(0.0);
@@ -37,8 +39,8 @@ impl EdgeLinkObservable for TransportLinkMeasurement {
     /// `None` until a probe has succeeded. Presence, not magnitude: a measured zero is a real
     /// latency and must not read as an absent one.
     fn average_latency(&self) -> Option<std::time::Duration> {
-        (self.latency_samples > 0)
-            .then(|| std::time::Duration::from_secs_f64(self.latency_average.get().max(0.0) / 1000.0))
+        self.latency_average
+            .map(|avg| std::time::Duration::from_secs_f64(avg.get().max(0.0) / 1000.0))
     }
 
     fn average_probe_rate(&self) -> Option<f64> {
@@ -58,7 +60,7 @@ impl EdgeLinkObservable for TransportLinkMeasurement {
 /// the caller's decision, not this function's: a link that was probed and never answered has earned
 /// [`NO_LATENCY_DATA_FLOOR`], while an edge known only from SURB round-trips has no latency to
 /// report *by construction* and must not be charged for it.
-fn latency_score(latency: std::time::Duration) -> f64 {
+const fn latency_score(latency: std::time::Duration) -> f64 {
     match latency.as_millis() {
         0..=75 => 1.0,
         76..=125 => 0.7,
