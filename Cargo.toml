@@ -33,16 +33,15 @@ hopr-network-graph   = { path = "graph", version = "0.5.0", default-features = f
 
 # HOPR crates published to crates.io
 blokli-client = "0.31.0"
-# TEMPORARY: both pinned to unreleased branches so this change can be compiled and tested end to
-# end, and pinned together so a single hopr-api major is in the graph — two majors coexisting makes
-# `hopr_api::chain::DeployedSafe` two distinct types. Revert to plain crates.io versions once
-# hopr-api 2.0.0 and hopr-utilities 0.9.0 are published.
+# TEMPORARY: `hopr-utils` is still pinned to an unreleased branch so this change can be compiled and
+# tested end to end. Revert to a plain crates.io version once hopr-utilities 0.9.0 is published;
+# hopr-api 2.0.0 already is.
 #
 # `version` alongside `git` is the "multiple locations" form: the git source wins locally, while
 # packaging keeps the version requirement and drops the git specification. Without it cargo refuses
 # to normalise the manifest at all, which fails the publish dry-run before it reaches any crate.
-hopr-api   = { version = "2.0.0", git = "https://github.com/hoprnet/hopr-api", rev = "ee65b340cf09fd6031735477cc1171d7610694a3" }
-hopr-utils = { package = "hopr-utilities", version = "0.9.0", git = "https://github.com/hoprnet/hopr-utilities", rev = "68e648be4aa9f1442c75df4006a53db414932f7e", default-features = false }
+hopr-api   = "2.0.0"
+hopr-utils = { package = "hopr-utilities", version = "0.9.0", git = "https://github.com/hoprnet/hopr-utilities", rev = "b705cc260d5e17e2ca5bd3c1e5ff0ffa972c00bc", default-features = false }
 
 # Third-party dependencies (versions mirror hoprnet's workspace to preserve compatibility)
 ahash = "0.8.12"
