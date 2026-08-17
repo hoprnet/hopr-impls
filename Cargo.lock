@@ -4080,7 +4080,8 @@ dependencies = [
 [[package]]
 name = "hopr-utilities"
 version = "0.9.0"
-source = "git+https://github.com/hoprnet/hopr-utilities?rev=b705cc260d5e17e2ca5bd3c1e5ff0ffa972c00bc#b705cc260d5e17e2ca5bd3c1e5ff0ffa972c00bc"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7de9a46fe251a9aa6ee3ab7e2edd7720ac6f09ad4f01566dd6c056913615cc43"
 dependencies = [
  "anyhow",
  "arrayvec",
@@ -4231,7 +4232,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "system-configuration",
  "tokio",
  "tower-service",
@@ -6294,7 +6295,7 @@ dependencies = [
  "quinn-udp 0.5.15",
  "rustc-hash",
  "rustls",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
@@ -6334,7 +6335,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.61.2",
 ]
@@ -6347,7 +6348,7 @@ checksum = "76150b617afc75e6e21ac5f39bc196e80b65415ae48d62dbef8e2519d040ce42"
 dependencies = [
  "cfg_aliases",
  "libc",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "windows-sys 0.61.2",
 ]
 
