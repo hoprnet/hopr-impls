@@ -21,14 +21,18 @@ lazy_static::lazy_static! {
 /// so the distribution tracks quality as it evolves per probe round.
 #[cfg(all(feature = "telemetry", not(test)))]
 fn observe_neighbor_quality(graph: &ChannelGraph, peer: &hopr_api::OffchainPublicKey) {
-    if let Some(obs) = graph.edge(graph.me(), peer) {
-        METRIC_PEERS_BY_QUALITY.observe(obs.score());
+    // Unobserved edges are skipped rather than recorded as a fabricated zero.
+    if let Some(obs) = graph.edge(graph.me(), peer)
+        && let Some(score) = obs.score()
+    {
+        METRIC_PEERS_BY_QUALITY.observe(score);
     }
 }
 
 /// Resolves a loopback path from serialized node-index bytes into a validated chain of edge indices.
 ///
-/// The `path_bytes` encode a `PathId` where each `u64` is a [`NodeIndex`].
+/// The `path_bytes` encode a `PathId` whose slots are key-derived (see
+/// [`path_id`](crate::petgraph::path_id)), not node indices.
 /// The path is expected to start and end at `me` (a closed loop).
 ///
 /// Walks consecutive node pairs, finding the connecting edge for each.
@@ -176,6 +180,10 @@ fn resolve_round_trip_edges(
 }
 
 impl hopr_api::graph::NetworkGraphUpdate for ChannelGraph {
+    fn set_ticket_face_value(&self, ticket_face_value: hopr_api::graph::traits::Balance) {
+        *self.ticket_face_value.write() = Some(ticket_face_value);
+    }
+
     #[tracing::instrument(level = "debug", skip(self, update))]
     fn record_edge<N, P>(&self, update: MeasurableEdge<N, P>)
     where
@@ -273,10 +281,9 @@ impl hopr_api::graph::NetworkGraphUpdate for ChannelGraph {
 
                 let target_idx = edges.len() - 2;
 
-                // Attributed duration = total RTT - sum of all known edge latencies.
-                // For each edge (including the target), use intermediate QoS if available,
-                // otherwise fall back to immediate QoS. The residual is attributed to the
-                // target edge as its new intermediate measurement.
+                // Attributed duration = total RTT - the latencies of the *other* edges on the
+                // loop, each taken from its intermediate QoS where available and its immediate QoS
+                // otherwise. What remains is the target edge's own latency.
                 //
                 // `timestamp()` is the probe's creation time (unix epoch millis), so the
                 // RTT is the elapsed time until now. A timestamp in the future (backward
@@ -299,9 +306,16 @@ impl hopr_api::graph::NetworkGraphUpdate for ChannelGraph {
                     );
                     return;
                 }
+                // Everything *except* the target: the residual is meant to be the target's own
+                // latency, so subtracting our current estimate of it too would yield the error in
+                // that estimate rather than a new measurement — and would drive the residual to
+                // zero exactly when the estimates are good.
                 let mut known_latency = std::time::Duration::ZERO;
 
-                for &edge in &edges {
+                for (i, &edge) in edges.iter().enumerate() {
+                    if i == target_idx {
+                        continue;
+                    }
                     if let Some(weight) = inner.graph.edge_weight(edge) {
                         let lat = weight
                             .intermediate_qos()
@@ -315,7 +329,39 @@ impl hopr_api::graph::NetworkGraphUpdate for ChannelGraph {
                     }
                 }
 
-                let attributed_duration = total_rtt.saturating_sub(known_latency);
+                // A saturating subtraction would turn "the known latencies already account for the
+                // whole round trip" into a measured zero — and a zero latency scores in the *fastest*
+                // band, so a clamp would be read as the best possible link. The residual is only a
+                // measurement while it stays positive; otherwise this probe tells us nothing about
+                // the target's speed and no latency is recorded for it.
+                // A saturating subtraction would turn "the other edges already account for the whole
+                // round trip" into a measured zero — and zero scores in the *fastest* latency band,
+                // so a clamp would read as the best possible link.
+                //
+                // The probe still succeeded, though, and the timeout branch below records failures
+                // unconditionally. Dropping the success here too would let an edge whose neighbours
+                // over-account accrue failures only and decay to looking dead. So the success is
+                // credited with the latency the edge already carries, leaving its average untouched
+                // while the probe rate still counts. With nothing carried yet there is no honest
+                // figure to record and the sample is skipped.
+                let attributed_duration = match total_rtt.checked_sub(known_latency) {
+                    Some(residual) => residual,
+                    None => {
+                        let carried = inner
+                            .graph
+                            .edge_weight(edges[target_idx])
+                            .and_then(|w| w.intermediate_qos().and_then(|q| q.average_latency()));
+                        tracing::debug!(
+                            total_rtt_ms = total_rtt.as_millis(),
+                            known_ms = known_latency.as_millis(),
+                            "known latencies already account for the loopback RTT, no new latency to attribute"
+                        );
+                        match carried {
+                            Some(latency) => latency,
+                            None => return,
+                        }
+                    }
+                };
 
                 tracing::trace!(
                     target_edge = edges[target_idx].index(),
@@ -375,9 +421,9 @@ impl hopr_api::graph::NetworkGraphUpdate for ChannelGraph {
                     weight.record(EdgeWeightType::Intermediate(Err(())));
                 }
             }
-            MeasurableEdge::Capacity(update) => {
+            MeasurableEdge::Balance(update) => {
                 self.upsert_edge(&update.src, &update.dest, |obs: &mut Observations| {
-                    obs.record(EdgeWeightType::Capacity(update.capacity));
+                    obs.record(EdgeWeightType::Balance(update.balance));
                 });
             }
             MeasurableEdge::ConnectionStatus { peer, connected } => {
@@ -689,9 +735,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn surb_round_trip_should_be_dropped_when_an_index_is_stale() -> anyhow::Result<()> {
-        // A PathId is a snapshot of node indices; one built against an older generation of the
-        // graph must be discarded rather than credited to whoever now occupies those slots.
+    async fn surb_round_trip_should_be_dropped_when_a_slot_is_stale() -> anyhow::Result<()> {
+        // A PathId names keys, not positions, so a slot whose node has left the graph resolves to
+        // nothing — the report is discarded rather than credited to some surviving edge.
         let (graph, exit, relay, me) = round_trip_graph()?;
         let (me_i, exit_i) = (slot_of(&graph, &me), slot_of(&graph, &exit));
         let _ = relay;
@@ -790,7 +836,7 @@ mod tests {
             "failed probe should not set latency"
         );
         assert!(
-            imm_fwd.average_probe_rate() < 1.0,
+            imm_fwd.average_probe_rate().expect("probed") < 1.0,
             "failed probe should lower success rate"
         );
 
@@ -804,7 +850,7 @@ mod tests {
             "failed probe should not set latency on reverse"
         );
         assert!(
-            imm_rev.average_probe_rate() < 1.0,
+            imm_rev.average_probe_rate().expect("probed") < 1.0,
             "failed probe should lower success rate on reverse"
         );
 
@@ -831,55 +877,56 @@ mod tests {
             .immediate_qos()
             .context("immediate QoS should be present after failed probe")?;
         assert!(immediate.average_latency().is_none());
-        assert!(immediate.average_probe_rate() < 1.0);
+        assert!(immediate.average_probe_rate().expect("probed") < 1.0);
         Ok(())
     }
 
     #[tokio::test]
-    async fn capacity_update_should_set_edge_capacity() -> anyhow::Result<()> {
+    async fn balance_update_should_set_edge_capacity() -> anyhow::Result<()> {
         let me = pubkey_from(&SECRET_0);
         let peer = pubkey_from(&SECRET_1);
         let graph = ChannelGraph::new(me);
         graph.add_node(peer);
         graph.add_edge(&me, &peer)?;
 
-        let capacity_update = hopr_api::graph::EdgeCapacityUpdate {
+        let capacity_update = hopr_api::graph::EdgeBalanceUpdate {
             src: me,
             dest: peer,
-            capacity: Some(1000),
+            balance: Some(hopr_api::graph::traits::Balance::from(1000u64)),
         };
-        graph.record_edge::<TestNeighbor, TestPath>(hopr_api::graph::MeasurableEdge::Capacity(Box::new(
-            capacity_update,
-        )));
+        graph
+            .record_edge::<TestNeighbor, TestPath>(hopr_api::graph::MeasurableEdge::Balance(Box::new(capacity_update)));
 
         let obs = graph.edge(&me, &peer).context("edge should exist")?;
         let intermediate = obs
             .intermediate_qos()
             .context("intermediate QoS should be present after capacity update")?;
-        assert_eq!(intermediate.capacity(), Some(1000));
+        assert_eq!(
+            intermediate.balance(),
+            Some(hopr_api::graph::traits::Balance::from(1000u64))
+        );
         Ok(())
     }
 
     #[tokio::test]
-    async fn capacity_update_should_accept_none_value() -> anyhow::Result<()> {
+    async fn balance_update_should_accept_none_value() -> anyhow::Result<()> {
         let me = pubkey_from(&SECRET_0);
         let peer = pubkey_from(&SECRET_1);
         let graph = ChannelGraph::new(me);
         graph.add_node(peer);
         graph.add_edge(&me, &peer)?;
 
-        let capacity_update = hopr_api::graph::EdgeCapacityUpdate {
+        let capacity_update = hopr_api::graph::EdgeBalanceUpdate {
             src: me,
             dest: peer,
-            capacity: None,
+            balance: None,
         };
-        graph.record_edge::<TestNeighbor, TestPath>(hopr_api::graph::MeasurableEdge::Capacity(Box::new(
-            capacity_update,
-        )));
+        graph
+            .record_edge::<TestNeighbor, TestPath>(hopr_api::graph::MeasurableEdge::Balance(Box::new(capacity_update)));
 
         let obs = graph.edge(&me, &peer).context("edge should exist")?;
         let intermediate = obs.intermediate_qos().context("intermediate QoS should be present")?;
-        assert_eq!(intermediate.capacity(), None);
+        assert_eq!(intermediate.balance(), None);
         Ok(())
     }
 
@@ -937,7 +984,7 @@ mod tests {
             qos.average_latency().context("latency should be set")?,
             std::time::Duration::from_millis(30), // rtt / 2 = 30ms
         );
-        assert!(qos.average_probe_rate() > 0.9, "all probes succeeded");
+        assert!(qos.average_probe_rate().expect("probed") > 0.9, "all probes succeeded");
         Ok(())
     }
 
@@ -1333,11 +1380,15 @@ mod tests {
         let qos = obs
             .intermediate_qos()
             .context("intermediate QoS should be present on me→a")?;
+        // The whole round trip, because the only *other* edge on the loop has no known latency.
+        // The target's own prior estimate is deliberately not subtracted: doing so would measure the
+        // error in that estimate rather than the edge, and would drive the residual to zero exactly
+        // when the estimate was good.
         assert_in_delta!(
             qos.average_latency().context("latency should be set")?.as_millis(),
-            50,
+            100,
             25
-        ); // 100ms total - 50ms (me→a immediate) = 50ms attributed to me→a
+        );
 
         // Immediate QoS should still be intact
         let imm = obs
@@ -1636,7 +1687,7 @@ mod tests {
             "latency should be set after multiple probes"
         );
         assert!(
-            qos.average_probe_rate() > 0.9,
+            qos.average_probe_rate().expect("probed") > 0.9,
             "all probes succeeded, rate should be high"
         );
 
@@ -1645,8 +1696,8 @@ mod tests {
 
     // This is handled by the moving average object, but the expectation test can stay here.
     #[tokio::test]
-    async fn loopback_saturating_sub_should_not_underflow() -> anyhow::Result<()> {
-        // If preceding edge latencies exceed total RTT, duration should saturate at 0
+    async fn loopback_should_not_attribute_when_other_edges_account_for_the_whole_rtt() -> anyhow::Result<()> {
+        // If the other edges already account for the whole RTT there is no residual to attribute.
         // Loopback: me(0) → a(1) → b(2) → c(3) → me(0). Target = b→c.
         // Preceding = [me→a, a→b] with me→a = 500ms
         let me = pubkey_from(&SECRET_0);
@@ -1674,14 +1725,14 @@ mod tests {
         // Total RTT = 100ms, but preceding latency is 500ms → 100 - 500 saturates to 0
         send_loopback(&graph, &[me, a, b, c, me], 100);
 
-        let obs = graph.edge(&b, &c).context("edge b→c should exist")?;
-        let qos = obs.intermediate_qos().context("intermediate QoS should be present")?;
-        // Duration::ZERO means latency_average gets updated with 0ms
-        // which the EMA may not report as Some(0) but rather None if <= 0
-        // Let's check the probe rate instead — it should be recorded
+        // Nothing is attributed. A clamp is not a measurement: recording the saturated zero would
+        // put this edge in the *fastest* latency band on the strength of knowing nothing about it.
         assert!(
-            qos.average_probe_rate() > 0.0,
-            "probe should still be recorded even with saturated duration"
+            graph
+                .edge(&b, &c)
+                .and_then(|obs| obs.intermediate_qos().cloned())
+                .is_none(),
+            "a round trip already accounted for by the other edges says nothing about the target"
         );
 
         Ok(())
@@ -1710,7 +1761,10 @@ mod tests {
             .intermediate_qos()
             .context("intermediate QoS should be present on a→b after timeout")?;
         assert!(qos.average_latency().is_none(), "failed probe should not set latency");
-        assert!(qos.average_probe_rate() < 1.0, "failed probe should lower success rate");
+        assert!(
+            qos.average_probe_rate().expect("probed") < 1.0,
+            "failed probe should lower success rate"
+        );
 
         // me→a should NOT have intermediate QoS
         let obs_me_a = graph.edge(&me, &a).context("edge me→a should exist")?;
@@ -1745,7 +1799,7 @@ mod tests {
             .intermediate_qos()
             .context("intermediate QoS should be present on b→c")?;
         assert!(qos.average_latency().is_none());
-        assert!(qos.average_probe_rate() < 1.0);
+        assert!(qos.average_probe_rate().expect("probed") < 1.0);
 
         // Earlier edges should NOT have intermediate QoS
         let obs_me_a = graph.edge(&me, &a).context("edge me→a should exist")?;

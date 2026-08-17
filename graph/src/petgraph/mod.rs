@@ -3,7 +3,7 @@ pub mod graph;
 pub mod traverse;
 pub mod update;
 
-pub use graph::ChannelGraph;
+pub use graph::{ChannelGraph, DEFAULT_EDGE_PENALTY, DEFAULT_MAX_PLAUSIBLE_LOOPBACK_RTT, DEFAULT_MIN_ACK_RATE};
 
 /// Encoding of nodes into [`PathId`](hopr_api::types::internal::routing::PathId) slots.
 ///

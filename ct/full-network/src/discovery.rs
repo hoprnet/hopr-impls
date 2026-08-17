@@ -202,17 +202,27 @@ where
                         .filter_map(|peer| {
                             let obs = graph.edge(&me, &peer);
                             if cfg.probe_connected_only {
-                                let connected = obs
+                                // Excludes peers observed to be down, not peers never checked:
+                                // skipping the latter would stop the probe that resolves them,
+                                // leaving them excluded for good.
+                                let known_down = obs
                                     .as_ref()
                                     .and_then(|o| o.immediate_qos())
-                                    .map(|imm| imm.is_connected())
-                                    .unwrap_or(false);
-                                if !connected {
+                                    .and_then(|imm| imm.is_connected())
+                                    == Some(false);
+                                if known_down {
                                     return futures::future::ready(None);
                                 }
                             }
                             let priority = match obs {
-                                Some(obs) => immediate_probe_priority(obs.score(), obs.last_update(), now, &cfg),
+                                Some(obs) => immediate_probe_priority(
+                                    // An unobserved edge scores as poorly as possible, which
+                                    // RFC-0010 §4.2.1.4 turns into maximum probing urgency.
+                                    obs.score().unwrap_or(0.0),
+                                    obs.last_update(),
+                                    now,
+                                    &cfg,
+                                ),
                                 None => immediate_probe_priority(0.0, std::time::Duration::ZERO, now, &cfg),
                             };
                             futures::future::ready(Some((peer, priority)))
@@ -507,7 +517,9 @@ mod tests {
         graph.upsert_edge(src, dst, |obs| {
             obs.record(EdgeWeightType::Connected(true));
             obs.record(EdgeWeightType::Immediate(Ok(std::time::Duration::from_millis(50))));
-            obs.record(EdgeWeightType::Capacity(Some(1000)));
+            obs.record(EdgeWeightType::Balance(Some(hopr_api::graph::traits::Balance::from(
+                1000u64,
+            ))));
         });
     }
 
@@ -580,7 +592,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn probe_connected_only_should_skip_unconnected_peers() -> anyhow::Result<()> {
+    async fn probe_connected_only_should_skip_peers_observed_down() -> anyhow::Result<()> {
+        // `probe_connected_only` excludes peers *observed* to be down. A peer whose connectivity
+        // was never observed must still be probed: skipping it would suppress the very probe that
+        // would establish whether it is reachable.
         let me = random_key();
         let graph = Arc::new(ChannelGraph::new(me));
 
@@ -589,8 +604,11 @@ mod tests {
         graph.record_node(connected_peer);
         graph.record_node(unconnected_peer);
 
-        // Only mark one peer as connected.
         mark_edge_ready(&graph, &me, &connected_peer);
+        graph.upsert_edge(&me, &unconnected_peer, |obs| {
+            use hopr_api::graph::traits::{EdgeObservableWrite, EdgeWeightType};
+            obs.record(EdgeWeightType::Connected(false));
+        });
 
         let cfg = ProberConfig {
             probe_connected_only: true,

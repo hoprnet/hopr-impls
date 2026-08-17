@@ -60,8 +60,21 @@ pub struct ChannelGraph {
     pub(crate) edge_penalty: f64,
     pub(crate) min_ack_rate: f64,
     pub(crate) max_plausible_loopback_rtt: std::time::Duration,
+    /// Current single-hop ticket face value, pushed in whenever the price or winning probability
+    /// changes. Held once for the whole graph so a change costs one write, not an edge sweep.
+    pub(crate) ticket_face_value: Arc<RwLock<Option<hopr_api::graph::traits::Balance>>>,
     pub(crate) inner: Arc<RwLock<InnerGraph>>,
 }
+
+/// Multiplier applied to an edge with no probe observations, keeping it discoverable (RFC-0010
+/// §4.2.3) rather than excluded.
+pub const DEFAULT_EDGE_PENALTY: f64 = 0.5;
+
+/// Acknowledgement floor below which data-path selection rejects an immediate peer.
+pub const DEFAULT_MIN_ACK_RATE: f64 = 0.1;
+
+/// Round-trip beyond which a loopback report is treated as clock skew rather than a measurement.
+pub const DEFAULT_MAX_PLAUSIBLE_LOOPBACK_RTT: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl ChannelGraph {
     /// Creates a new channel graph with the given self identity and default edge scoring
@@ -73,7 +86,12 @@ impl ChannelGraph {
     /// Production code should prefer [`with_edge_params`](Self::with_edge_params) to
     /// receive values from `PathPlannerConfig`.
     pub fn new(me: OffchainPublicKey) -> Self {
-        Self::with_edge_params(me, 0.5, 0.1, std::time::Duration::from_secs(30))
+        Self::with_edge_params(
+            me,
+            DEFAULT_EDGE_PENALTY,
+            DEFAULT_MIN_ACK_RATE,
+            DEFAULT_MAX_PLAUSIBLE_LOOPBACK_RTT,
+        )
     }
 
     /// Creates a new channel graph with custom edge scoring parameters.
@@ -106,6 +124,7 @@ impl ChannelGraph {
             edge_penalty,
             min_ack_rate,
             max_plausible_loopback_rtt,
+            ticket_face_value: Arc::new(RwLock::new(None)),
             inner: Arc::new(RwLock::new(InnerGraph { graph, indices, slots })),
         }
     }
@@ -132,6 +151,10 @@ impl ChannelGraph {
 impl hopr_api::graph::NetworkGraphView for ChannelGraph {
     type NodeId = OffchainPublicKey;
     type Observed = Observations;
+
+    fn ticket_face_value(&self) -> Option<hopr_api::graph::traits::Balance> {
+        *self.ticket_face_value.read()
+    }
 
     fn node_count(&self) -> usize {
         // The key mapping, not the vertex count: a removed node stays behind as an isolated vertex
