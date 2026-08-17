@@ -12,6 +12,35 @@ use crate::{Observations, errors::ChannelGraphError};
 pub(crate) struct InnerGraph {
     pub(crate) graph: StableDiGraph<OffchainPublicKey, Observations>,
     pub(crate) indices: BiHashMap<OffchainPublicKey, NodeIndex>,
+    /// Reverse of [`path_id::encode`](crate::petgraph::path_id::encode), maintained beside `indices`.
+    ///
+    /// Resolution runs per node pair while a telemetry report holds the write lock, so scanning
+    /// every node and re-encoding its key made one report cost time proportional to the size of the
+    /// network. Slots are 64 bits wide and derived from keys we do not choose, so one can in
+    /// principle be claimed twice; the entry keeps every claimant rather than the first, which is
+    /// what lets resolution keep failing closed on an ambiguous slot instead of guessing.
+    pub(crate) slots: std::collections::HashMap<u64, Vec<NodeIndex>>,
+}
+
+impl InnerGraph {
+    /// Registers a node's slot claim. Idempotent for a key already registered at that index.
+    pub(crate) fn claim_slot(&mut self, key: &OffchainPublicKey, idx: NodeIndex) {
+        let claimants = self.slots.entry(crate::petgraph::path_id::encode(key)).or_default();
+        if !claimants.contains(&idx) {
+            claimants.push(idx);
+        }
+    }
+
+    /// Releases a node's slot claim, dropping the entry once nothing claims it.
+    pub(crate) fn release_slot(&mut self, key: &OffchainPublicKey, idx: NodeIndex) {
+        let slot = crate::petgraph::path_id::encode(key);
+        if let Some(claimants) = self.slots.get_mut(&slot) {
+            claimants.retain(|held| *held != idx);
+            if claimants.is_empty() {
+                self.slots.remove(&slot);
+            }
+        }
+    }
 }
 
 /// A directed graph representing logical channels between nodes.
@@ -51,7 +80,8 @@ impl ChannelGraph {
     ///
     /// * `me` – offchain public key of the local node (added as the first graph node).
     /// * `edge_penalty` – penalty multiplier for edges lacking probe-based quality observations.
-    /// * `min_ack_rate` – minimum acceptable message acknowledgment rate for path selection.
+    /// * `min_ack_rate` – minimum acknowledgment rate for **data** path selection; deliberately not applied to loopback
+    ///   probe generation.
     /// * `max_plausible_loopback_rtt` – upper bound on a loopback probe RTT considered plausible; measurements above it
     ///   are discarded during attribution.
     pub fn with_edge_params(
@@ -65,19 +95,37 @@ impl ChannelGraph {
 
         let idx = graph.add_node(me);
         indices.insert(me, idx);
+        let mut slots: std::collections::HashMap<u64, Vec<NodeIndex>> = std::collections::HashMap::new();
+        slots
+            .entry(crate::petgraph::path_id::encode(&me))
+            .or_default()
+            .push(idx);
 
         Self {
             me,
             edge_penalty,
             min_ack_rate,
             max_plausible_loopback_rtt,
-            inner: Arc::new(RwLock::new(InnerGraph { graph, indices })),
+            inner: Arc::new(RwLock::new(InnerGraph { graph, indices, slots })),
         }
     }
 
     /// Returns the self-identity key of this graph.
     pub fn me(&self) -> &OffchainPublicKey {
         &self.me
+    }
+
+    /// Returns the configured penalty multiplier for edges lacking probe observations.
+    pub fn edge_penalty(&self) -> f64 {
+        self.edge_penalty
+    }
+
+    /// Returns the configured minimum acknowledgement rate for data path selection.
+    ///
+    /// Exposed so data-path callers apply the same threshold the graph was built with. Not applied
+    /// to loopback probe generation, which must reach edges data selection rejects.
+    pub fn min_ack_rate(&self) -> f64 {
+        self.min_ack_rate
     }
 }
 
@@ -125,9 +173,14 @@ impl hopr_api::graph::NetworkGraphView for ChannelGraph {
     }
 
     fn path_slot(&self, key: &OffchainPublicKey) -> Option<u64> {
-        // The same node index a `PathId` from `simple_paths` is built out of, so ids assembled from
-        // keys and ids handed out by path selection resolve identically.
-        self.inner.read().indices.get_by_left(key).map(|i| i.index() as u64)
+        // The same value `find_paths` writes into a `PathId`, so ids assembled from keys and ids
+        // handed out by path selection resolve identically. Key-derived rather than the node index:
+        // RFC-0010 §4.3.3 reserves `0` for padding, which a zero-based index cannot honour.
+        self.inner
+            .read()
+            .indices
+            .contains_left(key)
+            .then(|| crate::petgraph::path_id::encode(key))
     }
 }
 
@@ -141,6 +194,7 @@ impl hopr_api::graph::NetworkGraphWrite for ChannelGraph {
         if !inner.indices.contains_left(&key) {
             let idx = inner.graph.add_node(key);
             inner.indices.insert(key, idx);
+            inner.claim_slot(&key, idx);
         }
     }
 
@@ -162,6 +216,7 @@ impl hopr_api::graph::NetworkGraphWrite for ChannelGraph {
     fn remove_node(&self, key: &OffchainPublicKey) {
         let mut inner = self.inner.write();
         if let Some((_, idx)) = inner.indices.remove_by_left(key) {
+            inner.release_slot(key, idx);
             let incident: Vec<_> = {
                 use petgraph::visit::EdgeRef;
 
@@ -228,6 +283,7 @@ impl hopr_api::graph::NetworkGraphWrite for ChannelGraph {
             // src node missing, add it
             let idx = inner.graph.add_node(*src);
             inner.indices.insert(*src, idx);
+            inner.claim_slot(src, idx);
             idx
         };
 
@@ -237,6 +293,7 @@ impl hopr_api::graph::NetworkGraphWrite for ChannelGraph {
             // dest node missing, add it
             let idx = inner.graph.add_node(*dest);
             inner.indices.insert(*dest, idx);
+            inner.claim_slot(dest, idx);
             idx
         };
 
@@ -345,23 +402,33 @@ mod tests {
     }
 
     #[test]
-    fn path_slot_should_number_nodes_the_way_path_ids_do() -> anyhow::Result<()> {
-        // Load-bearing: SURB round-trips assemble a `PathId` out of public keys, while path
-        // selection builds one out of node indices. `resolve_round_trip_edges` compares the two
-        // numbering schemes directly, so if they ever diverged a reported round-trip would credit
-        // whichever edges the wrong numbers happened to name.
+    fn path_slot_should_hand_out_the_slot_a_path_id_carries() -> anyhow::Result<()> {
+        // Load-bearing: SURB round-trips assemble a `PathId` out of public keys via `path_slot`,
+        // while path selection builds one itself. Both must name the same value, or a reported
+        // round-trip credits whichever edges the wrong numbers happen to name -- silently, since a
+        // mismatched slot simply fails to resolve.
+        //
+        // Asserted against the encoding rather than against fixed numbers: a test pinning only one
+        // side passes happily while the other moves, which is how the two came to disagree. That
+        // `find_paths` writes this same encoding is pinned in `traverse.rs`; the end-to-end
+        // agreement is covered by the integration suite.
         let me = pubkey_from(&SECRET_0);
         let graph = ChannelGraph::new(me);
-        let first = pubkey_from(&SECRET_1);
-        let second = pubkey_from(&SECRET_2);
-        graph.add_node(first);
-        graph.add_node(second);
+        let known = pubkey_from(&SECRET_1);
+        graph.add_node(known);
 
-        // Self occupies the graph's first node, so it is slot 0 -- the value the round-trip
-        // resolver checks the forward leg starts at.
-        assert_eq!(Some(0), graph.path_slot(&me));
-        assert_eq!(Some(1), graph.path_slot(&first));
-        assert_eq!(Some(2), graph.path_slot(&second));
+        for key in [me, known] {
+            assert_eq!(
+                graph.path_slot(&key),
+                Some(crate::petgraph::path_id::encode(&key)),
+                "path_slot must hand out the key-derived slot a PathId carries"
+            );
+        }
+        assert_eq!(
+            None,
+            graph.path_slot(&pubkey_from(&SECRET_4)),
+            "a node the graph does not know has no slot"
+        );
         Ok(())
     }
 
@@ -377,23 +444,24 @@ mod tests {
         let last = pubkey_from(&SECRET_2);
         graph.add_node(middle);
         graph.add_node(last);
-        assert_eq!(Some(2), graph.path_slot(&last));
+        let (me_slot, middle_slot, last_slot) =
+            (graph.path_slot(&me), graph.path_slot(&middle), graph.path_slot(&last));
 
         graph.remove_node(&middle);
 
         assert_eq!(None, graph.path_slot(&middle), "the removed node resolves to nothing");
-        assert_eq!(Some(0), graph.path_slot(&me), "self must not move");
+        assert_eq!(me_slot, graph.path_slot(&me), "self must not move");
         assert_eq!(
-            Some(2),
+            last_slot,
             graph.path_slot(&last),
-            "the last node must not be swapped into the freed slot"
+            "a surviving node must keep the slot it had"
         );
 
         // Nor may a newcomer inherit it, which is what would make a stale id resolve to a live node.
         let newcomer = pubkey_from(&SECRET_3);
         graph.add_node(newcomer);
         assert_ne!(
-            Some(1),
+            middle_slot,
             graph.path_slot(&newcomer),
             "a freed slot must not be handed to a different node"
         );
