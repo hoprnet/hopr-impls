@@ -14,6 +14,14 @@ rust-version.workspace = true
 version                = "0.22.2"
 
 [features]
+pix-curvy     = ["dep:babyjubjub-ec", "dep:const-hex", "dep:curvy-core"]
+pix-curvy-sdk = [
+  "pix-curvy",
+  "dep:curvy-chain-blokli",
+  "dep:curvy-sdk",
+  "dep:serde",
+  "dep:tokio",
+]
 runtime-tokio = ["hopr-utils/runtime-tokio"]
 testing       = ["hopr-utils/testing-blokli"]
 
@@ -23,7 +31,12 @@ anyhow              = { workspace = true }
 async-broadcast     = { workspace = true }
 async-trait         = { workspace = true }
 atomic_enum         = { workspace = true }
+babyjubjub-ec       = { workspace = true, optional = true }
 blokli-client       = { workspace = true }
+const-hex           = { workspace = true, optional = true }
+curvy-chain-blokli  = { workspace = true, optional = true }
+curvy-core          = { workspace = true, optional = true }
+curvy-sdk           = { workspace = true, optional = true }
 dashmap             = { workspace = true }
 futures             = { workspace = true }
 futures-concurrency = { workspace = true }
@@ -33,10 +46,12 @@ parking_lot         = { workspace = true }
 petgraph            = { workspace = true, features = ["graphmap", "rayon"] }
 postcard            = { workspace = true }
 redb                = { workspace = true }
+serde               = { workspace = true, optional = true }
 serde_json          = { workspace = true }
 smart-default       = { workspace = true }
 tempfile            = { workspace = true }
 thiserror           = { workspace = true }
+tokio               = { workspace = true, optional = true }
 tracing             = { workspace = true }
 validator           = { workspace = true }
 
