@@ -263,11 +263,17 @@ fn model_to_service_metadata(rendered: &str) -> Result<ServiceMetadata, Connecto
 
 /// Converts a Unix timestamp in seconds, as the Blokli API represents registry timestamps.
 fn model_to_timestamp(seconds: &blokli_client::api::types::Uint64) -> Result<SystemTime, ConnectorError> {
-    seconds
+    let parsed = seconds
         .0
         .parse::<u64>()
-        .map(|seconds| UNIX_EPOCH + Duration::from_secs(seconds))
-        .map_err(|e| ConnectorError::TypeConversion(format!("invalid service timestamp {}: {e}", seconds.0)))
+        .map_err(|e| ConnectorError::TypeConversion(format!("invalid service timestamp {}: {e}", seconds.0)))?;
+
+    // A `Uint64` can name an instant that the platform's `SystemTime` cannot hold, and
+    // `SystemTime + Duration` panics on overflow instead of failing, so malformed Blokli data
+    // would terminate the process.
+    UNIX_EPOCH
+        .checked_add(Duration::from_secs(parsed))
+        .ok_or_else(|| ConnectorError::TypeConversion(format!("service timestamp {parsed} is out of range")))
 }
 
 /// Parses a service registry burn.

@@ -439,10 +439,15 @@ mod tests {
         Ok(())
     }
 
+    /// Blokli rejects a bare enumeration of the permissionless registry, so an unfiltered read is
+    /// answered per service type. Two types with an entry each pin that the fan-out covers every
+    /// type rather than issuing the `Any` query the server would refuse.
     #[tokio::test]
     async fn connector_should_enumerate_an_unfiltered_service_stream() -> anyhow::Result<()> {
+        let other_type: ServiceType = "gvpn:entry".parse()?;
         let blokli_client = BlokliTestStateBuilder::default()
-            .with_services([entry(ServiceType::GVPN_EXIT, NODE)?])
+            .with_service_types([(other_type, config())])
+            .with_services([entry(ServiceType::GVPN_EXIT, NODE)?, entry(other_type, OTHER_NODE)?])
             .build_static_client();
 
         let connector = create_connector(blokli_client)?;
@@ -451,7 +456,10 @@ mod tests {
             .stream_services(ServiceSelector::default())?
             .collect::<Vec<_>>()
             .await;
-        assert_eq!(1, entries.len());
+        assert_eq!(
+            vec![entry(ServiceType::GVPN_EXIT, NODE)?, entry(other_type, OTHER_NODE)?],
+            entries
+        );
 
         Ok(())
     }
@@ -492,6 +500,7 @@ mod tests {
     async fn connector_should_count_services() -> anyhow::Result<()> {
         let other_type: ServiceType = "gvpn:entry".parse()?;
         let blokli_client = BlokliTestStateBuilder::default()
+            .with_service_types([(other_type, config())])
             .with_services([
                 entry(ServiceType::GVPN_EXIT, NODE)?,
                 entry(ServiceType::GVPN_EXIT, OTHER_NODE)?,
@@ -502,7 +511,8 @@ mod tests {
 
         let connector = create_connector(blokli_client)?;
 
-        // Counting is the one read that an unfiltered selector is allowed to do.
+        // An unfiltered count is the one registry read Blokli answers directly, without the
+        // per-type fan-out that `stream_services` needs.
         assert_eq!(3, connector.count_services(ServiceSelector::default()).await?);
         assert_eq!(
             2,
@@ -832,5 +842,23 @@ mod tests {
         assert!(error.to_string().contains("node"), "{error}");
 
         Ok(())
+    }
+
+    /// A registry timestamp is a `Uint64`, so it can name an instant no `SystemTime` can hold.
+    /// `SystemTime + Duration` panics on overflow, which would let malformed Blokli data terminate
+    /// the process instead of failing the conversion.
+    #[test]
+    fn an_out_of_range_timestamp_fails_the_conversion_instead_of_panicking() {
+        // Both fields carry the boundary value, so the failure cannot come from `ServiceEntry`
+        // rejecting an update that precedes its registration.
+        let model = blokli_client::api::types::ServiceEntry {
+            registered_at: blokli_client::api::types::Uint64(u64::MAX.to_string()),
+            updated_at: blokli_client::api::types::Uint64(u64::MAX.to_string()),
+            ..entry_model(METADATA, UPDATED_AT)
+        };
+
+        let error = crate::utils::model_to_service_entry(&model)
+            .expect_err("a timestamp beyond the platform's SystemTime range must not convert");
+        assert!(error.to_string().contains("out of range"), "{error}");
     }
 }
