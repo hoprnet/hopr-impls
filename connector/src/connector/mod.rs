@@ -5,7 +5,7 @@ use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt};
 use futures_concurrency::stream::Merge;
 use futures_time::future::FutureExt as FuturesTimeExt;
 use hopr_api::{
-    chain::{ChainPathResolver, ChainReceipt, HoprKeyIdent},
+    chain::{ChainPathResolver, ChainReceipt, HoprKeyIdent, ServiceSelector},
     types::{chain::prelude::*, crypto::prelude::*, internal::prelude::*, primitive::prelude::*},
 };
 use hopr_utils::runtime::AbortHandle;
@@ -18,7 +18,8 @@ use crate::{
         keys::HoprKeyMapper,
         sequencer::TransactionSequencer,
         services::{
-            ServiceEvent, service_registry_config_to_events, service_type_update_to_event, service_update_to_event,
+            ReplayedServiceTypes, ReplayedServices, ServiceEvent, service_registry_config_to_events,
+            service_type_update_to_event, service_update_to_event,
         },
         values::CHAIN_INFO_CACHE_KEY,
     },
@@ -47,6 +48,11 @@ type EventsChannel = (
 );
 
 const MIN_CONNECTION_TIMEOUT: Duration = Duration::from_millis(100);
+/// Share of the connection budget the service registry pre-read may take.
+///
+/// The read is auxiliary: it only decides whether the subscription replay is suppressed, so it must
+/// never be able to spend the budget the channel graph needs to sync.
+const REGISTRY_READ_BUDGET_DIVISOR: u32 = 4;
 const MIN_TX_CONFIRM_TIMEOUT: Duration = Duration::from_secs(1);
 const TX_TIMEOUT_MULTIPLIER: u32 = 2;
 const DEFAULT_SYNC_TOLERANCE_PCT: usize = 90;
@@ -80,6 +86,76 @@ impl From<ChainHealthState> for hopr_api::node::ComponentStatus {
             ChainHealthState::ServerNotHealthy => Self::Unavailable("blokli server not healthy".into()),
             ChainHealthState::ConnectionFailed => Self::Unavailable("chain connection failed".into()),
             ChainHealthState::Dropped => Self::Unavailable("connector dropped".into()),
+        }
+    }
+}
+
+/// Reads the registry state that a snapshot-first subscription is going to replay.
+///
+/// Blokli offers no bare enumeration of the permissionless registry, so the entries are read one
+/// service type at a time; the types are queried once and reused for both results.
+async fn read_registry<C>(
+    client: &std::sync::Arc<C>,
+) -> Result<(ReplayedServices, ReplayedServiceTypes), ConnectorError>
+where
+    C: BlokliQueryClient + Send + Sync + 'static,
+{
+    let service_types = client
+        .query_service_types(None)
+        .await?
+        .iter()
+        .filter_map(|info| match crate::utils::model_to_service_type(&info.service_type) {
+            Ok(service_type) => Some(service_type),
+            // An unreadable type cannot be matched against a replay either, so its replay is
+            // reported rather than suppressed. Saying so beats a silent gap.
+            Err(error) => {
+                tracing::error!(%error, "cannot suppress the replay of an unreadable service type");
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let reader = HoprBlockchainReader(client.clone());
+    let mut entries = Vec::new();
+    for service_type in &service_types {
+        entries.extend(
+            reader
+                .query_service_entries(ServiceSelector::default().with_service_type(*service_type))
+                .await?,
+        );
+    }
+
+    Ok((entries.into_iter().collect(), service_types.into_iter().collect()))
+}
+
+/// Reads the replayed registry state within `budget`, giving up the suppression rather than the
+/// connection.
+///
+/// The service registry is auxiliary to the channel graph, so neither a failed read nor a slow one
+/// may stop the connector from becoming ready. Giving up degrades to the behaviour that existed
+/// before the suppression: the replay is delivered as registrations.
+async fn read_replayed_registry<C>(
+    client: &std::sync::Arc<C>,
+    budget: Duration,
+) -> (ReplayedServices, ReplayedServiceTypes)
+where
+    C: BlokliQueryClient + Send + Sync + 'static,
+{
+    match read_registry(client)
+        .timeout(futures_time::time::Duration::from(budget))
+        .await
+    {
+        Ok(Ok(replayed)) => replayed,
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "cannot read the service registry, its replay will be reported as new registrations");
+            Default::default()
+        }
+        Err(_) => {
+            tracing::warn!(
+                ?budget,
+                "timed out reading the service registry, its replay will be reported as new registrations"
+            );
+            Default::default()
         }
     }
 }
@@ -260,44 +336,6 @@ where
             .write()
             .replace((initial_chain_values.ticket_win_prob, initial_chain_values.ticket_price));
 
-        // The registry subscriptions below are snapshot-first: each replays the state that already
-        // exists as a `Registered` event before it reports any change. `connect` does not wait for
-        // those replays, and an event broadcast before a consumer subscribes is dropped, so a
-        // consumer that subscribes right after `connect` would see the pre-existing registry as
-        // either a burst of fresh registrations or nothing at all, depending on scheduling.
-        //
-        // The state is therefore read here and each replayed registration is suppressed exactly
-        // once below. Reading it as late as possible keeps the window in which an entry can be
-        // deregistered between this read and the subscription watermark - and so leave a stale key
-        // that would swallow a later re-registration of the same node and type - as small as it can
-        // be made without a snapshot marker from Blokli.
-        let mut seeded_service_types = self
-            .client
-            .query_service_types(None)
-            .await?
-            .iter()
-            .filter_map(|info| match crate::utils::model_to_service_type(&info.service_type) {
-                Ok(service_type) => Some(service_type),
-                // An unreadable type cannot be matched against a replay either, so the replay is
-                // reported rather than suppressed. Saying so beats a silent gap.
-                Err(error) => {
-                    tracing::error!(%error, "cannot suppress the replay of an unreadable service type");
-                    None
-                }
-            })
-            .collect::<ahash::HashSet<_>>();
-        let mut seeded_services = HoprBlockchainReader(self.client.clone())
-            .query_service_entries(Default::default())
-            .await?
-            .into_iter()
-            .map(|entry| (entry.service_type, entry.node))
-            .collect::<ahash::HashSet<_>>();
-        tracing::debug!(
-            services = seeded_services.len(),
-            service_types = seeded_service_types.len(),
-            "registry state to suppress from the subscription replay"
-        );
-
         #[allow(clippy::large_enum_variant)]
         #[derive(Debug)]
         enum SubscribedEventType {
@@ -316,8 +354,19 @@ where
 
         let ticket_values = self.ticket_values.clone();
         let health = self.health.clone();
+        let registry_read_budget = timeout / REGISTRY_READ_BUDGET_DIVISOR;
         hopr_utils::runtime::prelude::spawn(async move {
             let sync_started = std::time::Instant::now();
+
+            // The registry subscriptions below are snapshot-first: each replays the state that
+            // already exists as a `Registered` event before it reports any change. `connect` does
+            // not wait for those replays, and an event broadcast before a consumer subscribes is
+            // dropped, so a consumer that subscribes right after `connect` would see the
+            // pre-existing registry as either a burst of fresh registrations or nothing at all,
+            // depending on scheduling. Reading that state here, immediately before subscribing,
+            // lets the handlers below drop each replayed registration once.
+            let (mut replayed_services, mut replayed_service_types) =
+                read_replayed_registry(&client, registry_read_budget).await;
 
             let connections = client
                 .subscribe_accounts(blokli_client::api::AccountSelector::Any)
@@ -513,14 +562,8 @@ where
                 .inspect_ok(|update| tracing::trace!(?update, "new service registry event"))
                 .and_then(|update| futures::future::ready(service_update_to_event(update)))
                 // Drop the replay of an entry that already existed when this connection was
-                // established. Removing the key on the first match keeps a genuine re-registration
-                // of the same node and type after a deregistration.
-                .try_filter(move |event| {
-                    futures::future::ready(match event {
-                        ServiceEvent::Registered(entry) => !seeded_services.remove(&(entry.service_type, entry.node)),
-                        _ => true,
-                    })
-                })
+                // established, so a delivered registration always means it happened afterwards.
+                .try_filter(move |event| futures::future::ready(!replayed_services.consumes(event)))
                 .map_ok(SubscribedEventType::Service)
                 .fuse();
 
@@ -532,14 +575,8 @@ where
                 .try_filter(|update| futures::future::ready(update.registry_config.is_none()))
                 .and_then(|update| futures::future::ready(service_type_update_to_event(update)))
                 // As above, for a type that was already registered when this connection was
-                // established. Registering a type is one-way, so a suppressed key is never needed
-                // again.
-                .try_filter(move |event| {
-                    futures::future::ready(match event {
-                        ServiceEvent::TypeRegistered(service_type, _) => !seeded_service_types.remove(service_type),
-                        _ => true,
-                    })
-                })
+                // established.
+                .try_filter(move |event| futures::future::ready(!replayed_service_types.consumes(event)))
                 .map_ok(SubscribedEventType::Service)
                 .fuse();
 

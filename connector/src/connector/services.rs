@@ -23,9 +23,11 @@
 //! replayed registration once, so a [`ChainEvent::ServiceRegistered`] or
 //! [`ChainEvent::ServiceTypeRegistered`] delivered to a consumer always means what it says: this
 //! happened after you connected. A consumer that wants the state that already exists queries it,
-//! which needs no [`connect`](crate::HoprBlockchainConnector::connect). Suppression is keyed on
-//! identity and applied once, so a node that deregisters and registers again is reported both
-//! times.
+//! which needs no [`connect`](crate::HoprBlockchainConnector::connect). See [`ReplayedServices`]
+//! for why an entry is matched by value rather than by its service type and node.
+//!
+//! The read is bounded and may fail: the registry is auxiliary to the channel graph, so a read that
+//! is slow or unavailable gives up the suppression rather than the connection.
 //!
 //! Registry-wide configuration uses the same state-first contract, and its first value is dropped
 //! the same way. It is the one part of the registry that
@@ -202,6 +204,70 @@ impl From<ServiceEvent> for ChainEvent {
     }
 }
 
+/// The registry entries that a snapshot-first subscription is going to replay as registrations.
+///
+/// Built from a read taken before subscribing, and consumed as the replay arrives.
+#[derive(Debug, Default)]
+pub(crate) struct ReplayedServices(ahash::HashMap<(ServiceType, Address), ServiceEntry>);
+
+impl FromIterator<ServiceEntry> for ReplayedServices {
+    fn from_iter<I: IntoIterator<Item = ServiceEntry>>(entries: I) -> Self {
+        Self(
+            entries
+                .into_iter()
+                .map(|entry| ((entry.service_type, entry.node), entry))
+                .collect(),
+        )
+    }
+}
+
+impl ReplayedServices {
+    /// Whether `event` is the replay of an entry that already existed, consuming the match.
+    ///
+    /// The match is on the whole entry rather than on its service type and node alone. An entry
+    /// deregistered between the read and the subscription watermark is absent from the replay and
+    /// so leaves its record here forever; keying on identity alone would then let that stale record
+    /// swallow the next genuine registration of the same node and type. A re-registration carries a
+    /// new `registered_at`, so by value it no longer matches and is reported. Only a
+    /// re-registration landing in the same second as the original, with the same Safe and metadata,
+    /// still looks like the replay.
+    pub(crate) fn consumes(&mut self, event: &ServiceEvent) -> bool {
+        let ServiceEvent::Registered(entry) = event else {
+            return false;
+        };
+
+        let key = (entry.service_type, entry.node);
+        if self.0.get(&key).is_some_and(|replayed| replayed == entry) {
+            self.0.remove(&key);
+            return true;
+        }
+
+        false
+    }
+}
+
+/// The service types that a snapshot-first subscription is going to replay as registrations.
+#[derive(Debug, Default)]
+pub(crate) struct ReplayedServiceTypes(ahash::HashSet<ServiceType>);
+
+impl FromIterator<ServiceType> for ReplayedServiceTypes {
+    fn from_iter<I: IntoIterator<Item = ServiceType>>(service_types: I) -> Self {
+        Self(service_types.into_iter().collect())
+    }
+}
+
+impl ReplayedServiceTypes {
+    /// Whether `event` is the replay of a service type that was already registered, consuming the
+    /// match.
+    ///
+    /// Registering a type is one-way - abandoning it clears the owner but keeps the type - so
+    /// unlike an entry, a type that this was built from can never be registered again. Its identity
+    /// is therefore enough, and a record left over from a read that raced the watermark is inert.
+    pub(crate) fn consumes(&mut self, event: &ServiceEvent) -> bool {
+        matches!(event, ServiceEvent::TypeRegistered(service_type, _) if self.0.remove(service_type))
+    }
+}
+
 /// Converts a change of a single registry entry into the [`ServiceEvent`] it stands for.
 pub(crate) fn service_update_to_event(update: ServiceUpdate) -> Result<ServiceEvent, ConnectorError> {
     let ServiceUpdate {
@@ -341,16 +407,16 @@ mod tests {
     };
 
     use super::{
-        ServiceEvent, ServiceTypeUpdate, ServiceTypeUpdateKind, ServiceUpdate, ServiceUpdateKind,
-        service_registry_config_to_events, service_type_update_to_event, service_update_to_event,
+        ReplayedServiceTypes, ReplayedServices, ServiceEvent, ServiceTypeUpdate, ServiceTypeUpdateKind, ServiceUpdate,
+        ServiceUpdateKind, service_registry_config_to_events, service_type_update_to_event, service_update_to_event,
     };
     use crate::{
         HoprBlockchainReader,
         connector::{
             service_fixtures::{
-                FailingServiceQueries, METADATA, NODE, OTHER_NODE, REGISTRY_POINTER, SERVICE_TYPE, UPDATED_AT,
-                empty_registry, entry, entry_model, registry_config, safe_with_nodes, state_with_registry_config,
-                type_config as config,
+                FailingServiceQueries, METADATA, NODE, OTHER_NODE, REGISTERED_AT, REGISTRY_POINTER, SERVICE_TYPE,
+                UPDATED_AT, empty_registry, entry, entry_model, entry_with, registry_config, safe_with_nodes,
+                state_with_registry_config, type_config as config,
             },
             tests::{MODULE_ADDR, PRIVATE_KEY_1, create_connector},
         },
@@ -859,6 +925,59 @@ mod tests {
     /// A registry timestamp is a `Uint64`, so it can name an instant no `SystemTime` can hold.
     /// `SystemTime + Duration` panics on overflow, which would let malformed Blokli data terminate
     /// the process instead of failing the conversion.
+    /// The replay of an entry read before subscribing is dropped, and dropped only once.
+    #[test]
+    fn a_replayed_entry_is_consumed_exactly_once() -> anyhow::Result<()> {
+        let replayed = entry(ServiceType::GVPN_EXIT, NODE)?;
+        let mut services = ReplayedServices::from_iter([replayed.clone()]);
+
+        assert!(services.consumes(&ServiceEvent::Registered(replayed.clone())));
+        // A second registration of the same entry is a genuine one, whatever the registry did in
+        // between, and must be reported.
+        assert!(!services.consumes(&ServiceEvent::Registered(replayed.clone())));
+
+        // Only registrations are ever replayed.
+        assert!(!services.consumes(&ServiceEvent::Updated(replayed)));
+        assert!(!services.consumes(&ServiceEvent::Deregistered(ServiceType::GVPN_EXIT, NODE.into())));
+
+        Ok(())
+    }
+
+    /// An entry deregistered between the pre-read and the subscription watermark is absent from the
+    /// replay, so its record is never consumed. Matching on the whole entry rather than on the
+    /// service type and node keeps that stale record from swallowing the next genuine registration:
+    /// a re-registration carries a new `registered_at`.
+    #[test]
+    fn a_stale_record_does_not_swallow_a_later_registration_of_the_same_node() -> anyhow::Result<()> {
+        let mut services = ReplayedServices::from_iter([entry(ServiceType::GVPN_EXIT, NODE)?]);
+
+        let re_registered = entry_with(ServiceType::GVPN_EXIT, NODE, METADATA, REGISTERED_AT)?;
+        assert_ne!(entry(ServiceType::GVPN_EXIT, NODE)?, re_registered);
+        assert!(!services.consumes(&ServiceEvent::Registered(re_registered)));
+
+        // An entry that was never read is not a replay either.
+        assert!(!services.consumes(&ServiceEvent::Registered(entry(ServiceType::GVPN_EXIT, OTHER_NODE)?)));
+
+        Ok(())
+    }
+
+    /// Registering a service type is one-way, so identity is enough and a record left over from a
+    /// read that raced the watermark is inert.
+    #[test]
+    fn a_replayed_service_type_is_consumed_exactly_once() -> anyhow::Result<()> {
+        let owner = Address::from(REGISTRY_POINTER);
+        let mut service_types = ReplayedServiceTypes::from_iter([ServiceType::GVPN_EXIT]);
+
+        // The owner is not part of the match: a type registered before the read is that same type
+        // however its ownership is reported.
+        assert!(service_types.consumes(&ServiceEvent::TypeRegistered(ServiceType::GVPN_EXIT, owner)));
+        assert!(!service_types.consumes(&ServiceEvent::TypeRegistered(ServiceType::GVPN_EXIT, owner)));
+        assert!(!service_types.consumes(&ServiceEvent::TypeRegistered("gvpn:entry".parse()?, owner)));
+        assert!(!service_types.consumes(&ServiceEvent::TypeOwnerChanged(ServiceType::GVPN_EXIT, Some(owner))));
+
+        Ok(())
+    }
+
     #[test]
     fn an_out_of_range_timestamp_fails_the_conversion_instead_of_panicking() {
         // Both fields carry the boundary value, so the failure cannot come from `ServiceEntry`
