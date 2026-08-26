@@ -1730,9 +1730,9 @@ dependencies = [
 
 [[package]]
 name = "blokli-client"
-version = "0.31.0"
+version = "0.32.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1645e71eacbae4cf304636a390a08b5c03cf068a814923dbd1631d5558f7ddeb"
+checksum = "2e7ee57f8d848cdd86b0b2b4f144f10a9a28edba042d609d08850f57bbd79a47"
 dependencies = [
  "anyhow",
  "async-broadcast",
@@ -1745,7 +1745,7 @@ dependencies = [
  "futures",
  "futures-time",
  "hex",
- "hopr-types 2.3.0",
+ "hopr-types",
  "http",
  "indexmap 2.14.0",
  "launchdarkly-sdk-transport",
@@ -3806,9 +3806,9 @@ dependencies = [
 
 [[package]]
 name = "hopr-api"
-version = "3.1.0"
+version = "4.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "224e2ecb9821e45905ce5a5ad9e8b06a29cb85daf9f3f024b3efbaf665686e49"
+checksum = "5fc0875b8cc5c7e5037b3a7c2e466156fde906e29a83e6fbff89da71a19b91c5"
 dependencies = [
  "async-trait",
  "atomic_enum",
@@ -3816,9 +3816,10 @@ dependencies = [
  "chrono",
  "futures",
  "futures-concurrency",
- "hopr-types 3.1.0",
+ "hopr-types",
  "libp2p-identity",
  "serde",
+ "serde_bytes",
  "strum",
  "thiserror 2.0.20",
  "tracing",
@@ -4015,58 +4016,6 @@ dependencies = [
 
 [[package]]
 name = "hopr-types"
-version = "2.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a19fe24538d5d68590496763119afbb5f8ccb466f88abbf36cda7a8c7d49e1f1"
-dependencies = [
- "aes 0.9.2",
- "aquamarine",
- "ark-bn254 0.6.0",
- "ark-ec 0.6.0",
- "ark-ff 0.6.0",
- "ark-serialize 0.6.0",
- "arrayvec",
- "async-trait",
- "babyjubjub-ec",
- "bigdecimal",
- "blake3",
- "chacha20 0.10.1",
- "chrono",
- "cipher 0.5.2",
- "const-hex",
- "ctr 0.10.1",
- "curve25519-dalek 5.0.0",
- "digest 0.11.3",
- "ed25519-dalek 3.0.0",
- "elliptic-curve 0.14.1",
- "float-cmp",
- "hash2curve",
- "hex-literal",
- "hybrid-array",
- "k256 0.14.0",
- "lazy_static",
- "libp2p-identity",
- "multiaddr",
- "num_enum",
- "poly1305 0.9.1",
- "primitive-types 0.14.0",
- "rand 0.10.2",
- "rayon",
- "regex",
- "secp256k1 0.31.1",
- "sha2 0.11.0",
- "sha3 0.12.0",
- "smart-default",
- "strum",
- "subtle",
- "thiserror 2.0.20",
- "tracing",
- "typenum",
- "zeroize",
-]
-
-[[package]]
-name = "hopr-types"
 version = "3.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6994bdc05812ab588d3fa970c1df9a7bea3d8808907baf30c0596a54b84458f3"
@@ -4131,9 +4080,9 @@ dependencies = [
 
 [[package]]
 name = "hopr-utilities"
-version = "0.10.0"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c0b56012e914f380e83db462aa68e3b3f40fc1a762b68cee80214f140c462f0"
+checksum = "727f1af414f4923a9e32832304bf759cf1db56f262dc8bdf70a475806cae0e60"
 dependencies = [
  "anyhow",
  "arrayvec",
@@ -4146,7 +4095,7 @@ dependencies = [
  "futures-time",
  "hickory-resolver 0.26.1",
  "hopr-api",
- "hopr-types 3.1.0",
+ "hopr-types",
  "indexmap 2.14.0",
  "lazy_static",
  "libc",
