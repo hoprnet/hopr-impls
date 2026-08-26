@@ -92,8 +92,10 @@ impl From<ChainHealthState> for hopr_api::node::ComponentStatus {
 
 /// Reads the registry state that a snapshot-first subscription is going to replay.
 ///
-/// Blokli offers no bare enumeration of the permissionless registry, so the entries are read one
-/// service type at a time; the types are queried once and reused for both results.
+/// The entries come from one unfiltered enumeration, which Blokli answers from cursor pages pinned
+/// to a single indexer watermark, so what is read is a consistent snapshot. The service types are a
+/// separate query because they carry no watermark of their own; the set is owner-gated by the type
+/// registration fee and therefore bounded, unlike the entries.
 async fn read_registry<C>(
     client: &std::sync::Arc<C>,
 ) -> Result<(ReplayedServices, ReplayedServiceTypes), ConnectorError>
@@ -113,19 +115,13 @@ where
                 None
             }
         })
-        .collect::<Vec<_>>();
+        .collect::<ReplayedServiceTypes>();
 
-    let reader = HoprBlockchainReader(client.clone());
-    let mut entries = Vec::new();
-    for service_type in &service_types {
-        entries.extend(
-            reader
-                .query_service_entries(ServiceSelector::default().with_service_type(*service_type))
-                .await?,
-        );
-    }
+    let entries = HoprBlockchainReader(client.clone())
+        .query_service_entries(ServiceSelector::default())
+        .await?;
 
-    Ok((entries.into_iter().collect(), service_types.into_iter().collect()))
+    Ok((entries.into_iter().collect(), service_types))
 }
 
 /// Reads the replayed registry state within `budget`, giving up the suppression rather than the

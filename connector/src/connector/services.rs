@@ -532,9 +532,8 @@ mod tests {
         Ok(())
     }
 
-    /// Blokli rejects a bare enumeration of the permissionless registry, so an unfiltered read is
-    /// answered per service type. Two types with an entry each pin that the fan-out covers every
-    /// type rather than issuing the `Any` query the server would refuse.
+    /// An unfiltered selector enumerates the whole registry in one query. Two service types with
+    /// an entry each pin that the enumeration is not silently narrowed to one of them.
     #[tokio::test]
     async fn connector_should_enumerate_an_unfiltered_service_stream() -> anyhow::Result<()> {
         let other_type: ServiceType = "gvpn:entry".parse()?;
@@ -604,8 +603,7 @@ mod tests {
 
         let connector = create_connector(blokli_client)?;
 
-        // An unfiltered count is the one registry read Blokli answers directly, without the
-        // per-type fan-out that `stream_services` needs.
+        // Counting is answered by Blokli directly rather than by counting an enumeration.
         assert_eq!(3, connector.count_services(ServiceSelector::default()).await?);
         assert_eq!(
             2,

@@ -15,7 +15,7 @@ use crate::{
     errors::ConnectorError,
     utils::{
         model_to_chain_info, model_to_deployed_safe, model_to_redeemed_stats, model_to_service_entry,
-        model_to_service_registry_config, model_to_service_type, model_to_service_type_config,
+        model_to_service_registry_config, model_to_service_type_config,
     },
 };
 
@@ -50,10 +50,10 @@ impl<C> Clone for HoprBlockchainReader<C> {
 
 /// Maps the [`ServiceSelector`] of the HOPR Chain API onto the one of the Blokli client.
 ///
-/// An unfiltered selector becomes [`blokli_client::api::ServiceSelector::Any`], which only
-/// [`BlokliQueryClient::count_services`] accepts: the registry is permissionless and anyone can
-/// grow it, so Blokli offers no bare enumeration. [`HoprBlockchainReader::query_service_entries`]
-/// answers such a read one service type at a time instead.
+/// An unfiltered selector becomes [`blokli_client::api::ServiceSelector::Any`], which enumerates
+/// the whole registry. Blokli answers that from cursor pages pinned to one indexer watermark, so
+/// the enumeration is a consistent snapshot rather than a set that concurrent chain updates can
+/// shift underneath it.
 fn to_blokli_service_selector(selector: &ServiceSelector) -> blokli_client::api::ServiceSelector {
     match (selector.service_type, selector.node) {
         (Some(service_type), Some(node)) => blokli_client::api::ServiceSelector::ServiceTypeAndNode {
@@ -101,19 +101,6 @@ impl<C> HoprBlockchainReader<C>
 where
     C: BlokliQueryClient + Send + Sync + 'static,
 {
-    /// Runs one registry query, honouring the liveness filter.
-    async fn query_service_models(
-        &self,
-        query: blokli_client::api::ServiceSelector,
-        live_only: bool,
-    ) -> Result<Vec<blokli_client::api::types::ServiceEntry>, ConnectorError> {
-        Ok(if live_only {
-            self.0.query_live_services(query).await
-        } else {
-            self.0.query_services(query).await
-        }?)
-    }
-
     /// Queries the registry entries matching the `selector` and converts them.
     ///
     /// A failed query is propagated: "the read failed" and "nothing matched" are different answers,
@@ -122,34 +109,12 @@ where
         &self,
         selector: ServiceSelector,
     ) -> Result<Vec<ServiceEntry>, ConnectorError> {
-        let models = match to_blokli_service_selector(&selector) {
-            // Blokli rejects a bare enumeration, so an unfiltered read is answered one service
-            // type at a time. Every entry is registered under a service type, so iterating the
-            // types covers the registry.
-            blokli_client::api::ServiceSelector::Any => {
-                let mut models = Vec::new();
-                for info in self.0.query_service_types(None).await? {
-                    let service_type = match model_to_service_type(&info.service_type) {
-                        Ok(service_type) => service_type,
-                        // As for a malformed entry: one unreadable type must not hide the rest.
-                        Err(error) => {
-                            tracing::error!(%error, "skipping a service type that cannot be queried");
-                            continue;
-                        }
-                    };
-
-                    models.extend(
-                        self.query_service_models(
-                            blokli_client::api::ServiceSelector::ServiceType(service_type.as_encoded()),
-                            selector.live_only,
-                        )
-                        .await?,
-                    );
-                }
-                models
-            }
-            query => self.query_service_models(query, selector.live_only).await?,
-        };
+        let query = to_blokli_service_selector(&selector);
+        let models = if selector.live_only {
+            self.0.query_live_services(query).await
+        } else {
+            self.0.query_services(query).await
+        }?;
 
         Ok(select_service_entries(&models, selector))
     }
