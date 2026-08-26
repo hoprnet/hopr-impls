@@ -19,15 +19,25 @@
 //! registrations, and then continue with later changes. Both phases carry the same
 //! [`ChainEvent`] variants, so nothing distinguishes a replayed registration from a new one.
 //!
-//! The connector suppresses the replay. It reads the registry before subscribing and drops each
-//! replayed registration once, so a [`ChainEvent::ServiceRegistered`] or
-//! [`ChainEvent::ServiceTypeRegistered`] delivered to a consumer always means what it says: this
-//! happened after you connected. A consumer that wants the state that already exists queries it,
-//! which needs no [`connect`](crate::HoprBlockchainConnector::connect). See [`ReplayedServices`]
-//! for why an entry is matched by value rather than by its service type and node.
+//! The connector suppresses that replay on a best-effort basis. It reads the registry before
+//! subscribing and drops each replayed registration once, which removes it in the common case. A
+//! consumer that wants the state that already exists queries it, which needs no
+//! [`connect`](crate::HoprBlockchainConnector::connect).
 //!
-//! The read is bounded and may fail: the registry is auxiliary to the channel graph, so a read that
-//! is slow or unavailable gives up the suppression rather than the connection.
+//! Best-effort, because the read and the subscription share no watermark. Three cases still deliver
+//! a replayed registration as though it were new:
+//!
+//! - An entry or type created between the read and the subscription watermark is absent from what was read, so its
+//!   replay is forwarded even though it predates the consumer's subscription.
+//! - A read that fails or exceeds its budget forwards the whole replay, deliberately: the registry is auxiliary to the
+//!   channel graph, so a slow or unavailable read gives up the suppression rather than the connection.
+//! - Conversely, a re-registration indistinguishable from what was read is dropped; see [`ReplayedServices::consumes`].
+//!
+//! A consumer must therefore not treat a [`ChainEvent::ServiceRegistered`] or
+//! [`ChainEvent::ServiceTypeRegistered`] as proof that the registration postdates its subscription,
+//! and must not treat their absence as proof of the reverse. Closing the gap needs a snapshot
+//! boundary from Blokli, tracked in [#14](https://github.com/hoprnet/hopr-impls/issues/14) and
+//! [#15](https://github.com/hoprnet/hopr-impls/issues/15).
 //!
 //! Registry-wide configuration uses the same state-first contract, and its first value is dropped
 //! the same way. It is the one part of the registry that
@@ -227,10 +237,15 @@ impl ReplayedServices {
     /// The match is on the whole entry rather than on its service type and node alone. An entry
     /// deregistered between the read and the subscription watermark is absent from the replay and
     /// so leaves its record here forever; keying on identity alone would then let that stale record
-    /// swallow the next genuine registration of the same node and type. A re-registration carries a
-    /// new `registered_at`, so by value it no longer matches and is reported. Only a
-    /// re-registration landing in the same second as the original, with the same Safe and metadata,
-    /// still looks like the replay.
+    /// swallow the next genuine registration of the same node and type. A registration sets
+    /// `registered_at` to the moment it happened, so a re-registration after the read normally
+    /// differs there and is reported.
+    ///
+    /// This is a heuristic, not a discriminator. An entry that was never updated, re-registered
+    /// under a block timestamp equal to its original registration, is equal in every field and is
+    /// dropped as though it were the replay. Telling the two apart needs something the payload does
+    /// not carry - a subscription watermark or an explicit snapshot phase - which is tracked in
+    /// [#15](https://github.com/hoprnet/hopr-impls/issues/15).
     pub(crate) fn consumes(&mut self, event: &ServiceEvent) -> bool {
         let ServiceEvent::Registered(entry) = event else {
             return false;
@@ -415,7 +430,7 @@ mod tests {
         connector::{
             service_fixtures::{
                 FailingServiceQueries, METADATA, NODE, OTHER_NODE, REGISTERED_AT, REGISTRY_POINTER, SERVICE_TYPE,
-                UPDATED_AT, empty_registry, entry, entry_model, entry_with, registry_config, safe_with_nodes,
+                UPDATED_AT, empty_registry, entry, entry_model, entry_registered_at, registry_config, safe_with_nodes,
                 state_with_registry_config, type_config as config,
             },
             tests::{MODULE_ADDR, PRIVATE_KEY_1, create_connector},
@@ -949,14 +964,35 @@ mod tests {
     /// a re-registration carries a new `registered_at`.
     #[test]
     fn a_stale_record_does_not_swallow_a_later_registration_of_the_same_node() -> anyhow::Result<()> {
-        let mut services = ReplayedServices::from_iter([entry(ServiceType::GVPN_EXIT, NODE)?]);
+        let was_read = entry_registered_at(ServiceType::GVPN_EXIT, NODE, REGISTERED_AT)?;
+        let mut services = ReplayedServices::from_iter([was_read.clone()]);
 
-        let re_registered = entry_with(ServiceType::GVPN_EXIT, NODE, METADATA, REGISTERED_AT)?;
-        assert_ne!(entry(ServiceType::GVPN_EXIT, NODE)?, re_registered);
+        // `registered_at` is the only difference, which is the discriminator being relied on: every
+        // other field of a re-registration by the same node can repeat.
+        let re_registered = entry_registered_at(ServiceType::GVPN_EXIT, NODE, REGISTERED_AT + 1)?;
+        assert_eq!(was_read.service_type, re_registered.service_type);
+        assert_eq!(was_read.node, re_registered.node);
+        assert_eq!(was_read.safe, re_registered.safe);
+        assert_eq!(was_read.metadata, re_registered.metadata);
+        assert_ne!(was_read.registered_at, re_registered.registered_at);
+
         assert!(!services.consumes(&ServiceEvent::Registered(re_registered)));
 
         // An entry that was never read is not a replay either.
         assert!(!services.consumes(&ServiceEvent::Registered(entry(ServiceType::GVPN_EXIT, OTHER_NODE)?)));
+
+        Ok(())
+    }
+
+    /// Pins the limit of that discriminator rather than hiding it. A re-registration equal in every
+    /// field to the entry that was read is dropped, because nothing in the payload tells it apart
+    /// from the replay. See #15.
+    #[test]
+    fn a_re_registration_identical_to_the_read_entry_is_indistinguishable_from_the_replay() -> anyhow::Result<()> {
+        let was_read = entry_registered_at(ServiceType::GVPN_EXIT, NODE, REGISTERED_AT)?;
+        let mut services = ReplayedServices::from_iter([was_read.clone()]);
+
+        assert!(services.consumes(&ServiceEvent::Registered(was_read)));
 
         Ok(())
     }

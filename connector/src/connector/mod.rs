@@ -365,6 +365,11 @@ where
             // pre-existing registry as either a burst of fresh registrations or nothing at all,
             // depending on scheduling. Reading that state here, immediately before subscribing,
             // lets the handlers below drop each replayed registration once.
+            //
+            // This read and the subscriptions share no watermark, so the suppression is
+            // best-effort: anything created in the gap is replayed as though it were new, and so is
+            // the whole registry when the read is given up on. See the module documentation of
+            // `services` for what a consumer may and may not conclude from a registry event.
             let (mut replayed_services, mut replayed_service_types) =
                 read_replayed_registry(&client, registry_read_budget).await;
 

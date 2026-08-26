@@ -82,6 +82,27 @@ pub fn entry_with(
     )?)
 }
 
+/// The registry entry of `node` under `service_type` as it looks straight after a registration at
+/// `registered_at`: a registration sets `updated_at` to the same instant.
+///
+/// Unlike [`entry_with`], this varies `registered_at`, which is what tells two registrations of the
+/// same node apart.
+pub fn entry_registered_at(
+    service_type: ServiceType,
+    node: [u8; Address::SIZE],
+    registered_at: u64,
+) -> anyhow::Result<ServiceEntry> {
+    let at = UNIX_EPOCH + Duration::from_secs(registered_at);
+    Ok(ServiceEntry::new(
+        service_type,
+        node.into(),
+        SAFE.into(),
+        ServiceMetadata::try_from(METADATA.to_vec())?,
+        at,
+        at,
+    )?)
+}
+
 /// The Blokli model of the [`NODE`] entry under [`SERVICE_TYPE`], as the server renders it.
 pub fn entry_model(metadata: &[u8], updated_at: u64) -> types::ServiceEntry {
     types::ServiceEntry {
