@@ -122,7 +122,8 @@ mod tests {
         connector::{
             service_fixtures::{
                 METADATA, NEW_OWNER, NODE, OWNER, REGISTERED_AT, REQUIREMENT, SERVICE_TYPE, UPDATED_AT,
-                UPDATED_METADATA, empty_registry, entry_model, entry_with, registry_config, state_with_registry_config,
+                UPDATED_METADATA, empty_registry, entry, entry_model, entry_with, registry_config,
+                state_with_registry_config,
             },
             tests::{MODULE_ADDR, PRIVATE_KEY_1, PRIVATE_KEY_2, create_connector},
         },
@@ -385,6 +386,76 @@ mod tests {
         );
         assert!(
             matches!(&events[2], ChainEvent::ServiceDeregistered(service_type, node) if service_type == &ServiceType::GVPN_EXIT && node == &Address::from(NODE))
+        );
+
+        Ok(())
+    }
+
+    /// The registry subscriptions replay the state that already exists before reporting any
+    /// change, and `connect` does not wait for that replay. Whether a consumer that subscribes
+    /// right afterwards saw the replay was decided by the scheduler, so the registry appeared
+    /// either as a burst of fresh registrations or not at all.
+    ///
+    /// A multi-threaded runtime and a state large enough that the replay cannot be drained in one
+    /// go are what make the race land on the leaking side; before the suppression this observed a
+    /// pre-existing entry in every attempt.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn connecting_should_not_replay_the_registry_as_new_registrations() -> anyhow::Result<()> {
+        for _ in 0..10 {
+            // The default fixture state also pre-registers the service type, so this covers the
+            // type replay as well as the entry replay.
+            let mut builder = BlokliTestStateBuilder::default();
+            for node in 1u8..=40 {
+                builder = builder.with_services([entry(ServiceType::GVPN_EXIT, [node; Address::SIZE])?]);
+            }
+
+            let mut connector = create_connector(builder.build_static_client())?;
+            connector.connect().await?;
+
+            // No transaction is submitted, so anything arriving here is the replay.
+            let replayed = tokio::time::timeout(
+                Duration::from_millis(100),
+                connector.subscribe()?.take(1).collect::<Vec<_>>(),
+            )
+            .await;
+
+            assert!(
+                replayed.is_err(),
+                "the registry was replayed after connecting: {:?}",
+                replayed.expect("the timeout branch is the expected one")
+            );
+        }
+
+        Ok(())
+    }
+
+    /// The replay is suppressed by identity and only once, so a node that deregisters and then
+    /// registers again under the same service type is still reported both times.
+    #[tokio::test]
+    async fn a_node_that_re_registers_after_connecting_is_still_reported() -> anyhow::Result<()> {
+        let blokli_client = BlokliTestStateBuilder::default()
+            .with_services([entry_with(ServiceType::GVPN_EXIT, NODE, METADATA, REGISTERED_AT)?])
+            .build_dynamic_client_with_mutator(registry_mutator);
+
+        let mut connector = create_connector(blokli_client.clone())?;
+        connector.connect().await?;
+
+        let events = tokio::task::spawn(connector.subscribe()?.take(2).collect::<Vec<_>>());
+
+        blokli_client.submit_transaction(b"deregister").await?;
+        blokli_client.submit_transaction(b"register").await?;
+
+        // Bounded, because suppressing the replay by presence rather than by removal would swallow
+        // the second registration and leave this waiting forever rather than failing.
+        let events = tokio::time::timeout(Duration::from_secs(5), events)
+            .await
+            .expect("the re-registration must be reported")?;
+
+        assert!(
+            matches!(&events[0], ChainEvent::ServiceDeregistered(service_type, node) if service_type == &ServiceType::GVPN_EXIT && node == &Address::from(NODE))
+        );
+        assert!(
+            matches!(&events[1], ChainEvent::ServiceRegistered(entry) if entry == &entry_with(ServiceType::GVPN_EXIT, NODE, METADATA, REGISTERED_AT)?)
         );
 
         Ok(())

@@ -12,6 +12,7 @@ use hopr_utils::runtime::AbortHandle;
 use petgraph::prelude::DiGraphMap;
 
 use crate::{
+    HoprBlockchainReader,
     backend::Backend,
     connector::{
         keys::HoprKeyMapper,
@@ -259,6 +260,44 @@ where
             .write()
             .replace((initial_chain_values.ticket_win_prob, initial_chain_values.ticket_price));
 
+        // The registry subscriptions below are snapshot-first: each replays the state that already
+        // exists as a `Registered` event before it reports any change. `connect` does not wait for
+        // those replays, and an event broadcast before a consumer subscribes is dropped, so a
+        // consumer that subscribes right after `connect` would see the pre-existing registry as
+        // either a burst of fresh registrations or nothing at all, depending on scheduling.
+        //
+        // The state is therefore read here and each replayed registration is suppressed exactly
+        // once below. Reading it as late as possible keeps the window in which an entry can be
+        // deregistered between this read and the subscription watermark - and so leave a stale key
+        // that would swallow a later re-registration of the same node and type - as small as it can
+        // be made without a snapshot marker from Blokli.
+        let mut seeded_service_types = self
+            .client
+            .query_service_types(None)
+            .await?
+            .iter()
+            .filter_map(|info| match crate::utils::model_to_service_type(&info.service_type) {
+                Ok(service_type) => Some(service_type),
+                // An unreadable type cannot be matched against a replay either, so the replay is
+                // reported rather than suppressed. Saying so beats a silent gap.
+                Err(error) => {
+                    tracing::error!(%error, "cannot suppress the replay of an unreadable service type");
+                    None
+                }
+            })
+            .collect::<ahash::HashSet<_>>();
+        let mut seeded_services = HoprBlockchainReader(self.client.clone())
+            .query_service_entries(Default::default())
+            .await?
+            .into_iter()
+            .map(|entry| (entry.service_type, entry.node))
+            .collect::<ahash::HashSet<_>>();
+        tracing::debug!(
+            services = seeded_services.len(),
+            service_types = seeded_service_types.len(),
+            "registry state to suppress from the subscription replay"
+        );
+
         #[allow(clippy::large_enum_variant)]
         #[derive(Debug)]
         enum SubscribedEventType {
@@ -473,6 +512,15 @@ where
                 .map_err(ConnectorError::from)
                 .inspect_ok(|update| tracing::trace!(?update, "new service registry event"))
                 .and_then(|update| futures::future::ready(service_update_to_event(update)))
+                // Drop the replay of an entry that already existed when this connection was
+                // established. Removing the key on the first match keeps a genuine re-registration
+                // of the same node and type after a deregistration.
+                .try_filter(move |event| {
+                    futures::future::ready(match event {
+                        ServiceEvent::Registered(entry) => !seeded_services.remove(&(entry.service_type, entry.node)),
+                        _ => true,
+                    })
+                })
                 .map_ok(SubscribedEventType::Service)
                 .fuse();
 
@@ -483,6 +531,15 @@ where
                 // Registry-wide changes are consumed from the dedicated complete-state stream.
                 .try_filter(|update| futures::future::ready(update.registry_config.is_none()))
                 .and_then(|update| futures::future::ready(service_type_update_to_event(update)))
+                // As above, for a type that was already registered when this connection was
+                // established. Registering a type is one-way, so a suppressed key is never needed
+                // again.
+                .try_filter(move |event| {
+                    futures::future::ready(match event {
+                        ServiceEvent::TypeRegistered(service_type, _) => !seeded_service_types.remove(service_type),
+                        _ => true,
+                    })
+                })
                 .map_ok(SubscribedEventType::Service)
                 .fuse();
 

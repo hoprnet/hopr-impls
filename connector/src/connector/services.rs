@@ -15,10 +15,22 @@
 //! # State synchronization
 //!
 //! Blokli's service-entry and service-type subscriptions are snapshot-first: they register their
-//! live receivers at an indexer watermark, emit the complete matching state at that watermark, and
-//! then continue with later changes. The connector maps both phases onto the same
-//! [`ChainEvent`] variants, so consumers cannot miss the interval between a separate query and a
-//! subscription. Registry-wide configuration uses the same state-first contract.
+//! live receivers at an indexer watermark, replay the complete matching state at that watermark as
+//! registrations, and then continue with later changes. Both phases carry the same
+//! [`ChainEvent`] variants, so nothing distinguishes a replayed registration from a new one.
+//!
+//! The connector suppresses the replay. It reads the registry before subscribing and drops each
+//! replayed registration once, so a [`ChainEvent::ServiceRegistered`] or
+//! [`ChainEvent::ServiceTypeRegistered`] delivered to a consumer always means what it says: this
+//! happened after you connected. A consumer that wants the state that already exists queries it,
+//! which needs no [`connect`](crate::HoprBlockchainConnector::connect). Suppression is keyed on
+//! identity and applied once, so a node that deregisters and registers again is reported both
+//! times.
+//!
+//! Registry-wide configuration uses the same state-first contract, and its first value is dropped
+//! the same way. It is the one part of the registry that
+//! [`StateSyncOptions::ServiceRegistryConfig`](hopr_api::chain::StateSyncOptions) will replay on
+//! request, because the two values have no other way to reach a consumer that arrives late.
 
 use blokli_client::api::{
     BlokliQueryClient, BlokliTransactionClient,
