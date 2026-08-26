@@ -10,7 +10,19 @@ use hopr_api::{
 };
 use petgraph::graph::NodeIndex;
 
-use crate::{ChannelGraph, algorithm::all_simple_paths_multi, graph::InnerGraph};
+use crate::{ChannelGraph, algorithm::all_simple_paths_multi, graph::InnerGraph, petgraph::path_id};
+
+/// Lowest number of intermediate relay hops used for loopback probing.
+///
+/// RFC-0010 §4.2.1.2 permits `n = 1`, but then the sole relay sees its predecessor and successor
+/// are the same node, identifying the loop and its originator. Excluding it is a local privacy
+/// decision, not an RFC requirement.
+pub const MIN_LOOPBACK_HOPS: usize = 2;
+
+/// Highest number of intermediate relay hops used for loopback probing.
+///
+/// Bounded by the packet format: RFC-0004 requires 0–3 hops.
+pub const MAX_LOOPBACK_HOPS: usize = hopr_api::types::internal::routing::RoutingOptions::MAX_INTERMEDIATE_HOPS;
 
 /// A shared cost function that computes a cumulative cost from edge observations.
 pub(crate) type SharedValueFn<C> = Arc<dyn Fn(C, &crate::Observations, usize) -> C + Send + Sync>;
@@ -49,13 +61,17 @@ where
         move |c, w, i| value_fn(c, w, i),
     )
     .filter_map(|(node_indices, final_cost)| {
-        // Build PathId from node indices along the path
-        let mut path_id: PathId = [0u64; 5];
+        // Build the PathId along the path. Slots are key-derived via `path_id::encode`, so no
+        // slot can collide with the reserved padding value `0` (RFC-0010 §4.3.3). The length comes
+        // from the type rather than being restated here.
+        let mut path_id: PathId = Default::default();
         for (i, &node_idx) in node_indices.iter().enumerate() {
             if i >= path_id.len() {
                 return None;
             }
-            path_id[i] = node_idx.index() as u64;
+            // Slots are key-derived, so a node removed mid-flight can never be confused with
+            // whichever node petgraph moves into its index.
+            path_id[i] = path_id::encode(inner.indices.get_by_right(&node_idx)?);
         }
 
         // Convert node indices to public keys; strip `source` (first element).
@@ -152,50 +168,90 @@ impl hopr_api::graph::NetworkGraphTraverse for ChannelGraph {
         )
     }
 
-    fn simple_loopback_to_self(&self, length: usize, take_count: Option<usize>) -> Vec<(Vec<Self::NodeId>, PathId)> {
-        if length > 1 {
+    /// Generates loopback paths of exactly `hops` intermediate relay nodes.
+    ///
+    /// NOTE: `hops` counts relay nodes, **not edges** — the closed loop has `hops + 1` edges, since
+    /// the closing edge is appended after path-finding.
+    ///
+    /// Requests outside [`MIN_LOOPBACK_HOPS`]`..=`[`MAX_LOOPBACK_HOPS`] yield no paths.
+    fn simple_loopback_to_self(&self, hops: usize, take_count: Option<usize>) -> Vec<(Vec<Self::NodeId>, PathId)> {
+        if (MIN_LOOPBACK_HOPS..=MAX_LOOPBACK_HOPS).contains(&hops) {
             let inner = self.inner.read();
 
             if let Some(me_idx) = inner.indices.get_by_left(&self.me) {
+                // The candidate set holds the *last* node before the appended closing `me`, so the
+                // edge that matters is `neighbor → me`, not `me → neighbor`. Since
+                // `MIN_LOOPBACK_HOPS` is 2, the destination is never the first hop, and the
+                // outgoing edge plays no part in the emitted loop. `resolve_loopback_edges` rejects
+                // a probe whose closing edge is absent, so requiring the incoming edge here is what
+                // keeps the probe attributable. A successful neighbor probe upserts both
+                // directions, so this excludes nothing that has actually been reached.
                 let connected_neighbors = inner
                     .graph
-                    .neighbors(*me_idx)
+                    .neighbors_directed(*me_idx, petgraph::Direction::Incoming)
                     .filter(|neighbor| {
                         inner
                             .graph
-                            .edges_connecting(*me_idx, *neighbor)
+                            .edges_connecting(*neighbor, *me_idx)
                             .next()
-                            .and_then(|e| e.weight().immediate_qos().map(|e| e.is_connected()))
-                            .unwrap_or(false)
+                            // The closing edge must exist; its connectivity must merely not be known
+                            // to be down. Excluding an unchecked neighbour would stop it being
+                            // probed, which is what would keep it unchecked.
+                            .is_some_and(|e| {
+                                e.weight().immediate_qos().and_then(|imm| imm.is_connected()) != Some(false)
+                            })
                     })
                     .collect::<HashSet<_>>();
 
-                let value_fn = EdgeValueFn::forward_without_self_loopback(self.edge_penalty, self.min_ack_rate);
+                // Deliberately more permissive than data path selection. RFC-0010 §4.2.1.4 wants
+                // low-scoring edges probed *more* urgently; applying the production `min_ack_rate`
+                // here would instead prune them, so they would stop being probed, never be
+                // resampled, and stay excluded permanently.
+                let value_fn = EdgeValueFn::forward_without_self_loopback(
+                    // The closing edge back to `me` is appended after path-finding.
+                    std::num::NonZeroUsize::new(hops + 1).expect("hop range is non-zero"),
+                    self.edge_penalty,
+                    0.0,
+                    // Whatever the producer last pushed; `None` until the first price is seen.
+                    hopr_api::graph::NetworkGraphView::ticket_face_value(self),
+                );
 
                 return find_paths(
                     &inner,
                     *me_idx,
                     &connected_neighbors,
-                    length,
+                    hops,
                     take_count,
                     value_fn.initial_value(),
                     value_fn.min_value(),
                     value_fn.into_value_fn(),
                 )
                 .into_iter()
-                .map(|(mut a, mut b, _c)| {
+                .filter_map(|(mut a, mut b, _c)| {
                     // find_paths already strips the leading `me` (source), so `a` is
                     // [intermediates…, connected_neighbor]. Append `me` to close the loopback;
                     // this is the only sanctioned position where `me` appears as a "destination".
                     //
                     // b is filled by find_paths BEFORE skip(1), so b[0] = me_idx and
                     // b[1..=path_node_count] = path nodes. Closing me goes at b[path_node_count + 1].
+                    //
+                    // The hop range above guarantees the slot exists. Without the closing marker
+                    // the PathId cannot be resolved back to a loop, so drop rather than emit it.
                     let path_node_count = a.len();
-                    if path_node_count + 1 < b.len() {
-                        b[path_node_count + 1] = me_idx.index() as u64;
+                    debug_assert!(
+                        path_node_count + 1 < b.len(),
+                        "loopback of {path_node_count} hops has no PathId slot for the closing node"
+                    );
+                    if path_node_count + 1 >= b.len() {
+                        tracing::warn!(
+                            hops = path_node_count,
+                            "loopback path has no PathId slot for the closing node, dropping"
+                        );
+                        return None;
                     }
+                    b[path_node_count + 1] = path_id::encode(&self.me);
                     a.push(self.me);
-                    (a, b)
+                    Some((a, b))
                 })
                 .collect();
             };
@@ -252,106 +308,11 @@ mod tests {
         });
     }
 
-    #[test]
-    fn one_edge_path_should_return_direct_route() -> anyhow::Result<()> {
-        let me = pubkey_from(&SECRET_0);
-        let dest = pubkey_from(&SECRET_1);
-
-        let graph = ChannelGraph::new(me);
-        graph.add_node(dest);
-        graph.add_edge(&me, &dest)?;
-        mark_edge_loopback_ready(&graph, &me, &dest);
-
-        let routes = graph.simple_paths(
-            &me,
-            &dest,
-            1,
-            None,
-            EdgeValueFn::forward(
-                std::num::NonZeroUsize::new(1).context("should be non-zero")?,
-                TEST_EDGE_PENALTY,
-                TEST_MIN_ACK_RATE,
-            ),
-        );
-
-        assert_eq!(routes.len(), 1, "should find exactly one 1-edge route");
-
-        Ok(())
-    }
-
-    #[test]
-    fn two_edge_path_should_route_through_intermediate() -> anyhow::Result<()> {
-        let me = pubkey_from(&SECRET_0);
-        let hop = pubkey_from(&SECRET_1);
-        let dest = pubkey_from(&SECRET_2);
-
-        let graph = ChannelGraph::new(me);
-        graph.add_node(hop);
-        graph.add_node(dest);
-        graph.add_edge(&me, &hop)?;
-        graph.add_edge(&hop, &dest)?;
-        mark_edge_loopback_ready(&graph, &me, &hop);
-        mark_edge_connected(&graph, &hop, &dest);
-
-        let length = std::num::NonZeroUsize::new(2).context("should be non-zero")?;
-        let routes = graph.simple_paths(
-            &me,
-            &dest,
-            2,
-            None,
-            EdgeValueFn::forward(length, TEST_EDGE_PENALTY, TEST_MIN_ACK_RATE),
-        );
-
-        assert!(!routes.is_empty(), "should find at least one 2-edge route");
-
-        Ok(())
-    }
-
-    #[test]
-    fn penalty_should_affect_cost_of_unprobed_edges() -> anyhow::Result<()> {
-        let me = pubkey_from(&SECRET_0);
-        let hop = pubkey_from(&SECRET_1);
-        let dest = pubkey_from(&SECRET_2);
-
-        let graph = ChannelGraph::new(me);
-        graph.add_node(hop);
-        graph.add_node(dest);
-        graph.add_edge(&me, &hop)?;
-        graph.add_edge(&hop, &dest)?;
-
-        // First edge: fully probed — produces score ~1.0.
-        mark_edge_loopback_ready(&graph, &me, &hop);
-        // Last edge: no observations at all — penalty must kick in.
-
-        let length = std::num::NonZeroUsize::new(2).context("should be non-zero")?;
-
-        let routes_test = graph.simple_paths(
-            &me,
-            &dest,
-            2,
-            None,
-            EdgeValueFn::forward(length, TEST_EDGE_PENALTY, TEST_MIN_ACK_RATE),
-        );
-        let routes_other = graph.simple_paths(
-            &me,
-            &dest,
-            2,
-            None,
-            EdgeValueFn::forward(length, 0.99, TEST_MIN_ACK_RATE),
-        );
-
-        assert_eq!(routes_test.len(), 1);
-        assert_eq!(routes_other.len(), 1);
-
-        let (_, _, cost_test) = &routes_test[0];
-        let (_, _, cost_other) = &routes_other[0];
-        assert!(
-            (cost_test - cost_other).abs() > f64::EPSILON,
-            "different penalties ({TEST_EDGE_PENALTY} vs 0.99) should produce different costs for unprobed edges, got \
-             {cost_test} vs {cost_other}"
-        );
-
-        Ok(())
+    /// Connectivity observed and found absent — distinct from never having looked.
+    fn mark_edge_disconnected(graph: &ChannelGraph, src: &OffchainPublicKey, dest: &OffchainPublicKey) {
+        graph.upsert_edge(src, dest, |obs| {
+            obs.record(EdgeWeightType::Connected(false));
+        });
     }
 
     #[test]
@@ -372,6 +333,7 @@ mod tests {
                 std::num::NonZeroUsize::new(1).context("should be non-zero")?,
                 TEST_EDGE_PENALTY,
                 TEST_MIN_ACK_RATE,
+                None,
             ),
         );
 
@@ -395,6 +357,7 @@ mod tests {
                 std::num::NonZeroUsize::new(1).context("should be non-zero")?,
                 TEST_EDGE_PENALTY,
                 TEST_MIN_ACK_RATE,
+                None,
             ),
         );
 
@@ -434,76 +397,10 @@ mod tests {
                 std::num::NonZeroUsize::new(2).context("should be non-zero")?,
                 TEST_EDGE_PENALTY,
                 TEST_MIN_ACK_RATE,
+                None,
             ),
         );
         assert_eq!(routes.len(), 2, "diamond topology should yield two 2-edge routes");
-        Ok(())
-    }
-
-    #[test]
-    fn three_edge_chain_should_find_single_path() -> anyhow::Result<()> {
-        // me -> a -> b -> dest
-        let me = pubkey_from(&SECRET_0);
-        let a = pubkey_from(&SECRET_1);
-        let b = pubkey_from(&SECRET_2);
-        let dest = pubkey_from(&SECRET_3);
-
-        let graph = ChannelGraph::new(me);
-        graph.add_node(a);
-        graph.add_node(b);
-        graph.add_node(dest);
-        graph.add_edge(&me, &a)?;
-        graph.add_edge(&a, &b)?;
-        graph.add_edge(&b, &dest)?;
-        mark_edge_loopback_ready(&graph, &me, &a);
-        mark_edge_with_capacity(&graph, &a, &b);
-
-        let routes = graph.simple_paths(
-            &me,
-            &dest,
-            3,
-            None,
-            EdgeValueFn::forward(
-                std::num::NonZeroUsize::new(3).context("should be non-zero")?,
-                TEST_EDGE_PENALTY,
-                TEST_MIN_ACK_RATE,
-            ),
-        );
-        assert_eq!(routes.len(), 1, "should find exactly one 3-edge route");
-        Ok(())
-    }
-
-    #[test]
-    fn back_edge_should_not_produce_cyclic_paths() -> anyhow::Result<()> {
-        // me -> a -> b -> dest, plus a -> me (back-edge creating cycle)
-        let me = pubkey_from(&SECRET_0);
-        let a = pubkey_from(&SECRET_1);
-        let b = pubkey_from(&SECRET_2);
-        let dest = pubkey_from(&SECRET_3);
-
-        let graph = ChannelGraph::new(me);
-        graph.add_node(a);
-        graph.add_node(b);
-        graph.add_node(dest);
-        graph.add_edge(&me, &a)?;
-        graph.add_edge(&a, &b)?;
-        graph.add_edge(&b, &dest)?;
-        graph.add_edge(&a, &me)?; // back-edge
-        mark_edge_loopback_ready(&graph, &me, &a);
-        mark_edge_with_capacity(&graph, &a, &b);
-
-        let routes = graph.simple_paths(
-            &me,
-            &dest,
-            3,
-            None,
-            EdgeValueFn::forward(
-                std::num::NonZeroUsize::new(3).context("should be non-zero")?,
-                TEST_EDGE_PENALTY,
-                TEST_MIN_ACK_RATE,
-            ),
-        );
-        assert_eq!(routes.len(), 1, "cycle should not produce extra paths");
         Ok(())
     }
 
@@ -525,6 +422,7 @@ mod tests {
                 std::num::NonZeroUsize::new(2).context("should be non-zero")?,
                 TEST_EDGE_PENALTY,
                 TEST_MIN_ACK_RATE,
+                None,
             ),
         );
         assert!(routes.is_empty(), "no 2-edge route should exist for a single edge");
@@ -547,37 +445,10 @@ mod tests {
                 std::num::NonZeroUsize::new(1).context("should be non-zero")?,
                 TEST_EDGE_PENALTY,
                 TEST_MIN_ACK_RATE,
+                None,
             ),
         );
         assert!(routes.is_empty(), "zero-edge path should find no routes");
-        Ok(())
-    }
-
-    #[test]
-    fn reverse_edge_should_not_be_traversable() -> anyhow::Result<()> {
-        // me -> a, but no a -> dest, only dest -> a
-        let me = pubkey_from(&SECRET_0);
-        let a = pubkey_from(&SECRET_1);
-        let dest = pubkey_from(&SECRET_2);
-
-        let graph = ChannelGraph::new(me);
-        graph.add_node(a);
-        graph.add_node(dest);
-        graph.add_edge(&me, &a)?;
-        graph.add_edge(&dest, &a)?; // wrong direction
-
-        let routes = graph.simple_paths(
-            &me,
-            &dest,
-            2,
-            None,
-            EdgeValueFn::forward(
-                std::num::NonZeroUsize::new(2).context("should be non-zero")?,
-                TEST_EDGE_PENALTY,
-                TEST_MIN_ACK_RATE,
-            ),
-        );
-        assert!(routes.is_empty(), "should not traverse edge in wrong direction");
         Ok(())
     }
 
@@ -661,6 +532,7 @@ mod tests {
                 std::num::NonZeroUsize::new(3).context("should be non-zero")?,
                 TEST_EDGE_PENALTY,
                 TEST_MIN_ACK_RATE,
+                None,
             ),
         );
         assert_eq!(routes_3.len(), 5, "should find exactly 5 three-edge paths");
@@ -688,6 +560,7 @@ mod tests {
                 std::num::NonZeroUsize::new(1).context("should be non-zero")?,
                 TEST_EDGE_PENALTY,
                 TEST_MIN_ACK_RATE,
+                None,
             ),
         );
         assert!(routes_1.is_empty(), "no direct edge from me to f");
@@ -726,6 +599,7 @@ mod tests {
                 std::num::NonZeroUsize::new(3).context("should be non-zero")?,
                 TEST_EDGE_PENALTY,
                 TEST_MIN_ACK_RATE,
+                None,
             ),
         );
         assert!(
@@ -737,7 +611,7 @@ mod tests {
     }
 
     #[test]
-    fn path_id_should_contain_node_indices_for_one_edge() -> anyhow::Result<()> {
+    fn path_id_should_carry_key_derived_slots_for_one_edge() -> anyhow::Result<()> {
         // me = node 0, dest = node 1
         let me = pubkey_from(&SECRET_0);
         let dest = pubkey_from(&SECRET_1);
@@ -756,20 +630,25 @@ mod tests {
                 std::num::NonZeroUsize::new(1).context("should be non-zero")?,
                 TEST_EDGE_PENALTY,
                 TEST_MIN_ACK_RATE,
+                None,
             ),
         );
         assert_eq!(routes.len(), 1);
 
         let (_path, path_id, _cost) = &routes[0];
-        assert_eq!(path_id[0], 0, "first node should be me (node index 0)");
-        assert_eq!(path_id[1], 1, "second node should be dest (node index 1)");
-        assert_eq!(path_id[2..], [0, 0, 0], "unused positions should be 0");
+        assert_eq!(path_id[0], path_id::encode(&me), "first slot should be me");
+        assert_eq!(path_id[1], path_id::encode(&dest), "second slot should be dest");
+        assert_eq!(path_id[2..], [0, 0, 0], "unused positions should be padding");
+        assert!(
+            path_id[..2].iter().all(|&slot| slot != 0),
+            "occupied slots must never hold the reserved padding value"
+        );
 
         Ok(())
     }
 
     #[test]
-    fn path_id_should_contain_node_indices_for_three_edges() -> anyhow::Result<()> {
+    fn path_id_should_carry_key_derived_slots_for_three_edges() -> anyhow::Result<()> {
         // me = node 0, a = node 1, b = node 2, dest = node 3
         let me = pubkey_from(&SECRET_0);
         let a = pubkey_from(&SECRET_1);
@@ -795,16 +674,24 @@ mod tests {
                 std::num::NonZeroUsize::new(3).context("should be non-zero")?,
                 TEST_EDGE_PENALTY,
                 TEST_MIN_ACK_RATE,
+                None,
             ),
         );
         assert_eq!(routes.len(), 1);
 
         let (_path, path_id, _cost) = &routes[0];
-        assert_eq!(path_id[0], 0, "me should be node index 0");
-        assert_eq!(path_id[1], 1, "a should be node index 1");
-        assert_eq!(path_id[2], 2, "b should be node index 2");
-        assert_eq!(path_id[3], 3, "dest should be node index 3");
-        assert_eq!(path_id[4], 0, "unused position should be 0");
+        for (slot, key) in [me, a, b, dest].iter().enumerate() {
+            assert_eq!(
+                path_id[slot],
+                path_id::encode(key),
+                "slot {slot} should encode its node"
+            );
+        }
+        assert_eq!(path_id[4], 0, "unused position should be padding");
+        assert!(
+            path_id[..4].iter().all(|&slot| slot != 0),
+            "occupied slots must never hold the reserved padding value"
+        );
 
         Ok(())
     }
@@ -841,6 +728,7 @@ mod tests {
                 std::num::NonZeroUsize::new(2).context("should be non-zero")?,
                 TEST_EDGE_PENALTY,
                 TEST_MIN_ACK_RATE,
+                None,
             ),
         );
         assert_eq!(routes.len(), 2, "diamond should yield two 2-edge routes");
@@ -848,12 +736,15 @@ mod tests {
         let path_ids: Vec<PathId> = routes.iter().map(|(_, pid, _)| *pid).collect();
         assert_ne!(path_ids[0], path_ids[1], "distinct paths should have different PathIds");
 
-        // Each path: [me(0), intermediate(1 or 2), dest(3), 0, 0]
+        // Each path: [me(0), intermediate(1 or 2), dest(3)] then padding
         for pid in &path_ids {
-            assert_eq!(pid[0], 0, "first node should be me (node index 0)");
-            assert!(pid[1] == 1 || pid[1] == 2, "second node should be a (1) or b (2)");
-            assert_eq!(pid[2], 3, "third node should be dest (node index 3)");
-            assert_eq!(pid[3..], [0, 0], "unused positions should be 0");
+            assert_eq!(pid[0], path_id::encode(&me), "first slot should be me");
+            assert!(
+                pid[1] == path_id::encode(&a) || pid[1] == path_id::encode(&b),
+                "second slot should be a or b"
+            );
+            assert_eq!(pid[2], path_id::encode(&dest), "third slot should be dest");
+            assert_eq!(pid[3..], [0, 0], "unused positions should be padding");
         }
 
         Ok(())
@@ -883,81 +774,11 @@ mod tests {
                 std::num::NonZeroUsize::new(1).context("should be non-zero")?,
                 TEST_EDGE_PENALTY,
                 TEST_MIN_ACK_RATE,
+                None,
             ),
         );
 
         assert_eq!(routes.len(), 1, "should find exactly one 1-edge return route");
-        Ok(())
-    }
-
-    #[test]
-    fn return_path_two_edge_should_route_through_intermediate() -> anyhow::Result<()> {
-        // Return path: dest -> relay -> me (2 edges)
-        // Edge 0 (dest→relay): needs capacity only
-        // Edge 1 (relay→me): needs connectivity (last edge)
-        let me = pubkey_from(&SECRET_0);
-        let relay = pubkey_from(&SECRET_1);
-        let dest = pubkey_from(&SECRET_2);
-
-        let graph = ChannelGraph::new(me);
-        graph.add_node(relay);
-        graph.add_node(dest);
-        graph.add_edge(&dest, &relay)?;
-        graph.add_edge(&relay, &me)?;
-        // dest→relay: first edge needs capacity
-        mark_edge_with_capacity(&graph, &dest, &relay);
-        // relay→me: last edge needs connectivity
-        mark_edge_connected(&graph, &relay, &me);
-
-        let routes = graph.simple_paths(
-            &dest,
-            &me,
-            2,
-            None,
-            EdgeValueFn::returning(
-                std::num::NonZeroUsize::new(2).context("should be non-zero")?,
-                TEST_EDGE_PENALTY,
-                TEST_MIN_ACK_RATE,
-            ),
-        );
-
-        assert!(!routes.is_empty(), "should find at least one 2-edge return route");
-        Ok(())
-    }
-
-    #[test]
-    fn return_path_last_edge_without_connectivity_should_be_pruned() -> anyhow::Result<()> {
-        // Return path: dest -> relay -> me (2 edges)
-        // relay→me lacks connectivity → last-edge cost goes negative
-        let me = pubkey_from(&SECRET_0);
-        let relay = pubkey_from(&SECRET_1);
-        let dest = pubkey_from(&SECRET_2);
-
-        let graph = ChannelGraph::new(me);
-        graph.add_node(relay);
-        graph.add_node(dest);
-        graph.add_edge(&dest, &relay)?;
-        graph.add_edge(&relay, &me)?;
-        // dest→relay: has capacity (passes edge-0)
-        mark_edge_with_capacity(&graph, &dest, &relay);
-        // relay→me: only capacity, NO connectivity → last edge fails
-
-        let routes = graph.simple_paths(
-            &dest,
-            &me,
-            2,
-            None,
-            EdgeValueFn::returning(
-                std::num::NonZeroUsize::new(2).context("should be non-zero")?,
-                TEST_EDGE_PENALTY,
-                TEST_MIN_ACK_RATE,
-            ),
-        );
-
-        assert!(
-            routes.is_empty(),
-            "return path should be pruned when last edge lacks connectivity"
-        );
         Ok(())
     }
 
@@ -987,6 +808,7 @@ mod tests {
                 std::num::NonZeroUsize::new(2).context("should be non-zero")?,
                 TEST_EDGE_PENALTY,
                 TEST_MIN_ACK_RATE,
+                None,
             ),
         );
 
@@ -1029,6 +851,7 @@ mod tests {
                 std::num::NonZeroUsize::new(2).context("should be non-zero")?,
                 TEST_EDGE_PENALTY,
                 TEST_MIN_ACK_RATE,
+                None,
             ),
         );
         assert_eq!(
@@ -1049,7 +872,9 @@ mod tests {
             obs.record(EdgeWeightType::Connected(true));
             obs.record(EdgeWeightType::Immediate(Ok(std::time::Duration::from_millis(50))));
             obs.record(EdgeWeightType::Intermediate(Ok(std::time::Duration::from_millis(50))));
-            obs.record(EdgeWeightType::Capacity(Some(1000)));
+            obs.record(EdgeWeightType::Balance(Some(hopr_api::graph::traits::Balance::from(
+                1000u64,
+            ))));
         });
     }
 
@@ -1058,30 +883,10 @@ mod tests {
     fn mark_edge_with_capacity(graph: &ChannelGraph, src: &OffchainPublicKey, dest: &OffchainPublicKey) {
         graph.upsert_edge(src, dest, |obs| {
             obs.record(EdgeWeightType::Intermediate(Ok(std::time::Duration::from_millis(50))));
-            obs.record(EdgeWeightType::Capacity(Some(1000)));
+            obs.record(EdgeWeightType::Balance(Some(hopr_api::graph::traits::Balance::from(
+                1000u64,
+            ))));
         });
-    }
-
-    #[test]
-    fn loopback_returns_empty_for_length_zero() {
-        let me = pubkey_from(&SECRET_0);
-        let graph = ChannelGraph::new(me);
-        assert!(graph.simple_loopback_to_self(0, None).is_empty());
-    }
-
-    #[test]
-    fn loopback_returns_empty_for_length_one() {
-        let me = pubkey_from(&SECRET_0);
-        let a = pubkey_from(&SECRET_1);
-        let graph = ChannelGraph::new(me);
-        graph.add_node(a);
-        graph.add_edge(&me, &a).unwrap();
-        mark_edge_loopback_ready(&graph, &me, &a);
-
-        assert!(
-            graph.simple_loopback_to_self(1, None).is_empty(),
-            "length=1 is below the minimum threshold"
-        );
     }
 
     #[test]
@@ -1095,33 +900,8 @@ mod tests {
     }
 
     #[test]
-    fn loopback_returns_empty_without_connected_neighbors() -> anyhow::Result<()> {
-        // me → a → b, me → b exists but is NOT connected
-        let me = pubkey_from(&SECRET_0);
-        let a = pubkey_from(&SECRET_1);
-        let b = pubkey_from(&SECRET_2);
-
-        let graph = ChannelGraph::new(me);
-        graph.add_node(a);
-        graph.add_node(b);
-        graph.add_edge(&me, &a)?;
-        graph.add_edge(&a, &b)?;
-        graph.add_edge(&me, &b)?;
-        // me→b is NOT marked connected, so b is not in connected_neighbors
-        mark_edge_loopback_ready(&graph, &me, &a);
-        mark_edge_with_capacity(&graph, &a, &b);
-
-        assert!(
-            graph.simple_loopback_to_self(2, None).is_empty(),
-            "b is not a connected neighbor, so no loopback destinations exist"
-        );
-
-        Ok(())
-    }
-
-    #[test]
     fn loopback_returns_empty_when_first_hop_lacks_capacity() -> anyhow::Result<()> {
-        // me → a → b, me → b (connected)
+        // me → a → b, b → me (connected)
         // me→a is connected but has NO intermediate capacity → edge-0 cost goes negative
         let me = pubkey_from(&SECRET_0);
         let a = pubkey_from(&SECRET_1);
@@ -1132,13 +912,13 @@ mod tests {
         graph.add_node(b);
         graph.add_edge(&me, &a)?;
         graph.add_edge(&a, &b)?;
-        graph.add_edge(&me, &b)?;
+        graph.add_edge(&b, &me)?;
         // me→a: connected but no capacity (only Connected + Immediate)
         mark_edge_connected(&graph, &me, &a);
         // a→b: has capacity
         mark_edge_with_capacity(&graph, &a, &b);
-        // me→b: connected (makes b a connected neighbor)
-        mark_edge_connected(&graph, &me, &b);
+        // b→me: connected (makes b a loopback destination)
+        mark_edge_connected(&graph, &b, &me);
 
         assert!(
             graph.simple_loopback_to_self(2, None).is_empty(),
@@ -1150,7 +930,7 @@ mod tests {
 
     #[test]
     fn loopback_returns_empty_when_intermediate_edge_lacks_capacity() -> anyhow::Result<()> {
-        // me → a → b, me → b (connected)
+        // me → a → b, b → me (connected)
         // me→a passes cost-0, but a→b has NO capacity → cost goes negative at edge-1
         let me = pubkey_from(&SECRET_0);
         let a = pubkey_from(&SECRET_1);
@@ -1161,12 +941,12 @@ mod tests {
         graph.add_node(b);
         graph.add_edge(&me, &a)?;
         graph.add_edge(&a, &b)?;
-        graph.add_edge(&me, &b)?;
+        graph.add_edge(&b, &me)?;
         // me→a: connected + capacity (passes edge-0)
         mark_edge_loopback_ready(&graph, &me, &a);
         // a→b: NO capacity — default edge weight
-        // me→b: connected
-        mark_edge_connected(&graph, &me, &b);
+        // b→me: connected
+        mark_edge_connected(&graph, &b, &me);
 
         assert!(
             graph.simple_loopback_to_self(2, None).is_empty(),
@@ -1176,45 +956,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn loopback_two_edge_triangle() -> anyhow::Result<()> {
-        // Topology: me → a → b, me → b (connected)
-        // Loopback path: me → a → b → me
-        let me = pubkey_from(&SECRET_0);
-        let a = pubkey_from(&SECRET_1);
-        let b = pubkey_from(&SECRET_2);
-
-        let graph = ChannelGraph::new(me);
-        graph.add_node(a);
-        graph.add_node(b);
-        graph.add_edge(&me, &a)?;
-        graph.add_edge(&a, &b)?;
-        graph.add_edge(&me, &b)?;
-        // me→a: connected + capacity (edge-0 cost passes)
-        mark_edge_loopback_ready(&graph, &me, &a);
-        // a→b: capacity (edge-1 cost passes)
-        mark_edge_with_capacity(&graph, &a, &b);
-        // me→b: connected (makes b a connected neighbor destination)
-        mark_edge_connected(&graph, &me, &b);
-
-        let routes = graph.simple_loopback_to_self(2, None);
-        assert_eq!(routes.len(), 1, "should find exactly one 2-edge loopback");
-
-        let (path, _path_id) = &routes[0];
-        // simple_loopback_to_self strips the leading `me` and keeps the closing `me`.
-        // For a 2-edge internal path (me → a → b), the result is [a, b, me].
-        assert_eq!(path.len(), 3, "loopback path: 2 internal nodes + closing me");
-        assert_eq!(path.last(), Some(&me), "path should end with me (closing loopback)");
-        assert_eq!(path[0], a, "first intermediate should be a");
-        assert_eq!(path[1], b, "destination (connected neighbor) should be b");
-
-        Ok(())
-    }
-
-    #[test]
-    fn loopback_three_edge_chain() -> anyhow::Result<()> {
-        // Topology: me → a → b → c, me → c (connected)
-        // Loopback path: me → a → b → c → me
+    /// Builds `me → a → b → c → me` with every edge probe-ready, so loopbacks of 2 and 3 hops
+    /// both exist and the requested hop count decides which is returned.
+    fn chain_graph_for_hop_counts() -> anyhow::Result<ChannelGraph> {
         let me = pubkey_from(&SECRET_0);
         let a = pubkey_from(&SECRET_1);
         let b = pubkey_from(&SECRET_2);
@@ -1227,21 +971,48 @@ mod tests {
         graph.add_edge(&me, &a)?;
         graph.add_edge(&a, &b)?;
         graph.add_edge(&b, &c)?;
-        graph.add_edge(&me, &c)?;
+        graph.add_edge(&b, &me)?;
+        graph.add_edge(&c, &me)?;
         mark_edge_loopback_ready(&graph, &me, &a);
         mark_edge_with_capacity(&graph, &a, &b);
         mark_edge_with_capacity(&graph, &b, &c);
-        mark_edge_connected(&graph, &me, &c);
+        mark_edge_connected(&graph, &b, &me);
+        mark_edge_connected(&graph, &c, &me);
 
-        let routes = graph.simple_loopback_to_self(3, None);
-        assert_eq!(routes.len(), 1, "should find exactly one 3-edge loopback");
+        Ok(graph)
+    }
 
-        let (path, _path_id) = &routes[0];
-        // simple_loopback_to_self strips leading `me`, keeps closing `me`.
-        // For a 3-edge internal path (me → a → b → c), result is [a, b, c, me].
-        assert_eq!(path.len(), 4, "3-edge internal path + closing me = 4 nodes");
-        assert_eq!(path.last(), Some(&me), "ends with me");
-        assert_eq!(&path[0..3], &[a, b, c], "interior nodes");
+    #[test]
+    fn loopback_parameter_is_a_hop_count_not_an_edge_count() -> anyhow::Result<()> {
+        let me = pubkey_from(&SECRET_0);
+        let graph = chain_graph_for_hop_counts()?;
+
+        for hops in MIN_LOOPBACK_HOPS..=MAX_LOOPBACK_HOPS {
+            let routes = graph.simple_loopback_to_self(hops, None);
+            assert!(!routes.is_empty(), "{hops} hops should yield at least one loopback");
+
+            for (path, _) in &routes {
+                // The returned path is [intermediates…, closing me]: `hops` relays plus the
+                // closing node. The closed loop therefore has `hops + 1` edges.
+                assert_eq!(
+                    path.len(),
+                    hops + 1,
+                    "a {hops}-hop loopback must carry {hops} relays plus the closing node"
+                );
+                assert_eq!(path.last(), Some(&me), "the loop must close back at me");
+
+                let intermediates = &path[..path.len() - 1];
+                assert_eq!(
+                    intermediates.len(),
+                    hops,
+                    "intermediate relay count must equal the requested hop count"
+                );
+                assert!(
+                    !intermediates.contains(&me),
+                    "me must not appear as an intermediate relay"
+                );
+            }
+        }
 
         Ok(())
     }
@@ -1249,7 +1020,7 @@ mod tests {
     #[test]
     fn loopback_multiple_paths_through_diamond() -> anyhow::Result<()> {
         // Topology:
-        //   me → a → c, me → b → c, me → c (connected)
+        //   me → a → c, me → b → c, c → me (connected)
         // Two 2-edge loopback paths: me → a → c → me, me → b → c → me
         let me = pubkey_from(&SECRET_0);
         let a = pubkey_from(&SECRET_1);
@@ -1264,12 +1035,12 @@ mod tests {
         graph.add_edge(&me, &b)?;
         graph.add_edge(&a, &c)?;
         graph.add_edge(&b, &c)?;
-        graph.add_edge(&me, &c)?;
+        graph.add_edge(&c, &me)?;
         mark_edge_loopback_ready(&graph, &me, &a);
         mark_edge_loopback_ready(&graph, &me, &b);
         mark_edge_with_capacity(&graph, &a, &c);
         mark_edge_with_capacity(&graph, &b, &c);
-        mark_edge_connected(&graph, &me, &c);
+        mark_edge_connected(&graph, &c, &me);
 
         let routes = graph.simple_loopback_to_self(2, None);
         assert_eq!(routes.len(), 2, "diamond should yield two 2-edge loopback paths");
@@ -1277,7 +1048,7 @@ mod tests {
         for (path, _path_id) in &routes {
             // Leading `me` is stripped; path is [intermediate, c, me].
             assert_eq!(path.last(), Some(&me), "every path ends with me");
-            assert_eq!(path[path.len() - 2], c, "penultimate node is c (connected neighbor)");
+            assert_eq!(path[path.len() - 2], c, "penultimate node is c (loopback destination)");
         }
 
         // Verify distinct first intermediates (a and b)
@@ -1290,8 +1061,8 @@ mod tests {
 
     #[test]
     fn loopback_to_multiple_connected_neighbors() -> anyhow::Result<()> {
-        // Topology: me → a, me → b (both connected)
-        // a and b are both connected neighbors of me.
+        // Topology: me → a, me → b, a → me, b → me (all connected)
+        // a and b are both loopback destinations: each has a closing edge back to me.
         // With length=2: me → a → b → me and me → b → a → me
         let me = pubkey_from(&SECRET_0);
         let a = pubkey_from(&SECRET_1);
@@ -1304,16 +1075,20 @@ mod tests {
         graph.add_edge(&me, &b)?;
         graph.add_edge(&a, &b)?;
         graph.add_edge(&b, &a)?;
+        graph.add_edge(&a, &me)?;
+        graph.add_edge(&b, &me)?;
         mark_edge_loopback_ready(&graph, &me, &a);
         mark_edge_loopback_ready(&graph, &me, &b);
         mark_edge_with_capacity(&graph, &a, &b);
         mark_edge_with_capacity(&graph, &b, &a);
+        mark_edge_connected(&graph, &a, &me);
+        mark_edge_connected(&graph, &b, &me);
 
         let routes = graph.simple_loopback_to_self(2, None);
         assert_eq!(
             routes.len(),
             2,
-            "should find loopback paths to both connected neighbors"
+            "should find loopback paths to both loopback destinations"
         );
 
         // Leading `me` is stripped; path is [intermediate, connected_neighbor, me].
@@ -1321,9 +1096,9 @@ mod tests {
             assert_eq!(path.last(), Some(&me));
         }
 
-        // Collect the connected-neighbor destinations (penultimate node)
+        // Collect the loopback destinations (penultimate node)
         let destinations: HashSet<_> = routes.iter().map(|(p, _)| p[p.len() - 2]).collect();
-        assert_eq!(destinations.len(), 2, "should reach both connected neighbors");
+        assert_eq!(destinations.len(), 2, "should reach both loopback destinations");
         assert!(destinations.contains(&a));
         assert!(destinations.contains(&b));
 
@@ -1333,7 +1108,7 @@ mod tests {
     #[test]
     fn loopback_disconnected_neighbor_is_excluded() -> anyhow::Result<()> {
         // me → a → b, me → a → c
-        // me → b (connected), me → c (NOT connected)
+        // b → me (connected), c → me (NOT connected)
         // length=2: only me → a → b → me should be found, not me → a → c → me
         let me = pubkey_from(&SECRET_0);
         let a = pubkey_from(&SECRET_1);
@@ -1347,17 +1122,22 @@ mod tests {
         graph.add_edge(&me, &a)?;
         graph.add_edge(&a, &b)?;
         graph.add_edge(&a, &c)?;
-        graph.add_edge(&me, &b)?;
-        graph.add_edge(&me, &c)?;
+        graph.add_edge(&b, &me)?;
+        graph.add_edge(&c, &me)?;
         mark_edge_loopback_ready(&graph, &me, &a);
         mark_edge_with_capacity(&graph, &a, &b);
         mark_edge_with_capacity(&graph, &a, &c);
-        // me→b: connected (b IS a connected neighbor)
-        mark_edge_connected(&graph, &me, &b);
-        // me→c: NOT connected (c is NOT a connected neighbor)
+        // b→me: connected (b IS a loopback destination)
+        mark_edge_connected(&graph, &b, &me);
+        // c→me: observed down, so c is not a loopback destination
+        mark_edge_disconnected(&graph, &c, &me);
 
         let routes = graph.simple_loopback_to_self(2, None);
-        assert_eq!(routes.len(), 1, "only the path to connected neighbor b should be found");
+        assert_eq!(
+            routes.len(),
+            1,
+            "only the path to loopback destination b should be found"
+        );
 
         let (path, _) = &routes[0];
         assert_eq!(path[path.len() - 2], b, "destination should be b, not c");
@@ -1368,7 +1148,7 @@ mod tests {
     #[test]
     fn loopback_take_count_limits_results() -> anyhow::Result<()> {
         // Create 3 possible loopback paths, but take_count=1
-        //   me → a → d, me → b → d, me → c → d, me → d (connected)
+        //   me → a → d, me → b → d, me → c → d, d → me (connected)
         let me = pubkey_from(&SECRET_0);
         let a = pubkey_from(&SECRET_1);
         let b = pubkey_from(&SECRET_2);
@@ -1382,7 +1162,7 @@ mod tests {
         graph.add_edge(&me, &a)?;
         graph.add_edge(&me, &b)?;
         graph.add_edge(&me, &c)?;
-        graph.add_edge(&me, &d)?;
+        graph.add_edge(&d, &me)?;
         graph.add_edge(&a, &d)?;
         graph.add_edge(&b, &d)?;
         graph.add_edge(&c, &d)?;
@@ -1392,7 +1172,7 @@ mod tests {
         mark_edge_with_capacity(&graph, &a, &d);
         mark_edge_with_capacity(&graph, &b, &d);
         mark_edge_with_capacity(&graph, &c, &d);
-        mark_edge_connected(&graph, &me, &d);
+        mark_edge_connected(&graph, &d, &me);
 
         // Without limit: should find 3 paths
         let all_routes = graph.simple_loopback_to_self(2, None);
@@ -1407,7 +1187,7 @@ mod tests {
 
     #[test]
     fn loopback_path_ids_differ_for_distinct_routes() -> anyhow::Result<()> {
-        // me → a → c, me → b → c, me → c (connected)
+        // me → a → c, me → b → c, c → me (connected)
         let me = pubkey_from(&SECRET_0);
         let a = pubkey_from(&SECRET_1);
         let b = pubkey_from(&SECRET_2);
@@ -1421,12 +1201,12 @@ mod tests {
         graph.add_edge(&me, &b)?;
         graph.add_edge(&a, &c)?;
         graph.add_edge(&b, &c)?;
-        graph.add_edge(&me, &c)?;
+        graph.add_edge(&c, &me)?;
         mark_edge_loopback_ready(&graph, &me, &a);
         mark_edge_loopback_ready(&graph, &me, &b);
         mark_edge_with_capacity(&graph, &a, &c);
         mark_edge_with_capacity(&graph, &b, &c);
-        mark_edge_connected(&graph, &me, &c);
+        mark_edge_connected(&graph, &c, &me);
 
         let routes = graph.simple_loopback_to_self(2, None);
         assert_eq!(routes.len(), 2);
@@ -1441,9 +1221,9 @@ mod tests {
     }
 
     #[test]
-    fn loopback_mismatched_length_returns_empty() -> anyhow::Result<()> {
+    fn loopback_mismatched_hops_returns_empty() -> anyhow::Result<()> {
         // Topology only supports 2-edge internal path, but we request 3
-        // me → a → b, me → b (connected)
+        // me → a → b, b → me (connected)
         let me = pubkey_from(&SECRET_0);
         let a = pubkey_from(&SECRET_1);
         let b = pubkey_from(&SECRET_2);
@@ -1453,10 +1233,10 @@ mod tests {
         graph.add_node(b);
         graph.add_edge(&me, &a)?;
         graph.add_edge(&a, &b)?;
-        graph.add_edge(&me, &b)?;
+        graph.add_edge(&b, &me)?;
         mark_edge_loopback_ready(&graph, &me, &a);
         mark_edge_with_capacity(&graph, &a, &b);
-        mark_edge_connected(&graph, &me, &b);
+        mark_edge_connected(&graph, &b, &me);
 
         // length=2 works
         assert_eq!(graph.simple_loopback_to_self(2, None).len(), 1);

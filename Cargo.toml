@@ -28,14 +28,13 @@ rust-version = "1.97"
 
 [workspace.dependencies]
 # In-repo crates (path + version so they are publishable)
-hopr-chain-connector = { path = "connector", version = "0.23.0" }
-hopr-network-graph   = { path = "graph", version = "0.3.2", default-features = false }
+hopr-chain-connector = { path = "connector", version = "0.24.0" }
+hopr-network-graph   = { path = "graph", version = "0.6.0", default-features = false }
 
-# HOPR crates. TODO: revert to crates.io versions once the service-registry wave is published;
-# these revs are the `feat/service-registry` tips and exist only so the branch is testable.
-blokli-client = { git = "https://github.com/hoprnet/blokli-client", rev = "e304d847ba3bc81d87f79e422e5204a3f766da80" }
-hopr-api      = { git = "https://github.com/hoprnet/hopr-api", rev = "7469050a8259c497b89728a2923e57887f64194b" }
-hopr-utils    = { package = "hopr-utilities", git = "https://github.com/hoprnet/hopr-utilities", rev = "16a89a7dfbe08748aa9b44b90a04d5910505ddd3", default-features = false }
+# HOPR crates published to crates.io
+blokli-client = "0.32.0"
+hopr-api      = "4.0.1"
+hopr-utils    = { package = "hopr-utilities", version = "0.11.0", default-features = false }
 
 # Third-party dependencies (versions mirror hoprnet's workspace to preserve compatibility)
 ahash = "0.8.12"
@@ -77,6 +76,7 @@ parking_lot = "0.12.5"
 petgraph = { version = "0.8.3", default-features = false, features = [
   "rayon",
   "serde-1",
+  "stable_graph",
   "std",
 ] }
 pin-project = "1.1.13"

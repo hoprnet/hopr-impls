@@ -1,7 +1,7 @@
 use hopr_api::graph::{MeasurableEdge, MeasurableNode, NetworkGraphWrite, traits::EdgeObservableWrite};
 #[cfg(all(feature = "telemetry", not(test)))]
 use hopr_api::graph::{NetworkGraphView, traits::EdgeObservableRead};
-use petgraph::graph::{EdgeIndex, NodeIndex};
+use petgraph::graph::EdgeIndex;
 
 use crate::{ChannelGraph, Observations, graph::InnerGraph};
 
@@ -21,21 +21,29 @@ lazy_static::lazy_static! {
 /// so the distribution tracks quality as it evolves per probe round.
 #[cfg(all(feature = "telemetry", not(test)))]
 fn observe_neighbor_quality(graph: &ChannelGraph, peer: &hopr_api::OffchainPublicKey) {
-    if let Some(obs) = graph.edge(graph.me(), peer) {
-        METRIC_PEERS_BY_QUALITY.observe(obs.score());
+    // Unobserved edges are skipped rather than recorded as a fabricated zero.
+    if let Some(obs) = graph.edge(graph.me(), peer)
+        && let Some(score) = obs.score()
+    {
+        METRIC_PEERS_BY_QUALITY.observe(score);
     }
 }
 
 /// Resolves a loopback path from serialized node-index bytes into a validated chain of edge indices.
 ///
-/// The `path_bytes` encode a `PathId` where each `u64` is a [`NodeIndex`].
-/// The path is expected to start and end at `me_idx` (a closed loop).
+/// The `path_bytes` encode a `PathId` whose slots are key-derived (see
+/// [`path_id`](crate::petgraph::path_id)), not node indices.
+/// The path is expected to start and end at `me` (a closed loop).
 ///
 /// Walks consecutive node pairs, finding the connecting edge for each.
-/// Stops when the loop closes back to `me_idx` or when no edge exists
+/// Stops when the loop closes back to `me` or when no edge exists
 /// between a pair. Returns `None` if the path bytes have wrong length,
-/// the first node is not `me_idx`, or fewer than 2 edges can be resolved.
-fn resolve_loopback_edges(inner: &InnerGraph, me_idx: NodeIndex, path_bytes: &[u8]) -> Option<Vec<EdgeIndex>> {
+/// the first node is not `me`, or fewer than 2 edges can be resolved.
+fn resolve_loopback_edges(
+    inner: &InnerGraph,
+    me: &hopr_api::OffchainPublicKey,
+    path_bytes: &[u8],
+) -> Option<Vec<EdgeIndex>> {
     if path_bytes.len() != size_of::<hopr_api::ct::PathId>() {
         tracing::warn!(
             path_len = path_bytes.len(),
@@ -45,12 +53,12 @@ fn resolve_loopback_edges(inner: &InnerGraph, me_idx: NodeIndex, path_bytes: &[u
         return None;
     }
 
-    let mut path_id = [0u64; 5];
+    let mut path_id: hopr_api::ct::PathId = Default::default();
     for (i, chunk) in path_bytes.chunks_exact(8).enumerate() {
         path_id[i] = u64::from_le_bytes(chunk.try_into().expect("chunk is 8 bytes"));
     }
 
-    let me_val = me_idx.index() as u64;
+    let me_val = crate::petgraph::path_id::encode(me);
 
     // First node must be self
     if path_id[0] != me_val {
@@ -64,16 +72,47 @@ fn resolve_loopback_edges(inner: &InnerGraph, me_idx: NodeIndex, path_bytes: &[u
         return None;
     };
 
-    // Walk consecutive node pairs up to (and including) the closing node
-    let mut edges = Vec::new();
+    // The closing node must be the last one. `find_paths` zero-fills the unused tail, so anything
+    // else is a payload the local producer could not have emitted. Accepting it would let
+    // `[me, a, me, b, 0]` attribute a longer path's residual latency to `me → a`.
+    if path_id[end_pos + 1..].iter().any(|&slot| slot != 0) {
+        tracing::warn!("loopback path has non-padding slots after the closing node");
+        return None;
+    }
+
+    // Walk consecutive node pairs up to and including the closing node. Every pair must resolve:
+    // attribution targets `edges[len - 2]`, so a truncated chain would retarget the whole path's
+    // residual latency onto a different edge. Dropping the sample beats corrupting one.
+    let mut edges = Vec::with_capacity(end_pos);
 
     for pair in path_id[..=end_pos].windows(2) {
-        let from = NodeIndex::new(pair[0] as usize);
-        let to = NodeIndex::new(pair[1] as usize);
+        let (Some(from), Some(to)) = (
+            crate::petgraph::path_id::resolve(inner, pair[0]),
+            crate::petgraph::path_id::resolve(inner, pair[1]),
+        ) else {
+            // Padding mid-path, a node removed while the probe was in flight, or a slot no node
+            // claims. All three mean the sample cannot be attributed to a known edge.
+            tracing::warn!("loopback path slot does not resolve to a known node, cannot attribute");
+            return None;
+        };
         let Some(edge) = inner.graph.find_edge(from, to) else {
-            break;
+            tracing::warn!(
+                resolved = edges.len(),
+                expected = end_pos,
+                "loopback path edge missing from graph, cannot attribute"
+            );
+            return None;
         };
         edges.push(edge);
+    }
+
+    if edges.len() != end_pos {
+        tracing::warn!(
+            edge_count = edges.len(),
+            expected = end_pos,
+            "incomplete loopback path resolution"
+        );
+        return None;
     }
 
     if edges.len() < 2 {
@@ -87,7 +126,64 @@ fn resolve_loopback_edges(inner: &InnerGraph, me_idx: NodeIndex, path_bytes: &[u
     Some(edges)
 }
 
+/// Resolves the edges a SURB round-trip traversed, across both of its legs.
+///
+/// The two legs overlap at the replier: the forward path ends where the return path begins. That
+/// shared node is what makes the join unambiguous, so the trim uses real information rather than
+/// guessing at where the padding starts.
+///
+/// Slots are key-derived (see [`path_id`](crate::petgraph::path_id)), so `0` is unambiguously
+/// padding and a slot is never handed to a different node. Returns `None` when the legs do not join,
+/// do not come home, or name a node or edge the graph no longer has — attributing a stale round-trip
+/// would credit edges it never used.
+fn resolve_round_trip_edges(
+    inner: &InnerGraph,
+    me: &hopr_api::OffchainPublicKey,
+    paths: &hopr_api::graph::ForwardAndReturnPath,
+) -> Option<Vec<EdgeIndex>> {
+    let me_val = crate::petgraph::path_id::encode(me);
+    let replier = paths.reply[0];
+
+    if paths.forward[0] != me_val {
+        tracing::warn!("surb round-trip forward leg does not start at self");
+        return None;
+    }
+
+    // The forward leg runs up to the replier; the return leg from the replier back to us.
+    let forward_end = paths.forward.iter().position(|&v| v == replier)?;
+    let reply_end = paths.reply[1..].iter().position(|&v| v == me_val).map(|p| p + 1)?;
+
+    let loop_nodes: Vec<u64> = paths.forward[..=forward_end]
+        .iter()
+        .chain(paths.reply[1..=reply_end].iter())
+        .copied()
+        .collect();
+
+    let mut edges = Vec::with_capacity(loop_nodes.len().saturating_sub(1));
+    for pair in loop_nodes.windows(2) {
+        // Resolved against the nodes actually present, so a slot belonging to a node that has since
+        // been removed cannot alias whichever node now occupies its old index.
+        let (Some(from), Some(to)) = (
+            crate::petgraph::path_id::resolve(inner, pair[0]),
+            crate::petgraph::path_id::resolve(inner, pair[1]),
+        ) else {
+            tracing::warn!("surb round-trip slot does not resolve to a known node, cannot attribute");
+            return None;
+        };
+        // A missing edge means the path is stale; attributing the rest would credit edges the
+        // round-trip may never have used.
+        let edge = inner.graph.find_edge(from, to)?;
+        edges.push(edge);
+    }
+
+    (!edges.is_empty()).then_some(edges)
+}
+
 impl hopr_api::graph::NetworkGraphUpdate for ChannelGraph {
+    fn set_ticket_face_value(&self, ticket_face_value: hopr_api::graph::traits::Balance) {
+        *self.ticket_face_value.write() = Some(ticket_face_value);
+    }
+
     #[tracing::instrument(level = "debug", skip(self, update))]
     fn record_edge<N, P>(&self, update: MeasurableEdge<N, P>)
     where
@@ -100,6 +196,55 @@ impl hopr_api::graph::NetworkGraphUpdate for ChannelGraph {
         };
 
         match update {
+            MeasurableEdge::Surb(telemetry) => {
+                // The window buckets this report at `Instant::now()`, so a report that was produced
+                // several window widths ago would be counted as current traffic and could set or
+                // clear the trend on its own. `timestamp` is the interval's reporting time (unix
+                // epoch millis); a report from the future (backward clock drift) or from further
+                // back than the window can still hold is discarded rather than misfiled, the same
+                // way the loopback branch below discards an implausible RTT.
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis();
+                let Some(age_ms) = now_ms.checked_sub(telemetry.timestamp) else {
+                    tracing::debug!("surb round-trip timestamp in the future, dropping the report");
+                    return;
+                };
+                if age_ms > crate::weight::surb_window().as_millis() {
+                    tracing::debug!(age_ms, "surb round-trip report older than the window, dropping it");
+                    return;
+                }
+
+                let mut inner = self.inner.write();
+                if !inner.indices.contains_left(&self.me) {
+                    tracing::warn!("self not present in the graph; dropping surb round-trip");
+                    return;
+                }
+                let Some(edges) = resolve_round_trip_edges(&inner, &self.me, &telemetry.paths) else {
+                    return;
+                };
+
+                // Every edge on the loop, unlike the loopback handler above which attributes to a
+                // single edge. That one is doing incremental latency tomography: it knows the rest
+                // of the loop already and subtracts to isolate one unknown. A round-trip has no
+                // unknown to isolate — it is direct evidence that the whole loop carried traffic,
+                // so crediting one edge would discard most of what was observed.
+                tracing::trace!(
+                    edge_count = edges.len(),
+                    expected = telemetry.expected,
+                    observed = telemetry.observed,
+                    "recording surb round-trips across the loop"
+                );
+                for edge in edges {
+                    if let Some(weight) = inner.graph.edge_weight_mut(edge) {
+                        weight.record(EdgeWeightType::SurbRoundTrips {
+                            expected: telemetry.expected,
+                            observed: telemetry.observed,
+                        });
+                    }
+                }
+            }
             MeasurableEdge::Probe(Ok(hopr_api::graph::EdgeTransportTelemetry::Neighbor(ref telemetry))) => {
                 tracing::trace!(
                     peer = %telemetry.peer(),
@@ -125,21 +270,20 @@ impl hopr_api::graph::NetworkGraphUpdate for ChannelGraph {
                 tracing::trace!("loopback probe successful");
 
                 let mut inner = self.inner.write();
-                let Some(me_idx) = inner.indices.get_by_left(&self.me).copied() else {
+                let Some(_me_idx) = inner.indices.get_by_left(&self.me).copied() else {
                     tracing::debug!("failed to resolve index of myself for loopback probe attribution");
                     return;
                 };
-                let Some(edges) = resolve_loopback_edges(&inner, me_idx, telemetry.path()) else {
+                let Some(edges) = resolve_loopback_edges(&inner, &self.me, telemetry.path()) else {
                     tracing::debug!("failed to resolve loopback path for probe attribution");
                     return;
                 };
 
                 let target_idx = edges.len() - 2;
 
-                // Attributed duration = total RTT - sum of all known edge latencies.
-                // For each edge (including the target), use intermediate QoS if available,
-                // otherwise fall back to immediate QoS. The residual is attributed to the
-                // target edge as its new intermediate measurement.
+                // Attributed duration = total RTT - the latencies of the *other* edges on the
+                // loop, each taken from its intermediate QoS where available and its immediate QoS
+                // otherwise. What remains is the target edge's own latency.
                 //
                 // `timestamp()` is the probe's creation time (unix epoch millis), so the
                 // RTT is the elapsed time until now. A timestamp in the future (backward
@@ -162,9 +306,16 @@ impl hopr_api::graph::NetworkGraphUpdate for ChannelGraph {
                     );
                     return;
                 }
+                // Everything *except* the target: the residual is meant to be the target's own
+                // latency, so subtracting our current estimate of it too would yield the error in
+                // that estimate rather than a new measurement — and would drive the residual to
+                // zero exactly when the estimates are good.
                 let mut known_latency = std::time::Duration::ZERO;
 
-                for &edge in &edges {
+                for (i, &edge) in edges.iter().enumerate() {
+                    if i == target_idx {
+                        continue;
+                    }
                     if let Some(weight) = inner.graph.edge_weight(edge) {
                         let lat = weight
                             .intermediate_qos()
@@ -178,7 +329,39 @@ impl hopr_api::graph::NetworkGraphUpdate for ChannelGraph {
                     }
                 }
 
-                let attributed_duration = total_rtt.saturating_sub(known_latency);
+                // A saturating subtraction would turn "the known latencies already account for the
+                // whole round trip" into a measured zero — and a zero latency scores in the *fastest*
+                // band, so a clamp would be read as the best possible link. The residual is only a
+                // measurement while it stays positive; otherwise this probe tells us nothing about
+                // the target's speed and no latency is recorded for it.
+                // A saturating subtraction would turn "the other edges already account for the whole
+                // round trip" into a measured zero — and zero scores in the *fastest* latency band,
+                // so a clamp would read as the best possible link.
+                //
+                // The probe still succeeded, though, and the timeout branch below records failures
+                // unconditionally. Dropping the success here too would let an edge whose neighbours
+                // over-account accrue failures only and decay to looking dead. So the success is
+                // credited with the latency the edge already carries, leaving its average untouched
+                // while the probe rate still counts. With nothing carried yet there is no honest
+                // figure to record and the sample is skipped.
+                let attributed_duration = match total_rtt.checked_sub(known_latency) {
+                    Some(residual) => residual,
+                    None => {
+                        let carried = inner
+                            .graph
+                            .edge_weight(edges[target_idx])
+                            .and_then(|w| w.intermediate_qos().and_then(|q| q.average_latency()));
+                        tracing::debug!(
+                            total_rtt_ms = total_rtt.as_millis(),
+                            known_ms = known_latency.as_millis(),
+                            "known latencies already account for the loopback RTT, no new latency to attribute"
+                        );
+                        match carried {
+                            Some(latency) => latency,
+                            None => return,
+                        }
+                    }
+                };
 
                 tracing::trace!(
                     target_edge = edges[target_idx].index(),
@@ -217,11 +400,11 @@ impl hopr_api::graph::NetworkGraphUpdate for ChannelGraph {
                 tracing::trace!("loopback probe failed");
 
                 let mut inner = self.inner.write();
-                let Some(me_idx) = inner.indices.get_by_left(&self.me).copied() else {
+                let Some(_me_idx) = inner.indices.get_by_left(&self.me).copied() else {
                     tracing::debug!("failed to resolve index of myself");
                     return;
                 };
-                let Some(edges) = resolve_loopback_edges(&inner, me_idx, telemetry.path()) else {
+                let Some(edges) = resolve_loopback_edges(&inner, &self.me, telemetry.path()) else {
                     tracing::debug!("failed to resolve loopback path for probe timeout, cannot attribute");
                     return;
                 };
@@ -238,9 +421,9 @@ impl hopr_api::graph::NetworkGraphUpdate for ChannelGraph {
                     weight.record(EdgeWeightType::Intermediate(Err(())));
                 }
             }
-            MeasurableEdge::Capacity(update) => {
+            MeasurableEdge::Balance(update) => {
                 self.upsert_edge(&update.src, &update.dest, |obs: &mut Observations| {
-                    obs.record(EdgeWeightType::Capacity(update.capacity));
+                    obs.record(EdgeWeightType::Balance(update.balance));
                 });
             }
             MeasurableEdge::ConnectionStatus { peer, connected } => {
@@ -330,6 +513,249 @@ mod tests {
         }
     }
 
+    /// Builds the graph `me -> exit -> relay -> me` and returns the node keys plus their indices,
+    /// which is the shape a 0-hop-forward / 1-hop-return session produces.
+    fn round_trip_graph() -> anyhow::Result<(ChannelGraph, OffchainPublicKey, OffchainPublicKey, OffchainPublicKey)> {
+        let me = pubkey_from(&SECRET_0);
+        let exit = pubkey_from(&SECRET_1);
+        let relay = pubkey_from(&SECRET_2);
+
+        let graph = ChannelGraph::new(me);
+        graph.add_node(exit);
+        graph.add_node(relay);
+        graph.add_edge(&me, &exit)?;
+        graph.add_edge(&exit, &relay)?;
+        graph.add_edge(&relay, &me)?;
+        Ok((graph, exit, relay, me))
+    }
+
+    /// The `PathId` slot a node occupies.
+    ///
+    /// Key-derived, not the petgraph index: RFC-0010 §4.3.3 reserves `0` for padding and forbids it
+    /// as an identifier, which a zero-based index cannot honour.
+    fn slot_of(graph: &ChannelGraph, key: &OffchainPublicKey) -> u64 {
+        assert!(
+            graph.inner.read().indices.contains_left(key),
+            "node should be in the graph"
+        );
+        crate::petgraph::path_id::encode(key)
+    }
+
+    fn now_ms() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    }
+
+    fn surb(
+        paths: hopr_api::graph::ForwardAndReturnPath,
+        expected: u64,
+        observed: u64,
+    ) -> hopr_api::graph::SurbTelemetry {
+        surb_stamped(paths, expected, observed, now_ms())
+    }
+
+    fn surb_stamped(
+        paths: hopr_api::graph::ForwardAndReturnPath,
+        expected: u64,
+        observed: u64,
+        timestamp: u128,
+    ) -> hopr_api::graph::SurbTelemetry {
+        hopr_api::graph::SurbTelemetry {
+            paths,
+            timestamp,
+            expected,
+            observed,
+        }
+    }
+
+    #[tokio::test]
+    async fn surb_round_trip_should_credit_every_edge_on_both_legs() -> anyhow::Result<()> {
+        // The distinguishing property of this handler. A loopback probe attributes to one edge
+        // because it is isolating an unknown latency by subtraction; a round-trip has no unknown to
+        // isolate, so crediting a single edge would throw away most of what was observed.
+        let (graph, exit, relay, me) = round_trip_graph()?;
+        let (me_i, exit_i, relay_i) = (slot_of(&graph, &me), slot_of(&graph, &exit), slot_of(&graph, &relay));
+
+        let paths = hopr_api::graph::ForwardAndReturnPath {
+            forward: [me_i, exit_i, 0, 0, 0],
+            reply: [exit_i, relay_i, me_i, 0, 0],
+        };
+        graph.record_edge::<TestNeighbor, TestPath>(hopr_api::graph::MeasurableEdge::Surb(surb(paths, 4, 3)));
+
+        for (src, dst) in [(me, exit), (exit, relay), (relay, me)] {
+            let obs = graph.edge(&src, &dst).context("edge should exist")?;
+            let rate = obs
+                .intermediate_qos()
+                .context("surb telemetry lands in the intermediate measurement")?
+                .surb_delivery_rate()
+                .context("window should hold the round-trips")?;
+            // Read relatively: the first report sets the edge's own peak, so a path that has only
+            // ever been seen delivering at one level reads as fully healthy whatever that level
+            // was. The absolute ratio is not a delivery rate -- it also measures how far the
+            // balancer over-mints -- so only movement away from the peak is meaningful.
+            assert_in_delta!(rate, 1.0, 1e-9);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_round_trip_report_from_outside_the_window_should_be_dropped() -> anyhow::Result<()> {
+        // The window buckets a report at `Instant::now()` regardless of when it was produced, so a
+        // batch delayed past the window would be counted as current traffic and could move the
+        // trend on its own. Same treatment as an implausible loopback RTT: discard, do not misfile.
+        let (graph, exit, relay, me) = round_trip_graph()?;
+        let (me_i, exit_i, relay_i) = (slot_of(&graph, &me), slot_of(&graph, &exit), slot_of(&graph, &relay));
+        let paths = hopr_api::graph::ForwardAndReturnPath {
+            forward: [me_i, exit_i, 0, 0, 0],
+            reply: [exit_i, relay_i, me_i, 0, 0],
+        };
+
+        let window_ms = crate::weight::surb_window().as_millis();
+        for (label, stamp) in [
+            ("older than the window", now_ms() - window_ms - 1_000),
+            ("from the future", now_ms() + 60_000),
+        ] {
+            graph.record_edge::<TestNeighbor, TestPath>(hopr_api::graph::MeasurableEdge::Surb(surb_stamped(
+                paths, 4, 3, stamp,
+            )));
+
+            let obs = graph.edge(&me, &exit).context("edge should exist")?;
+            assert!(
+                obs.intermediate_qos().and_then(|q| q.surb_delivery_rate()).is_none(),
+                "a report {label} must not be counted as current traffic"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_round_trip_reported_after_its_relay_was_removed_should_credit_nothing() -> anyhow::Result<()> {
+        // Slots are resolved when a SURB is minted and reported an interval later, so a removal can
+        // land in between. What must not happen is the report being applied to whatever now sits at
+        // those slots: `remove_node` retires the slot instead of freeing it, so the stale id finds
+        // an isolated vertex, the loop fails to resolve, and nothing is credited.
+        let (graph, exit, relay, me) = round_trip_graph()?;
+        let (me_i, exit_i, relay_i) = (slot_of(&graph, &me), slot_of(&graph, &exit), slot_of(&graph, &relay));
+        let paths = hopr_api::graph::ForwardAndReturnPath {
+            forward: [me_i, exit_i, 0, 0, 0],
+            reply: [exit_i, relay_i, me_i, 0, 0],
+        };
+
+        graph.remove_node(&relay);
+        // A newcomer must not inherit the retired slot, which is what would make the stale id
+        // resolve to a live node.
+        let newcomer = pubkey_from(&SECRET_3);
+        graph.add_node(newcomer);
+        graph.add_edge(&exit, &newcomer)?;
+        graph.add_edge(&newcomer, &me)?;
+
+        graph.record_edge::<TestNeighbor, TestPath>(hopr_api::graph::MeasurableEdge::Surb(surb(paths, 4, 3)));
+
+        for (src, dst) in [(me, exit), (exit, newcomer), (newcomer, me)] {
+            let obs = graph.edge(&src, &dst).context("edge should exist")?;
+            assert!(
+                obs.intermediate_qos().and_then(|q| q.surb_delivery_rate()).is_none(),
+                "a surviving edge must not be credited with a round-trip it never carried: {src} -> {dst}"
+            );
+        }
+        Ok(())
+    }
+
+    /// A leg that stops delivering must fall away from its own peak, which is the signal the score
+    /// is built on.
+    #[tokio::test]
+    async fn surb_round_trip_should_fall_when_delivery_drops_off_its_peak() -> anyhow::Result<()> {
+        let (graph, exit, relay, me) = round_trip_graph()?;
+        let (me_i, exit_i, relay_i) = (slot_of(&graph, &me), slot_of(&graph, &exit), slot_of(&graph, &relay));
+        let paths = hopr_api::graph::ForwardAndReturnPath {
+            forward: [me_i, exit_i, 0, 0, 0],
+            reply: [exit_i, relay_i, me_i, 0, 0],
+        };
+
+        // Healthy: everything minted comes back, establishing the peak.
+        graph.record_edge::<TestNeighbor, TestPath>(hopr_api::graph::MeasurableEdge::Surb(surb(paths, 100, 100)));
+        // Then the return path breaks and nothing does.
+        graph.record_edge::<TestNeighbor, TestPath>(hopr_api::graph::MeasurableEdge::Surb(surb(paths, 100, 0)));
+
+        let obs = graph.edge(&exit, &relay).context("edge should exist")?;
+        let rate = obs
+            .intermediate_qos()
+            .context("surb telemetry lands in the intermediate measurement")?
+            .surb_delivery_rate()
+            .context("window should hold the round-trips")?;
+
+        assert!(rate < 0.6, "a leg that stopped delivering still reads {rate}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn surb_round_trip_should_leave_latency_untouched() -> anyhow::Result<()> {
+        // A round-trip carries no per-edge latency, so it must not invent one.
+        let (graph, exit, relay, me) = round_trip_graph()?;
+        let (me_i, exit_i, relay_i) = (slot_of(&graph, &me), slot_of(&graph, &exit), slot_of(&graph, &relay));
+
+        let paths = hopr_api::graph::ForwardAndReturnPath {
+            forward: [me_i, exit_i, 0, 0, 0],
+            reply: [exit_i, relay_i, me_i, 0, 0],
+        };
+        graph.record_edge::<TestNeighbor, TestPath>(hopr_api::graph::MeasurableEdge::Surb(surb(paths, 1, 1)));
+
+        let obs = graph.edge(&exit, &relay).context("edge should exist")?;
+        assert!(
+            obs.intermediate_qos()
+                .context("intermediate present")?
+                .average_latency()
+                .is_none(),
+            "latency must stay unknown"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn surb_round_trip_should_be_dropped_when_the_legs_do_not_join() -> anyhow::Result<()> {
+        let (graph, exit, relay, me) = round_trip_graph()?;
+        let (me_i, exit_i, relay_i) = (slot_of(&graph, &me), slot_of(&graph, &exit), slot_of(&graph, &relay));
+
+        // The reply leg starts at the relay, which never appears on the forward leg — so the two
+        // legs describe no single round-trip and attributing either would be a guess.
+        let paths = hopr_api::graph::ForwardAndReturnPath {
+            forward: [me_i, exit_i, 0, 0, 0],
+            reply: [relay_i, me_i, 0, 0, 0],
+        };
+        graph.record_edge::<TestNeighbor, TestPath>(hopr_api::graph::MeasurableEdge::Surb(surb(paths, 4, 0)));
+
+        let obs = graph.edge(&me, &exit).context("edge should exist")?;
+        assert!(
+            obs.intermediate_qos().is_none_or(|i| i.surb_delivery_rate().is_none()),
+            "a non-joining round-trip must not be attributed"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn surb_round_trip_should_be_dropped_when_a_slot_is_stale() -> anyhow::Result<()> {
+        // A PathId names keys, not positions, so a slot whose node has left the graph resolves to
+        // nothing — the report is discarded rather than credited to some surviving edge.
+        let (graph, exit, relay, me) = round_trip_graph()?;
+        let (me_i, exit_i) = (slot_of(&graph, &me), slot_of(&graph, &exit));
+        let _ = relay;
+
+        let paths = hopr_api::graph::ForwardAndReturnPath {
+            forward: [me_i, exit_i, 0, 0, 0],
+            reply: [exit_i, 999, me_i, 0, 0],
+        };
+        graph.record_edge::<TestNeighbor, TestPath>(hopr_api::graph::MeasurableEdge::Surb(surb(paths, 4, 4)));
+
+        let obs = graph.edge(&me, &exit).context("edge should exist")?;
+        assert!(
+            obs.intermediate_qos().is_none_or(|i| i.surb_delivery_rate().is_none()),
+            "a stale path must not be attributed"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn neighbor_probe_should_update_edge_observation() -> anyhow::Result<()> {
         let me_kp = OffchainKeypair::from_secret(&SECRET_0)?;
@@ -410,7 +836,7 @@ mod tests {
             "failed probe should not set latency"
         );
         assert!(
-            imm_fwd.average_probe_rate() < 1.0,
+            imm_fwd.average_probe_rate().expect("probed") < 1.0,
             "failed probe should lower success rate"
         );
 
@@ -424,7 +850,7 @@ mod tests {
             "failed probe should not set latency on reverse"
         );
         assert!(
-            imm_rev.average_probe_rate() < 1.0,
+            imm_rev.average_probe_rate().expect("probed") < 1.0,
             "failed probe should lower success rate on reverse"
         );
 
@@ -451,55 +877,56 @@ mod tests {
             .immediate_qos()
             .context("immediate QoS should be present after failed probe")?;
         assert!(immediate.average_latency().is_none());
-        assert!(immediate.average_probe_rate() < 1.0);
+        assert!(immediate.average_probe_rate().expect("probed") < 1.0);
         Ok(())
     }
 
     #[tokio::test]
-    async fn capacity_update_should_set_edge_capacity() -> anyhow::Result<()> {
+    async fn balance_update_should_set_edge_capacity() -> anyhow::Result<()> {
         let me = pubkey_from(&SECRET_0);
         let peer = pubkey_from(&SECRET_1);
         let graph = ChannelGraph::new(me);
         graph.add_node(peer);
         graph.add_edge(&me, &peer)?;
 
-        let capacity_update = hopr_api::graph::EdgeCapacityUpdate {
+        let capacity_update = hopr_api::graph::EdgeBalanceUpdate {
             src: me,
             dest: peer,
-            capacity: Some(1000),
+            balance: Some(hopr_api::graph::traits::Balance::from(1000u64)),
         };
-        graph.record_edge::<TestNeighbor, TestPath>(hopr_api::graph::MeasurableEdge::Capacity(Box::new(
-            capacity_update,
-        )));
+        graph
+            .record_edge::<TestNeighbor, TestPath>(hopr_api::graph::MeasurableEdge::Balance(Box::new(capacity_update)));
 
         let obs = graph.edge(&me, &peer).context("edge should exist")?;
         let intermediate = obs
             .intermediate_qos()
             .context("intermediate QoS should be present after capacity update")?;
-        assert_eq!(intermediate.capacity(), Some(1000));
+        assert_eq!(
+            intermediate.balance(),
+            Some(hopr_api::graph::traits::Balance::from(1000u64))
+        );
         Ok(())
     }
 
     #[tokio::test]
-    async fn capacity_update_should_accept_none_value() -> anyhow::Result<()> {
+    async fn balance_update_should_accept_none_value() -> anyhow::Result<()> {
         let me = pubkey_from(&SECRET_0);
         let peer = pubkey_from(&SECRET_1);
         let graph = ChannelGraph::new(me);
         graph.add_node(peer);
         graph.add_edge(&me, &peer)?;
 
-        let capacity_update = hopr_api::graph::EdgeCapacityUpdate {
+        let capacity_update = hopr_api::graph::EdgeBalanceUpdate {
             src: me,
             dest: peer,
-            capacity: None,
+            balance: None,
         };
-        graph.record_edge::<TestNeighbor, TestPath>(hopr_api::graph::MeasurableEdge::Capacity(Box::new(
-            capacity_update,
-        )));
+        graph
+            .record_edge::<TestNeighbor, TestPath>(hopr_api::graph::MeasurableEdge::Balance(Box::new(capacity_update)));
 
         let obs = graph.edge(&me, &peer).context("edge should exist")?;
         let intermediate = obs.intermediate_qos().context("intermediate QoS should be present")?;
-        assert_eq!(intermediate.capacity(), None);
+        assert_eq!(intermediate.balance(), None);
         Ok(())
     }
 
@@ -557,7 +984,7 @@ mod tests {
             qos.average_latency().context("latency should be set")?,
             std::time::Duration::from_millis(30), // rtt / 2 = 30ms
         );
-        assert!(qos.average_probe_rate() > 0.9, "all probes succeeded");
+        assert!(qos.average_probe_rate().expect("probed") > 0.9, "all probes succeeded");
         Ok(())
     }
 
@@ -570,7 +997,22 @@ mod tests {
     }
 
     impl LoopbackTestPath {
-        fn new(path_id: [u64; 5], timestamp_ms: u128) -> Self {
+        /// Builds telemetry from raw slot values, for payloads a correct encoder cannot produce.
+        fn from_slots(path_id: [u64; 5], timestamp_ms: u128) -> Self {
+            Self {
+                path_bytes: path_id.iter().flat_map(|v| v.to_le_bytes()).collect(),
+                timestamp_ms,
+            }
+        }
+
+        fn new(nodes: &[hopr_api::OffchainPublicKey], timestamp_ms: u128) -> Self {
+            assert!(nodes.len() <= 5, "a PathId holds at most 5 slots");
+
+            let mut path_id: hopr_api::ct::PathId = Default::default();
+            for (slot, key) in path_id.iter_mut().zip(nodes) {
+                *slot = crate::petgraph::path_id::encode(key);
+            }
+
             let path_bytes = path_id.iter().flat_map(|v| v.to_le_bytes()).collect();
             Self {
                 path_bytes,
@@ -605,25 +1047,23 @@ mod tests {
     ///
     /// The telemetry timestamp is set `rtt_ms` in the past so the receiver
     /// computes an elapsed RTT of approximately `rtt_ms`.
-    fn send_loopback(graph: &ChannelGraph, path_id: [u64; 5], rtt_ms: u128) {
+    fn send_loopback(graph: &ChannelGraph, nodes: &[hopr_api::OffchainPublicKey], rtt_ms: u128) {
         let telemetry: Result<
             EdgeTransportTelemetry<TestNeighbor, LoopbackTestPath>,
             NetworkGraphError<LoopbackTestPath>,
         > = Ok(EdgeTransportTelemetry::Loopback(LoopbackTestPath::new(
-            path_id,
+            nodes,
             now_unix_ms() - rtt_ms,
         )));
         graph.record_edge(hopr_api::graph::MeasurableEdge::Probe(telemetry));
     }
 
     /// Helper to send a loopback timeout with the given path.
-    fn send_loopback_timeout(graph: &ChannelGraph, path_id: [u64; 5]) {
+    fn send_loopback_timeout(graph: &ChannelGraph, nodes: &[hopr_api::OffchainPublicKey]) {
         let telemetry: Result<
             EdgeTransportTelemetry<TestNeighbor, LoopbackTestPath>,
             NetworkGraphError<LoopbackTestPath>,
-        > = Err(NetworkGraphError::ProbeLoopbackTimeout(LoopbackTestPath::new(
-            path_id, 0,
-        )));
+        > = Err(NetworkGraphError::ProbeLoopbackTimeout(LoopbackTestPath::new(nodes, 0)));
         graph.record_edge(hopr_api::graph::MeasurableEdge::Probe(telemetry));
     }
 
@@ -644,7 +1084,7 @@ mod tests {
         graph.add_edge(&a, &b)?;
         graph.add_edge(&b, &me)?; // return edge
 
-        send_loopback(&graph, [0, 1, 2, 0, 0], 200);
+        send_loopback(&graph, &[me, a, b, me], 200);
 
         let obs = graph.edge(&a, &b).context("edge a→b should exist")?;
         let qos = obs
@@ -683,7 +1123,7 @@ mod tests {
         graph.add_edge(&b, &c)?;
         graph.add_edge(&c, &me)?; // return edge
 
-        send_loopback(&graph, [0, 1, 2, 3, 0], 300);
+        send_loopback(&graph, &[me, a, b, c, me], 300);
 
         // Edge b→c (target) should have the intermediate QoS
         let obs = graph.edge(&b, &c).context("edge b→c should exist")?;
@@ -740,7 +1180,7 @@ mod tests {
             )));
         });
 
-        send_loopback(&graph, [0, 1, 2, 3, 0], 300);
+        send_loopback(&graph, &[me, a, b, c, me], 300);
 
         let obs = graph.edge(&b, &c).context("edge b→c should exist")?;
         let qos = obs
@@ -780,7 +1220,7 @@ mod tests {
             )));
         });
 
-        send_loopback(&graph, [0, 1, 2, 0, 0], 200);
+        send_loopback(&graph, &[me, a, b, me], 200);
 
         let obs = graph.edge(&a, &b).context("edge a→b should exist")?;
         let qos = obs
@@ -841,7 +1281,7 @@ mod tests {
         graph.add_edge(&b, &me)?; // return edge
 
         // Probe withheld 90 s before replay: computed RTT far above the 30 s cap.
-        send_loopback(&graph, [0, 1, 2, 0, 0], 90_000);
+        send_loopback(&graph, &[me, a, b, me], 90_000);
 
         let obs = graph.edge(&a, &b).context("edge a→b should exist")?;
         assert!(
@@ -872,7 +1312,7 @@ mod tests {
             EdgeTransportTelemetry<TestNeighbor, LoopbackTestPath>,
             NetworkGraphError<LoopbackTestPath>,
         > = Ok(EdgeTransportTelemetry::Loopback(LoopbackTestPath::new(
-            [0, 1, 2, 0, 0],
+            &[me, a, b, me],
             now_unix_ms() + 5_000, // timestamp 5 s in the future
         )));
         graph.record_edge(hopr_api::graph::MeasurableEdge::Probe(telemetry));
@@ -900,7 +1340,7 @@ mod tests {
         graph.add_node(a);
         graph.add_edge(&me, &a)?;
 
-        send_loopback(&graph, [0, 1, 0, 0, 0], 100);
+        send_loopback(&graph, &[me, a, me], 100);
 
         let obs = graph.edge(&me, &a).context("edge should exist")?;
         assert!(
@@ -934,17 +1374,21 @@ mod tests {
             )));
         });
 
-        send_loopback(&graph, [0, 1, 0, 0, 0], 100);
+        send_loopback(&graph, &[me, a, me], 100);
 
         let obs = graph.edge(&me, &a).context("edge me→a should exist")?;
         let qos = obs
             .intermediate_qos()
             .context("intermediate QoS should be present on me→a")?;
+        // The whole round trip, because the only *other* edge on the loop has no known latency.
+        // The target's own prior estimate is deliberately not subtracted: doing so would measure the
+        // error in that estimate rather than the edge, and would drive the residual to zero exactly
+        // when the estimate was good.
         assert_in_delta!(
             qos.average_latency().context("latency should be set")?.as_millis(),
-            50,
+            100,
             25
-        ); // 100ms total - 50ms (me→a immediate) = 50ms attributed to me→a
+        );
 
         // Immediate QoS should still be intact
         let imm = obs
@@ -976,7 +1420,7 @@ mod tests {
         graph.add_edge(&me, &a)?;
         graph.add_edge(&b, &c)?; // b→c, NOT a→c
 
-        send_loopback(&graph, [0, 1, 3, 0, 0], 200);
+        send_loopback(&graph, &[me, a, c, me], 200);
 
         let obs_me_a = graph.edge(&me, &a).context("edge me→a should exist")?;
         assert!(
@@ -988,16 +1432,222 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn loopback_wrong_start_node_should_be_ignored() -> anyhow::Result<()> {
-        // PathId starts with node 99 which is not me → early reject
+    async fn loopback_truncated_to_two_edges_should_not_attribute_to_the_first_edge() -> anyhow::Result<()> {
+        // Regression guard for misattribution by truncation.
+        //
+        // Probed path: me(0) → a(1) → b(2) → c(3) → me(0), i.e. 4 edges, whose penultimate edge
+        // is b→c. Edge b→c is absent from the graph, so resolution stops after me→a and a→b.
+        //
+        // A truncated chain of exactly two edges still satisfies a `len >= 2` check, and
+        // `target_idx = len - 2` then points at index 0 — so the residual latency computed for
+        // the *whole four-edge* path would be attributed to me→a. That corrupts the score of an
+        // edge the probe says nothing about. The sample must be discarded instead.
+        let me = pubkey_from(&SECRET_0);
+        let a = pubkey_from(&SECRET_1);
+        let b = pubkey_from(&SECRET_2);
+        let c = pubkey_from(&SECRET_3);
+
+        let graph = ChannelGraph::new(me);
+        graph.add_node(a);
+        graph.add_node(b);
+        graph.add_node(c);
+        graph.add_edge(&me, &a)?;
+        graph.add_edge(&a, &b)?;
+        // b→c deliberately absent, so the chain truncates to exactly two resolvable edges.
+        graph.add_edge(&c, &me)?;
+
+        send_loopback(&graph, &[me, a, b, c, me], 400);
+
+        let obs_me_a = graph.edge(&me, &a).context("edge me→a should exist")?;
+        assert!(
+            obs_me_a.intermediate_qos().is_none(),
+            "a truncated loopback must not attribute the whole path's residual to the first edge"
+        );
+
+        let obs_a_b = graph.edge(&a, &b).context("edge a→b should exist")?;
+        assert!(
+            obs_a_b.intermediate_qos().is_none(),
+            "a truncated loopback must not attribute to any edge"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn a_removed_nodes_slot_must_become_unclaimable() {
+        // The property that makes reuse impossible, asserted directly on the resolver: once a node is
+        // gone nothing claims its slot, and resolution fails closed.
+        //
+        // `remove_node` retains the petgraph node, so indices are not reissued and reuse is
+        // unreachable through that path. This asserts the resolver's own guarantee rather than that
+        // mechanism, so the two remain independent.
+        let me = pubkey_from(&SECRET_0);
+        let a = pubkey_from(&SECRET_1);
+        let b = pubkey_from(&SECRET_2);
+        let c = pubkey_from(&SECRET_3);
+
+        let graph = ChannelGraph::new(me);
+        for node in [a, b, c] {
+            graph.add_node(node);
+        }
+
+        let b_slot = crate::petgraph::path_id::encode(&b);
+        let index_of = |key: &hopr_api::OffchainPublicKey| {
+            let inner = graph.inner.read();
+            inner.indices.get_by_left(key).copied()
+        };
+        let b_index = index_of(&b).expect("b is in the graph");
+
+        graph.remove_node(&b);
+
+        let inner = graph.inner.read();
+        assert_eq!(
+            crate::petgraph::path_id::resolve(&inner, b_slot),
+            None,
+            "the removed node's slot must resolve to nothing"
+        );
+        // The index b held is still a live petgraph index; the point is that no slot maps onto it.
+        assert!(
+            inner.indices.get_by_right(&b_index).is_none(),
+            "the vacated index must be claimed by no key"
+        );
+        assert_eq!(
+            crate::petgraph::path_id::resolve(&inner, crate::petgraph::path_id::encode(&c)),
+            index_of(&c),
+            "a surviving node must still resolve"
+        );
+    }
+
+    #[tokio::test]
+    async fn loopback_should_not_attribute_after_a_node_is_removed_mid_flight() -> anyhow::Result<()> {
+        // Regression guard for identifier reuse. `remove_node` moves the last node into the vacated
+        // index, so with position-derived slots an in-flight probe for `me → a → b → me` resolves on
+        // return to `me → a → c → me` once `b` is gone and `c` takes its index. The topology below
+        // makes that shifted chain resolve *completely*, so the residual latency would land on the
+        // a→c edge — an edge the probe never traversed. Key-derived slots leave the removed node's
+        // slot unclaimable, so the sample is dropped instead.
+        let me = pubkey_from(&SECRET_0);
+        let a = pubkey_from(&SECRET_1);
+        let b = pubkey_from(&SECRET_2);
+        let c = pubkey_from(&SECRET_3);
+
+        let graph = ChannelGraph::new(me);
+        for node in [a, b, c] {
+            graph.add_node(node);
+        }
+        // The traversed path.
+        graph.add_edge(&me, &a)?;
+        graph.add_edge(&a, &b)?;
+        graph.add_edge(&b, &me)?;
+        // The chain the shifted indices would resolve to, complete end to end.
+        graph.add_edge(&a, &c)?;
+        graph.add_edge(&c, &me)?;
+
+        graph.remove_node(&b);
+        assert!(
+            graph.has_edge(&a, &c) && graph.has_edge(&c, &me),
+            "the aliasing chain must be intact for this test to be meaningful"
+        );
+
+        send_loopback(&graph, &[me, a, b, me], 200);
+
+        let victim = graph.edge(&a, &c).context("edge a→c should exist")?;
+        assert!(
+            victim.intermediate_qos().is_none(),
+            "the edge that inherits the removed node's index must not absorb the measurement"
+        );
+        let first = graph.edge(&me, &a).context("edge me→a should exist")?;
+        assert!(first.intermediate_qos().is_none(), "nor may any other surviving edge");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn loopback_oversized_slot_should_not_alias_a_real_node() -> anyhow::Result<()> {
+        // Regression guard for narrowing. Resolving a slot arithmetically into `NodeIndex` would
+        // truncate to its `u32` index type, so a slot of `2^32 + n` could alias node `n`. Slots are
+        // now matched against the nodes actually present, which no oversized value can satisfy.
         let me = pubkey_from(&SECRET_0);
         let a = pubkey_from(&SECRET_1);
 
         let graph = ChannelGraph::new(me);
         graph.add_node(a);
         graph.add_edge(&me, &a)?;
+        graph.add_edge(&a, &me)?;
 
-        send_loopback(&graph, [99, 1, 0, 0, 0], 200);
+        let me_slot = crate::petgraph::path_id::encode(&me);
+        let a_slot = crate::petgraph::path_id::encode(&a);
+        let aliasing = a_slot.wrapping_add(1u64 << 32);
+
+        let telemetry: Result<
+            EdgeTransportTelemetry<TestNeighbor, LoopbackTestPath>,
+            NetworkGraphError<LoopbackTestPath>,
+        > = Ok(EdgeTransportTelemetry::Loopback(LoopbackTestPath::from_slots(
+            [me_slot, aliasing, me_slot, 0, 0],
+            now_unix_ms() - 100,
+        )));
+        graph.record_edge(hopr_api::graph::MeasurableEdge::Probe(telemetry));
+
+        let obs = graph.edge(&me, &a).context("edge me→a should exist")?;
+        assert!(
+            obs.intermediate_qos().is_none(),
+            "a slot differing from a real one only above bit 32 must not resolve to that node"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn loopback_slots_after_the_closing_node_must_be_padding() -> anyhow::Result<()> {
+        // `[me, a, me, b, 0]` closes at slot 2 but keeps going. Taking the first reoccurrence of
+        // `me` as the end would attribute a longer path's residual latency to `me → a`.
+        let me = pubkey_from(&SECRET_0);
+        let a = pubkey_from(&SECRET_1);
+        let b = pubkey_from(&SECRET_2);
+
+        let graph = ChannelGraph::new(me);
+        graph.add_node(a);
+        graph.add_node(b);
+        graph.add_edge(&me, &a)?;
+        graph.add_edge(&a, &me)?;
+        graph.add_edge(&me, &b)?;
+
+        let telemetry: Result<
+            EdgeTransportTelemetry<TestNeighbor, LoopbackTestPath>,
+            NetworkGraphError<LoopbackTestPath>,
+        > = Ok(EdgeTransportTelemetry::Loopback(LoopbackTestPath::from_slots(
+            [
+                crate::petgraph::path_id::encode(&me),
+                crate::petgraph::path_id::encode(&a),
+                crate::petgraph::path_id::encode(&me),
+                crate::petgraph::path_id::encode(&b),
+                0,
+            ],
+            now_unix_ms() - 100,
+        )));
+        graph.record_edge(hopr_api::graph::MeasurableEdge::Probe(telemetry));
+
+        let obs = graph.edge(&me, &a).context("edge me→a should exist")?;
+        assert!(
+            obs.intermediate_qos().is_none(),
+            "a payload that does not end at the closing node must be rejected, not truncated"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn loopback_wrong_start_node_should_be_ignored() -> anyhow::Result<()> {
+        // PathId starts with a node that is not me → early reject
+        let me = pubkey_from(&SECRET_0);
+        let a = pubkey_from(&SECRET_1);
+        let stranger = pubkey_from(&SECRET_3);
+
+        let graph = ChannelGraph::new(me);
+        graph.add_node(a);
+        graph.add_edge(&me, &a)?;
+
+        send_loopback(&graph, &[stranger, a, me], 200);
 
         let obs = graph.edge(&me, &a).context("edge should exist")?;
         assert!(
@@ -1027,7 +1677,7 @@ mod tests {
         // After each probe the target's intermediate QoS is subtracted from subsequent
         // attributions, so the attributed value converges rather than staying at 100ms.
         for _ in 0..5 {
-            send_loopback(&graph, [0, 1, 2, 0, 0], 100);
+            send_loopback(&graph, &[me, a, b, me], 100);
         }
 
         let obs = graph.edge(&a, &b).context("edge a→b should exist")?;
@@ -1037,7 +1687,7 @@ mod tests {
             "latency should be set after multiple probes"
         );
         assert!(
-            qos.average_probe_rate() > 0.9,
+            qos.average_probe_rate().expect("probed") > 0.9,
             "all probes succeeded, rate should be high"
         );
 
@@ -1046,8 +1696,8 @@ mod tests {
 
     // This is handled by the moving average object, but the expectation test can stay here.
     #[tokio::test]
-    async fn loopback_saturating_sub_should_not_underflow() -> anyhow::Result<()> {
-        // If preceding edge latencies exceed total RTT, duration should saturate at 0
+    async fn loopback_should_not_attribute_when_other_edges_account_for_the_whole_rtt() -> anyhow::Result<()> {
+        // If the other edges already account for the whole RTT there is no residual to attribute.
         // Loopback: me(0) → a(1) → b(2) → c(3) → me(0). Target = b→c.
         // Preceding = [me→a, a→b] with me→a = 500ms
         let me = pubkey_from(&SECRET_0);
@@ -1073,16 +1723,16 @@ mod tests {
         });
 
         // Total RTT = 100ms, but preceding latency is 500ms → 100 - 500 saturates to 0
-        send_loopback(&graph, [0, 1, 2, 3, 0], 100);
+        send_loopback(&graph, &[me, a, b, c, me], 100);
 
-        let obs = graph.edge(&b, &c).context("edge b→c should exist")?;
-        let qos = obs.intermediate_qos().context("intermediate QoS should be present")?;
-        // Duration::ZERO means latency_average gets updated with 0ms
-        // which the EMA may not report as Some(0) but rather None if <= 0
-        // Let's check the probe rate instead — it should be recorded
+        // Nothing is attributed. A clamp is not a measurement: recording the saturated zero would
+        // put this edge in the *fastest* latency band on the strength of knowing nothing about it.
         assert!(
-            qos.average_probe_rate() > 0.0,
-            "probe should still be recorded even with saturated duration"
+            graph
+                .edge(&b, &c)
+                .and_then(|obs| obs.intermediate_qos().cloned())
+                .is_none(),
+            "a round trip already accounted for by the other edges says nothing about the target"
         );
 
         Ok(())
@@ -1104,14 +1754,17 @@ mod tests {
         graph.add_edge(&a, &b)?;
         graph.add_edge(&b, &me)?; // return edge
 
-        send_loopback_timeout(&graph, [0, 1, 2, 0, 0]);
+        send_loopback_timeout(&graph, &[me, a, b, me]);
 
         let obs = graph.edge(&a, &b).context("edge a→b should exist")?;
         let qos = obs
             .intermediate_qos()
             .context("intermediate QoS should be present on a→b after timeout")?;
         assert!(qos.average_latency().is_none(), "failed probe should not set latency");
-        assert!(qos.average_probe_rate() < 1.0, "failed probe should lower success rate");
+        assert!(
+            qos.average_probe_rate().expect("probed") < 1.0,
+            "failed probe should lower success rate"
+        );
 
         // me→a should NOT have intermediate QoS
         let obs_me_a = graph.edge(&me, &a).context("edge me→a should exist")?;
@@ -1138,7 +1791,7 @@ mod tests {
         graph.add_edge(&b, &c)?;
         graph.add_edge(&c, &me)?;
 
-        send_loopback_timeout(&graph, [0, 1, 2, 3, 0]);
+        send_loopback_timeout(&graph, &[me, a, b, c, me]);
 
         // Edge b→c (target) should have a failed intermediate record
         let obs = graph.edge(&b, &c).context("edge b→c should exist")?;
@@ -1146,7 +1799,7 @@ mod tests {
             .intermediate_qos()
             .context("intermediate QoS should be present on b→c")?;
         assert!(qos.average_latency().is_none());
-        assert!(qos.average_probe_rate() < 1.0);
+        assert!(qos.average_probe_rate().expect("probed") < 1.0);
 
         // Earlier edges should NOT have intermediate QoS
         let obs_me_a = graph.edge(&me, &a).context("edge me→a should exist")?;
@@ -1192,7 +1845,7 @@ mod tests {
         graph.add_node(a);
         graph.add_edge(&me, &a)?;
 
-        send_loopback_timeout(&graph, [0, 1, 0, 0, 0]);
+        send_loopback_timeout(&graph, &[me, a, me]);
 
         let obs = graph.edge(&me, &a).context("edge should exist")?;
         assert!(

@@ -7,5 +7,9 @@ ignore = [
   # libp2p). Both advisories below can only be cleared by a major libp2p bump.
   "RUSTSEC-2026-0118", # hickory-proto: NSEC3 unbounded loop — no fixed upstream release available
   "RUSTSEC-2026-0119", # hickory-proto: O(n^2) name compression — fix (>=0.26.1) requires a libp2p major upgrade
-  "RUSTSEC-2026-0249", # smartstring 1.0.1 unmaintaned.
+  # smartstring 1.0.1 is unmaintained with no patched release. It enters the tree via
+  # opentelemetry-prometheus-text-exporter 0.3.0 -> smartstring 1.0.1; drop this ignore once
+  # that exporter switches to a maintained replacement.
+  "RUSTSEC-2026-0249", # smartstring: unmaintained
+  "RUSTSEC-2026-0258", # h2: requires a new version of reqwest
 ]

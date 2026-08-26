@@ -76,7 +76,7 @@ where
                         .map(|current| {
                             let events = service_registry_config_to_events(current, previous.as_ref());
                             *previous = Some(current);
-                            events
+                            events.into_iter().map(ChainEvent::from).collect::<Vec<_>>()
                         });
                     futures::future::ready(Some(events))
                 })
@@ -103,7 +103,7 @@ mod tests {
     use std::time::Duration;
 
     use blokli_client::{
-        api::{BlokliTransactionClient, types::ServiceRegistryConfig as BlokliServiceRegistryConfig},
+        api::BlokliTransactionClient,
         errors::{BlokliClientError, ErrorKind},
     };
     use futures::StreamExt;
@@ -119,42 +119,15 @@ mod tests {
     };
 
     use crate::{
-        connector::tests::{MODULE_ADDR, PRIVATE_KEY_1, PRIVATE_KEY_2, create_connector},
+        connector::{
+            service_fixtures::{
+                METADATA, NEW_OWNER, NODE, OWNER, REGISTERED_AT, REQUIREMENT, SERVICE_TYPE, UPDATED_AT,
+                UPDATED_METADATA, empty_registry, entry_model, entry_with, registry_config, state_with_registry_config,
+            },
+            tests::{MODULE_ADDR, PRIVATE_KEY_1, PRIVATE_KEY_2, create_connector},
+        },
         testing::{BlokliTestState, BlokliTestStateBuilder},
     };
-
-    /// The service type of the registry fixtures, as Blokli renders it.
-    const SERVICE_TYPE: &str = "gvpn:exit";
-    const SERVICE_NODE: [u8; Address::SIZE] = [0x11; Address::SIZE];
-    const SERVICE_SAFE: [u8; Address::SIZE] = [0x33; Address::SIZE];
-    const TYPE_OWNER: [u8; Address::SIZE] = [0x44; Address::SIZE];
-    const NEW_TYPE_OWNER: [u8; Address::SIZE] = [0x55; Address::SIZE];
-    const TYPE_REQUIREMENT: [u8; Address::SIZE] = [0x66; Address::SIZE];
-
-    const REGISTERED_AT: i32 = 1_700_000_000;
-    const UPDATED_AT: i32 = 1_700_000_060;
-
-    fn service_entry_model(metadata: &str, updated_at: i32) -> blokli_client::api::types::ServiceEntry {
-        blokli_client::api::types::ServiceEntry {
-            service_type: SERVICE_TYPE.into(),
-            node: const_hex::encode(SERVICE_NODE),
-            safe: const_hex::encode(SERVICE_SAFE),
-            metadata: metadata.into(),
-            registered_at: blokli_client::api::types::Uint64(REGISTERED_AT.to_string()),
-            updated_at: blokli_client::api::types::Uint64(updated_at.to_string()),
-        }
-    }
-
-    fn expected_service_entry(metadata: &[u8], updated_at: i32) -> anyhow::Result<ServiceEntry> {
-        Ok(ServiceEntry::new(
-            ServiceType::GVPN_EXIT,
-            SERVICE_NODE.into(),
-            SERVICE_SAFE.into(),
-            ServiceMetadata::try_from(metadata.to_vec())?,
-            std::time::UNIX_EPOCH + Duration::from_secs(REGISTERED_AT as u64),
-            std::time::UNIX_EPOCH + Duration::from_secs(updated_at as u64),
-        )?)
-    }
 
     fn service_type_mut(
         state: &mut BlokliTestState,
@@ -170,17 +143,13 @@ mod tests {
     /// behind, so a test drives the registry by submitting a transaction whose payload names the
     /// change to apply.
     fn registry_mutator(command: &[u8], state: &mut BlokliTestState) -> Result<(), BlokliClientError> {
-        let key = BlokliTestState::service_entry_key(SERVICE_TYPE, &SERVICE_NODE);
+        let key = BlokliTestState::service_entry_key(SERVICE_TYPE, &NODE);
         match command {
             b"register" => {
-                state
-                    .services
-                    .insert(key, service_entry_model("0xdeadbeef", REGISTERED_AT));
+                state.services.insert(key, entry_model(METADATA, REGISTERED_AT));
             }
             b"update" => {
-                state
-                    .services
-                    .insert(key, service_entry_model("0xfeedface", UPDATED_AT));
+                state.services.insert(key, entry_model(UPDATED_METADATA, UPDATED_AT));
             }
             b"deregister" => {
                 state.services.shift_remove(&key);
@@ -190,17 +159,17 @@ mod tests {
                     SERVICE_TYPE.into(),
                     blokli_client::api::types::ServiceTypeInfo {
                         service_type: SERVICE_TYPE.into(),
-                        owner: Some(const_hex::encode(TYPE_OWNER)),
+                        owner: Some(const_hex::encode(OWNER)),
                         requirement: None,
                         registration_burn: "1 wxHOPR".into(),
                         update_burn: "0 wxHOPR".into(),
                     },
                 );
             }
-            b"change-owner" => service_type_mut(state)?.owner = Some(const_hex::encode(NEW_TYPE_OWNER)),
+            b"change-owner" => service_type_mut(state)?.owner = Some(const_hex::encode(NEW_OWNER)),
             b"abandon" => service_type_mut(state)?.owner = None,
             b"set-requirement" => {
-                service_type_mut(state)?.requirement = Some(const_hex::encode(TYPE_REQUIREMENT));
+                service_type_mut(state)?.requirement = Some(const_hex::encode(REQUIREMENT));
             }
             b"set-registration-burn" => service_type_mut(state)?.registration_burn = "2 wxHOPR".into(),
             b"set-update-burn" => service_type_mut(state)?.update_burn = "500 wei wxHOPR".into(),
@@ -245,7 +214,7 @@ mod tests {
                 registered_nodes: vec![],
                 deployer: deployer_addr,
             }])
-            .with_hopr_network_chain_info("rotsee")
+            .with_hopr_network_chain_info("piz-palu-staging")
             .build_dynamic_client(MODULE_ADDR.into())
             .with_tx_simulation_delay(Duration::from_millis(100));
 
@@ -333,7 +302,7 @@ mod tests {
                 (account_2.clone(), HoprBalance::new_base(100), XDaiBalance::new_base(1)),
             ])
             .with_channels([channel_1, channel_2])
-            .with_hopr_network_chain_info("rotsee")
+            .with_hopr_network_chain_info("piz-palu-staging")
             .build_static_client();
 
         let mut connector = create_connector(blokli_client)?;
@@ -366,12 +335,9 @@ mod tests {
 
     #[tokio::test]
     async fn registry_config_state_sync_starts_with_both_current_values() -> anyhow::Result<()> {
-        let mut state = BlokliTestState::default();
-        state.service_registry_config = BlokliServiceRegistryConfig {
-            type_registration_fee: "5 wxHOPR".into(),
-            node_safe_registry: const_hex::encode(TYPE_REQUIREMENT),
-        };
-        let mut connector = create_connector(BlokliTestStateBuilder::from(state).build_static_client())?;
+        let expected = registry_config();
+        let mut connector =
+            create_connector(BlokliTestStateBuilder::from(state_with_registry_config()).build_static_client())?;
         connector.connect().await?;
 
         let events = connector
@@ -382,11 +348,11 @@ mod tests {
 
         assert!(matches!(
             &events[0],
-            ChainEvent::ServiceTypeRegistrationFeeChanged(fee) if *fee == HoprBalance::new_base(5)
+            ChainEvent::ServiceTypeRegistrationFeeChanged(fee) if *fee == expected.type_registration_fee
         ));
         assert!(matches!(
             &events[1],
-            ChainEvent::ServiceRegistryPointerChanged(pointer) if *pointer == TYPE_REQUIREMENT.into()
+            ChainEvent::ServiceRegistryPointerChanged(pointer) if *pointer == expected.node_safe_registry
         ));
         Ok(())
     }
@@ -399,7 +365,9 @@ mod tests {
         connector.connect().await?;
 
         // The receiver is activated by `subscribe` before the first transaction is submitted, so
-        // no event can be missed here.
+        // no event can be missed here. The fixture state seeds neither accounts nor channels, so
+        // the registry subscription is the only source that can produce an event: the positional
+        // assertions below depend on that.
         let events = tokio::task::spawn(connector.subscribe()?.take(3).collect::<Vec<_>>());
 
         blokli_client.submit_transaction(b"register").await?;
@@ -409,14 +377,14 @@ mod tests {
         let events = events.await?;
 
         assert!(
-            matches!(&events[0], ChainEvent::ServiceRegistered(entry) if entry == &expected_service_entry(&hex!("deadbeef"), REGISTERED_AT)?)
+            matches!(&events[0], ChainEvent::ServiceRegistered(entry) if entry == &entry_with(ServiceType::GVPN_EXIT, NODE, METADATA, REGISTERED_AT)?)
         );
         // The update carries the whole entry, so the registration timestamp survives it.
         assert!(
-            matches!(&events[1], ChainEvent::ServiceUpdated(entry) if entry == &expected_service_entry(&hex!("feedface"), UPDATED_AT)?)
+            matches!(&events[1], ChainEvent::ServiceUpdated(entry) if entry == &entry_with(ServiceType::GVPN_EXIT, NODE, UPDATED_METADATA, UPDATED_AT)?)
         );
         assert!(
-            matches!(&events[2], ChainEvent::ServiceDeregistered(service_type, node) if service_type == &ServiceType::GVPN_EXIT && node == &Address::from(SERVICE_NODE))
+            matches!(&events[2], ChainEvent::ServiceDeregistered(service_type, node) if service_type == &ServiceType::GVPN_EXIT && node == &Address::from(NODE))
         );
 
         Ok(())
@@ -424,11 +392,14 @@ mod tests {
 
     #[tokio::test]
     async fn connector_should_stream_service_type_configuration_events() -> anyhow::Result<()> {
-        let blokli_client = BlokliTestStateBuilder::default().build_dynamic_client_with_mutator(registry_mutator);
+        // The registration below has to be the first appearance of the type, so this cannot start
+        // from the default fixture state, which pre-registers it.
+        let blokli_client = empty_registry().build_dynamic_client_with_mutator(registry_mutator);
 
         let mut connector = create_connector(blokli_client.clone())?;
         connector.connect().await?;
 
+        // As above, the registry subscription is the only source of events in this state.
         let events = tokio::task::spawn(connector.subscribe()?.take(6).collect::<Vec<_>>());
 
         for command in [
@@ -445,17 +416,17 @@ mod tests {
         let events = events.await?;
 
         assert!(
-            matches!(&events[0], ChainEvent::ServiceTypeRegistered(service_type, owner) if service_type == &ServiceType::GVPN_EXIT && owner == &Address::from(TYPE_OWNER))
+            matches!(&events[0], ChainEvent::ServiceTypeRegistered(service_type, owner) if service_type == &ServiceType::GVPN_EXIT && owner == &Address::from(OWNER))
         );
         assert!(
-            matches!(&events[1], ChainEvent::ServiceTypeOwnerChanged(service_type, Some(owner)) if service_type == &ServiceType::GVPN_EXIT && owner == &Address::from(NEW_TYPE_OWNER))
+            matches!(&events[1], ChainEvent::ServiceTypeOwnerChanged(service_type, Some(owner)) if service_type == &ServiceType::GVPN_EXIT && owner == &Address::from(NEW_OWNER))
         );
         // Abandoning a type is an owner change to nobody, and is one-way.
         assert!(
             matches!(&events[2], ChainEvent::ServiceTypeOwnerChanged(service_type, None) if service_type == &ServiceType::GVPN_EXIT)
         );
         assert!(
-            matches!(&events[3], ChainEvent::ServiceTypeRequirementChanged(service_type, Some(requirement)) if service_type == &ServiceType::GVPN_EXIT && requirement == &Address::from(TYPE_REQUIREMENT))
+            matches!(&events[3], ChainEvent::ServiceTypeRequirementChanged(service_type, Some(requirement)) if service_type == &ServiceType::GVPN_EXIT && requirement == &Address::from(REQUIREMENT))
         );
         assert!(
             matches!(&events[4], ChainEvent::ServiceTypeRegistrationBurnChanged(service_type, burn) if service_type == &ServiceType::GVPN_EXIT && burn == &HoprBalance::new_base(2))
@@ -506,7 +477,7 @@ mod tests {
                 (account_2.clone(), HoprBalance::new_base(100), XDaiBalance::new_base(1)),
             ])
             .with_channels([channel_1])
-            .with_hopr_network_chain_info("rotsee")
+            .with_hopr_network_chain_info("piz-palu-staging")
             .build_dynamic_client_with_mutator(registry_mutator);
 
         let mut connector = create_connector(blokli_client.clone())?;
@@ -524,7 +495,16 @@ mod tests {
         assert_eq!(2, accounts_before.len());
         assert_eq!(1, channels_before.len());
 
-        let events = tokio::task::spawn(connector.subscribe()?.take(1).collect::<Vec<_>>());
+        // Unlike the registry-only tests above, this state has accounts and channels, so the
+        // subscription merges sources that can also produce events. Select the registry event by
+        // variant rather than by position, which `.merge()` does not fix.
+        let events = tokio::task::spawn(
+            connector
+                .subscribe()?
+                .filter(|event| futures::future::ready(matches!(event, ChainEvent::ServiceRegistered(_))))
+                .take(1)
+                .collect::<Vec<_>>(),
+        );
         blokli_client.submit_transaction(b"register").await?;
         let events = events.await?;
         assert!(matches!(&events[0], ChainEvent::ServiceRegistered(_)));

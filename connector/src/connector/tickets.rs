@@ -204,7 +204,7 @@ mod tests {
                 (account_2, HoprBalance::new_base(100), XDaiBalance::new_base(1)),
             ])
             .with_channels([channel_1])
-            .with_hopr_network_chain_info("rotsee")
+            .with_hopr_network_chain_info("piz-palu-staging")
             .build_dynamic_client(MODULE_ADDR.into())
             .with_tx_simulation_delay(Duration::from_millis(100)))
     }

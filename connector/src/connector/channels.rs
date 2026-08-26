@@ -272,7 +272,7 @@ mod tests {
                 (account_2, HoprBalance::new_base(100), XDaiBalance::new_base(1)),
             ])
             .with_channels([channel_1, channel_2])
-            .with_hopr_network_chain_info("rotsee")
+            .with_hopr_network_chain_info("piz-palu-staging")
             .build_dynamic_client(MODULE_ADDR.into());
 
         let mut connector = create_connector(blokli_client)?;
@@ -369,7 +369,7 @@ mod tests {
                 (account_1.clone(), HoprBalance::new_base(100), XDaiBalance::new_base(1)),
                 (account_2.clone(), HoprBalance::new_base(100), XDaiBalance::new_base(1)),
             ])
-            .with_hopr_network_chain_info("rotsee")
+            .with_hopr_network_chain_info("piz-palu-staging")
             .build_dynamic_client(MODULE_ADDR.into());
 
         let mut connector = create_connector(blokli_client)?;
@@ -422,7 +422,7 @@ mod tests {
                 (account_2, HoprBalance::new_base(100), XDaiBalance::new_base(1)),
             ])
             .with_channels([channel_1])
-            .with_hopr_network_chain_info("rotsee")
+            .with_hopr_network_chain_info("piz-palu-staging")
             .build_dynamic_client(MODULE_ADDR.into());
 
         let mut connector = create_connector(blokli_client)?;
@@ -475,7 +475,7 @@ mod tests {
                 (account_2, HoprBalance::new_base(100), XDaiBalance::new_base(1)),
             ])
             .with_channels([channel_1])
-            .with_hopr_network_chain_info("rotsee")
+            .with_hopr_network_chain_info("piz-palu-staging")
             .build_dynamic_client(MODULE_ADDR.into());
 
         let mut connector = create_connector(blokli_client)?;
@@ -539,7 +539,7 @@ mod tests {
                 (account_2, HoprBalance::new_base(100), XDaiBalance::new_base(1)),
             ])
             .with_channels([channel_1])
-            .with_hopr_network_chain_info("rotsee")
+            .with_hopr_network_chain_info("piz-palu-staging")
             .build_dynamic_client(MODULE_ADDR.into());
 
         let mut connector = create_connector(blokli_client)?;
@@ -592,7 +592,7 @@ mod tests {
                 (account_2, HoprBalance::new_base(100), XDaiBalance::new_base(1)),
             ])
             .with_channels([channel_1])
-            .with_hopr_network_chain_info("rotsee")
+            .with_hopr_network_chain_info("piz-palu-staging")
             .build_dynamic_client(MODULE_ADDR.into());
 
         let mut connector = create_connector(blokli_client)?;
@@ -608,7 +608,7 @@ mod tests {
     #[tokio::test]
     async fn connector_should_not_close_non_existing_channel() -> anyhow::Result<()> {
         let blokli_client = BlokliTestStateBuilder::default()
-            .with_hopr_network_chain_info("rotsee")
+            .with_hopr_network_chain_info("piz-palu-staging")
             .build_dynamic_client(MODULE_ADDR.into());
 
         let mut connector = create_connector(blokli_client)?;
@@ -672,7 +672,7 @@ mod tests {
                 (account_2, HoprBalance::new_base(100), XDaiBalance::new_base(1)),
             ])
             .with_channels([channel_1])
-            .with_hopr_network_chain_info("rotsee")
+            .with_hopr_network_chain_info("piz-palu-staging")
             .build_dynamic_client(MODULE_ADDR.into());
 
         let mut connector = create_connector(blokli_client)?;
@@ -743,7 +743,7 @@ mod tests {
                 (account_3, HoprBalance::new_base(100), XDaiBalance::new_base(1)),
             ])
             .with_channels([channel_1])
-            .with_hopr_network_chain_info("rotsee")
+            .with_hopr_network_chain_info("piz-palu-staging")
             .build_dynamic_client(MODULE_ADDR.into());
 
         let mut connector = create_connector(blokli_client)?;
@@ -769,7 +769,7 @@ mod tests {
     #[tokio::test]
     async fn connector_should_not_fund_non_existing_channel() -> anyhow::Result<()> {
         let blokli_client = BlokliTestStateBuilder::default()
-            .with_hopr_network_chain_info("rotsee")
+            .with_hopr_network_chain_info("piz-palu-staging")
             .build_dynamic_client(MODULE_ADDR.into());
 
         let mut connector = create_connector(blokli_client)?;
@@ -835,7 +835,7 @@ mod tests {
                 (account_2, HoprBalance::new_base(100), XDaiBalance::new_base(1)),
             ])
             .with_channels([channel_1])
-            .with_hopr_network_chain_info("rotsee")
+            .with_hopr_network_chain_info("piz-palu-staging")
             .build_dynamic_client(MODULE_ADDR.into());
 
         let mut connector = create_connector(blokli_client)?;

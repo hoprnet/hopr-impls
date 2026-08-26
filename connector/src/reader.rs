@@ -66,11 +66,12 @@ fn to_blokli_service_selector(selector: &ServiceSelector) -> blokli_client::api:
 
 /// Converts the queried entries and applies the `selector` to each of them.
 ///
-/// An entry that fails to convert, or whose Safe binding cannot be resolved for a `live_only`
-/// selector, is dropped with a log: the stream carries plain entries and has nowhere to report an
-/// error, and a live-only read must not admit an entry whose liveness could not be established.
+/// A single entry that fails to convert is dropped with a log naming the offending field: one
+/// malformed record must not hide the rest of the registry. A failed *query* is a different
+/// matter and is never turned into an absent entry, see
+/// [`HoprBlockchainReader::query_service_entries`].
 fn select_service_entries(
-    models: Vec<blokli_client::api::types::ServiceEntry>,
+    models: &[blokli_client::api::types::ServiceEntry],
     selector: ServiceSelector,
 ) -> Vec<ServiceEntry> {
     let mut entries = Vec::with_capacity(models.len());
@@ -98,6 +99,24 @@ impl<C> HoprBlockchainReader<C>
 where
     C: BlokliQueryClient + Send + Sync + 'static,
 {
+    /// Queries the registry entries matching the `selector` and converts them.
+    ///
+    /// A failed query is propagated: "the read failed" and "nothing matched" are different answers,
+    /// and a discovery API that conflates them reports an unreachable Blokli as an empty registry.
+    pub(crate) async fn query_service_entries(
+        &self,
+        selector: ServiceSelector,
+    ) -> Result<Vec<ServiceEntry>, ConnectorError> {
+        let query = to_blokli_service_selector(&selector);
+        let models = if selector.live_only {
+            self.0.query_live_services(query).await
+        } else {
+            self.0.query_services(query).await
+        }?;
+
+        Ok(select_service_entries(&models, selector))
+    }
+
     /// Builds the stream of the registry entries matching the `selector`.
     ///
     /// The stream owns its handle to the client, so it outlives the reader it was built from. The
@@ -107,18 +126,14 @@ where
         &self,
         selector: ServiceSelector,
     ) -> Result<BoxStream<'static, ServiceEntry>, ConnectorError> {
-        let query = to_blokli_service_selector(&selector);
-        let client = self.0.clone();
+        let reader = self.clone();
         Ok(futures::stream::once(async move {
-            let response = if selector.live_only {
-                client.query_live_services(query).await
-            } else {
-                client.query_services(query).await
-            };
-            futures::stream::iter(match response {
-                Ok(models) => select_service_entries(models, selector),
+            futures::stream::iter(match reader.query_service_entries(selector).await {
+                Ok(entries) => entries,
+                // `stream_services` yields plain entries, so the trait leaves nowhere to report
+                // this. `count_services` therefore does not count this stream.
                 Err(error) => {
-                    tracing::error!(%error, ?query, "failed to query the service registry");
+                    tracing::error!(%error, ?selector, "failed to query the service registry");
                     Vec::new()
                 }
             })
@@ -142,8 +157,10 @@ where
     async fn count_services(&self, selector: ServiceSelector) -> Result<usize, Self::Error> {
         if selector.live_only {
             // Liveness is a property of the node-Safe registry rather than of a registry entry, so
-            // Blokli cannot count it: the entries must be fetched and filtered here.
-            return Ok(self.service_entry_stream(selector)?.count().await);
+            // Blokli cannot count it: the entries must be fetched and filtered here. This does not
+            // go through `service_entry_stream`, whose item type forces it to swallow a query
+            // failure - counting would then report an unreachable Blokli as `Ok(0)`.
+            return Ok(self.query_service_entries(selector).await?.len());
         }
 
         Ok(self.0.count_services(to_blokli_service_selector(&selector)).await? as usize)
@@ -156,8 +173,7 @@ where
         self.0
             .query_service_types(Some(service_type.as_encoded()))
             .await?
-            .into_iter()
-            .next()
+            .first()
             .map(model_to_service_type_config)
             .transpose()
     }
@@ -348,7 +364,7 @@ mod tests {
                 registered_nodes: vec![],
                 deployer: [2u8; Address::SIZE].into(),
             }])
-            .with_hopr_network_chain_info("rotsee")
+            .with_hopr_network_chain_info("piz-palu-staging")
             .build_static_client();
 
         let reader = HoprBlockchainReader::new(blokli_client);

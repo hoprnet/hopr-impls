@@ -16,7 +16,9 @@ use crate::{
     connector::{
         keys::HoprKeyMapper,
         sequencer::TransactionSequencer,
-        services::{service_registry_config_to_events, service_type_update_to_event, service_update_to_event},
+        services::{
+            ServiceEvent, service_registry_config_to_events, service_type_update_to_event, service_update_to_event,
+        },
         values::CHAIN_INFO_CACHE_KEY,
     },
     errors::ConnectorError,
@@ -32,6 +34,8 @@ mod events;
 mod keys;
 mod safe;
 mod sequencer;
+#[cfg(test)]
+pub(crate) mod service_fixtures;
 mod services;
 mod tickets;
 mod values;
@@ -265,9 +269,10 @@ where
             /// A change of the service registry, already decoded into the event it stands for.
             ///
             /// Both registry subscriptions feed this variant: entry changes give the three
-            /// `ChainEvent::Service{Registered,Updated,Deregistered}` values, and configuration
-            /// changes give the remaining seven.
-            Service(ChainEvent),
+            /// `ServiceEvent::{Registered,Updated,Deregistered}` values, and configuration changes
+            /// give the remaining seven. `ServiceEvent` rather than the whole `ChainEvent`, so a
+            /// registry stream cannot smuggle an account or channel event through here.
+            Service(ServiceEvent),
         }
 
         let ticket_values = self.ticket_values.clone();
@@ -611,11 +616,15 @@ where
                             let _ = event_tx.broadcast_direct(ChainEvent::TicketPriceChanged(new)).await;
                         }
                         Ok(SubscribedEventType::Service(event)) => {
+                            let event = ChainEvent::from(event);
                             tracing::debug!(%event, "service registry changed");
                             let _ = event_tx.broadcast_direct(event).await;
                         }
                         Err(error) => {
-                            tracing::error!(%error, "error processing account/graph/ticket params subscription");
+                            tracing::error!(
+                                %error,
+                                "error processing account/graph/ticket params/service registry subscription"
+                            );
                         }
                     }
                 }
@@ -854,7 +863,7 @@ pub(crate) mod tests {
             InMemoryBackend::default(),
             SafePayloadGenerator::new(
                 &ckp,
-                contract_addresses_for_network("rotsee").unwrap().1,
+                contract_addresses_for_network("piz-palu-staging").unwrap().1,
                 MODULE_ADDR.into(),
             ),
         ))
@@ -931,7 +940,7 @@ pub(crate) mod tests {
                 (account_2, HoprBalance::new_base(100), XDaiBalance::new_base(1)),
             ])
             .with_channels([channel_1])
-            .with_hopr_network_chain_info("rotsee")
+            .with_hopr_network_chain_info("piz-palu-staging")
             .build_dynamic_client_with_mutator(ChainMutator::new(
                 move |_: &[u8], state: &mut BlokliTestState| -> Result<(), blokli_client::errors::BlokliClientError> {
                     // Update the channel ticket index, without the client noticing the change

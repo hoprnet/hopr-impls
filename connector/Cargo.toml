@@ -1,6 +1,6 @@
 [package]
 authors.workspace      = true
-categories             = ["blockchain", "network-programming"]
+categories             = ["network-programming"]
 description            = "Implementation of HOPR Chain APIs using Blokli client"
 edition.workspace      = true
 homepage.workspace     = true
@@ -11,7 +11,7 @@ name                   = "hopr-chain-connector"
 readme                 = "README.md"
 repository.workspace   = true
 rust-version.workspace = true
-version                = "0.23.0"
+version                = "0.24.0"
 
 [features]
 runtime-tokio = ["hopr-utils/runtime-tokio"]
