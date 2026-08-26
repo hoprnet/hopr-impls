@@ -11,5 +11,4 @@ ignore = [
   # opentelemetry-prometheus-text-exporter 0.3.0 -> smartstring 1.0.1; drop this ignore once
   # that exporter switches to a maintained replacement.
   "RUSTSEC-2026-0249", # smartstring: unmaintained
-  "RUSTSEC-2026-0258", # h2: requires a new version of reqwest
 ]
