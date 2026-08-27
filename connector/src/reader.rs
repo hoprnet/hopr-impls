@@ -1,16 +1,22 @@
 use std::time::Duration;
 
 use blokli_client::api::{BlokliQueryClient, BlokliSubscriptionClient, RedeemedStatsSelector};
-use futures::{StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt, stream::BoxStream};
 use futures_time::future::FutureExt as FuturesTimeExt;
 use hopr_api::{
-    chain::{ChainInfo, DeployedSafe, DomainSeparators, RedemptionStats, SafeSelector},
+    chain::{
+        ChainInfo, DeployedSafe, DomainSeparators, RedemptionStats, SafeSelector, ServiceRegistryConfig,
+        ServiceSelector, ServiceTypeConfig,
+    },
     types::{internal::prelude::*, primitive::prelude::*},
 };
 
 use crate::{
     errors::ConnectorError,
-    utils::{model_to_chain_info, model_to_deployed_safe, model_to_redeemed_stats},
+    utils::{
+        model_to_chain_info, model_to_deployed_safe, model_to_redeemed_stats, model_to_service_entry,
+        model_to_service_registry_config, model_to_service_type_config,
+    },
 };
 
 /// A simplified version of [`HoprBlockchainConnector`](crate::HoprBlockchainConnector)
@@ -20,6 +26,7 @@ use crate::{
 ///
 /// - [`ChainValues`](hopr_api::chain::ChainValues)
 /// - [`ChainReadSafeOperations`](hopr_api::chain::ChainReadSafeOperations)
+/// - [`ChainReadServiceOperations`](hopr_api::chain::ChainReadServiceOperations)
 ///
 /// The implementation is currently realized using the Blokli client and acts as a partial HOPR Chain API compatible
 /// wrapper for [`blokli_client::BlokliClient`].
@@ -38,6 +45,147 @@ impl<C> HoprBlockchainReader<C> {
 impl<C> Clone for HoprBlockchainReader<C> {
     fn clone(&self) -> Self {
         Self(self.0.clone())
+    }
+}
+
+/// Maps the [`ServiceSelector`] of the HOPR Chain API onto the one of the Blokli client.
+///
+/// An unfiltered selector becomes [`blokli_client::api::ServiceSelector::Any`], which enumerates
+/// the whole registry. Blokli answers that from cursor pages pinned to one indexer watermark, so
+/// the enumeration is a consistent snapshot rather than a set that concurrent chain updates can
+/// shift underneath it.
+fn to_blokli_service_selector(selector: &ServiceSelector) -> blokli_client::api::ServiceSelector {
+    match (selector.service_type, selector.node) {
+        (Some(service_type), Some(node)) => blokli_client::api::ServiceSelector::ServiceTypeAndNode {
+            service_type: service_type.as_encoded(),
+            node: node.into(),
+        },
+        (Some(service_type), None) => blokli_client::api::ServiceSelector::ServiceType(service_type.as_encoded()),
+        (None, Some(node)) => blokli_client::api::ServiceSelector::Node(node.into()),
+        (None, None) => blokli_client::api::ServiceSelector::Any,
+    }
+}
+
+/// Converts the queried entries and applies the `selector` to each of them.
+///
+/// A single entry that fails to convert is dropped with a log naming the offending field: one
+/// malformed record must not hide the rest of the registry. A failed *query* is a different
+/// matter and is never turned into an absent entry, see
+/// [`HoprBlockchainReader::query_service_entries`].
+fn select_service_entries(
+    models: &[blokli_client::api::types::ServiceEntry],
+    selector: ServiceSelector,
+) -> Vec<ServiceEntry> {
+    let mut entries = Vec::with_capacity(models.len());
+
+    for model in models {
+        let entry = match model_to_service_entry(model) {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::error!(%error, "skipping an invalid service registry entry");
+                continue;
+            }
+        };
+
+        // A live-only query was already checked against the exact NodeSafeRegistry pointer by
+        // Blokli. For ordinary queries the liveness argument is ignored by `satisfies`.
+        if selector.satisfies(&entry, selector.live_only) {
+            entries.push(entry);
+        }
+    }
+
+    entries
+}
+
+impl<C> HoprBlockchainReader<C>
+where
+    C: BlokliQueryClient + Send + Sync + 'static,
+{
+    /// Queries the registry entries matching the `selector` and converts them.
+    ///
+    /// A failed query is propagated: "the read failed" and "nothing matched" are different answers,
+    /// and a discovery API that conflates them reports an unreachable Blokli as an empty registry.
+    pub(crate) async fn query_service_entries(
+        &self,
+        selector: ServiceSelector,
+    ) -> Result<Vec<ServiceEntry>, ConnectorError> {
+        let query = to_blokli_service_selector(&selector);
+        let models = if selector.live_only {
+            self.0.query_live_services(query).await
+        } else {
+            self.0.query_services(query).await
+        }?;
+
+        Ok(select_service_entries(&models, selector))
+    }
+
+    /// Builds the stream of the registry entries matching the `selector`.
+    ///
+    /// The stream owns its handle to the client, so it outlives the reader it was built from. The
+    /// [connector](crate::HoprBlockchainConnector) relies on that when it delegates here through a
+    /// temporary reader.
+    pub(crate) fn service_entry_stream(
+        &self,
+        selector: ServiceSelector,
+    ) -> Result<BoxStream<'static, ServiceEntry>, ConnectorError> {
+        let reader = self.clone();
+        Ok(futures::stream::once(async move {
+            futures::stream::iter(match reader.query_service_entries(selector).await {
+                Ok(entries) => entries,
+                // `stream_services` yields plain entries, so the trait leaves nowhere to report
+                // this. `count_services` therefore does not count this stream.
+                Err(error) => {
+                    tracing::error!(%error, ?selector, "failed to query the service registry");
+                    Vec::new()
+                }
+            })
+        })
+        .flatten()
+        .boxed())
+    }
+}
+
+#[async_trait::async_trait]
+impl<C> hopr_api::chain::ChainReadServiceOperations for HoprBlockchainReader<C>
+where
+    C: BlokliQueryClient + Send + Sync + 'static,
+{
+    type Error = ConnectorError;
+
+    fn stream_services<'a>(&'a self, selector: ServiceSelector) -> Result<BoxStream<'a, ServiceEntry>, Self::Error> {
+        self.service_entry_stream(selector)
+    }
+
+    async fn count_services(&self, selector: ServiceSelector) -> Result<usize, Self::Error> {
+        if selector.live_only {
+            // Liveness is a property of the node-Safe registry rather than of a registry entry, so
+            // Blokli cannot count it: the entries must be fetched and filtered here. This does not
+            // go through `service_entry_stream`, whose item type forces it to swallow a query
+            // failure - counting would then report an unreachable Blokli as `Ok(0)`.
+            return Ok(self.query_service_entries(selector).await?.len());
+        }
+
+        Ok(self.0.count_services(to_blokli_service_selector(&selector)).await? as usize)
+    }
+
+    async fn get_service_type_config(
+        &self,
+        service_type: ServiceType,
+    ) -> Result<Option<ServiceTypeConfig>, Self::Error> {
+        self.0
+            .query_service_types(Some(service_type.as_encoded()))
+            .await?
+            .first()
+            .map(model_to_service_type_config)
+            .transpose()
+    }
+
+    async fn get_service_registry_config(&self) -> Result<ServiceRegistryConfig, Self::Error> {
+        self.0
+            .query_service_registry_config()
+            .await
+            .map_err(ConnectorError::from)
+            .and_then(model_to_service_registry_config)
     }
 }
 

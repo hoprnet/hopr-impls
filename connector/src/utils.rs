@@ -1,7 +1,10 @@
-use std::{str::FromStr, time::Duration};
+use std::{
+    str::FromStr,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use hopr_api::{
-    chain::{ChainInfo, DeployedSafe, DomainSeparators, RedemptionStats},
+    chain::{ChainInfo, DeployedSafe, DomainSeparators, RedemptionStats, ServiceRegistryConfig, ServiceTypeConfig},
     types::{
         chain::{chain_events::ChainEvent, payload::GasEstimation},
         crypto::types::Hash,
@@ -230,6 +233,108 @@ pub(crate) fn model_to_deployed_safe(model: blokli_client::api::types::Safe) -> 
             .map(|addr| Address::from_hex(&addr))
             .collect::<Result<Vec<_>, _>>()?,
         deployer: Address::from_hex(&model.chain_key)?,
+    })
+}
+
+/// Decodes a service type the way Blokli renders it: the ASCII name of the type, or `0x`-prefixed
+/// hexadecimal for a type that does not follow that convention.
+///
+/// The two renderings cannot be confused: an ASCII name is at most [`ServiceType::SIZE`]
+/// characters long, while the hexadecimal form always has two characters per byte plus the prefix.
+pub(crate) fn model_to_service_type(rendered: &str) -> Result<ServiceType, ConnectorError> {
+    if rendered.len() == 2 + 2 * ServiceType::SIZE && rendered.starts_with("0x") {
+        ServiceType::from_hex(rendered)
+    } else {
+        rendered.parse()
+    }
+    .map_err(|e| ConnectorError::TypeConversion(format!("invalid service type {rendered}: {e}")))
+}
+
+/// Decodes the opaque metadata of a registry entry, which Blokli renders as `0x`-prefixed
+/// hexadecimal.
+fn model_to_service_metadata(rendered: &str) -> Result<ServiceMetadata, ConnectorError> {
+    let bytes = const_hex::decode(rendered)
+        .map_err(|e| ConnectorError::TypeConversion(format!("invalid service metadata: {e}")))?;
+
+    // Rejects metadata above the cap the registry contract enforces on every write path.
+    ServiceMetadata::try_from(bytes)
+        .map_err(|e| ConnectorError::TypeConversion(format!("invalid service metadata: {e}")))
+}
+
+/// Converts a Unix timestamp in seconds, as the Blokli API represents registry timestamps.
+fn model_to_timestamp(seconds: &blokli_client::api::types::Uint64) -> Result<SystemTime, ConnectorError> {
+    let parsed = seconds
+        .0
+        .parse::<u64>()
+        .map_err(|e| ConnectorError::TypeConversion(format!("invalid service timestamp {}: {e}", seconds.0)))?;
+
+    // A `Uint64` can name an instant that the platform's `SystemTime` cannot hold, and
+    // `SystemTime + Duration` panics on overflow instead of failing, so malformed Blokli data
+    // would terminate the process.
+    UNIX_EPOCH
+        .checked_add(Duration::from_secs(parsed))
+        .ok_or_else(|| ConnectorError::TypeConversion(format!("service timestamp {parsed} is out of range")))
+}
+
+/// Parses a service registry burn.
+///
+/// Blokli renders every balance through [`Display`](std::fmt::Display), which carries the
+/// currency - `"1.5 wxHOPR"`, not `"1500000000000000000"` - so this is a plain
+/// [`FromStr`] parse. Do NOT reach for a bare-decimal parser here: `HoprBalance::from_str`
+/// rejects an unsuffixed number, so the two encodings cannot be confused silently.
+pub(crate) fn service_burn_to_hopr_balance(amount: &str) -> Result<HoprBalance, ConnectorError> {
+    HoprBalance::from_str(amount)
+        .map_err(|e| ConnectorError::TypeConversion(format!("invalid service registry burn {amount}: {e}")))
+}
+
+/// Decodes an address of the service registry, naming the field it came from.
+///
+/// A registry entry that fails to convert is dropped by the read path with only the error
+/// attached, so without the field name an operator investigating a missing service cannot tell
+/// which of the four addresses was unparseable.
+pub(crate) fn model_to_registry_address(field: &str, rendered: &str) -> Result<Address, ConnectorError> {
+    Address::from_hex(rendered)
+        .map_err(|e| ConnectorError::TypeConversion(format!("invalid service registry {field} {rendered}: {e}")))
+}
+
+pub(crate) fn model_to_service_entry(
+    model: &blokli_client::api::types::ServiceEntry,
+) -> Result<ServiceEntry, ConnectorError> {
+    Ok(ServiceEntry::new(
+        model_to_service_type(&model.service_type)?,
+        model_to_registry_address("node", &model.node)?,
+        model_to_registry_address("safe", &model.safe)?,
+        model_to_service_metadata(&model.metadata)?,
+        model_to_timestamp(&model.registered_at)?,
+        model_to_timestamp(&model.updated_at)?,
+    )?)
+}
+
+pub(crate) fn model_to_service_type_config(
+    model: &blokli_client::api::types::ServiceTypeInfo,
+) -> Result<ServiceTypeConfig, ConnectorError> {
+    Ok(ServiceTypeConfig {
+        owner: model
+            .owner
+            .as_deref()
+            .map(|owner| model_to_registry_address("type owner", owner))
+            .transpose()?,
+        requirement: model
+            .requirement
+            .as_deref()
+            .map(|requirement| model_to_registry_address("type requirement", requirement))
+            .transpose()?,
+        registration_burn: service_burn_to_hopr_balance(&model.registration_burn)?,
+        update_burn: service_burn_to_hopr_balance(&model.update_burn)?,
+    })
+}
+
+pub(crate) fn model_to_service_registry_config(
+    model: blokli_client::api::types::ServiceRegistryConfig,
+) -> Result<ServiceRegistryConfig, ConnectorError> {
+    Ok(ServiceRegistryConfig {
+        type_registration_fee: service_burn_to_hopr_balance(&model.type_registration_fee)?,
+        node_safe_registry: model_to_registry_address("node-Safe registry", &model.node_safe_registry)?,
     })
 }
 

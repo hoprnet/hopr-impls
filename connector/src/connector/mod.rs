@@ -5,19 +5,28 @@ use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt};
 use futures_concurrency::stream::Merge;
 use futures_time::future::FutureExt as FuturesTimeExt;
 use hopr_api::{
-    chain::{ChainPathResolver, ChainReceipt, HoprKeyIdent},
+    chain::{ChainPathResolver, ChainReceipt, HoprKeyIdent, ServiceSelector},
     types::{chain::prelude::*, crypto::prelude::*, internal::prelude::*, primitive::prelude::*},
 };
 use hopr_utils::runtime::AbortHandle;
 use petgraph::prelude::DiGraphMap;
 
 use crate::{
+    HoprBlockchainReader,
     backend::Backend,
-    connector::{keys::HoprKeyMapper, sequencer::TransactionSequencer, values::CHAIN_INFO_CACHE_KEY},
+    connector::{
+        keys::HoprKeyMapper,
+        sequencer::TransactionSequencer,
+        services::{
+            ReplayedServiceTypes, ReplayedServices, ServiceEvent, service_registry_config_to_events,
+            service_type_update_to_event, service_update_to_event,
+        },
+        values::CHAIN_INFO_CACHE_KEY,
+    },
     errors::ConnectorError,
     utils::{
-        ParsedChainInfo, model_to_account_entry, model_to_graph_entry, model_to_ticket_params,
-        process_channel_changes_into_events,
+        ParsedChainInfo, model_to_account_entry, model_to_graph_entry, model_to_service_registry_config,
+        model_to_ticket_params, process_channel_changes_into_events,
     },
 };
 
@@ -27,6 +36,9 @@ mod events;
 mod keys;
 mod safe;
 mod sequencer;
+#[cfg(test)]
+pub(crate) mod service_fixtures;
+mod services;
 mod tickets;
 mod values;
 
@@ -36,6 +48,11 @@ type EventsChannel = (
 );
 
 const MIN_CONNECTION_TIMEOUT: Duration = Duration::from_millis(100);
+/// Share of the connection budget the service registry pre-read may take.
+///
+/// The read is auxiliary: it only decides whether the subscription replay is suppressed, so it must
+/// never be able to spend the budget the channel graph needs to sync.
+const REGISTRY_READ_BUDGET_DIVISOR: u32 = 4;
 const MIN_TX_CONFIRM_TIMEOUT: Duration = Duration::from_secs(1);
 const TX_TIMEOUT_MULTIPLIER: u32 = 2;
 const DEFAULT_SYNC_TOLERANCE_PCT: usize = 90;
@@ -69,6 +86,72 @@ impl From<ChainHealthState> for hopr_api::node::ComponentStatus {
             ChainHealthState::ServerNotHealthy => Self::Unavailable("blokli server not healthy".into()),
             ChainHealthState::ConnectionFailed => Self::Unavailable("chain connection failed".into()),
             ChainHealthState::Dropped => Self::Unavailable("connector dropped".into()),
+        }
+    }
+}
+
+/// Reads the registry state that a snapshot-first subscription is going to replay.
+///
+/// The entries come from one unfiltered enumeration, which Blokli answers from cursor pages pinned
+/// to a single indexer watermark, so what is read is a consistent snapshot. The service types are a
+/// separate query because they carry no watermark of their own; the set is owner-gated by the type
+/// registration fee and therefore bounded, unlike the entries.
+async fn read_registry<C>(
+    client: &std::sync::Arc<C>,
+) -> Result<(ReplayedServices, ReplayedServiceTypes), ConnectorError>
+where
+    C: BlokliQueryClient + Send + Sync + 'static,
+{
+    let service_types = client
+        .query_service_types(None)
+        .await?
+        .iter()
+        .filter_map(|info| match crate::utils::model_to_service_type(&info.service_type) {
+            Ok(service_type) => Some(service_type),
+            // An unreadable type cannot be matched against a replay either, so its replay is
+            // reported rather than suppressed. Saying so beats a silent gap.
+            Err(error) => {
+                tracing::error!(%error, "cannot suppress the replay of an unreadable service type");
+                None
+            }
+        })
+        .collect::<ReplayedServiceTypes>();
+
+    let entries = HoprBlockchainReader(client.clone())
+        .query_service_entries(ServiceSelector::default())
+        .await?;
+
+    Ok((entries.into_iter().collect(), service_types))
+}
+
+/// Reads the replayed registry state within `budget`, giving up the suppression rather than the
+/// connection.
+///
+/// The service registry is auxiliary to the channel graph, so neither a failed read nor a slow one
+/// may stop the connector from becoming ready. Giving up degrades to the behaviour that existed
+/// before the suppression: the replay is delivered as registrations.
+async fn read_replayed_registry<C>(
+    client: &std::sync::Arc<C>,
+    budget: Duration,
+) -> (ReplayedServices, ReplayedServiceTypes)
+where
+    C: BlokliQueryClient + Send + Sync + 'static,
+{
+    match read_registry(client)
+        .timeout(futures_time::time::Duration::from(budget))
+        .await
+    {
+        Ok(Ok(replayed)) => replayed,
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "cannot read the service registry, its replay will be reported as new registrations");
+            Default::default()
+        }
+        Err(_) => {
+            tracing::warn!(
+                ?budget,
+                "timed out reading the service registry, its replay will be reported as new registrations"
+            );
+            Default::default()
         }
     }
 }
@@ -256,17 +339,67 @@ where
             Channel((ChannelEntry, Option<Vec<ChannelChange>>)),
             WinningProbability((WinningProbability, Option<WinningProbability>)),
             TicketPrice((HoprBalance, Option<HoprBalance>)),
+            /// A change of the service registry, already decoded into the event it stands for.
+            ///
+            /// Both registry subscriptions feed this variant: entry changes give the three
+            /// `ServiceEvent::{Registered,Updated,Deregistered}` values, and configuration changes
+            /// give the remaining seven. `ServiceEvent` rather than the whole `ChainEvent`, so a
+            /// registry stream cannot smuggle an account or channel event through here.
+            Service(ServiceEvent),
         }
 
         let ticket_values = self.ticket_values.clone();
         let health = self.health.clone();
+        let registry_read_budget = timeout / REGISTRY_READ_BUDGET_DIVISOR;
         hopr_utils::runtime::prelude::spawn(async move {
             let sync_started = std::time::Instant::now();
+
+            // The registry subscriptions below are snapshot-first: each replays the state that
+            // already exists as a `Registered` event before it reports any change. `connect` does
+            // not wait for those replays, and an event broadcast before a consumer subscribes is
+            // dropped, so a consumer that subscribes right after `connect` would see the
+            // pre-existing registry as either a burst of fresh registrations or nothing at all,
+            // depending on scheduling. Reading that state here, immediately before subscribing,
+            // lets the handlers below drop each replayed registration once.
+            //
+            // This read and the subscriptions share no watermark, so the suppression is
+            // best-effort: anything created in the gap is replayed as though it were new, and so is
+            // the whole registry when the read is given up on. See the module documentation of
+            // `services` for what a consumer may and may not conclude from a registry event.
+            let (mut replayed_services, mut replayed_service_types) =
+                read_replayed_registry(&client, registry_read_budget).await;
 
             let connections = client
                 .subscribe_accounts(blokli_client::api::AccountSelector::Any)
                 .and_then(|accounts| Ok((accounts, client.subscribe_graph()?)))
-                .and_then(|(accounts, channels)| Ok((accounts, channels, client.subscribe_ticket_params()?)));
+                .and_then(|(accounts, channels)| Ok((accounts, channels, client.subscribe_ticket_params()?)))
+                .and_then(|(accounts, channels, ticket_params)| {
+                    Ok((
+                        accounts,
+                        channels,
+                        ticket_params,
+                        client.subscribe_services(blokli_client::api::ServiceSelector::Any)?,
+                    ))
+                })
+                .and_then(|(accounts, channels, ticket_params, services)| {
+                    Ok((
+                        accounts,
+                        channels,
+                        ticket_params,
+                        services,
+                        client.subscribe_service_types(None)?,
+                    ))
+                })
+                .and_then(|(accounts, channels, ticket_params, services, service_types)| {
+                    Ok((
+                        accounts,
+                        channels,
+                        ticket_params,
+                        services,
+                        service_types,
+                        client.subscribe_service_registry_config()?,
+                    ))
+                });
 
             if let Err(error) = connections {
                 if let Some(connection_ready_tx) = connection_ready_tx.take() {
@@ -275,7 +408,14 @@ where
                 return;
             }
 
-            let (account_stream, channel_stream, ticket_params_stream) = connections.unwrap();
+            let (
+                account_stream,
+                channel_stream,
+                ticket_params_stream,
+                service_stream,
+                service_type_stream,
+                service_registry_config_stream,
+            ) = connections.unwrap();
 
             // Stream of Account events (Announcements)
             let graph_clone = graph.clone();
@@ -417,6 +557,55 @@ where
                 .try_flatten()
                 .fuse();
 
+            // Stream of service registry entry changes (registrations, updates, deregistrations)
+            let service_stream = service_stream
+                .map_err(ConnectorError::from)
+                .inspect_ok(|update| tracing::trace!(?update, "new service registry event"))
+                .and_then(|update| futures::future::ready(service_update_to_event(update)))
+                // Drop the replay of an entry that already existed when this connection was
+                // established, so a delivered registration always means it happened afterwards.
+                .try_filter(move |event| futures::future::ready(!replayed_services.consumes(event)))
+                .map_ok(SubscribedEventType::Service)
+                .fuse();
+
+            // Stream of service type and registry-wide configuration changes
+            let service_type_stream = service_type_stream
+                .map_err(ConnectorError::from)
+                .inspect_ok(|update| tracing::trace!(?update, "new service type event"))
+                // Registry-wide changes are consumed from the dedicated complete-state stream.
+                .try_filter(|update| futures::future::ready(update.registry_config.is_none()))
+                .and_then(|update| futures::future::ready(service_type_update_to_event(update)))
+                // As above, for a type that was already registered when this connection was
+                // established.
+                .try_filter(move |event| futures::future::ready(!replayed_service_types.consumes(event)))
+                .map_ok(SubscribedEventType::Service)
+                .fuse();
+
+            // The first configuration initializes both registry-wide values. Later complete-state
+            // items are diffed locally so unchanged fields do not create duplicate ChainEvents.
+            let service_registry_config_stream = service_registry_config_stream
+                .map_err(ConnectorError::from)
+                .and_then(|config| futures::future::ready(model_to_service_registry_config(config)))
+                .scan((None, true), |(previous, initial), config| {
+                    let events = config.map(|current| {
+                        let events = if *initial {
+                            Vec::new()
+                        } else {
+                            service_registry_config_to_events(current, previous.as_ref())
+                                .into_iter()
+                                .map(SubscribedEventType::Service)
+                                .collect::<Vec<_>>()
+                        };
+                        *previous = Some(current);
+                        *initial = false;
+                        events
+                    });
+                    futures::future::ready(Some(events))
+                })
+                .map_ok(|events| futures::stream::iter(events).map(Ok::<_, ConnectorError>))
+                .try_flatten()
+                .fuse();
+
             let mut account_counter = 0;
             let mut channel_counter = 0;
             if min_accounts == 0 && min_channels == 0 {
@@ -425,7 +614,15 @@ where
             }
 
             futures::stream::Abortable::new(
-                (account_stream, channel_stream, ticket_params_stream).merge(),
+                (
+                    account_stream,
+                    channel_stream,
+                    ticket_params_stream,
+                    service_stream,
+                    service_type_stream,
+                    service_registry_config_stream,
+                )
+                    .merge(),
                 abort_reg,
             )
             .inspect_ok(move |event_type| {
@@ -433,6 +630,8 @@ where
                     match event_type {
                         SubscribedEventType::Account(_) => account_counter += 1,
                         SubscribedEventType::Channel(_) => channel_counter += 1,
+                        // Service registry events deliberately do not count towards the connection
+                        // quota: a node with no services must still reach the Ready state.
                         _ => {}
                     }
 
@@ -511,8 +710,16 @@ where
                             tracing::debug!(%new, ?old, "ticket price changed");
                             let _ = event_tx.broadcast_direct(ChainEvent::TicketPriceChanged(new)).await;
                         }
+                        Ok(SubscribedEventType::Service(event)) => {
+                            let event = ChainEvent::from(event);
+                            tracing::debug!(%event, "service registry changed");
+                            let _ = event_tx.broadcast_direct(event).await;
+                        }
                         Err(error) => {
-                            tracing::error!(%error, "error processing account/graph/ticket params subscription");
+                            tracing::error!(
+                                %error,
+                                "error processing account/graph/ticket params/service registry subscription"
+                            );
                         }
                     }
                 }
