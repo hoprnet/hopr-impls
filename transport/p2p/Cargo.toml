@@ -11,7 +11,7 @@ name                   = "hopr-transport-p2p"
 readme                 = "README.md"
 repository.workspace   = true
 rust-version.workspace = true
-version                = "0.10.0"
+version                = "0.11.0"
 
 [lib]
 crate-type = ["rlib"]
