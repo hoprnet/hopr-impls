@@ -32,9 +32,9 @@ hopr-chain-connector = { path = "connector", version = "0.24.0" }
 hopr-network-graph   = { path = "graph", version = "0.6.0", default-features = false }
 
 # HOPR crates published to crates.io
-blokli-client = "0.32.0"
-hopr-api      = "4.0.1"
-hopr-utils    = { package = "hopr-utilities", version = "0.11.0", default-features = false }
+blokli-client = "0.32.1"
+hopr-api      = "4.1.0"
+hopr-utils    = { package = "hopr-utilities", version = "0.12.0", default-features = false }
 
 # Third-party dependencies (versions mirror hoprnet's workspace to preserve compatibility)
 ahash = "0.8.12"
