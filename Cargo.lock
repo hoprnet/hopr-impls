@@ -464,7 +464,7 @@ dependencies = [
  "fixed-cache",
  "foldhash 0.2.0",
  "hashbrown 0.17.1",
- "indexmap 2.14.0",
+ "indexmap 2.14.1",
  "itoa",
  "k256 0.13.4",
  "keccak-asm",
@@ -691,7 +691,7 @@ dependencies = [
  "alloy-sol-macro-input",
  "const-hex",
  "heck 0.5.0",
- "indexmap 2.14.0",
+ "indexmap 2.14.1",
  "proc-macro-error2",
  "proc-macro2",
  "quote",
@@ -1747,7 +1747,7 @@ dependencies = [
  "hex",
  "hopr-types",
  "http",
- "indexmap 2.14.0",
+ "indexmap 2.14.1",
  "launchdarkly-sdk-transport",
  "parking_lot",
  "rand 0.10.2",
@@ -2511,7 +2511,7 @@ version = "0.11.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7793e157a59a0bd2142a5723860aeaef3aa459feae1467b597351e5f58251904"
 dependencies = [
- "indexmap 2.14.0",
+ "indexmap 2.14.1",
  "lalrpop-util",
  "logos",
 ]
@@ -3530,7 +3530,7 @@ dependencies = [
  "futures-core",
  "futures-sink",
  "http",
- "indexmap 2.14.0",
+ "indexmap 2.14.1",
  "slab",
  "tokio",
  "tokio-util",
@@ -3845,7 +3845,7 @@ dependencies = [
 
 [[package]]
 name = "hopr-chain-connector"
-version = "0.25.0"
+version = "0.25.1"
 dependencies = [
  "ahash",
  "anyhow",
@@ -3928,7 +3928,7 @@ dependencies = [
  "hex-literal",
  "hopr-api",
  "hopr-utilities",
- "indexmap 2.14.0",
+ "indexmap 2.14.1",
  "insta",
  "lazy_static",
  "parking_lot",
@@ -4096,7 +4096,7 @@ dependencies = [
  "hickory-resolver 0.26.1",
  "hopr-api",
  "hopr-types",
- "indexmap 2.14.0",
+ "indexmap 2.14.1",
  "lazy_static",
  "libc",
  "libp2p-identity",
@@ -4499,9 +4499,9 @@ dependencies = [
 
 [[package]]
 name = "indexmap"
-version = "2.14.0"
+version = "2.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d466e9454f08e4a911e14806c24e16fba1b4c121d1ea474396f396069cf949d9"
+checksum = "07aa2048142242915a31d35844fb311e0e53fcca590c3a0a40dcf1b841fa09eb"
 dependencies = [
  "equivalent",
  "hashbrown 0.17.1",
@@ -5867,7 +5867,7 @@ checksum = "8701b58ea97060d5e5b155d383a69952a60943f0e6dfe30b04c287beb0b27455"
 dependencies = [
  "fixedbitset",
  "hashbrown 0.15.5",
- "indexmap 2.14.0",
+ "indexmap 2.14.1",
  "rayon",
  "serde",
  "serde_derive",
@@ -7140,7 +7140,7 @@ dependencies = [
  "chrono",
  "hex",
  "indexmap 1.9.3",
- "indexmap 2.14.0",
+ "indexmap 2.14.1",
  "jiff",
  "schemars 0.9.0",
  "schemars 1.2.2",
@@ -7845,7 +7845,7 @@ version = "0.25.13+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6975367e4d2ef766d86af01ffad14b622fecc8d4357a998fbc4deb6e9bacaf9b"
 dependencies = [
- "indexmap 2.14.0",
+ "indexmap 2.14.1",
  "toml_datetime",
  "toml_parser",
  "winnow",
