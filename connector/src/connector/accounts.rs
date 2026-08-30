@@ -176,8 +176,6 @@ where
         balance: Balance<Cy>,
         recipient: &Address,
     ) -> Result<BoxFuture<'_, Result<ChainReceipt, Self::Error>>, Self::Error> {
-        self.check_connection_state()?;
-
         let tx_req = self.payload_generator.transfer(*recipient, balance)?;
 
         Ok(self.send_tx(tx_req, None, None).await?.boxed())
@@ -189,8 +187,6 @@ where
         balance: Balance<Cy>,
         recipient: &Address,
     ) -> Result<BoxFuture<'_, Result<ChainReceipt, Self::Error>>, Self::Error> {
-        self.check_connection_state()?;
-
         let tx_req = self.payload_generator.transfer(*recipient, balance)?;
 
         Ok(self.send_tx(tx_req, None, Some(signer.clone())).await?.boxed())
