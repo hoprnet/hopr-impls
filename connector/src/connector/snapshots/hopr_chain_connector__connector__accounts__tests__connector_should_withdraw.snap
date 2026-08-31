@@ -1,24 +1,48 @@
 ---
 source: connector/src/connector/accounts.rs
+assertion_line: 546
 expression: "*connector.client.snapshot()"
 ---
-accounts: {}
+accounts:
+  0:
+    chain_key: 668430def9eacd2b5064acf85d73fb0b351a1c8c
+    keyid: 0
+    multi_addresses: []
+    packet_key: a22b260b9199743de7a02d08783631429f38f536f307000115bd53b4d6c891ac
+    safe_address: "0202020202020202020202020202020202020202"
 native_balances:
   "0101010101010101010101010101010101010101":
     __typename: NativeBalance
     balance: 1 xDai
   668430def9eacd2b5064acf85d73fb0b351a1c8c:
     __typename: NativeBalance
-    balance: 8.999999999999999998 xDai
+    balance: 9.999999999999999998 xDai
+  "0202020202020202020202020202020202020202":
+    __typename: NativeBalance
+    balance: 9 xDai
 token_balances:
   "0101010101010101010101010101010101010101":
     __typename: HoprBalance
     balance: 10 wxHOPR
   668430def9eacd2b5064acf85d73fb0b351a1c8c:
     __typename: HoprBalance
+    balance: 0 wxHOPR
+  "0202020202020202020202020202020202020202":
+    __typename: HoprBalance
     balance: 990 wxHOPR
-safe_allowances: {}
-deployed_safes: {}
+safe_allowances:
+  "0202020202020202020202020202020202020202":
+    __typename: SafeHoprAllowance
+    allowance: 10000000000000 wxHOPR
+deployed_safes:
+  "0202020202020202020202020202020202020202":
+    address: "0202020202020202020202020202020202020202"
+    chain_key: 668430def9eacd2b5064acf85d73fb0b351a1c8c
+    owners:
+      - 668430def9eacd2b5064acf85d73fb0b351a1c8c
+    module_address: 463977c851087dca6e69d488fbd69dbad3ffc7fe
+    registered_nodes: []
+    threshold: "1"
 safe_redeem_stats: {}
 tx_counts:
   668430def9eacd2b5064acf85d73fb0b351a1c8c: 2

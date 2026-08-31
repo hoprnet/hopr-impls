@@ -250,7 +250,7 @@ where
 mod tests {
     use hex_literal::hex;
     use hopr_api::{
-        chain::{ChainReadAccountOperations, ChainWriteAccountOperations, DeployedSafe},
+        chain::{ChainReadAccountOperations, ChainValues, ChainWriteAccountOperations, DeployedSafe},
         types::internal::account::AccountType,
     };
 
@@ -502,19 +502,32 @@ mod tests {
         Ok(())
     }
 
+    /// The connector is built with a [`SafePayloadGenerator`], so `withdraw` executes through the
+    /// Safe's module and the **Safe** is what pays — the node key only signs. The account therefore
+    /// has to name a Safe, and that Safe has to hold the funds being moved; `with_accounts` places
+    /// the token balance on the Safe for exactly this reason.
     #[tokio::test]
     async fn connector_should_withdraw() -> anyhow::Result<()> {
+        let me = ChainKeypair::from_secret(&PRIVATE_KEY_1)?.public().to_address();
+        let safe: Address = [2u8; Address::SIZE].into();
+
         let blokli_client = BlokliTestStateBuilder::default()
             .with_balances([([1u8; Address::SIZE].into(), HoprBalance::zero())])
             .with_balances([([1u8; Address::SIZE].into(), XDaiBalance::zero())])
-            .with_balances([(
-                ChainKeypair::from_secret(&PRIVATE_KEY_1)?.public().to_address(),
+            .with_accounts([(
+                AccountEntry {
+                    public_key: *OffchainKeypair::from_secret(&PRIVATE_KEY_1)?.public(),
+                    chain_addr: me,
+                    entry_type: AccountType::NotAnnounced,
+                    safe_address: Some(safe),
+                    key_id: 0u32.into(),
+                },
+                HoprBalance::new_base(1000),
                 XDaiBalance::new_base(10),
             )])
-            .with_balances([(
-                ChainKeypair::from_secret(&PRIVATE_KEY_1)?.public().to_address(),
-                HoprBalance::new_base(1000),
-            )])
+            // `with_accounts` leaves the Safe without xDai, which is the shape of a real
+            // deployment. The native withdrawal below comes out of the Safe, so it needs some.
+            .with_balances([(safe, XDaiBalance::new_base(10))])
             .with_hopr_network_chain_info("piz-palu-staging")
             .build_dynamic_client(MODULE_ADDR.into());
 
@@ -535,45 +548,68 @@ mod tests {
         Ok(())
     }
 
+    /// `withdraw_from_signer` cannot move an arbitrary signer's funds through a
+    /// [`SafePayloadGenerator`], and this pins that down rather than asserting it works.
+    ///
+    /// The payload is built by the connector's own generator, so it is an
+    /// `execTransactionFromModule` call on *this connector's* Safe; only the signature comes from
+    /// `signer`. An unrelated EOA is not an owner of that Safe and cannot drive its module, so on
+    /// a real chain the transaction reverts — and the funds that would move are the Safe's, not the
+    /// signer's, which is the opposite of what the name suggests.
+    ///
+    /// This used to appear to succeed: the emulator attributed every withdrawal to whoever signed
+    /// it, so the signer's balance moved and the Safe wrapping went unnoticed. Since
+    /// `hopr-utilities` began settling withdrawals against the payer the action names, the
+    /// emulator reproduces the revert instead.
+    ///
+    /// The method is only usable with a [`BasicPayloadGenerator`], where `transfer` is a plain
+    /// EOA-signed call. Callers wanting to spend a key they hold — sweeping a one-off deposit
+    /// address, say — must build a basic connector for that key rather than reach for this.
     #[tokio::test]
-    async fn connector_should_withdraw_from_signer() -> anyhow::Result<()> {
+    async fn connector_should_not_withdraw_from_an_unrelated_signer_through_the_safe() -> anyhow::Result<()> {
+        let me = ChainKeypair::from_secret(&PRIVATE_KEY_1)?.public().to_address();
+        let safe: Address = [2u8; Address::SIZE].into();
+        let signer = ChainKeypair::from_secret(&PRIVATE_KEY_2)?;
+
         let blokli_client = BlokliTestStateBuilder::default()
             .with_balances([([1u8; Address::SIZE].into(), HoprBalance::zero())])
             .with_balances([([1u8; Address::SIZE].into(), XDaiBalance::zero())])
-            .with_balances([(
-                ChainKeypair::from_secret(&PRIVATE_KEY_1)?.public().to_address(),
+            .with_accounts([(
+                AccountEntry {
+                    public_key: *OffchainKeypair::from_secret(&PRIVATE_KEY_1)?.public(),
+                    chain_addr: me,
+                    entry_type: AccountType::NotAnnounced,
+                    safe_address: Some(safe),
+                    key_id: 0u32.into(),
+                },
+                HoprBalance::new_base(1000),
                 XDaiBalance::new_base(10),
             )])
-            .with_balances([(
-                ChainKeypair::from_secret(&PRIVATE_KEY_1)?.public().to_address(),
-                HoprBalance::new_base(1000),
-            )])
-            .with_balances([(
-                ChainKeypair::from_secret(&PRIVATE_KEY_2)?.public().to_address(),
-                XDaiBalance::new_base(10),
-            )])
-            .with_balances([(
-                ChainKeypair::from_secret(&PRIVATE_KEY_2)?.public().to_address(),
-                HoprBalance::new_base(1000),
-            )])
+            // The signer is funded and holds gas, so a refusal cannot be mistaken for a shortfall
+            // on its side. It is simply not a party to the Safe.
+            .with_balances([(signer.public().to_address(), XDaiBalance::new_base(10))])
+            .with_balances([(signer.public().to_address(), HoprBalance::new_base(1000))])
             .with_hopr_network_chain_info("piz-palu-staging")
             .build_dynamic_client(MODULE_ADDR.into());
 
         let mut connector = create_connector(blokli_client)?;
         connector.connect().await?;
 
-        let signer = ChainKeypair::from_secret(&PRIVATE_KEY_2)?;
-
-        connector
+        let result = connector
             .withdraw_from_signer(&signer, HoprBalance::new_base(10), &[1u8; Address::SIZE].into())
             .await?
-            .await?;
-        connector
-            .withdraw_from_signer(&signer, XDaiBalance::new_base(1), &[1u8; Address::SIZE].into())
-            .await?
-            .await?;
+            .await;
 
-        insta::assert_yaml_snapshot!(*connector.client.snapshot());
+        assert!(
+            result.is_err(),
+            "a Safe-wrapped transfer signed by an unrelated EOA must not settle, got {result:?}"
+        );
+        let signer_balance: HoprBalance = ChainValues::balance(&connector, signer.public().to_address()).await?;
+        assert_eq!(
+            signer_balance,
+            HoprBalance::new_base(1000),
+            "the signer's own balance must be untouched"
+        );
 
         Ok(())
     }
