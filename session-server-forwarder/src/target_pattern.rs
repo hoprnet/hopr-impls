@@ -1,0 +1,466 @@
+//! Patterns that select [`SessionTarget`]s, used to attach admission rules to classes of target.
+//!
+//! The grammar is a single string so that a rule reads as one line of configuration, matching how
+//! [`target_allow_list`](crate::config::SessionIpForwardingConfig::target_allow_list) already spells
+//! its addresses:
+//!
+//! | Pattern | Matches |
+//! |---|---|
+//! | `*` | every target, including services |
+//! | `tcp:example.com:443` | that name, over TCP, on that port |
+//! | `tcp:*:443` | any host, over TCP, on port 443 |
+//! | `tcp:*.example.com:*` | any subdomain of `example.com`, over TCP, on any port |
+//! | `udp:10.0.0.0/8:*` | any address in that block, over UDP |
+//! | `*:*:53` | port 53, over either protocol |
+//! | `service:0` | the node-local service with that id |
+//! | `service:*` | any node-local service |
+//!
+//! Matching runs against the *unsealed* target, so a rule is written in terms of the host the peer
+//! actually asked for rather than the ciphertext it travelled as.
+
+use std::{
+    fmt::{Display, Formatter},
+    net::IpAddr,
+    str::FromStr,
+};
+
+use hopr_utils::network_types::prelude::{IpOrHost, ServiceId, SessionTarget};
+
+/// Error produced when a [`TargetPattern`] cannot be parsed.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error("invalid target pattern '{pattern}': {reason}")]
+pub struct InvalidTargetPattern {
+    /// The pattern as written.
+    pub pattern: String,
+    /// Why it was rejected.
+    pub reason: String,
+}
+
+impl InvalidTargetPattern {
+    fn new(pattern: &str, reason: impl Display) -> Self {
+        Self {
+            pattern: pattern.to_string(),
+            reason: reason.to_string(),
+        }
+    }
+}
+
+/// Which transport a stream pattern selects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolPattern {
+    /// Either transport.
+    Any,
+    /// TCP only.
+    Tcp,
+    /// UDP only.
+    Udp,
+}
+
+/// Which host a stream pattern selects.
+///
+/// A name pattern never matches an address and an address pattern never matches a name: the two are
+/// different things to the operator, and silently equating them would let `10.0.0.0/8` also capture
+/// a target that merely resolves into that block later, which is the allow-list's job and is checked
+/// after resolution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostPattern {
+    /// Any host.
+    Any,
+    /// One exact DNS name, compared case-insensitively.
+    Name(String),
+    /// Any strict subdomain of this name — `*.example.com` does not match `example.com` itself.
+    Subdomain(String),
+    /// One exact IP address.
+    Address(IpAddr),
+    /// Any address inside this block.
+    Network(ipnet::IpNet),
+}
+
+/// Which port a stream pattern selects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortPattern {
+    /// Any port.
+    Any,
+    /// One exact port.
+    Exact(u16),
+}
+
+/// Selects a class of [`SessionTarget`]. See the [module documentation](self) for the grammar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TargetPattern {
+    /// Matches every target.
+    Any,
+    /// Matches node-local services, either one by id or all of them.
+    Service(Option<ServiceId>),
+    /// Matches forwarded TCP/UDP streams.
+    Stream {
+        /// The transport to match.
+        protocol: ProtocolPattern,
+        /// The host to match.
+        host: HostPattern,
+        /// The port to match.
+        port: PortPattern,
+    },
+}
+
+impl TargetPattern {
+    /// Whether this pattern selects `target`, whose host must already be unsealed.
+    pub fn matches(&self, target: &UnsealedTarget) -> bool {
+        match (self, target) {
+            (TargetPattern::Any, _) => true,
+            (TargetPattern::Service(None), UnsealedTarget::Service(_)) => true,
+            (TargetPattern::Service(Some(wanted)), UnsealedTarget::Service(id)) => wanted == id,
+            (TargetPattern::Service(_), _) | (TargetPattern::Stream { .. }, UnsealedTarget::Service(_)) => false,
+            (
+                TargetPattern::Stream { protocol, host, port },
+                UnsealedTarget::Stream {
+                    protocol: target_protocol,
+                    host: target_host,
+                },
+            ) => protocol.matches(*target_protocol) && port.matches(target_host.port()) && host.matches(target_host),
+        }
+    }
+}
+
+impl ProtocolPattern {
+    fn matches(self, protocol: StreamProtocol) -> bool {
+        match self {
+            ProtocolPattern::Any => true,
+            ProtocolPattern::Tcp => protocol == StreamProtocol::Tcp,
+            ProtocolPattern::Udp => protocol == StreamProtocol::Udp,
+        }
+    }
+}
+
+impl PortPattern {
+    fn matches(self, port: u16) -> bool {
+        match self {
+            PortPattern::Any => true,
+            PortPattern::Exact(wanted) => wanted == port,
+        }
+    }
+}
+
+impl HostPattern {
+    fn matches(&self, host: &IpOrHost) -> bool {
+        match (self, host) {
+            (HostPattern::Any, _) => true,
+            (HostPattern::Name(wanted), IpOrHost::Dns(name, _)) => wanted.eq_ignore_ascii_case(name),
+            (HostPattern::Subdomain(suffix), IpOrHost::Dns(name, _)) => name
+                .len()
+                .checked_sub(suffix.len())
+                .and_then(|split| split.checked_sub(1))
+                .is_some_and(|dot| name.as_bytes()[dot] == b'.' && suffix.eq_ignore_ascii_case(&name[dot + 1..])),
+            (HostPattern::Address(wanted), IpOrHost::Ip(addr)) => *wanted == addr.ip(),
+            (HostPattern::Network(net), IpOrHost::Ip(addr)) => net.contains(&addr.ip()),
+            // A name pattern against an address, or an address pattern against a name.
+            (HostPattern::Name(_) | HostPattern::Subdomain(_), IpOrHost::Ip(_))
+            | (HostPattern::Address(_) | HostPattern::Network(_), IpOrHost::Dns(..)) => false,
+        }
+    }
+}
+
+/// Which transport an [`UnsealedTarget`] is forwarded over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamProtocol {
+    /// TCP.
+    Tcp,
+    /// UDP.
+    Udp,
+}
+
+/// A [`SessionTarget`] with its host opened, which is the form rules are matched against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnsealedTarget {
+    /// A forwarded TCP or UDP stream.
+    Stream {
+        /// The transport it is forwarded over.
+        protocol: StreamProtocol,
+        /// The host it is forwarded to, unsealed.
+        host: IpOrHost,
+    },
+    /// A node-local service.
+    Service(ServiceId),
+}
+
+impl UnsealedTarget {
+    /// Opens `target`'s host with `keypair`, so it can be matched against a [`TargetPattern`].
+    ///
+    /// A [`SessionTarget::ExitNode`] carries no host and cannot be sealed, so it needs no key.
+    pub fn new(
+        target: &SessionTarget,
+        keypair: &hopr_api::types::crypto::prelude::OffchainKeypair,
+    ) -> Result<Self, hopr_utils::network_types::errors::NetworkTypeError> {
+        let (protocol, sealed) = match target {
+            SessionTarget::TcpStream(host) => (StreamProtocol::Tcp, host),
+            SessionTarget::UdpStream(host) => (StreamProtocol::Udp, host),
+            SessionTarget::ExitNode(id) => return Ok(UnsealedTarget::Service(*id)),
+        };
+
+        Ok(UnsealedTarget::Stream {
+            protocol,
+            host: sealed.clone().unseal(keypair)?,
+        })
+    }
+}
+
+impl FromStr for TargetPattern {
+    type Err = InvalidTargetPattern;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let pattern = s.trim();
+        if pattern == "*" {
+            return Ok(TargetPattern::Any);
+        }
+
+        // The protocol is up to the first colon and the port after the last, which leaves everything
+        // between them as the host. Splitting that way rather than on every colon is what lets an
+        // IPv6 literal or a CIDR block sit in the middle unquoted.
+        let (protocol, rest) = pattern
+            .split_once(':')
+            .ok_or_else(|| InvalidTargetPattern::new(pattern, "expected '<protocol>:<host>:<port>' or '*'"))?;
+
+        if protocol.eq_ignore_ascii_case("service") {
+            return match rest {
+                "*" => Ok(TargetPattern::Service(None)),
+                id => id
+                    .parse()
+                    .map(|id| TargetPattern::Service(Some(id)))
+                    .map_err(|e| InvalidTargetPattern::new(pattern, format!("service id: {e}"))),
+            };
+        }
+
+        let protocol = match protocol {
+            "*" => ProtocolPattern::Any,
+            p if p.eq_ignore_ascii_case("tcp") => ProtocolPattern::Tcp,
+            p if p.eq_ignore_ascii_case("udp") => ProtocolPattern::Udp,
+            other => {
+                return Err(InvalidTargetPattern::new(
+                    pattern,
+                    format!("unknown protocol '{other}', expected 'tcp', 'udp', 'service' or '*'"),
+                ));
+            }
+        };
+
+        let (host, port) = rest
+            .rsplit_once(':')
+            .ok_or_else(|| InvalidTargetPattern::new(pattern, "missing ':<port>'"))?;
+
+        let port = match port {
+            "*" => PortPattern::Any,
+            number => PortPattern::Exact(
+                number
+                    .parse()
+                    .map_err(|e| InvalidTargetPattern::new(pattern, format!("port: {e}")))?,
+            ),
+        };
+
+        let host = if host == "*" {
+            HostPattern::Any
+        } else if let Some(suffix) = host.strip_prefix("*.") {
+            if suffix.is_empty() {
+                return Err(InvalidTargetPattern::new(pattern, "'*.' needs a name to suffix"));
+            }
+            HostPattern::Subdomain(suffix.to_ascii_lowercase())
+        } else if host.contains('/') {
+            HostPattern::Network(
+                host.parse()
+                    .map_err(|e| InvalidTargetPattern::new(pattern, format!("network: {e}")))?,
+            )
+        } else if let Some(literal) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+            // Bracketed IPv6, the form a `host:port` string has to use to be unambiguous.
+            HostPattern::Address(
+                literal
+                    .parse()
+                    .map_err(|e| InvalidTargetPattern::new(pattern, format!("address: {e}")))?,
+            )
+        } else if let Ok(address) = host.parse() {
+            HostPattern::Address(address)
+        } else if host.is_empty() {
+            return Err(InvalidTargetPattern::new(pattern, "empty host"));
+        } else {
+            HostPattern::Name(host.to_ascii_lowercase())
+        };
+
+        Ok(TargetPattern::Stream { protocol, host, port })
+    }
+}
+
+impl Display for TargetPattern {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TargetPattern::Any => write!(f, "*"),
+            TargetPattern::Service(None) => write!(f, "service:*"),
+            TargetPattern::Service(Some(id)) => write!(f, "service:{id}"),
+            TargetPattern::Stream { protocol, host, port } => {
+                match protocol {
+                    ProtocolPattern::Any => write!(f, "*:")?,
+                    ProtocolPattern::Tcp => write!(f, "tcp:")?,
+                    ProtocolPattern::Udp => write!(f, "udp:")?,
+                }
+                match host {
+                    HostPattern::Any => write!(f, "*")?,
+                    HostPattern::Name(name) => write!(f, "{name}")?,
+                    HostPattern::Subdomain(suffix) => write!(f, "*.{suffix}")?,
+                    HostPattern::Address(addr @ IpAddr::V6(_)) => write!(f, "[{addr}]")?,
+                    HostPattern::Address(addr) => write!(f, "{addr}")?,
+                    HostPattern::Network(net) => write!(f, "{net}")?,
+                }
+                match port {
+                    PortPattern::Any => write!(f, ":*"),
+                    PortPattern::Exact(port) => write!(f, ":{port}"),
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::Context;
+
+    use super::*;
+
+    fn dns(name: &str, port: u16) -> UnsealedTarget {
+        UnsealedTarget::Stream {
+            protocol: StreamProtocol::Tcp,
+            host: IpOrHost::Dns(name.into(), port),
+        }
+    }
+
+    fn ip(addr: &str, protocol: StreamProtocol) -> anyhow::Result<UnsealedTarget> {
+        Ok(UnsealedTarget::Stream {
+            protocol,
+            host: IpOrHost::Ip(addr.parse().context("parsing socket address")?),
+        })
+    }
+
+    fn parse(pattern: &str) -> anyhow::Result<TargetPattern> {
+        pattern.parse().context("parsing target pattern")
+    }
+
+    #[test]
+    fn every_pattern_survives_a_string_round_trip() -> anyhow::Result<()> {
+        for pattern in [
+            "*",
+            "service:*",
+            "service:7",
+            "tcp:example.com:443",
+            "udp:*:53",
+            "*:*:*",
+            "tcp:*.example.com:*",
+            "udp:10.0.0.0/8:*",
+            "tcp:192.168.1.1:8080",
+            "tcp:[2001:db8::1]:443",
+            "udp:2001:db8::/32:*",
+        ] {
+            assert_eq!(parse(pattern)?.to_string(), pattern, "round trip of {pattern}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn the_catch_all_matches_streams_and_services_alike() -> anyhow::Result<()> {
+        let any = parse("*")?;
+        assert!(any.matches(&dns("example.com", 443)));
+        assert!(any.matches(&ip("10.1.2.3:80", StreamProtocol::Udp)?));
+        assert!(any.matches(&UnsealedTarget::Service(0)));
+        Ok(())
+    }
+
+    #[test]
+    fn a_service_pattern_matches_only_services() -> anyhow::Result<()> {
+        assert!(parse("service:0")?.matches(&UnsealedTarget::Service(0)));
+        assert!(!parse("service:0")?.matches(&UnsealedTarget::Service(1)));
+        assert!(!parse("service:0")?.matches(&dns("example.com", 443)));
+
+        assert!(parse("service:*")?.matches(&UnsealedTarget::Service(9)));
+        // …and a stream pattern never captures a service, however wild.
+        assert!(!parse("*:*:*")?.matches(&UnsealedTarget::Service(0)));
+        Ok(())
+    }
+
+    #[test]
+    fn protocol_and_port_narrow_independently() -> anyhow::Result<()> {
+        let tcp_443 = parse("tcp:*:443")?;
+        assert!(tcp_443.matches(&dns("example.com", 443)));
+        assert!(!tcp_443.matches(&dns("example.com", 80)));
+        assert!(!tcp_443.matches(&UnsealedTarget::Stream {
+            protocol: StreamProtocol::Udp,
+            host: IpOrHost::Dns("example.com".into(), 443),
+        }));
+
+        let any_proto_53 = parse("*:*:53")?;
+        assert!(any_proto_53.matches(&ip("1.1.1.1:53", StreamProtocol::Udp)?));
+        assert!(any_proto_53.matches(&ip("1.1.1.1:53", StreamProtocol::Tcp)?));
+        Ok(())
+    }
+
+    #[test]
+    fn a_subdomain_pattern_excludes_the_bare_name_and_sibling_names() -> anyhow::Result<()> {
+        let pattern = parse("tcp:*.example.com:*")?;
+
+        assert!(pattern.matches(&dns("a.example.com", 443)));
+        assert!(pattern.matches(&dns("deep.nested.example.com", 1)));
+        // Case is irrelevant in DNS.
+        assert!(pattern.matches(&dns("A.Example.COM", 443)));
+
+        // The bare name is not a subdomain of itself.
+        assert!(!pattern.matches(&dns("example.com", 443)));
+        // Nor is a name that merely ends with the same characters.
+        assert!(!pattern.matches(&dns("notexample.com", 443)));
+        assert!(!pattern.matches(&dns("evil-example.com", 443)));
+        Ok(())
+    }
+
+    #[test]
+    fn names_and_addresses_never_match_each_others_patterns() -> anyhow::Result<()> {
+        assert!(!parse("tcp:*.example.com:*")?.matches(&ip("10.0.0.1:443", StreamProtocol::Tcp)?));
+        assert!(!parse("tcp:example.com:443")?.matches(&ip("10.0.0.1:443", StreamProtocol::Tcp)?));
+        assert!(!parse("tcp:10.0.0.0/8:*")?.matches(&dns("example.com", 443)));
+        assert!(!parse("tcp:10.0.0.1:443")?.matches(&dns("10.0.0.1", 443)));
+        Ok(())
+    }
+
+    #[test]
+    fn a_network_pattern_matches_inside_the_block_only() -> anyhow::Result<()> {
+        let private = parse("udp:10.0.0.0/8:*")?;
+        assert!(private.matches(&ip("10.1.2.3:53", StreamProtocol::Udp)?));
+        assert!(private.matches(&ip("10.255.255.255:1", StreamProtocol::Udp)?));
+        assert!(!private.matches(&ip("11.0.0.1:53", StreamProtocol::Udp)?));
+
+        let v6 = parse("tcp:2001:db8::/32:*")?;
+        assert!(v6.matches(&ip("[2001:db8::1]:443", StreamProtocol::Tcp)?));
+        assert!(!v6.matches(&ip("[2001:db9::1]:443", StreamProtocol::Tcp)?));
+        Ok(())
+    }
+
+    #[test]
+    fn a_bracketed_v6_literal_matches_that_address_alone() -> anyhow::Result<()> {
+        let pattern = parse("tcp:[2001:db8::1]:443")?;
+        assert!(pattern.matches(&ip("[2001:db8::1]:443", StreamProtocol::Tcp)?));
+        assert!(!pattern.matches(&ip("[2001:db8::2]:443", StreamProtocol::Tcp)?));
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_patterns_are_rejected_rather_than_silently_narrowed() {
+        for pattern in [
+            "",
+            "tcp",
+            "tcp:example.com",
+            "sctp:*:443",
+            "tcp:*:notaport",
+            "tcp:*:70000",
+            "tcp:*.:443",
+            "tcp::443",
+            "service:nine",
+            "tcp:10.0.0.0/99:*",
+        ] {
+            assert!(
+                pattern.parse::<TargetPattern>().is_err(),
+                "'{pattern}' should not parse"
+            );
+        }
+    }
+}

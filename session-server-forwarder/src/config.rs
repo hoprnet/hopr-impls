@@ -1,6 +1,11 @@
 use std::{collections::HashSet, net::SocketAddr, num::NonZeroUsize, time::Duration};
 
 use serde_with::serde_as;
+// In scope for the `#[validate(nested)]` on `session_admission_rules`, whose generated code calls
+// `Validate::validate` on the `Vec`.
+use validator::Validate;
+
+use crate::target_pattern::TargetPattern;
 
 /// Configuration of the Exit node (see [`HoprServerIpForwardingReactor`](crate::HoprServerIpForwardingReactor))
 /// and the Entry node.
@@ -55,6 +60,77 @@ pub struct SessionIpForwardingConfig {
     /// `None` (default) lets the implementation choose automatically.
     #[serde(default)]
     pub udp_rx_parallelism: Option<NonZeroUsize>,
+
+    /// Terms on which Sessions are admitted, per class of target.
+    ///
+    /// Rules are tried in order and the **first match wins**, so write the specific ones above the
+    /// general ones, as in a firewall. A target matching no rule is admitted on the node's own
+    /// configured terms, which is what every target gets when this list is empty.
+    ///
+    /// These decide what a Session *costs*, not whether the target may be reached at all — that
+    /// remains [`target_allow_list`](Self::target_allow_list), which is checked later, against
+    /// resolved addresses. A rule is matched against the unsealed target before the Session exists.
+    ///
+    /// Defaults to empty.
+    #[serde(default)]
+    #[validate(nested)]
+    pub session_admission_rules: Vec<SessionAdmissionRule>,
+}
+
+/// Terms on which Sessions to one class of target are admitted.
+///
+/// Every term other than `target` is optional and unset means "leave the node's configured value
+/// alone", so a rule states only what it changes.
+#[serde_as]
+#[derive(
+    Clone, Debug, Eq, PartialEq, smart_default::SmartDefault, serde::Deserialize, serde::Serialize, validator::Validate,
+)]
+#[serde(deny_unknown_fields)]
+#[validate(schema(function = "validate_admission_rule_quota", skip_on_field_errors = false))]
+pub struct SessionAdmissionRule {
+    /// Which targets this rule applies to. See [`TargetPattern`] for the grammar.
+    #[serde_as(as = "serde_with::DisplayFromStr")]
+    #[default(TargetPattern::Any)]
+    pub target: TargetPattern,
+
+    /// Whether Sessions to these targets must pay (PIX), overriding the node's setting.
+    ///
+    /// `Some(false)` serves this class for free on a node that otherwise demands payment;
+    /// `Some(true)` demands payment on a node that otherwise does not.
+    #[serde(default)]
+    pub enforce_pix: Option<bool>,
+
+    /// Lower bound of the quota accepted for these targets, in bytes.
+    ///
+    /// **Narrows only.** The node's configured quota range is the envelope — it is validated at
+    /// startup against the deadlines and reconstructor memory it implies — and this is intersected
+    /// with it rather than replacing it. Widening a class beyond the node's range is done by
+    /// configuring a wider node range and narrowing the other classes.
+    #[serde(default)]
+    pub quota_range_min: Option<u64>,
+
+    /// Upper bound of the quota accepted for these targets, in bytes. Narrows only; see
+    /// [`quota_range_min`](Self::quota_range_min).
+    #[serde(default)]
+    pub quota_range_max: Option<u64>,
+}
+
+/// Rejects a rule whose quota bounds exclude every quota, which is a typo rather than a policy.
+fn validate_admission_rule_quota(rule: &SessionAdmissionRule) -> Result<(), validator::ValidationError> {
+    if let (Some(min), Some(max)) = (rule.quota_range_min, rule.quota_range_max)
+        && min > max
+    {
+        let mut error = validator::ValidationError::new("empty quota range");
+        error.message = Some(
+            format!(
+                "rule for '{}' has quota_range_min {min} above quota_range_max {max}, which admits nothing",
+                rule.target
+            )
+            .into(),
+        );
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn default_target_retry_delay() -> Duration {

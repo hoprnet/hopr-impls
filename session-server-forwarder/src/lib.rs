@@ -1,10 +1,14 @@
 //! HOPR session server that bridges TCP/UDP sockets from the Session Exit node to a destination.
 
 pub mod config;
+pub mod target_pattern;
 
 use std::{marker::PhantomData, net::SocketAddr};
 
-use hopr_api::{node::IncomingSession, types::crypto::prelude::OffchainKeypair};
+use hopr_api::{
+    node::{IncomingSession, SessionAdmissionDecision, SessionAdmissionRequest},
+    types::crypto::prelude::OffchainKeypair,
+};
 use hopr_utils::{
     network_types::{
         prelude::{ForeignDataMode, IpOrHostExt, ServiceId, SessionTarget},
@@ -14,7 +18,7 @@ use hopr_utils::{
     parallelize::cpu::spawn_blocking,
 };
 
-use crate::config::SessionIpForwardingConfig;
+use crate::{config::SessionIpForwardingConfig, target_pattern::UnsealedTarget};
 
 #[cfg(all(feature = "telemetry", not(test)))]
 lazy_static::lazy_static! {
@@ -39,11 +43,21 @@ pub const HOPR_UDP_QUEUE_SIZE: usize = 8192;
 pub enum ForwarderError {
     #[error("{0}")]
     General(String),
+    /// The target was refused by policy rather than failing technically.
+    ///
+    /// Separate from [`General`](Self::General) because the two want opposite responses: a refusal
+    /// is the configuration working, and repeating the request will not help.
+    #[error("target not admitted: {0}")]
+    Denied(String),
 }
 
 impl ForwarderError {
     fn general(s: impl std::fmt::Display) -> Self {
         Self::General(s.to_string())
+    }
+
+    fn denied(s: impl std::fmt::Display) -> Self {
+        Self::Denied(s.to_string())
     }
 }
 
@@ -108,6 +122,62 @@ where
 {
     type Error = ForwarderError;
     type Session = IncomingSession<S>;
+
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn admit(&self, request: SessionAdmissionRequest) -> Result<SessionAdmissionDecision, ForwarderError> {
+        // Nothing to say about any target, so skip the unsealing entirely: with no rules configured
+        // this hook costs a match and a return.
+        if self.cfg.session_admission_rules.is_empty() {
+            return Ok(SessionAdmissionDecision::default());
+        }
+
+        // Rules are written against the host the peer asked for, so the target has to be opened
+        // before it can be matched. Failing here denies the Session, which is the same outcome it
+        // would reach a moment later: `process` unseals with this key too, and cannot forward what
+        // it cannot read.
+        let kp = self.keypair.clone();
+        let target = request.target.clone();
+        let target = spawn_blocking(move || UnsealedTarget::new(&target, &kp), "admission_unseal")
+            .await
+            .map_err(|e| ForwarderError::general(format!("failed to spawn unseal task: {e}")))?
+            .map_err(|e| ForwarderError::denied(format!("cannot unseal target: {e}")))?;
+
+        // First match wins, so a specific rule placed above a general one overrides it.
+        let Some(rule) = self
+            .cfg
+            .session_admission_rules
+            .iter()
+            .find(|rule| rule.target.matches(&target))
+        else {
+            tracing::debug!(
+                session_id = ?request.session_id,
+                "no admission rule matches the target, admitting on the node's own terms"
+            );
+            return Ok(SessionAdmissionDecision::default());
+        };
+
+        let mut decision = SessionAdmissionDecision::default();
+        if let Some(enforce_pix) = rule.enforce_pix {
+            decision = decision.with_enforce_pix(enforce_pix);
+        }
+        // A bound left unset does not narrow that end, so it is carried over from the node's own
+        // range by the saturating value rather than by inventing one here.
+        if rule.quota_range_min.is_some() || rule.quota_range_max.is_some() {
+            decision = decision.with_pix_quota_range(
+                rule.quota_range_min.unwrap_or(u64::MIN)..=rule.quota_range_max.unwrap_or(u64::MAX),
+            );
+        }
+
+        tracing::debug!(
+            session_id = ?request.session_id,
+            rule = %rule.target,
+            enforce_pix = ?decision.enforce_pix,
+            quota_range = ?decision.pix_quota_range,
+            "admitting session on the matched rule's terms"
+        );
+
+        Ok(decision)
+    }
 
     #[tracing::instrument(level = "debug", skip(self, session))]
     async fn process(&self, mut session: IncomingSession<S>) -> Result<(), ForwarderError> {
@@ -332,5 +402,227 @@ where
                 "server does not support internal session processing".into(),
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use anyhow::Context;
+    use hopr_api::{
+        node::HoprSessionServer,
+        types::{crypto::keypairs::Keypair, crypto_random::Randomizable, network::SessionId},
+    };
+    use hopr_utils::network_types::prelude::{IpOrHost, SealedHost};
+    use validator::Validate;
+
+    use super::*;
+    use crate::config::SessionAdmissionRule;
+
+    /// The reactor never touches the byte-stream during admission, so a placeholder suffices.
+    type Reactor = HoprServerIpForwardingReactor<tokio::io::DuplexStream>;
+
+    fn reactor_with(rules: Vec<SessionAdmissionRule>) -> Reactor {
+        HoprServerIpForwardingReactor::new(
+            OffchainKeypair::random(),
+            SessionIpForwardingConfig {
+                session_admission_rules: rules,
+                ..Default::default()
+            },
+        )
+    }
+
+    fn rule(target: &str) -> anyhow::Result<SessionAdmissionRule> {
+        Ok(SessionAdmissionRule {
+            target: target.parse().context("parsing rule target")?,
+            ..Default::default()
+        })
+    }
+
+    fn tcp(host: &str) -> anyhow::Result<SessionAdmissionRequest> {
+        Ok(SessionAdmissionRequest::new(
+            SessionId::random(),
+            SessionTarget::TcpStream(SealedHost::Plain(
+                IpOrHost::from_str(host).context("parsing target host")?,
+            )),
+        ))
+    }
+
+    fn service(id: ServiceId) -> SessionAdmissionRequest {
+        SessionAdmissionRequest::new(SessionId::random(), SessionTarget::ExitNode(id))
+    }
+
+    #[tokio::test]
+    async fn a_reactor_with_no_rules_imposes_no_terms() -> anyhow::Result<()> {
+        let decision = reactor_with(vec![]).admit(tcp("example.com:443")?).await?;
+
+        assert_eq!(decision, SessionAdmissionDecision::default());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_target_matching_no_rule_falls_through_to_the_nodes_own_terms() -> anyhow::Result<()> {
+        let reactor = reactor_with(vec![SessionAdmissionRule {
+            enforce_pix: Some(true),
+            ..rule("tcp:*:443")?
+        }]);
+
+        let decision = reactor.admit(tcp("example.com:8080")?).await?;
+
+        assert_eq!(decision, SessionAdmissionDecision::default());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_first_matching_rule_wins_over_a_later_broader_one() -> anyhow::Result<()> {
+        let reactor = reactor_with(vec![
+            SessionAdmissionRule {
+                enforce_pix: Some(false),
+                ..rule("tcp:free.example.com:*")?
+            },
+            SessionAdmissionRule {
+                enforce_pix: Some(true),
+                ..rule("*")?
+            },
+        ]);
+
+        assert_eq!(
+            reactor.admit(tcp("free.example.com:443")?).await?.enforce_pix,
+            Some(false),
+            "the specific rule listed first must win"
+        );
+        assert_eq!(
+            reactor.admit(tcp("paid.example.com:443")?).await?.enforce_pix,
+            Some(true),
+            "anything it does not cover falls to the catch-all"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_rule_states_only_the_terms_it_sets() -> anyhow::Result<()> {
+        let enforce_only = reactor_with(vec![SessionAdmissionRule {
+            enforce_pix: Some(true),
+            ..rule("*")?
+        }])
+        .admit(tcp("example.com:443")?)
+        .await?;
+        assert_eq!(enforce_only.enforce_pix, Some(true));
+        assert!(
+            enforce_only.pix_quota_range.is_none(),
+            "an unset quota must not be invented"
+        );
+
+        let quota_only = reactor_with(vec![SessionAdmissionRule {
+            quota_range_min: Some(10),
+            quota_range_max: Some(20),
+            ..rule("*")?
+        }])
+        .admit(tcp("example.com:443")?)
+        .await?;
+        assert!(quota_only.enforce_pix.is_none());
+        assert_eq!(quota_only.pix_quota_range, Some(10..=20));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn one_open_quota_bound_narrows_only_the_other_end() -> anyhow::Result<()> {
+        let floor_only = reactor_with(vec![SessionAdmissionRule {
+            quota_range_min: Some(10),
+            ..rule("*")?
+        }])
+        .admit(tcp("example.com:443")?)
+        .await?;
+        // The open end saturates, so intersecting it with the node's range leaves that end alone.
+        assert_eq!(floor_only.pix_quota_range, Some(10..=u64::MAX));
+
+        let ceiling_only = reactor_with(vec![SessionAdmissionRule {
+            quota_range_max: Some(20),
+            ..rule("*")?
+        }])
+        .admit(tcp("example.com:443")?)
+        .await?;
+        assert_eq!(ceiling_only.pix_quota_range, Some(u64::MIN..=20));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_service_rule_applies_to_services_and_not_to_streams() -> anyhow::Result<()> {
+        let reactor = reactor_with(vec![SessionAdmissionRule {
+            enforce_pix: Some(false),
+            ..rule("service:0")?
+        }]);
+
+        assert_eq!(
+            reactor.admit(service(SERVICE_ID_LOOPBACK)).await?.enforce_pix,
+            Some(false)
+        );
+        assert_eq!(reactor.admit(service(1)).await?.enforce_pix, None);
+        assert_eq!(reactor.admit(tcp("example.com:443")?).await?.enforce_pix, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_target_that_cannot_be_unsealed_is_denied_rather_than_defaulted() -> anyhow::Result<()> {
+        let reactor = reactor_with(vec![SessionAdmissionRule {
+            enforce_pix: Some(true),
+            ..rule("*")?
+        }]);
+
+        // Sealed to a key that is not this node's, so unsealing cannot succeed. Falling through to
+        // the node's terms here would let a peer skip a rule simply by sealing its target.
+        let request = SessionAdmissionRequest::new(
+            SessionId::random(),
+            SessionTarget::TcpStream(SealedHost::Sealed(vec![1, 2, 3].into_boxed_slice())),
+        );
+
+        assert!(matches!(reactor.admit(request).await, Err(ForwarderError::Denied(_))));
+        Ok(())
+    }
+
+    #[test]
+    fn rules_deserialize_from_configuration() -> anyhow::Result<()> {
+        let cfg: SessionIpForwardingConfig = serde_json::from_str(
+            r#"{
+                "session_admission_rules": [
+                    { "target": "service:0", "enforce_pix": false },
+                    { "target": "tcp:*.example.com:443", "quota_range_min": 340000000 },
+                    { "target": "*", "enforce_pix": true, "quota_range_max": 650000000 }
+                ]
+            }"#,
+        )
+        .context("deserializing forwarding config")?;
+
+        assert_eq!(cfg.session_admission_rules.len(), 3);
+        assert_eq!(cfg.session_admission_rules[0].target.to_string(), "service:0");
+        assert_eq!(cfg.session_admission_rules[1].quota_range_min, Some(340000000));
+        assert_eq!(cfg.session_admission_rules[2].enforce_pix, Some(true));
+        // Absent stanza means no rules, so an existing config keeps its behaviour.
+        assert!(
+            serde_json::from_str::<SessionIpForwardingConfig>("{}")
+                .context("deserializing empty config")?
+                .session_admission_rules
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_rule_whose_quota_bounds_cross_is_rejected_at_load() -> anyhow::Result<()> {
+        let cfg = SessionIpForwardingConfig {
+            session_admission_rules: vec![SessionAdmissionRule {
+                quota_range_min: Some(20),
+                quota_range_max: Some(10),
+                ..rule("*")?
+            }],
+            ..Default::default()
+        };
+
+        assert!(
+            cfg.validate().is_err(),
+            "a range admitting nothing is a typo, not a policy"
+        );
+        Ok(())
     }
 }
