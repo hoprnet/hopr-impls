@@ -116,6 +116,12 @@ pub struct SessionAdmissionRule {
 }
 
 /// Rejects a rule whose quota bounds exclude every quota, which is a typo rather than a policy.
+///
+/// Only the bounds *within* one rule, because the node's own quota range is not part of this
+/// configuration — it lives with the transport that owns the deadlines and reconstructor memory it
+/// implies. A rule that does not overlap that range has the same effect as a crossed one and cannot
+/// be caught here; the transport warns once per Session when the intersection comes out empty,
+/// naming both ranges.
 fn validate_admission_rule_quota(rule: &SessionAdmissionRule) -> Result<(), validator::ValidationError> {
     if let (Some(min), Some(max)) = (rule.quota_range_min, rule.quota_range_max)
         && min > max

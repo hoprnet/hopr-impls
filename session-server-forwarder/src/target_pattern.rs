@@ -142,12 +142,14 @@ impl HostPattern {
     fn matches(&self, host: &IpOrHost) -> bool {
         match (self, host) {
             (HostPattern::Any, _) => true,
-            (HostPattern::Name(wanted), IpOrHost::Dns(name, _)) => wanted.eq_ignore_ascii_case(name),
-            (HostPattern::Subdomain(suffix), IpOrHost::Dns(name, _)) => name
-                .len()
-                .checked_sub(suffix.len())
-                .and_then(|split| split.checked_sub(1))
-                .is_some_and(|dot| name.as_bytes()[dot] == b'.' && suffix.eq_ignore_ascii_case(&name[dot + 1..])),
+            (HostPattern::Name(wanted), IpOrHost::Dns(name, _)) => wanted.eq_ignore_ascii_case(without_root_dot(name)),
+            (HostPattern::Subdomain(suffix), IpOrHost::Dns(name, _)) => {
+                let name = without_root_dot(name);
+                name.len()
+                    .checked_sub(suffix.len())
+                    .and_then(|split| split.checked_sub(1))
+                    .is_some_and(|dot| name.as_bytes()[dot] == b'.' && suffix.eq_ignore_ascii_case(&name[dot + 1..]))
+            }
             (HostPattern::Address(wanted), IpOrHost::Ip(addr)) => *wanted == addr.ip(),
             (HostPattern::Network(net), IpOrHost::Ip(addr)) => net.contains(&addr.ip()),
             // A name pattern against an address, or an address pattern against a name.
@@ -155,6 +157,47 @@ impl HostPattern {
             | (HostPattern::Address(_) | HostPattern::Network(_), IpOrHost::Dns(..)) => false,
         }
     }
+}
+
+/// Drops one trailing DNS root dot.
+///
+/// `example.com.` and `example.com` name the same host and resolve alike, so a rule has to price
+/// them alike. Comparing them literally would let a peer pick the spelling the rule does not match,
+/// fall through to the node's default terms, and reach the very same target — and the peer chooses
+/// the spelling, so the bypass would be theirs to take.
+fn without_root_dot(name: &str) -> &str {
+    name.strip_suffix('.').unwrap_or(name)
+}
+
+/// Puts a name written in a pattern into the form [`HostPattern`] compares against, rejecting what
+/// no DNS name can equal.
+///
+/// The rejection matters more than it looks. A host that reaches here is otherwise taken as a
+/// literal name, so `*example.com` (a missing dot) or `ex ample.com` (a stray space) parses happily
+/// and then matches nothing — and a rule that matches nothing is not inert, it drops its whole class
+/// back to the node's default terms. For a rule written to *demand* payment that fails open, and
+/// silently. The parser already rejects a bad port and a bad CIDR block loudly; a name that cannot
+/// be a name deserves the same.
+fn dns_name(pattern: &str, name: &str) -> Result<String, InvalidTargetPattern> {
+    let name = without_root_dot(name);
+
+    if name.is_empty() {
+        return Err(InvalidTargetPattern::new(pattern, "empty host name"));
+    }
+
+    // Punycode has already folded internationalized names into this set by the time anyone writes
+    // one down, and `_` is here for the underscore labels that service records use.
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_'))
+    {
+        return Err(InvalidTargetPattern::new(
+            pattern,
+            format!("'{name}' is not a DNS name; a wildcard label is written '*.'"),
+        ));
+    }
+
+    Ok(name.to_ascii_lowercase())
 }
 
 /// A [`SessionTarget`] with its host opened, which is the form rules are matched against.
@@ -245,10 +288,7 @@ impl FromStr for TargetPattern {
         let host = if host == "*" {
             HostPattern::Any
         } else if let Some(suffix) = host.strip_prefix("*.") {
-            if suffix.is_empty() {
-                return Err(InvalidTargetPattern::new(pattern, "'*.' needs a name to suffix"));
-            }
-            HostPattern::Subdomain(suffix.to_ascii_lowercase())
+            HostPattern::Subdomain(dns_name(pattern, suffix)?)
         } else if host.contains('/') {
             HostPattern::Network(
                 host.parse()
@@ -263,10 +303,8 @@ impl FromStr for TargetPattern {
             )
         } else if let Ok(address) = host.parse() {
             HostPattern::Address(address)
-        } else if host.is_empty() {
-            return Err(InvalidTargetPattern::new(pattern, "empty host"));
         } else {
-            HostPattern::Name(host.to_ascii_lowercase())
+            HostPattern::Name(dns_name(pattern, host)?)
         };
 
         Ok(TargetPattern::Stream { protocol, host, port })
@@ -408,6 +446,27 @@ mod tests {
         Ok(())
     }
 
+    /// The peer chooses how it spells the name, so the two spellings of one host must price alike —
+    /// otherwise the fully qualified form is a way to miss the rule and get the node's default terms.
+    #[test]
+    fn a_fully_qualified_name_is_the_same_host_as_the_bare_one() -> anyhow::Result<()> {
+        let exact = parse("tcp:example.com:443")?;
+        assert!(exact.matches(&dns("example.com.", 443)), "peer wrote the root dot");
+        assert!(
+            parse("tcp:example.com.:443")?.matches(&dns("example.com", 443)),
+            "operator wrote the root dot"
+        );
+        assert_eq!(parse("tcp:example.com.:443")?, exact, "and they are one pattern");
+
+        let subdomain = parse("tcp:*.example.com:*")?;
+        assert!(subdomain.matches(&dns("a.example.com.", 443)));
+        assert!(parse("tcp:*.example.com.:*")?.matches(&dns("a.example.com", 443)));
+        // The exclusions survive normalization: the bare name is still not its own subdomain.
+        assert!(!subdomain.matches(&dns("example.com.", 443)));
+        assert!(!subdomain.matches(&dns("notexample.com.", 443)));
+        Ok(())
+    }
+
     #[test]
     fn names_and_addresses_never_match_each_others_patterns() -> anyhow::Result<()> {
         assert!(!parse("tcp:*.example.com:*")?.matches(&ip("10.0.0.1:443", IpProtocol::TCP)?));
@@ -451,6 +510,18 @@ mod tests {
             "tcp::443",
             "service:nine",
             "tcp:10.0.0.0/99:*",
+            // A name no `IpOrHost::Dns` can equal matches nothing, and a rule that matches nothing
+            // hands its class back to the node's default terms — the permissive direction, so these
+            // have to fail at load rather than at midnight.
+            "tcp:*example.com:443",
+            "tcp:ex ample.com:443",
+            "tcp:exam!ple.com:443",
+            // Neither a bracketed literal, a parsable address, nor a network: the colon is what the
+            // two-ended split leaves behind, not a host anyone meant to write.
+            "tcp:a:b:c:443",
+            // A bare root dot names nothing once normalized.
+            "tcp:.:443",
+            "tcp:*..:443",
         ] {
             assert!(
                 pattern.parse::<TargetPattern>().is_err(),

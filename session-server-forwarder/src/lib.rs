@@ -123,7 +123,12 @@ where
     type Error = ForwarderError;
     type Session = IncomingSession<S>;
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    // `skip_all` rather than `skip(self)`: the remaining argument would otherwise be formatted with
+    // `Debug` into every span, and for a `SealedHost::Plain` target that puts the host the peer asked
+    // for next to its session id in the log. This is an exit node in a privacy network, and that
+    // association is the linkage the network exists to avoid — the node has to learn the target to
+    // forward to it, but it need not persist the pair into whatever sink is configured.
+    #[tracing::instrument(level = "debug", skip_all, fields(session_id = ?request.session_id))]
     async fn admit(&self, request: SessionAdmissionRequest) -> Result<SessionAdmissionDecision, ForwarderError> {
         // Nothing to say about any target, so skip the unsealing entirely: with no rules configured
         // this hook costs a match and a return.
@@ -174,9 +179,10 @@ where
             capabilities = format!("{:#010b}", request.capabilities),
             // What the peer asked for, beside what it is being given: an operator tuning a rule
             // needs both, and the offer is the only half that is not already in the config file.
-            offered_quota_per_ssa = ?request.offered.map(|offer| offer.quota_per_ssa),
+            offered_quota_per_ssa = ?request.offered.as_ref().map(|offer| offer.quota_per_ssa),
             offered_dimensions = ?request
                 .offered
+                .as_ref()
                 .map(|offer| (offer.parts_per_ssa, offer.shares_per_part, offer.surplus_shares)),
             enforce_pix = ?decision.enforce_pix,
             quota_range = ?decision.pix_quota_range,
@@ -458,6 +464,16 @@ mod tests {
         ))
     }
 
+    fn udp(host: &str) -> anyhow::Result<SessionAdmissionRequest> {
+        Ok(SessionAdmissionRequest::new(
+            SessionId::random(),
+            SessionTarget::UdpStream(SealedHost::Plain(
+                IpOrHost::from_str(host).context("parsing target host")?,
+            )),
+            0,
+        ))
+    }
+
     fn service(id: ServiceId) -> SessionAdmissionRequest {
         SessionAdmissionRequest::new(SessionId::random(), SessionTarget::ExitNode(id), 0)
     }
@@ -467,6 +483,42 @@ mod tests {
         let decision = reactor_with(vec![]).admit(tcp("example.com:443")?).await?;
 
         assert_eq!(decision, SessionAdmissionDecision::default());
+        Ok(())
+    }
+
+    /// `UnsealedTarget::new` is the only place the wire's two stream variants become an
+    /// [`IpProtocol`](hopr_utils::network_types::prelude::IpProtocol), and the pattern tests build
+    /// `UnsealedTarget` directly — so nothing else would notice the two arms being transposed, and a
+    /// transposition misprices every UDP Session.
+    #[tokio::test]
+    async fn a_protocol_rule_tells_the_two_stream_kinds_apart() -> anyhow::Result<()> {
+        let udp_only = reactor_with(vec![SessionAdmissionRule {
+            enforce_pix: Some(true),
+            ..rule("udp:*:*")?
+        }]);
+
+        assert_eq!(
+            udp_only.admit(udp("example.com:53")?).await?.enforce_pix,
+            Some(true),
+            "a UDP rule must catch a UDP target"
+        );
+        assert_eq!(
+            udp_only.admit(tcp("example.com:53")?).await?,
+            SessionAdmissionDecision::default(),
+            "and must not catch the TCP target at the same host and port"
+        );
+
+        // The other direction, so that a transposition cannot pass by being wrong both ways.
+        let tcp_only = reactor_with(vec![SessionAdmissionRule {
+            enforce_pix: Some(true),
+            ..rule("tcp:*:*")?
+        }]);
+
+        assert_eq!(tcp_only.admit(tcp("example.com:53")?).await?.enforce_pix, Some(true));
+        assert_eq!(
+            tcp_only.admit(udp("example.com:53")?).await?,
+            SessionAdmissionDecision::default()
+        );
         Ok(())
     }
 
