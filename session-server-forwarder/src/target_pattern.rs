@@ -24,7 +24,7 @@ use std::{
     str::FromStr,
 };
 
-use hopr_utils::network_types::prelude::{IpOrHost, ServiceId, SessionTarget};
+use hopr_utils::network_types::prelude::{IpOrHost, IpProtocol, ServiceId, SessionTarget};
 
 /// Error produced when a [`TargetPattern`] cannot be parsed.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -50,10 +50,8 @@ impl InvalidTargetPattern {
 pub enum ProtocolPattern {
     /// Either transport.
     Any,
-    /// TCP only.
-    Tcp,
-    /// UDP only.
-    Udp,
+    /// That transport only.
+    Only(IpProtocol),
 }
 
 /// Which host a stream pattern selects.
@@ -123,11 +121,10 @@ impl TargetPattern {
 }
 
 impl ProtocolPattern {
-    fn matches(self, protocol: StreamProtocol) -> bool {
+    fn matches(self, protocol: IpProtocol) -> bool {
         match self {
             ProtocolPattern::Any => true,
-            ProtocolPattern::Tcp => protocol == StreamProtocol::Tcp,
-            ProtocolPattern::Udp => protocol == StreamProtocol::Udp,
+            ProtocolPattern::Only(wanted) => wanted == protocol,
         }
     }
 }
@@ -160,22 +157,13 @@ impl HostPattern {
     }
 }
 
-/// Which transport an [`UnsealedTarget`] is forwarded over.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StreamProtocol {
-    /// TCP.
-    Tcp,
-    /// UDP.
-    Udp,
-}
-
 /// A [`SessionTarget`] with its host opened, which is the form rules are matched against.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnsealedTarget {
     /// A forwarded TCP or UDP stream.
     Stream {
         /// The transport it is forwarded over.
-        protocol: StreamProtocol,
+        protocol: IpProtocol,
         /// The host it is forwarded to, unsealed.
         host: IpOrHost,
     },
@@ -192,8 +180,8 @@ impl UnsealedTarget {
         keypair: &hopr_api::types::crypto::prelude::OffchainKeypair,
     ) -> Result<Self, hopr_utils::network_types::errors::NetworkTypeError> {
         let (protocol, sealed) = match target {
-            SessionTarget::TcpStream(host) => (StreamProtocol::Tcp, host),
-            SessionTarget::UdpStream(host) => (StreamProtocol::Udp, host),
+            SessionTarget::TcpStream(host) => (IpProtocol::TCP, host),
+            SessionTarget::UdpStream(host) => (IpProtocol::UDP, host),
             SessionTarget::ExitNode(id) => return Ok(UnsealedTarget::Service(*id)),
         };
 
@@ -232,14 +220,13 @@ impl FromStr for TargetPattern {
 
         let protocol = match protocol {
             "*" => ProtocolPattern::Any,
-            p if p.eq_ignore_ascii_case("tcp") => ProtocolPattern::Tcp,
-            p if p.eq_ignore_ascii_case("udp") => ProtocolPattern::Udp,
-            other => {
-                return Err(InvalidTargetPattern::new(
+            // `IpProtocol`'s own parser is case-insensitive, so `TCP` and `tcp` are one pattern.
+            other => ProtocolPattern::Only(other.parse().map_err(|_| {
+                InvalidTargetPattern::new(
                     pattern,
                     format!("unknown protocol '{other}', expected 'tcp', 'udp', 'service' or '*'"),
-                ));
-            }
+                )
+            })?),
         };
 
         let (host, port) = rest
@@ -295,8 +282,8 @@ impl Display for TargetPattern {
             TargetPattern::Stream { protocol, host, port } => {
                 match protocol {
                     ProtocolPattern::Any => write!(f, "*:")?,
-                    ProtocolPattern::Tcp => write!(f, "tcp:")?,
-                    ProtocolPattern::Udp => write!(f, "udp:")?,
+                    // `IpProtocol` renders lowercase, which is the form the parser reads back.
+                    ProtocolPattern::Only(protocol) => write!(f, "{protocol}:")?,
                 }
                 match host {
                     HostPattern::Any => write!(f, "*")?,
@@ -323,12 +310,12 @@ mod tests {
 
     fn dns(name: &str, port: u16) -> UnsealedTarget {
         UnsealedTarget::Stream {
-            protocol: StreamProtocol::Tcp,
+            protocol: IpProtocol::TCP,
             host: IpOrHost::Dns(name.into(), port),
         }
     }
 
-    fn ip(addr: &str, protocol: StreamProtocol) -> anyhow::Result<UnsealedTarget> {
+    fn ip(addr: &str, protocol: IpProtocol) -> anyhow::Result<UnsealedTarget> {
         Ok(UnsealedTarget::Stream {
             protocol,
             host: IpOrHost::Ip(addr.parse().context("parsing socket address")?),
@@ -363,7 +350,7 @@ mod tests {
     fn the_catch_all_matches_streams_and_services_alike() -> anyhow::Result<()> {
         let any = parse("*")?;
         assert!(any.matches(&dns("example.com", 443)));
-        assert!(any.matches(&ip("10.1.2.3:80", StreamProtocol::Udp)?));
+        assert!(any.matches(&ip("10.1.2.3:80", IpProtocol::UDP)?));
         assert!(any.matches(&UnsealedTarget::Service(0)));
         Ok(())
     }
@@ -386,13 +373,21 @@ mod tests {
         assert!(tcp_443.matches(&dns("example.com", 443)));
         assert!(!tcp_443.matches(&dns("example.com", 80)));
         assert!(!tcp_443.matches(&UnsealedTarget::Stream {
-            protocol: StreamProtocol::Udp,
+            protocol: IpProtocol::UDP,
             host: IpOrHost::Dns("example.com".into(), 443),
         }));
 
         let any_proto_53 = parse("*:*:53")?;
-        assert!(any_proto_53.matches(&ip("1.1.1.1:53", StreamProtocol::Udp)?));
-        assert!(any_proto_53.matches(&ip("1.1.1.1:53", StreamProtocol::Tcp)?));
+        assert!(any_proto_53.matches(&ip("1.1.1.1:53", IpProtocol::UDP)?));
+        assert!(any_proto_53.matches(&ip("1.1.1.1:53", IpProtocol::TCP)?));
+        Ok(())
+    }
+
+    /// The protocol is spelled however the operator spelled it, and normalizes on the way back out.
+    #[test]
+    fn the_protocol_is_read_case_insensitively() -> anyhow::Result<()> {
+        assert_eq!(parse("TCP:example.com:443")?, parse("tcp:example.com:443")?);
+        assert_eq!(parse("Udp:*:53")?.to_string(), "udp:*:53");
         Ok(())
     }
 
@@ -415,8 +410,8 @@ mod tests {
 
     #[test]
     fn names_and_addresses_never_match_each_others_patterns() -> anyhow::Result<()> {
-        assert!(!parse("tcp:*.example.com:*")?.matches(&ip("10.0.0.1:443", StreamProtocol::Tcp)?));
-        assert!(!parse("tcp:example.com:443")?.matches(&ip("10.0.0.1:443", StreamProtocol::Tcp)?));
+        assert!(!parse("tcp:*.example.com:*")?.matches(&ip("10.0.0.1:443", IpProtocol::TCP)?));
+        assert!(!parse("tcp:example.com:443")?.matches(&ip("10.0.0.1:443", IpProtocol::TCP)?));
         assert!(!parse("tcp:10.0.0.0/8:*")?.matches(&dns("example.com", 443)));
         assert!(!parse("tcp:10.0.0.1:443")?.matches(&dns("10.0.0.1", 443)));
         Ok(())
@@ -425,21 +420,21 @@ mod tests {
     #[test]
     fn a_network_pattern_matches_inside_the_block_only() -> anyhow::Result<()> {
         let private = parse("udp:10.0.0.0/8:*")?;
-        assert!(private.matches(&ip("10.1.2.3:53", StreamProtocol::Udp)?));
-        assert!(private.matches(&ip("10.255.255.255:1", StreamProtocol::Udp)?));
-        assert!(!private.matches(&ip("11.0.0.1:53", StreamProtocol::Udp)?));
+        assert!(private.matches(&ip("10.1.2.3:53", IpProtocol::UDP)?));
+        assert!(private.matches(&ip("10.255.255.255:1", IpProtocol::UDP)?));
+        assert!(!private.matches(&ip("11.0.0.1:53", IpProtocol::UDP)?));
 
         let v6 = parse("tcp:2001:db8::/32:*")?;
-        assert!(v6.matches(&ip("[2001:db8::1]:443", StreamProtocol::Tcp)?));
-        assert!(!v6.matches(&ip("[2001:db9::1]:443", StreamProtocol::Tcp)?));
+        assert!(v6.matches(&ip("[2001:db8::1]:443", IpProtocol::TCP)?));
+        assert!(!v6.matches(&ip("[2001:db9::1]:443", IpProtocol::TCP)?));
         Ok(())
     }
 
     #[test]
     fn a_bracketed_v6_literal_matches_that_address_alone() -> anyhow::Result<()> {
         let pattern = parse("tcp:[2001:db8::1]:443")?;
-        assert!(pattern.matches(&ip("[2001:db8::1]:443", StreamProtocol::Tcp)?));
-        assert!(!pattern.matches(&ip("[2001:db8::2]:443", StreamProtocol::Tcp)?));
+        assert!(pattern.matches(&ip("[2001:db8::1]:443", IpProtocol::TCP)?));
+        assert!(!pattern.matches(&ip("[2001:db8::2]:443", IpProtocol::TCP)?));
         Ok(())
     }
 
