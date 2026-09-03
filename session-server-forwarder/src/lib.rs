@@ -171,6 +171,13 @@ where
         tracing::debug!(
             session_id = ?request.session_id,
             rule = %rule.target,
+            capabilities = format!("{:#010b}", request.capabilities),
+            // What the peer asked for, beside what it is being given: an operator tuning a rule
+            // needs both, and the offer is the only half that is not already in the config file.
+            offered_quota_per_ssa = ?request.offered.map(|offer| offer.quota_per_ssa),
+            offered_dimensions = ?request
+                .offered
+                .map(|offer| (offer.parts_per_ssa, offer.shares_per_part, offer.surplus_shares)),
             enforce_pix = ?decision.enforce_pix,
             quota_range = ?decision.pix_quota_range,
             "admitting session on the matched rule's terms"
@@ -441,16 +448,18 @@ mod tests {
     }
 
     fn tcp(host: &str) -> anyhow::Result<SessionAdmissionRequest> {
+        // Rules match on the target, so the capability bits are immaterial to these tests.
         Ok(SessionAdmissionRequest::new(
             SessionId::random(),
             SessionTarget::TcpStream(SealedHost::Plain(
                 IpOrHost::from_str(host).context("parsing target host")?,
             )),
+            0,
         ))
     }
 
     fn service(id: ServiceId) -> SessionAdmissionRequest {
-        SessionAdmissionRequest::new(SessionId::random(), SessionTarget::ExitNode(id))
+        SessionAdmissionRequest::new(SessionId::random(), SessionTarget::ExitNode(id), 0)
     }
 
     #[tokio::test]
@@ -575,6 +584,7 @@ mod tests {
         let request = SessionAdmissionRequest::new(
             SessionId::random(),
             SessionTarget::TcpStream(SealedHost::Sealed(vec![1, 2, 3].into_boxed_slice())),
+            0,
         );
 
         assert!(matches!(reactor.admit(request).await, Err(ForwarderError::Denied(_))));
