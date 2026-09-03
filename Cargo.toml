@@ -66,6 +66,7 @@ hex-literal = "1.1.0"
 humantime-serde = "1.1.1"
 indexmap = { version = "2.14.1" }
 insta = { version = "1.48.0", features = ["redactions", "yaml"] }
+ipnet = "2.12.1"
 lazy_static = "1.5.0"
 libp2p = { version = "0.56.0", default-features = false }
 libp2p-stream = { version = "0.4.0-alpha" }
@@ -101,3 +102,11 @@ tokio = { version = "1.53.1", features = [
 tokio-retry = "0.3.2"
 tracing = { version = "0.1.44", features = ["release_max_level_debug"] }
 validator = { version = "0.21.0", features = ["derive"] }
+
+# Temporary, for the duration of hoprnet/hoprnet#8376: `HoprSessionServer::admit` is not published
+# yet. A `[patch]` rather than a git dependency because `hopr-api` also reaches this workspace
+# through `hopr-chain-connector` and `hopr-network-graph`; a git dep would leave two distinct
+# `hopr-api` packages in the graph whose traits do not unify. Pinned by `rev` rather than by
+# branch so the resolved commit cannot move under CI. Reverted once 4.3.0 is on crates.io.
+[patch.crates-io]
+hopr-api = { git = "https://github.com/hoprnet/hopr-api", rev = "8818e6ca00ffa3618b002b97ce004c6deca426a3" }
