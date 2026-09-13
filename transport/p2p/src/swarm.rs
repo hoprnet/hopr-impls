@@ -32,8 +32,56 @@ lazy_static::lazy_static! {
          hopr_api::types::telemetry::SimpleGauge::new("hopr_network_health", "Connectivity health indicator").unwrap();
 }
 
+#[cfg(all(feature = "insecure-plaintext", feature = "transport-quic"))]
+compile_error!(
+    "features `insecure-plaintext` and `transport-quic` are mutually exclusive: QUIC has no \
+     unencrypted mode, so a node built with both would still exchange packets no observer can \
+     read. Build the diagnostic node with `--no-default-features` plus `insecure-plaintext`."
+);
+
 pub struct InactiveNetwork {
     swarm: libp2p::Swarm<HoprNetworkBehavior>,
+}
+
+/// Connection security upgrade offered on TCP connections.
+///
+/// Normally `noise` — the only thing a production node ever negotiates. Under the
+/// `insecure-plaintext` feature this becomes `/plaintext/2.0.0`, which performs the peer-identity
+/// exchange and then hands the raw stream to the multiplexer with no encryption at all.
+///
+/// # Why this exists
+///
+/// HOPR's own onion encryption is what a protocol debugger wants to see, and it sits *under* the
+/// transport's encryption. With `noise` in the way, a packet capture of a node's traffic is
+/// uniformly random bytes even to someone holding every node's `OffchainKeypair`, because the
+/// noise session keys are ephemeral and never leave the process. Removing that one layer makes a
+/// local cluster's traffic dissectable end to end (see the `hopr-wireshark` dissector), without
+/// touching the HOPR layer the dissection is about.
+///
+/// # This is not a production configuration
+///
+/// A node built this way exchanges every packet — tickets, acknowledgements, SURBs, session
+/// payloads — in a form any on-path observer can read, and offers no protection against an active
+/// attacker rewriting them. It is for a local cluster on loopback and nothing else. The feature is
+/// off by default, cannot be combined with QUIC (see above), and the node logs a warning on every
+/// start.
+#[cfg(all(feature = "runtime-tokio", not(feature = "insecure-plaintext")))]
+fn security_upgrade(
+    keypair: &libp2p::identity::Keypair,
+) -> std::result::Result<libp2p::noise::Config, libp2p::noise::Error> {
+    libp2p::noise::Config::new(keypair)
+}
+
+#[cfg(all(feature = "runtime-tokio", feature = "insecure-plaintext"))]
+fn security_upgrade(
+    keypair: &libp2p::identity::Keypair,
+) -> std::result::Result<libp2p::plaintext::Config, std::convert::Infallible> {
+    warn!(
+        "SECURITY: this node was built with the `insecure-plaintext` feature and negotiates \
+         /plaintext/2.0.0 instead of noise. All p2p traffic, including tickets and session \
+         payloads, is readable by anyone on the path. Never run this on a real network."
+    );
+    Ok(libp2p::plaintext::Config::new(keypair))
 }
 
 #[cfg(any(feature = "testing", target_os = "android", target_os = "ios"))]
@@ -59,13 +107,18 @@ impl InactiveNetwork {
             .with_tokio()
             .with_tcp(
                 libp2p::tcp::Config::default().nodelay(true),
-                libp2p::noise::Config::new,
+                security_upgrade,
                 // use default yamux configuration to enable auto-tuning
                 // see https://github.com/libp2p/rust-libp2p/pull/4970
                 libp2p::yamux::Config::default,
             )
             .map_err(|e| crate::errors::P2PError::Libp2p(e.to_string()))?;
 
+        // QUIC encrypts inside the transport with TLS 1.3 and offers no plaintext mode, so a
+        // `insecure-plaintext` build that still dialled QUIC would produce connections the
+        // observer the feature exists for cannot read. The features are mutually exclusive at
+        // the top of this file rather than here, so the contradiction is a compile error rather
+        // than a capture that silently comes back empty.
         #[cfg(feature = "transport-quic")]
         let swarm = swarm.with_quic();
 

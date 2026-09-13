@@ -17,11 +17,17 @@ version                = "0.11.0"
 crate-type = ["rlib"]
 
 [features]
-default        = []
-runtime-tokio  = ["libp2p/tokio"]
-telemetry      = ["dep:lazy_static", "hopr-api/types-telemetry"]
-testing        = []
-transport-quic = ["dep:quinn-udp", "libp2p/quic"]
+default = []
+# Negotiates `/plaintext/2.0.0` instead of `noise`, leaving p2p traffic unencrypted on the wire.
+#
+# Diagnostic only — it exists so a local cluster's HOPR-layer traffic can be dissected from a
+# packet capture. Mutually exclusive with `transport-quic`, and rejected at compile time when both
+# are on. See `swarm::security_upgrade` for the full rationale and warning.
+insecure-plaintext = ["libp2p/plaintext"]
+runtime-tokio      = ["libp2p/tokio"]
+telemetry          = ["dep:lazy_static", "hopr-api/types-telemetry"]
+testing            = []
+transport-quic     = ["dep:quinn-udp", "libp2p/quic"]
 
 [dependencies]
 async-broadcast = { workspace = true }
