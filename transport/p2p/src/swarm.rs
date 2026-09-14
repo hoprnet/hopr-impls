@@ -51,12 +51,13 @@ pub struct InactiveNetwork {
 /// local cluster's traffic dissectable end to end (see the `hopr-wireshark` dissector), without
 /// touching the HOPR layer the dissection is about.
 ///
-/// # Scope
+/// # `transport-quic` takes precedence
 ///
-/// This is the TCP security upgrade and nothing else. QUIC encrypts inside the transport with
-/// TLS 1.3 and has no unencrypted mode, so a node with both compiled in is observable over TCP
-/// only — it is not misconfigured, but a capture of its QUIC traffic stays unreadable. It warns
-/// about that on start, because the announced address decides which one a peer actually uses.
+/// Enabling `transport-quic` as well leaves the node on `noise`, as though `insecure-plaintext`
+/// had not been asked for. The feature exists to make a capture readable, and QUIC's TLS 1.3 is
+/// part of the transport with no unencrypted mode — so a node that can reach for QUIC cannot be
+/// read whatever TCP does, and giving up TCP's encryption would buy nothing in exchange. Rather
+/// than reject the build, the node reports on start that the feature was overridden.
 ///
 /// # This is not a production configuration
 ///
@@ -64,30 +65,37 @@ pub struct InactiveNetwork {
 /// payloads — in a form any on-path observer can read, and offers no protection against an active
 /// attacker rewriting them. It is for a local cluster on loopback and nothing else. The feature is
 /// off by default and the node logs a warning on every start.
-#[cfg(all(feature = "runtime-tokio", not(feature = "insecure-plaintext")))]
+#[cfg(all(
+    feature = "runtime-tokio",
+    any(not(feature = "insecure-plaintext"), feature = "transport-quic")
+))]
 fn security_upgrade(
     keypair: &libp2p::identity::Keypair,
 ) -> std::result::Result<libp2p::noise::Config, libp2p::noise::Error> {
+    // Reached only when both features are on. Silently ignoring one of them would look like the
+    // dissector was broken rather than the build being wrong for it.
+    #[cfg(feature = "insecure-plaintext")]
+    warn!(
+        "`insecure-plaintext` was requested but is overridden by `transport-quic`, and this node negotiates noise as \
+         usual. QUIC has no unencrypted mode, so unencrypting TCP could not have made this node readable anyway. \
+         Rebuild without `transport-quic` if a readable capture is what you wanted."
+    );
+
     libp2p::noise::Config::new(keypair)
 }
 
-#[cfg(all(feature = "runtime-tokio", feature = "insecure-plaintext"))]
+#[cfg(all(
+    feature = "runtime-tokio",
+    feature = "insecure-plaintext",
+    not(feature = "transport-quic")
+))]
 fn security_upgrade(
     keypair: &libp2p::identity::Keypair,
 ) -> std::result::Result<libp2p::plaintext::Config, std::convert::Infallible> {
     warn!(
         "SECURITY: this node was built with the `insecure-plaintext` feature and negotiates /plaintext/2.0.0 instead \
-         of noise. All TCP p2p traffic, including tickets and session payloads, is readable by anyone on the path. \
-         Never run this on a real network."
-    );
-
-    // QUIC's TLS 1.3 is inside the transport and cannot be turned off, so this feature does not
-    // reach it. Worth saying out loud: the failure mode is a capture that comes back empty for no
-    // visible reason, and the fix is to announce a TCP address.
-    #[cfg(feature = "transport-quic")]
-    warn!(
-        "This node also has QUIC compiled in, which is unaffected by `insecure-plaintext` and stays encrypted. Only \
-         its TCP connections can be observed, so make sure it announces a TCP address."
+         of noise. All p2p traffic, including tickets and session payloads, is readable by anyone on the path. Never \
+         run this on a real network."
     );
 
     Ok(libp2p::plaintext::Config::new(keypair))
@@ -123,8 +131,9 @@ impl InactiveNetwork {
             )
             .map_err(|e| crate::errors::P2PError::Libp2p(e.to_string()))?;
 
-        // Unaffected by `insecure-plaintext`: QUIC's TLS 1.3 is part of the transport and has no
-        // unencrypted mode. See `security_upgrade`.
+        // QUIC's TLS 1.3 is part of the transport and has no unencrypted mode, which is why
+        // enabling this overrides `insecure-plaintext` rather than combining with it. See
+        // `security_upgrade`.
         #[cfg(feature = "transport-quic")]
         let swarm = swarm.with_quic();
 
@@ -528,6 +537,50 @@ mod tests {
                 .name_servers()
                 .iter()
                 .any(|server| server.socket_addr.ip() == IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)))
+        );
+    }
+
+    /// The protocol the TCP security upgrade actually offers, for whichever feature set this was
+    /// compiled with. Asking the upgrade itself rather than reading the `cfg` cascade back, so a
+    /// cascade that resolves the wrong way is a test failure instead of a silent one.
+    #[cfg(feature = "runtime-tokio")]
+    fn offered_tcp_protocol() -> &'static str {
+        use libp2p::core::upgrade::UpgradeInfo;
+
+        let keypair = libp2p::identity::Keypair::generate_ed25519();
+        let config = super::security_upgrade(&keypair).expect("the security upgrade should build");
+
+        config.protocol_info().next().expect("an upgrade offers a protocol")
+    }
+
+    #[test]
+    #[cfg(all(feature = "runtime-tokio", not(feature = "insecure-plaintext")))]
+    fn tcp_negotiates_noise_by_default() {
+        assert_eq!(offered_tcp_protocol(), "/noise");
+    }
+
+    #[test]
+    #[cfg(all(
+        feature = "runtime-tokio",
+        feature = "insecure-plaintext",
+        not(feature = "transport-quic")
+    ))]
+    fn insecure_plaintext_gives_up_tcp_encryption() {
+        assert_eq!(offered_tcp_protocol(), "/plaintext/2.0.0");
+    }
+
+    #[test]
+    #[cfg(all(
+        feature = "runtime-tokio",
+        feature = "insecure-plaintext",
+        feature = "transport-quic"
+    ))]
+    fn transport_quic_overrides_insecure_plaintext() {
+        assert_eq!(
+            offered_tcp_protocol(),
+            "/noise",
+            "`transport-quic` takes precedence over `insecure-plaintext`: QUIC cannot be observed either way, so a \
+             node that has it keeps TCP encrypted rather than giving that up for nothing"
         );
     }
 }
