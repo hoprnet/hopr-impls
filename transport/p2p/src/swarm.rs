@@ -34,9 +34,9 @@ lazy_static::lazy_static! {
 
 #[cfg(all(feature = "insecure-plaintext", feature = "transport-quic"))]
 compile_error!(
-    "features `insecure-plaintext` and `transport-quic` are mutually exclusive: QUIC has no \
-     unencrypted mode, so a node built with both would still exchange packets no observer can \
-     read. Build the diagnostic node with `--no-default-features` plus `insecure-plaintext`."
+    "features `insecure-plaintext` and `transport-quic` are mutually exclusive: QUIC has no unencrypted mode, so a \
+     node built with both would still exchange packets no observer can read. Build the diagnostic node with \
+     `--no-default-features` plus `insecure-plaintext`."
 );
 
 pub struct InactiveNetwork {
@@ -77,9 +77,9 @@ fn security_upgrade(
     keypair: &libp2p::identity::Keypair,
 ) -> std::result::Result<libp2p::plaintext::Config, std::convert::Infallible> {
     warn!(
-        "SECURITY: this node was built with the `insecure-plaintext` feature and negotiates \
-         /plaintext/2.0.0 instead of noise. All p2p traffic, including tickets and session \
-         payloads, is readable by anyone on the path. Never run this on a real network."
+        "SECURITY: this node was built with the `insecure-plaintext` feature and negotiates /plaintext/2.0.0 instead \
+         of noise. All p2p traffic, including tickets and session payloads, is readable by anyone on the path. Never \
+         run this on a real network."
     );
     Ok(libp2p::plaintext::Config::new(keypair))
 }
