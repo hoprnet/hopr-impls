@@ -18,7 +18,8 @@ crate-type = ["rlib"]
 
 [features]
 default = []
-# Negotiates `/plaintext/2.0.0` instead of `noise`, leaving p2p traffic unencrypted on the wire.
+# Negotiates `/plaintext/2.0.0` instead of `noise`, leaving TCP traffic unencrypted on the wire.
+# Diagnostic only. QUIC is unaffected and stays encrypted.
 insecure-plaintext = ["libp2p/plaintext"]
 runtime-tokio      = ["libp2p/tokio"]
 telemetry          = ["dep:lazy_static", "hopr-api/types-telemetry"]

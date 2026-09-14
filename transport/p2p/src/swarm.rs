@@ -32,13 +32,6 @@ lazy_static::lazy_static! {
          hopr_api::types::telemetry::SimpleGauge::new("hopr_network_health", "Connectivity health indicator").unwrap();
 }
 
-#[cfg(all(feature = "insecure-plaintext", feature = "transport-quic"))]
-compile_error!(
-    "features `insecure-plaintext` and `transport-quic` are mutually exclusive: QUIC has no unencrypted mode, so a \
-     node built with both would still exchange packets no observer can read. Build the diagnostic node with \
-     `--no-default-features` plus `insecure-plaintext`."
-);
-
 pub struct InactiveNetwork {
     swarm: libp2p::Swarm<HoprNetworkBehavior>,
 }
@@ -58,13 +51,19 @@ pub struct InactiveNetwork {
 /// local cluster's traffic dissectable end to end (see the `hopr-wireshark` dissector), without
 /// touching the HOPR layer the dissection is about.
 ///
+/// # Scope
+///
+/// This is the TCP security upgrade and nothing else. QUIC encrypts inside the transport with
+/// TLS 1.3 and has no unencrypted mode, so a node with both compiled in is observable over TCP
+/// only — it is not misconfigured, but a capture of its QUIC traffic stays unreadable. It warns
+/// about that on start, because the announced address decides which one a peer actually uses.
+///
 /// # This is not a production configuration
 ///
 /// A node built this way exchanges every packet — tickets, acknowledgements, SURBs, session
 /// payloads — in a form any on-path observer can read, and offers no protection against an active
 /// attacker rewriting them. It is for a local cluster on loopback and nothing else. The feature is
-/// off by default, cannot be combined with QUIC (see above), and the node logs a warning on every
-/// start.
+/// off by default and the node logs a warning on every start.
 #[cfg(all(feature = "runtime-tokio", not(feature = "insecure-plaintext")))]
 fn security_upgrade(
     keypair: &libp2p::identity::Keypair,
@@ -78,9 +77,19 @@ fn security_upgrade(
 ) -> std::result::Result<libp2p::plaintext::Config, std::convert::Infallible> {
     warn!(
         "SECURITY: this node was built with the `insecure-plaintext` feature and negotiates /plaintext/2.0.0 instead \
-         of noise. All p2p traffic, including tickets and session payloads, is readable by anyone on the path. Never \
-         run this on a real network."
+         of noise. All TCP p2p traffic, including tickets and session payloads, is readable by anyone on the path. \
+         Never run this on a real network."
     );
+
+    // QUIC's TLS 1.3 is inside the transport and cannot be turned off, so this feature does not
+    // reach it. Worth saying out loud: the failure mode is a capture that comes back empty for no
+    // visible reason, and the fix is to announce a TCP address.
+    #[cfg(feature = "transport-quic")]
+    warn!(
+        "This node also has QUIC compiled in, which is unaffected by `insecure-plaintext` and stays encrypted. Only \
+         its TCP connections can be observed, so make sure it announces a TCP address."
+    );
+
     Ok(libp2p::plaintext::Config::new(keypair))
 }
 
@@ -114,11 +123,8 @@ impl InactiveNetwork {
             )
             .map_err(|e| crate::errors::P2PError::Libp2p(e.to_string()))?;
 
-        // QUIC encrypts inside the transport with TLS 1.3 and offers no plaintext mode, so a
-        // `insecure-plaintext` build that still dialled QUIC would produce connections the
-        // observer the feature exists for cannot read. The features are mutually exclusive at
-        // the top of this file rather than here, so the contradiction is a compile error rather
-        // than a capture that silently comes back empty.
+        // Unaffected by `insecure-plaintext`: QUIC's TLS 1.3 is part of the transport and has no
+        // unencrypted mode. See `security_upgrade`.
         #[cfg(feature = "transport-quic")]
         let swarm = swarm.with_quic();
 
