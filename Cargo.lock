@@ -3944,7 +3944,7 @@ dependencies = [
 
 [[package]]
 name = "hopr-session-server-forwarder"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4083,16 +4083,18 @@ dependencies = [
 
 [[package]]
 name = "hopr-utilities"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "752062e541c6d679acec0bf94af8099bca83a225d0ce8b933aaf464ad7396877"
+version = "0.15.0"
+source = "git+https://github.com/hoprnet/hopr-utilities?branch=kauki%2Ffix%2Fsession%2Fdatagram-aware-copy-loop#e9e822f1e8350430dbdb619e26661c61060a7692"
 dependencies = [
  "anyhow",
  "arrayvec",
+ "async-broadcast",
+ "async-trait",
  "auto_impl",
  "blokli-client",
  "const-hex",
  "crossfire",
+ "dashmap",
  "flume",
  "futures",
  "futures-time",
