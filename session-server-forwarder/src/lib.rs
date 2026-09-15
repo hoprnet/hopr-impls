@@ -38,6 +38,16 @@ pub const HOPR_UDP_BUFFER_SIZE: usize = 16384;
 /// Size of the queue (back-pressure) for data incoming from a UDP stream.
 pub const HOPR_UDP_QUEUE_SIZE: usize = 8192;
 
+/// Ingress queue depth (in datagrams) for the datagram-preserving UDP relay.
+///
+/// This bounds how long a datagram can sit queued while the session egress is back-pressured before
+/// it is dropped: once the queue is full the UDP receiver stops draining the socket, the kernel
+/// socket buffer fills, and the kernel drops. A real-time UDP transport (WireGuard) wants *bounded
+/// delay then loss*, not unbounded buffering — at a real-time rate of ~200 datagrams/s, 256 is about
+/// one second. The larger [`HOPR_UDP_QUEUE_SIZE`] (~40 s at that rate) is a latency bubble that
+/// makes the tunnel unusable under sustained overload. See hoprnet#8421.
+pub const HOPR_UDP_DATAGRAM_QUEUE_SIZE: usize = 256;
+
 /// Error type for [`HoprServerIpForwardingReactor`].
 #[derive(Debug, thiserror::Error)]
 pub enum ForwarderError {
@@ -236,7 +246,7 @@ where
                     .with_buffer_size(HOPR_UDP_BUFFER_SIZE)
                     .with_counterparty(resolved_udp_target)
                     .with_foreign_data_mode(ForeignDataMode::Error)
-                    .with_queue_size(HOPR_UDP_QUEUE_SIZE)
+                    .with_queue_size(HOPR_UDP_DATAGRAM_QUEUE_SIZE)
                     .with_receiver_parallelism(
                         self.cfg
                             .udp_rx_parallelism
