@@ -9,7 +9,7 @@ use hopr_utils::{
     network_types::{
         prelude::{ForeignDataMode, IpOrHostExt, ServiceId, SessionTarget},
         udp::{ConnectedUdpStream, UdpStreamParallelism},
-        utils::transfer_session,
+        utils::{transfer_session, transfer_session_datagram},
     },
     parallelize::cpu::spawn_blocking,
 };
@@ -177,7 +177,14 @@ where
 
                     // The Session forwards the termination to the udp_bridge, terminating
                     // the UDP socket.
-                    match transfer_session(&mut session.session, &mut udp_bridge, HOPR_UDP_BUFFER_SIZE, None).await {
+                    //
+                    // Datagram-aware transfer: each UDP datagram received from the target is written
+                    // to the session as its own write, so the segmenter emits one frame per datagram
+                    // instead of coalescing several return-path datagrams under write backpressure
+                    // (which WireGuard-over-Session cannot decode). See hoprnet#8421.
+                    match transfer_session_datagram(&mut session.session, &mut udp_bridge, HOPR_UDP_BUFFER_SIZE, None)
+                        .await
+                    {
                         Ok((session_to_stream_bytes, stream_to_session_bytes)) => tracing::info!(
                             ?session_id,
                             session_to_stream_bytes,
