@@ -3943,7 +3943,7 @@ dependencies = [
 
 [[package]]
 name = "hopr-session-server-forwarder"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "hopr-api",
@@ -4079,9 +4079,8 @@ dependencies = [
 
 [[package]]
 name = "hopr-utilities"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7de9a46fe251a9aa6ee3ab7e2edd7720ac6f09ad4f01566dd6c056913615cc43"
+version = "0.9.1"
+source = "git+https://github.com/hoprnet/hopr-utilities?branch=compat%2Fv4#01bc0410f23a26a77b7d46adf1eef45584ae4cb5"
 dependencies = [
  "anyhow",
  "arrayvec",

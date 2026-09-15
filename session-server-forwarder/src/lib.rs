@@ -9,7 +9,7 @@ use hopr_utils::{
     network_types::{
         prelude::{ForeignDataMode, IpOrHostExt, ServiceId, SessionTarget},
         udp::{ConnectedUdpStream, UdpStreamParallelism},
-        utils::transfer_session,
+        utils::{transfer_session, transfer_session_datagram},
     },
     parallelize::cpu::spawn_blocking,
 };
@@ -33,6 +33,16 @@ pub const HOPR_UDP_BUFFER_SIZE: usize = 16384;
 
 /// Size of the queue (back-pressure) for data incoming from a UDP stream.
 pub const HOPR_UDP_QUEUE_SIZE: usize = 8192;
+
+/// Ingress queue depth (in datagrams) for the datagram-preserving UDP relay.
+///
+/// This bounds how long a datagram can sit queued while the session egress is back-pressured before
+/// it is dropped: once the queue is full the UDP receiver stops draining the socket, the kernel
+/// socket buffer fills, and the kernel drops. A real-time UDP transport (WireGuard) wants *bounded
+/// delay then loss*, not unbounded buffering — at a real-time rate of ~200 datagrams/s, 256 is about
+/// one second. The larger [`HOPR_UDP_QUEUE_SIZE`] (~40 s at that rate) is a latency bubble that
+/// makes the tunnel unusable under sustained overload. See hoprnet#8421.
+pub const HOPR_UDP_DATAGRAM_QUEUE_SIZE: usize = 256;
 
 /// Error type for [`HoprServerIpForwardingReactor`].
 #[derive(Debug, thiserror::Error)]
@@ -153,7 +163,7 @@ where
                     .with_buffer_size(HOPR_UDP_BUFFER_SIZE)
                     .with_counterparty(resolved_udp_target)
                     .with_foreign_data_mode(ForeignDataMode::Error)
-                    .with_queue_size(HOPR_UDP_QUEUE_SIZE)
+                    .with_queue_size(HOPR_UDP_DATAGRAM_QUEUE_SIZE)
                     .with_receiver_parallelism(
                         self.cfg
                             .udp_rx_parallelism
@@ -177,7 +187,14 @@ where
 
                     // The Session forwards the termination to the udp_bridge, terminating
                     // the UDP socket.
-                    match transfer_session(&mut session.session, &mut udp_bridge, HOPR_UDP_BUFFER_SIZE, None).await {
+                    //
+                    // Datagram-aware transfer: each UDP datagram received from the target is written
+                    // to the session as its own write, so the segmenter emits one frame per datagram
+                    // instead of coalescing several return-path datagrams under write backpressure
+                    // (which WireGuard-over-Session cannot decode). See hoprnet#8421.
+                    match transfer_session_datagram(&mut session.session, &mut udp_bridge, HOPR_UDP_BUFFER_SIZE, None)
+                        .await
+                    {
                         Ok((session_to_stream_bytes, stream_to_session_bytes)) => tracing::info!(
                             ?session_id,
                             session_to_stream_bytes,
