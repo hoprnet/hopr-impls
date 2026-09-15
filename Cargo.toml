@@ -34,10 +34,7 @@ hopr-network-graph   = { path = "graph", version = "0.5.0", default-features = f
 # HOPR crates published to crates.io
 blokli-client = "0.31.0"
 hopr-api      = "2.0.0"
-# TEMPORARY: git-pinned to the v4-compat maintenance branch carrying the 0.9.x datagram-aware copy
-# loop (hoprnet#8421), which is on the hopr-types 2.x line consumed by hoprnet release/4.0. Revert
-# to a plain `version = "0.9.1"` once hopr-utilities 0.9.1 is published from compat/v4.
-hopr-utils    = { package = "hopr-utilities", version = "0.9.1", git = "https://github.com/hoprnet/hopr-utilities", branch = "compat/v4", default-features = false }
+hopr-utils    = { package = "hopr-utilities", version = "0.9.1", default-features = false }
 
 # Third-party dependencies (versions mirror hoprnet's workspace to preserve compatibility)
 ahash = "0.8.12"

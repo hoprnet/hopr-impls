@@ -4080,7 +4080,8 @@ dependencies = [
 [[package]]
 name = "hopr-utilities"
 version = "0.9.1"
-source = "git+https://github.com/hoprnet/hopr-utilities?branch=compat%2Fv4#01bc0410f23a26a77b7d46adf1eef45584ae4cb5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d4be85522dd5a1a42e3114d17ee354002cd5fe51aac691af95c035e3b953bfee"
 dependencies = [
  "anyhow",
  "arrayvec",
