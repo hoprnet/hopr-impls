@@ -38,7 +38,7 @@ hopr-api      = "4.3.0"
 # forwarder compiles and is tested end to end. `version` alongside `git` is the "multiple
 # locations" form: git wins locally, the version requirement survives packaging. Revert to a
 # plain `version = "0.15.0"` once hopr-utilities 0.15.0 is published.
-hopr-utils    = { package = "hopr-utilities", version = "0.15.0", git = "https://github.com/hoprnet/hopr-utilities", branch = "kauki/fix/session/datagram-aware-copy-loop", default-features = false }
+hopr-utils = { package = "hopr-utilities", version = "0.15.0", git = "https://github.com/hoprnet/hopr-utilities", branch = "kauki/fix/session/datagram-aware-copy-loop", default-features = false }
 
 # Third-party dependencies (versions mirror hoprnet's workspace to preserve compatibility)
 ahash = "0.8.12"
