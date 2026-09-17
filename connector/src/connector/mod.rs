@@ -54,7 +54,7 @@ const MIN_CONNECTION_TIMEOUT: Duration = Duration::from_millis(100);
 /// never be able to spend the budget the channel graph needs to sync.
 const REGISTRY_READ_BUDGET_DIVISOR: u32 = 4;
 const MIN_TX_CONFIRM_TIMEOUT: Duration = Duration::from_secs(1);
-const TX_TIMEOUT_MULTIPLIER: u32 = 2;
+const TX_TIMEOUT_MULTIPLIER: u32 = 4;
 const DEFAULT_SYNC_TOLERANCE_PCT: usize = 90;
 
 /// Connector health states.
@@ -174,7 +174,7 @@ pub struct BlockchainConnectorConfig {
     /// Transaction waits for confirmation by multiplying chain's blocktime, finality, and this multiplier.
     /// Set it to higher values if transactions are failing due to timeout at the client.
     ///
-    /// Default is 2, minimum is 1.
+    /// Default is 4, minimum is 1.
     #[default(TX_TIMEOUT_MULTIPLIER)]
     pub tx_timeout_multiplier: u32,
 }
