@@ -5,7 +5,11 @@ use hopr_api::{
     types::{chain::prelude::*, crypto::prelude::Keypair, internal::prelude::*, primitive::prelude::*},
 };
 
-use crate::{backend::Backend, connector::HoprBlockchainConnector, errors::ConnectorError};
+use crate::{
+    backend::Backend,
+    connector::{CHANNEL_CUSTOM_TIMEMOUT_MULTIPLIER, HoprBlockchainConnector},
+    errors::ConnectorError,
+};
 
 impl<B, C, P, R> HoprBlockchainConnector<C, B, P, R>
 where
@@ -138,7 +142,10 @@ where
         let tx_req = self.payload_generator.fund_channel(*dst, amount)?;
         tracing::debug!( %dst, %amount, "opening channel");
 
-        Ok(self.send_tx(tx_req, Some(4), None).await?.boxed())
+        Ok(self
+            .send_tx(tx_req, Some(CHANNEL_CUSTOM_TIMEMOUT_MULTIPLIER), None)
+            .await?
+            .boxed())
     }
 
     async fn fund_channel<'a>(
@@ -155,7 +162,10 @@ where
         let tx_req = self.payload_generator.fund_channel(channel.destination, amount)?;
         tracing::debug!(%channel_id, %amount, "funding channel");
 
-        Ok(self.send_tx(tx_req, Some(4), None).await?.boxed())
+        Ok(self
+            .send_tx(tx_req, Some(CHANNEL_CUSTOM_TIMEMOUT_MULTIPLIER), None)
+            .await?
+            .boxed())
     }
 
     async fn close_channel<'a>(
@@ -199,7 +209,10 @@ where
             _ => return Err(ConnectorError::InvalidState("channel closure time has not elapsed")),
         };
 
-        Ok(self.send_tx(tx_req, Some(4), None).await?.boxed())
+        Ok(self
+            .send_tx(tx_req, Some(CHANNEL_CUSTOM_TIMEMOUT_MULTIPLIER), None)
+            .await?
+            .boxed())
     }
 }
 
