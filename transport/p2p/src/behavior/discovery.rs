@@ -64,6 +64,7 @@ fn initial_backoff() -> backon::ExponentialBackoff {
         .with_max_delay(std::time::Duration::from_secs(120))
         .with_factor(1.5)
         .with_jitter()
+        .without_max_times()
         .build()
 }
 
@@ -386,6 +387,29 @@ mod tests {
         if !b.connected_peers.contains_key(&peer) && !b.not_connected_peers.contains_key(&peer) {
             b.schedule_dial_with(peer, initial_backoff());
         }
+    }
+
+    #[test]
+    fn initial_backoff_continues_at_max_delay() {
+        let max_delay = std::time::Duration::from_secs(120);
+        let delays = initial_backoff().take(20).collect::<Vec<_>>();
+
+        assert_eq!(
+            delays.len(),
+            20,
+            "peer discovery backoff must not stop producing delays"
+        );
+
+        let mut base_delay = std::time::Duration::from_secs(3);
+        for (attempt, delay) in delays.into_iter().enumerate() {
+            assert!(
+                delay >= base_delay && delay < base_delay.saturating_mul(2),
+                "attempt {attempt} delay {delay:?} must include jitter based on {base_delay:?}"
+            );
+            base_delay = base_delay.mul_f32(1.5).min(max_delay);
+        }
+
+        assert_eq!(base_delay, max_delay);
     }
 
     // ── regression: announce must not re-enqueue dial for a connected peer ──
