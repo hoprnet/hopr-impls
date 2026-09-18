@@ -234,8 +234,10 @@ impl NetworkBehaviour for Behaviour {
                 tracing::debug!(?peer_id, %error, "Failed to dial peer");
 
                 // on a failed dial get the next scheduled dial using the backoff,
-                // but only if the peer hasn't already connected via an inbound
-                // connection that raced with our outbound dial attempt.
+                // but only if the peer isn't connected, has a known address, the
+                // failure is transient (not `DialError::NoAddresses`), and no dial
+                // is already queued; otherwise cancel any pending retry until the
+                // peer is announced again.
                 if let Some(peer) = peer_id {
                     if self.connected_peers.contains_key(&peer)
                         || matches!(error, DialError::NoAddresses)
