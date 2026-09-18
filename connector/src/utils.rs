@@ -7,7 +7,7 @@ use hopr_api::{
     chain::{ChainInfo, DeployedSafe, DomainSeparators, RedemptionStats, ServiceRegistryConfig, ServiceTypeConfig},
     types::{
         chain::{chain_events::ChainEvent, payload::GasEstimation},
-        crypto::types::Hash,
+        crypto::types::{Hash, OffchainPublicKey},
         internal::prelude::*,
         primitive::prelude::*,
     },
@@ -36,8 +36,17 @@ pub(crate) fn model_to_account_entry(
         AccountType::NotAnnounced
     };
 
+    // The compact `OffchainPublicKey` only checks its length when parsed, so that the vast
+    // majority of keys - which never enter an elliptic-curve computation - do not pay for a point
+    // decompression. This is the boundary where keys enter the node from the chain indexer, and
+    // the one place where a key that is not on the curve is worth rejecting outright: left
+    // unchecked it would be accepted into the account tables and only fail much later, when a
+    // packet is built for a path that happens to include it.
+    let public_key: OffchainPublicKey = model.packet_key.parse()?;
+    public_key.validate()?;
+
     Ok(AccountEntry {
-        public_key: model.packet_key.parse()?,
+        public_key,
         chain_addr: model.chain_key.parse()?,
         key_id: (model.keyid as u32).into(),
         entry_type,
