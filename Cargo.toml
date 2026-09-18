@@ -102,3 +102,9 @@ tokio = { version = "1.53.1", features = [
 tokio-retry = "0.3.2"
 tracing = { version = "0.1.44", features = ["release_max_level_debug"] }
 validator = { version = "0.21.0", features = ["derive"] }
+
+# Points at the branches carrying the compact/expanded `OffchainPublicKey` split
+# (hopr-types#52). Drop these once the train is published.
+[patch.crates-io]
+hopr-types = { git = "https://github.com/hoprnet/hopr-types", branch = "lukas/extended-offchain-key" }
+hopr-api = { git = "https://github.com/hoprnet/hopr-api", branch = "lukas/extended-offchain-key" }
