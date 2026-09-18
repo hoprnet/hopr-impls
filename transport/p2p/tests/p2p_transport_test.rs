@@ -218,6 +218,54 @@ impl Drop for SelfClosingJoinHandle {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn addressless_peer_connects_after_announcement() -> anyhow::Result<()> {
+    let (api1, (network1, process1)) = build_p2p_swarm(Announcement::QUIC, 1).await?;
+    let (mut api2, (_network2, process2)) = build_p2p_swarm(Announcement::QUIC, 1).await?;
+
+    let _sjh1 = SelfClosingJoinHandle::new(process1());
+    let _sjh2 = SelfClosingJoinHandle::new(process2());
+
+    let initial_open = timeout(std::time::Duration::from_secs(2), network1.clone().open(api2.me))
+        .await
+        .context("addressless stream open timed out")?;
+    assert!(initial_open.is_err(), "opening a stream without an address must fail");
+
+    api1.update_from_announcements
+        .unbounded_send(PeerDiscovery::Announce(api2.me, vec![api2.address.clone()]))
+        .context("failed to send announcement")?;
+
+    let mut stream = timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            match network1.clone().open(api2.me).await {
+                Ok(stream) => break stream,
+                Err(_) => sleep(std::time::Duration::from_millis(50)).await,
+            }
+        }
+    })
+    .await
+    .context("announced peer did not become dialable")?;
+
+    let payload = Bytes::from_static(b"connected after announcement");
+    let mut frame = Vec::with_capacity(4 + payload.len());
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&payload);
+    stream
+        .write_all(&frame)
+        .await
+        .context("failed to write after announcement")?;
+    stream.flush().await.context("failed to flush after announcement")?;
+
+    let (_, received) = timeout(std::time::Duration::from_secs(5), api2.recv_msg.next())
+        .await
+        .context("receive after announcement timed out")?
+        .context("receive channel closed after announcement")?;
+
+    assert_eq!(received, payload);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn p2p_only_communication_quic() -> anyhow::Result<()> {
     let packet_count: usize = 2 * 1024 * 10; // ~10 MB
     let (mut api1, (_swarm1, process1)) = build_p2p_swarm(Announcement::QUIC, packet_count).await?;
