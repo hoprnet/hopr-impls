@@ -102,3 +102,7 @@ tokio = { version = "1.53.1", features = [
 tokio-retry = "0.3.2"
 tracing = { version = "0.1.44", features = ["release_max_level_debug"] }
 validator = { version = "0.21.0", features = ["derive"] }
+
+
+[patch.crates-io]
+blokli-client = { git = "https://github.com/hoprnet/blokli-client.git", rev = "9624b7d55bc21faa721aad4b906441c83789a73b" }
