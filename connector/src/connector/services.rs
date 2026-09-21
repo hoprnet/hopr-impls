@@ -822,13 +822,11 @@ mod tests {
         );
     }
 
-    /// Pins the coupling between the connector and the `chainInfo` payload of Blokli.
-    ///
-    /// `ContractAddresses` puts `#[serde(default)]` on none of its fields, so a Blokli that does
-    /// not report the service registry address makes the connector unusable rather than merely
-    /// serviceless. The failure must therefore name the missing field.
+    /// A Blokli serving a pre-service-registry chain omits that address. Such a chain remains
+    /// usable for the rest of the connector API; the missing deployment is represented by the
+    /// zero address.
     #[tokio::test]
-    async fn chain_info_without_the_service_registry_address_fails_naming_the_field() -> anyhow::Result<()> {
+    async fn chain_info_without_the_service_registry_address_uses_zero_address() -> anyhow::Result<()> {
         let mut state = BlokliTestState::default();
         let mut addresses: serde_json::Value = serde_json::from_str(&state.chain_info.contract_addresses.0)?;
         assert!(addresses["service_registry"].is_string());
@@ -841,24 +839,25 @@ mod tests {
 
         let blokli_client = BlokliTestStateBuilder::from(state).build_static_client();
 
-        let error = HoprBlockchainReader::new(blokli_client.clone())
+        let info = HoprBlockchainReader::new(blokli_client.clone())
             .chain_info()
             .await
-            .expect_err("chain info without the service registry address must fail");
-        assert!(error.to_string().contains("service_registry"), "{error}");
+            .expect("chain info without the service registry address must remain usable");
+        assert_eq!(
+            hopr_api::types::chain::prelude::ContractAddresses::default().service_registry,
+            info.contract_addresses.service_registry
+        );
 
         // The same payload is parsed a second time when the connector takes its contract addresses
         // from Blokli instead of from the caller.
-        let error = crate::create_trustful_hopr_blokli_connector(
+        crate::create_trustful_hopr_blokli_connector(
             &ChainKeypair::from_secret(&PRIVATE_KEY_1)?,
             Default::default(),
             blokli_client,
             MODULE_ADDR.into(),
         )
         .await
-        .err()
-        .expect("connector construction without the service registry address must fail");
-        assert!(error.to_string().contains("service_registry"), "{error}");
+        .expect("connector construction without the service registry address must remain usable");
 
         Ok(())
     }

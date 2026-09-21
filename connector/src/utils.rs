@@ -6,7 +6,7 @@ use std::{
 use hopr_api::{
     chain::{ChainInfo, DeployedSafe, DomainSeparators, RedemptionStats, ServiceRegistryConfig, ServiceTypeConfig},
     types::{
-        chain::{chain_events::ChainEvent, payload::GasEstimation},
+        chain::{chain_events::ChainEvent, payload::GasEstimation, prelude::ContractAddresses},
         crypto::types::Hash,
         internal::prelude::*,
         primitive::prelude::*,
@@ -14,6 +14,27 @@ use hopr_api::{
 };
 
 use crate::errors::ConnectorError;
+
+/// Parses Blokli's contract-address map, accepting deployments from before the
+/// service registry was introduced.
+///
+/// HOPR 4.x chains have no service registry. Their Blokli `chainInfo` payloads
+/// therefore omit `service_registry`; represent that absence with the zero
+/// address, which is the documented value for a network without a deployment.
+pub(crate) fn parse_contract_addresses(raw: &str) -> Result<ContractAddresses, ConnectorError> {
+    let mut addresses: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|e| ConnectorError::TypeConversion(format!("invalid contract addresses JSON: {e}")))?;
+
+    let object = addresses
+        .as_object_mut()
+        .ok_or_else(|| ConnectorError::TypeConversion("invalid contract addresses JSON: expected an object".into()))?;
+    object
+        .entry("service_registry")
+        .or_insert_with(|| serde_json::Value::String(Address::default().to_string()));
+
+    serde_json::from_value(addresses)
+        .map_err(|e| ConnectorError::TypeConversion(format!("invalid contract addresses JSON: {e}")))
+}
 
 pub(crate) fn model_to_account_entry(
     model: blokli_client::api::types::Account,
@@ -191,8 +212,7 @@ pub(crate) fn model_to_chain_info(
         info: ChainInfo {
             chain_id: model.chain_id as u64,
             hopr_network_name: model.network,
-            contract_addresses: serde_json::from_str(&model.contract_addresses.0)
-                .map_err(|e| ConnectorError::TypeConversion(format!("invalid contract addresses JSON: {e}")))?,
+            contract_addresses: parse_contract_addresses(&model.contract_addresses.0)?,
         },
         ticket_win_prob: WinningProbability::try_from_f64(model.min_ticket_winning_probability)
             .map_err(|e| ConnectorError::TypeConversion(format!("invalid winning probability info: {e}")))?,
