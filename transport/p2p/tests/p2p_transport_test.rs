@@ -20,7 +20,7 @@ use futures::{
     channel::mpsc::{Receiver, Sender},
 };
 use hopr_api::{
-    network::traits::NetworkStreamControl,
+    network::{NetworkView, traits::NetworkStreamControl},
     types::crypto::{keypairs::Keypair, prelude::OffchainKeypair},
 };
 use hopr_transport_p2p::{HoprLibp2pNetworkBuilder, HoprNetwork, PeerDiscovery};
@@ -163,20 +163,13 @@ async fn build_p2p_swarm(
 ) -> anyhow::Result<(Interface, (TestSwarm, hopr_api::network::BoxedProcessFn))> {
     let random_port = random_free_local_ipv4_port().context("could not find a free port")?;
     let random_keypair = OffchainKeypair::random();
-    let peer_id: PeerId = libp2p::identity::Keypair::from(&random_keypair).public().into();
-
-    let (transport_updates_tx, transport_updates_rx) = futures::channel::mpsc::unbounded::<PeerDiscovery>();
 
     let multiaddress = match announcement {
-        Announcement::QUIC => format!("/ip4/127.0.0.1/udp/{random_port}/quic-v1"),
+        Announcement::QUIC => quic_addr(random_port),
     };
-    let multiaddress = Multiaddr::from_str(&multiaddress).context("failed to create a valid multiaddress")?;
 
-    let network_builder = HoprLibp2pNetworkBuilder::new(transport_updates_rx);
-    let (network, process) = network_builder
-        .build(&random_keypair, vec![multiaddress.clone()], TEST_MSG_PROTOCOL, true)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to build network: {e}"))?;
+    let (peer_id, transport_updates_tx, network, process) =
+        build_node(&random_keypair, vec![multiaddress.clone()]).await?;
 
     let (send_msg, recv_msg) = spawn_stream_protocol(network.clone(), per_peer_channel_capacity)?;
 
@@ -261,6 +254,153 @@ async fn addressless_peer_connects_after_announcement() -> anyhow::Result<()> {
         .context("receive channel closed after announcement")?;
 
     assert_eq!(received, payload);
+
+    Ok(())
+}
+
+fn quic_addr(port: u16) -> Multiaddr {
+    Multiaddr::from_str(&format!("/ip4/127.0.0.1/udp/{port}/quic-v1")).expect("valid quic multiaddress")
+}
+
+/// Block until `127.0.0.1:<port>` (UDP) can be bound again, i.e. the previous
+/// owner has released it, so a peer can be rebuilt on the same port.
+async fn wait_udp_port_free(port: u16) -> anyhow::Result<()> {
+    for _ in 0..200 {
+        if std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).is_ok() {
+            return Ok(());
+        }
+        sleep(std::time::Duration::from_millis(50)).await;
+    }
+    anyhow::bail!("udp port {port} was not released in time")
+}
+
+/// Build a swarm on a fixed keypair and port, announcing `announced` addresses.
+/// `allow_private_addresses` is enabled so loopback addresses are exercised.
+async fn build_node(
+    keypair: &OffchainKeypair,
+    announced: Vec<Multiaddr>,
+) -> anyhow::Result<(
+    PeerId,
+    futures::channel::mpsc::UnboundedSender<PeerDiscovery>,
+    HoprNetwork,
+    hopr_api::network::BoxedProcessFn,
+)> {
+    let peer_id: PeerId = libp2p::identity::Keypair::from(keypair).public().into();
+    let (tx, rx) = futures::channel::mpsc::unbounded::<PeerDiscovery>();
+    let (network, process) = HoprLibp2pNetworkBuilder::new(rx)
+        .build(keypair, announced, TEST_MSG_PROTOCOL, true)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to build network: {e}"))?;
+    Ok((peer_id, tx, network, process))
+}
+
+/// Poll `network` until `peer` reaches `connected`, or `deadline` elapses.
+async fn wait_until_connected_is(
+    network: &HoprNetwork,
+    peer: PeerId,
+    connected: bool,
+    deadline: std::time::Duration,
+) -> anyhow::Result<()> {
+    timeout(deadline, async {
+        while network.is_connected(&peer) != connected {
+            sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .with_context(|| format!("timed out waiting for peer connected={connected}"))?;
+    Ok(())
+}
+
+async fn wait_until_connected(net: &HoprNetwork, peer: PeerId, deadline: std::time::Duration) -> anyhow::Result<()> {
+    wait_until_connected_is(net, peer, true, deadline).await
+}
+
+async fn wait_until_disconnected(net: &HoprNetwork, peer: PeerId, deadline: std::time::Duration) -> anyhow::Result<()> {
+    wait_until_connected_is(net, peer, false, deadline).await
+}
+
+/// Regression for #31 ("Expected"): a disconnected peer reconnects through its
+/// announced address.
+///
+/// The fix makes discovery dial only the announced address (`bootstrap_peers`)
+/// with behaviour-contributed addresses disabled, and disables identify's
+/// passive address cache. This test exercises that dial path end-to-end over
+/// real QUIC: two nodes connect, one is torn down and brought back on the same
+/// port and peer id, and the dialer must re-establish the connection.
+///
+/// Note: the *permanent* undialability in the wild requires a peer sharing the
+/// local node's UDP port across hosts (a loopback dial to self, failing
+/// `WrongPeerId` and never evicted). That collision cannot be reproduced on a
+/// single host — two processes cannot bind one UDP port — and the distinguishing
+/// dial state (`DialOpts` addresses / `extend_addresses_through_behaviour`) is
+/// not observable from a test, so there is no in-process test that fails under
+/// the pre-fix behaviour. This test guards that the fix does not regress the
+/// reconnection path; the exclusion itself rests on libp2p's documented flag
+/// semantics.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn disconnected_peer_reconnects_via_announced_address() -> anyhow::Result<()> {
+    // Generous deadlines: connection setup waits on discovery's exponential backoff
+    // (min 3s), and each phase competes with backoff growth, so keep CI margin.
+    let connect_timeout = std::time::Duration::from_secs(30);
+
+    let kp_a = OffchainKeypair::random();
+    let port_a = random_free_local_ipv4_port().context("no free port for A")?;
+    let (_a_id, a_tx, a_net, a_proc) = build_node(&kp_a, vec![quic_addr(port_a)]).await?;
+
+    let kp_b = OffchainKeypair::random();
+    let port_b = random_free_local_ipv4_port().context("no free port for B")?;
+    let b_announced = vec![quic_addr(port_b)];
+    let (b_id, _b_tx, b_net, b_proc) = build_node(&kp_b, b_announced.clone()).await?;
+
+    let _a_handle = SelfClosingJoinHandle::new(a_proc());
+    let b_handle = SelfClosingJoinHandle::new(b_proc());
+
+    // Announce B to A only, so A is the sole dialer (B accepts inbound). A
+    // mutual announcement would make both sides dial simultaneously and collide
+    // on the loopback QUIC handshake, which is a libp2p artefact unrelated to
+    // this fix.
+    //
+    // Re-announce on a ticker: in production HOPR's network graph pushes
+    // announcements continuously, which wakes discovery to fire its backed-off
+    // dial attempts. A quiet test has no such wakeups, so a scheduled dial would
+    // otherwise wait for an unrelated swarm event. The re-announce is idempotent
+    // (discovery de-duplicates a peer already queued/connected).
+    let announce_b = PeerDiscovery::Announce(b_id, b_announced.clone());
+    let _nudge = {
+        let a_tx = a_tx.clone();
+        let announce_b = announce_b.clone();
+        SelfClosingJoinHandle::new(async move {
+            loop {
+                if a_tx.unbounded_send(announce_b.clone()).is_err() {
+                    break;
+                }
+                sleep(std::time::Duration::from_millis(500)).await;
+            }
+        })
+    };
+
+    wait_until_connected(&a_net, b_id, connect_timeout)
+        .await
+        .context("A must connect to B initially")?;
+
+    // Tear B down and wait for A to notice.
+    drop(b_handle);
+    drop(b_net);
+    wait_until_disconnected(&a_net, b_id, connect_timeout)
+        .await
+        .context("A must observe B disconnecting")?;
+
+    // Bring B back up on the same port and peer id.
+    wait_udp_port_free(port_b).await?;
+    let (b_id2, _b_tx2, b_net2, b_proc2) = build_node(&kp_b, b_announced).await?;
+    anyhow::ensure!(b_id2 == b_id, "rebuilt B must keep its peer id");
+    let _b_handle2 = SelfClosingJoinHandle::new(b_proc2());
+    let _b_net2 = b_net2;
+
+    // A must reconnect via B's announced address.
+    wait_until_connected(&a_net, b_id, std::time::Duration::from_secs(60))
+        .await
+        .context("A must reconnect to B after it returns")?;
 
     Ok(())
 }

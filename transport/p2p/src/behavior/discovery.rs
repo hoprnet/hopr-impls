@@ -332,9 +332,24 @@ impl NetworkBehaviour for Behaviour {
                 continue;
             }
 
+            // Dial only the addresses HOPR discovery announced for this peer. Passing
+            // explicit addresses leaves `extend_addresses_through_behaviour` at its
+            // default of `false`, so other behaviours (e.g. autonat's address cache,
+            // which may hold a peer-advertised loopback address pointing at us) cannot
+            // inject additional dial targets.
+            //
+            // A scheduled peer always has a non-empty `bootstrap_peers` entry
+            // (`schedule_dial_with` enforces `has_known_address`). Guard the invariant
+            // anyway: dialing with an empty address set would fail `NoAddresses` and be
+            // silently cancelled, so surface it as a warning and drop the schedule.
+            let Some(addresses) = self.bootstrap_peers.get(&peer).cloned().filter(|a| !a.is_empty()) else {
+                tracing::warn!(%peer, "scheduled dial for a peer without a known address, dropping schedule");
+                self.cancel_dial(&peer);
+                continue;
+            };
             tracing::trace!(%peer, "attempting a new dial attempt item");
             self.pending_events.push_back(ToSwarm::Dial {
-                opts: DialOpts::peer_id(peer).build(),
+                opts: DialOpts::peer_id(peer).addresses(addresses).build(),
             });
         }
 
@@ -556,6 +571,41 @@ mod tests {
 
         assert!(b.not_connected_peers.contains_key(&peer));
         assert_eq!(b.next_dial_attempts.len(), 1);
+    }
+
+    // ── regression #31: dials carry only announced addresses ────────────────
+
+    /// Smoke test: a scheduled dial for a peer with a known announced address is
+    /// emitted for that peer.
+    ///
+    /// This does not, on its own, guard the #31 fix: `DialOpts` addresses and the
+    /// `extend_addresses_through_behaviour` flag are `pub(crate)` to libp2p-swarm,
+    /// so the address set this test cares about is not inspectable here. The fix's
+    /// guarantee rests on that flag defaulting to `false` when explicit addresses
+    /// are supplied (libp2p-swarm 0.47.1); the reconnection path is covered
+    /// end-to-end by `disconnected_peer_reconnects_via_announced_address`.
+    #[test]
+    fn scheduled_dial_with_address_emits_dial_for_peer() {
+        let mut b = make_behaviour();
+        let peer = PeerId::random();
+        let address: Multiaddr = "/ip4/127.0.0.1/tcp/9000".parse().unwrap();
+
+        b.bootstrap_peers.insert(peer, vec![address]);
+        b.not_connected_peers.insert(peer, initial_backoff());
+        b.next_dial_attempts.push(Reverse(Delayed {
+            release_at: std::time::Instant::now(),
+            item: peer,
+        }));
+
+        let waker = futures::task::noop_waker_ref();
+        let mut cx = std::task::Context::from_waker(waker);
+
+        match b.poll(&mut cx) {
+            std::task::Poll::Ready(ToSwarm::Dial { opts }) => {
+                assert_eq!(opts.get_peer_id(), Some(peer));
+            }
+            _ => panic!("expected a Dial for the scheduled peer"),
+        }
     }
 
     #[test]
