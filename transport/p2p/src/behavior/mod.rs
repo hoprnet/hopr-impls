@@ -38,10 +38,22 @@ impl HoprNetworkBehavior {
         Self {
             streams: libp2p_stream::Behaviour::new(),
             discovery: discovery::Behaviour::new(my_peer_id, external_discovery_events),
-            identify: libp2p::identify::Behaviour::new(libp2p::identify::Config::new(
-                "/hopr/identify/1.0.0".to_string(),
-                me,
-            )),
+            identify: libp2p::identify::Behaviour::new(
+                libp2p::identify::Config::new("/hopr/identify/1.0.0".to_string(), me)
+                    // Disable identify's passive peer-address cache. Otherwise identify
+                    // emits every remote `listen_addr` (including loopback/private ones)
+                    // as `NewExternalAddrOfPeer`, which the swarm forwards to all
+                    // behaviours before our public-address filter runs, permanently
+                    // polluting autonat's address cache. Addresses come from HOPR
+                    // discovery, so the passive cache is not needed.
+                    .with_cache_size(0)
+                    // Advertise only our curated external addresses (the announced
+                    // multiaddresses registered via `add_external_address`), not the
+                    // auto-expanded interface listen addresses, so we never advertise a
+                    // loopback/private address that a peer on the same port would then
+                    // dial back to us.
+                    .with_hide_listen_addrs(true),
+            ),
             autonat: libp2p::autonat::Behaviour::new(my_peer_id, Default::default()),
         }
     }
