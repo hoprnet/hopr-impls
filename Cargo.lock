@@ -1731,7 +1731,8 @@ dependencies = [
 [[package]]
 name = "blokli-client"
 version = "0.33.2"
-source = "git+https://github.com/hoprnet/blokli-client.git?rev=9624b7d55bc21faa721aad4b906441c83789a73b#9624b7d55bc21faa721aad4b906441c83789a73b"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9ebcb344ef0f25e9d0da565b4469182e0184077589e2f92583a6d2486e1ccc6"
 dependencies = [
  "anyhow",
  "async-broadcast",
