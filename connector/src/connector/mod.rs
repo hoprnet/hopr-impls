@@ -39,6 +39,7 @@ const MIN_CONNECTION_TIMEOUT: Duration = Duration::from_millis(100);
 const MIN_TX_CONFIRM_TIMEOUT: Duration = Duration::from_secs(1);
 const TX_TIMEOUT_MULTIPLIER: u32 = 2;
 const DEFAULT_SYNC_TOLERANCE_PCT: usize = 90;
+const CHANNEL_CUSTOM_TIMEMOUT_MULTIPLIER: u32 = 4;
 
 /// Connector health states.
 ///
