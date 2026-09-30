@@ -5,7 +5,11 @@ use hopr_api::{
     types::{chain::prelude::*, crypto::prelude::*, internal::prelude::*, primitive::prelude::HoprBalance},
 };
 
-use crate::{backend::Backend, connector::{HoprBlockchainConnector, TICKET_CUSTOM_TIMEOUT_MULTIPLIER}, errors::ConnectorError};
+use crate::{
+    backend::Backend,
+    connector::{HoprBlockchainConnector, TICKET_CUSTOM_TIMEOUT_MULTIPLIER},
+    errors::ConnectorError,
+};
 
 impl<B, C, P, R> hopr_api::chain::ChainReadTicketOperations for HoprBlockchainConnector<C, B, P, R> {
     type Error = ConnectorError;
