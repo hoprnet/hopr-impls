@@ -5,7 +5,7 @@ use hopr_api::{
     types::{chain::prelude::*, crypto::prelude::*, internal::prelude::*, primitive::prelude::HoprBalance},
 };
 
-use crate::{backend::Backend, connector::HoprBlockchainConnector, errors::ConnectorError};
+use crate::{backend::Backend, connector::{HoprBlockchainConnector, TICKET_CUSTOM_TIMEOUT_MULTIPLIER}, errors::ConnectorError};
 
 impl<B, C, P, R> hopr_api::chain::ChainReadTicketOperations for HoprBlockchainConnector<C, B, P, R> {
     type Error = ConnectorError;
@@ -125,7 +125,7 @@ where
         match self.prepare_ticket_redeem_payload(ticket).await {
             Ok(tx_req) => {
                 Ok(self
-                    .send_tx(tx_req, None, None)
+                    .send_tx(tx_req, Some(TICKET_CUSTOM_TIMEOUT_MULTIPLIER), None)
                     .await
                     .map_err(|e| TicketRedeemError::ProcessingError(ticket.ticket, e))?
                     .map_err(move |tx_tracking_error|
