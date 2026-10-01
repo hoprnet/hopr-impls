@@ -25,7 +25,7 @@ telemetry = ["dep:lazy_static", "hopr-api/types-telemetry"]
 
 [dependencies]
 async-trait = { workspace = true }
-futures     = { workspace = true }
+futures = { workspace = true }
 hopr-api = { workspace = true, features = [
   "node-session-server",
   "types-keypair",
