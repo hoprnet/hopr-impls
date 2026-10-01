@@ -165,8 +165,17 @@ impl HostPattern {
 /// them alike. Comparing them literally would let a peer pick the spelling the rule does not match,
 /// fall through to the node's default terms, and reach the very same target — and the peer chooses
 /// the spelling, so the bypass would be theirs to take.
-fn without_root_dot(name: &str) -> &str {
+pub(crate) fn without_root_dot(name: &str) -> &str {
     name.strip_suffix('.').unwrap_or(name)
+}
+
+/// Whether every byte of `name` is one a DNS name is spelled with.
+///
+/// Punycode has already folded internationalized names into this set by the time anyone writes
+/// one down, and `_` is here for the underscore labels that service records use.
+pub(crate) fn is_dns_charset(name: &str) -> bool {
+    name.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_'))
 }
 
 /// Puts a name written in a pattern into the form [`HostPattern`] compares against, rejecting what
@@ -185,12 +194,7 @@ fn dns_name(pattern: &str, name: &str) -> Result<String, InvalidTargetPattern> {
         return Err(InvalidTargetPattern::new(pattern, "empty host name"));
     }
 
-    // Punycode has already folded internationalized names into this set by the time anyone writes
-    // one down, and `_` is here for the underscore labels that service records use.
-    if !name
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_'))
-    {
+    if !is_dns_charset(name) {
         return Err(InvalidTargetPattern::new(
             pattern,
             format!("'{name}' is not a DNS name; a wildcard label is written '*.'"),

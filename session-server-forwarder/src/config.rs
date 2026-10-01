@@ -1,11 +1,12 @@
 use std::{collections::HashSet, net::SocketAddr, num::NonZeroUsize, time::Duration};
 
+use hopr_utils::network_types::prelude::IpOrHost;
 use serde_with::serde_as;
 // In scope for the `#[validate(nested)]` on `session_admission_rules`, whose generated code calls
 // `Validate::validate` on the `Vec`.
 use validator::Validate;
 
-use crate::target_pattern::TargetPattern;
+use crate::target_pattern::{TargetPattern, is_dns_charset, without_root_dot};
 
 /// Configuration of the Exit node (see [`HoprServerIpForwardingReactor`](crate::HoprServerIpForwardingReactor))
 /// and the Entry node.
@@ -22,7 +23,12 @@ pub struct SessionIpForwardingConfig {
     #[default(true)]
     pub use_target_allow_list: bool,
 
-    /// Enforces only the given target addresses (after DNS resolution).
+    /// Enforces only the given targets, each an `IP:PORT` or a `NAME:PORT`.
+    ///
+    /// A target is allowed if it is a listed name on its port, or if the addresses it resolves to are
+    /// listed, either literally or as what a listed name resolves to at that moment. Names are
+    /// resolved for every Session rather than once at startup, subject to the resolver's own caching.
+    /// List only names you control, since whoever controls a name decides where it leads.
     ///
     /// This is used only if `use_target_allow_list` is set to `true`.
     /// If left empty (and `use_target_allow_list` is `true`), the node will not act as an Exit node.
@@ -30,7 +36,8 @@ pub struct SessionIpForwardingConfig {
     /// Defaults to empty.
     #[serde(default)]
     #[serde_as(as = "HashSet<serde_with::DisplayFromStr>")]
-    pub target_allow_list: HashSet<SocketAddr>,
+    #[validate(custom(function = "validate_target_allow_list"))]
+    pub target_allow_list: HashSet<IpOrHost>,
 
     /// Delay between retries in seconds to reach a TCP target.
     ///
@@ -68,8 +75,8 @@ pub struct SessionIpForwardingConfig {
     /// configured terms, which is what every target gets when this list is empty.
     ///
     /// These decide what a Session *costs*, not whether the target may be reached at all — that
-    /// remains [`target_allow_list`](Self::target_allow_list), which is checked later, against
-    /// resolved addresses. A rule is matched against the unsealed target before the Session exists.
+    /// remains [`target_allow_list`](Self::target_allow_list), which is checked later, once the target
+    /// is resolved. A rule is matched against the unsealed target before the Session exists.
     ///
     /// Defaults to empty.
     #[serde(default)]
@@ -137,6 +144,52 @@ fn validate_admission_rule_quota(rule: &SessionAdmissionRule) -> Result<(), vali
         return Err(error);
     }
     Ok(())
+}
+
+/// Rejects a name in the allow list that no host can have.
+///
+/// Such an entry matches nothing, so the targets it was written to allow are denied without a word
+/// of explanation. The case worth catching is an IPv4 address missing a number, such as
+/// `172.30.0:8000`, which `IpOrHost` takes for a name.
+fn validate_target_allow_list(list: &HashSet<IpOrHost>) -> Result<(), validator::ValidationError> {
+    let mut unusable: Vec<String> = list
+        .iter()
+        .filter_map(|entry| match entry {
+            IpOrHost::Dns(name, _) => dns_entry_problem(name).map(|problem| format!("'{entry}' ({problem})")),
+            IpOrHost::Ip(_) => None,
+        })
+        .collect();
+
+    if unusable.is_empty() {
+        return Ok(());
+    }
+
+    // A set iterates in arbitrary order; sorted, one config always reports one message.
+    unusable.sort();
+    let mut error = validator::ValidationError::new("unusable allow list entry");
+    error.message = Some(format!("no host name can match {}", unusable.join(", ")).into());
+    Err(error)
+}
+
+/// Why `name` cannot be the name of a host, if it cannot.
+fn dns_entry_problem(name: &str) -> Option<&'static str> {
+    let name = without_root_dot(name);
+
+    if name.is_empty() {
+        Some("empty host name")
+    } else if !is_dns_charset(name) {
+        Some("not a DNS name")
+    } else if name.split('.').any(str::is_empty) {
+        Some("empty label")
+    } else if name
+        .rsplit('.')
+        .next()
+        .is_some_and(|label| label.bytes().all(|b| b.is_ascii_digit()))
+    {
+        Some("last label is numeric, like a mistyped IPv4 address")
+    } else {
+        None
+    }
 }
 
 fn default_target_retry_delay() -> Duration {

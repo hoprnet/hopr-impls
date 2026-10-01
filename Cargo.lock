@@ -3944,10 +3944,11 @@ dependencies = [
 
 [[package]]
 name = "hopr-session-server-forwarder"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "futures",
  "hopr-api",
  "hopr-utilities",
  "ipnet",
