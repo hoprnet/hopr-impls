@@ -234,7 +234,10 @@ where
 ///
 /// Returns `false` if the id had already been issued before, meaning Blokli deduplicated the
 /// submission to a transaction that is already in flight.
-fn record_issued_tx_id(issued: &moka::sync::Cache<blokli_client::api::TxId, ()>, tx_id: &blokli_client::api::TxId) -> bool {
+fn record_issued_tx_id(
+    issued: &moka::sync::Cache<blokli_client::api::TxId, ()>,
+    tx_id: &blokli_client::api::TxId,
+) -> bool {
     if issued.contains_key(tx_id) {
         false
     } else {
