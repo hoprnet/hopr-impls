@@ -28,13 +28,13 @@ rust-version = "1.97"
 
 [workspace.dependencies]
 # In-repo crates (path + version so they are publishable)
-hopr-chain-connector = { path = "connector", version = "0.26.0" }
-hopr-network-graph   = { path = "graph", version = "0.7.0", default-features = false }
+hopr-chain-connector = { path = "connector", version = "0.27.0" }
+hopr-network-graph   = { path = "graph", version = "0.8.0", default-features = false }
 
 # HOPR crates published to crates.io
 blokli-client = "0.34.0"
-hopr-api      = "4.3.1"
-hopr-utils    = { package = "hopr-utilities", version = "0.17.0", default-features = false }
+hopr-api      = "4.3.2"
+hopr-utils    = { package = "hopr-utilities", version = "0.17.1", default-features = false }
 
 # Third-party dependencies (versions mirror hoprnet's workspace to preserve compatibility)
 ahash = "0.8.12"
