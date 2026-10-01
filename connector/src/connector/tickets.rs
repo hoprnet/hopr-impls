@@ -136,7 +136,15 @@ where
                         // For ticket redemption, certain errors are to be handled differently
                         if let ConnectorError::InnerTxFailed(reason) = tx_tracking_error {
                             TicketRedeemError::Rejected(ticket.ticket, format!("inner transaction rejected: {reason}"))
+                        } else if let Some((operation, reason)) = tx_tracking_error.as_hopr_action_rejection() {
+                            // Blokli refused the redemption as deterministically invalid against
+                            // the indexed chain state: retrying it can never succeed.
+                            TicketRedeemError::Rejected(
+                                ticket.ticket,
+                                format!("blokli rejected the {operation} action: {reason}"),
+                            )
                         } else {
+                            // This includes a throttled redemption, which may be retried later.
                             TicketRedeemError::ProcessingError(ticket.ticket, tx_tracking_error)
                         })
                     .and_then(move |receipt| futures::future::ok((ticket.ticket, receipt)))
@@ -156,7 +164,7 @@ where
 mod tests {
     use std::time::Duration;
 
-    use blokli_client::BlokliTestClient;
+    use blokli_client::{BlokliTestClient, SimulatedPolicyOutcome};
     use hex_literal::hex;
     use hopr_api::{
         chain::{ChainValues, ChainWriteChannelOperations, ChainWriteTicketOperations},
@@ -532,6 +540,76 @@ mod tests {
         ));
 
         insta::assert_yaml_snapshot!(*connector.client().snapshot());
+
+        Ok(())
+    }
+
+    fn redeemable_ticket() -> anyhow::Result<RedeemableTicket> {
+        let hkc1 = ChainKeypair::from_secret(&hex!(
+            "e17fe86ce6e99f4806715b0c9412f8dad89334bf07f72d5834207a9d8f19d7f8"
+        ))?;
+        let hkc2 = ChainKeypair::from_secret(&hex!(
+            "492057cf93e99b31d2a85bc5e98a9c3aa0021feec52c227cc8170e8f7d047775"
+        ))?;
+
+        Ok(TicketBuilder::default()
+            .counterparty(&ChainKeypair::from_secret(&PRIVATE_KEY_1)?)
+            .amount(1)
+            .index(1)
+            .channel_epoch(1)
+            .eth_challenge(
+                Challenge::from_hint_and_share(
+                    &HalfKeyChallenge::new(hkc1.public().as_ref()),
+                    &HalfKeyChallenge::new(hkc2.public().as_ref()),
+                )?
+                .to_ethereum_challenge(),
+            )
+            .build_signed(&ChainKeypair::from_secret(&PRIVATE_KEY_2)?, &Hash::default())?
+            .into_acknowledged(Response::from_half_keys(
+                &HalfKey::try_from(hkc1.secret().as_ref())?,
+                &HalfKey::try_from(hkc2.secret().as_ref())?,
+            )?)
+            .into_redeemable(&ChainKeypair::from_secret(&PRIVATE_KEY_1)?, &Hash::default())?)
+    }
+
+    #[tokio::test]
+    async fn connector_should_reject_ticket_when_blokli_rejects_the_redemption() -> anyhow::Result<()> {
+        let blokli_client = prepare_client()?.with_policy_outcome(Some(SimulatedPolicyOutcome::Rejected {
+            operation: "redeem_ticket".into(),
+            reason: "ticket_index_already_redeemed".into(),
+        }));
+
+        let mut connector = create_connector(blokli_client)?;
+        connector.connect().await?;
+
+        let res = connector.redeem_ticket(redeemable_ticket()?).await?.await;
+        assert!(
+            matches!(&res, Err(TicketRedeemError::Rejected(_, reason)) if reason.contains("ticket_index_already_redeemed")),
+            "unexpected result: {res:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connector_should_not_reject_ticket_when_blokli_throttles_the_redemption() -> anyhow::Result<()> {
+        let blokli_client = prepare_client()?.with_policy_outcome(Some(SimulatedPolicyOutcome::Throttled {
+            operation: "redeem_ticket".into(),
+            reason: "ticket_index_already_redeemed".into(),
+            retry_after: Duration::from_secs(30),
+        }));
+
+        let mut connector = create_connector(blokli_client)?;
+        connector.connect().await?;
+
+        let res = connector.redeem_ticket(redeemable_ticket()?).await?.await;
+        match res {
+            Err(TicketRedeemError::ProcessingError(_, error)) => {
+                assert_eq!(Some(Duration::from_secs(30)), error.retry_after());
+                assert!(error.as_hopr_action_rejection().is_none());
+            }
+            other => anyhow::bail!("unexpected result: {other:?}"),
+        }
 
         Ok(())
     }

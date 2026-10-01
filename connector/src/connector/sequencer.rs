@@ -37,6 +37,10 @@ const TX_QUEUE_CAPACITY: usize = 2048;
 // How long until nonces for other signers (than node's own) expire
 const OTHER_SIGNER_NONCE_EXPIRATION: Duration = Duration::from_mins(5);
 
+// How long a tracking id handed out by Blokli is remembered to detect deduplicated submissions.
+// Must outlive the time a transaction can stay in flight, i.e. the longest tracking timeout.
+const ISSUED_TX_ID_RETENTION: Duration = Duration::from_mins(5);
+
 struct FixedTti {
     fixed: Address,
     tti: std::time::Duration,
@@ -97,6 +101,19 @@ where
                 fixed: signer.public().to_address(),
                 tti: OTHER_SIGNER_NONCE_EXPIRATION,
             })
+            .build();
+
+        // Tracking ids Blokli has already handed out to this sequencer.
+        //
+        // When Blokli recognizes a submission as a retry of a HOPR action that is still in flight,
+        // it does not broadcast it and returns the id of the transaction already tracking that
+        // action instead. The client reports this as an ordinary success, but the nonce the retry
+        // was signed with was never used: incrementing the local nonce would open a gap that
+        // stalls every later transaction of that signer. Since the in-flight transaction was
+        // submitted through this sequencer, its id has been seen before, which identifies the
+        // deduplication.
+        let issued_tx_ids = moka::sync::CacheBuilder::new(4 * TX_QUEUE_CAPACITY as u64)
+            .time_to_live(ISSUED_TX_ID_RETENTION)
             .build();
 
         let current_nonce_clone = current_nonce.clone();
@@ -168,9 +185,20 @@ where
                     }
                 })
                 .for_each(move |(res, signer_addr, notifier)| {
-                    // The nonce is incremented when the transaction succeeded or failed due to on-chain
-                    // rejection.
-                    if res.is_ok()
+                    // The nonce is incremented when the transaction was broadcast and either succeeded
+                    // or failed due to on-chain rejection.
+                    // It is not incremented when Blokli refused the transaction before broadcasting it
+                    // (rejected/throttled HOPR action, overloaded Blokli) nor when it deduplicated it.
+                    let deduplicated = res
+                        .as_ref()
+                        .is_ok_and(|tx_id| !record_issued_tx_id(&issued_tx_ids, tx_id));
+                    if deduplicated {
+                        tracing::debug!(
+                            signer = %signer_addr,
+                            ?res,
+                            "nonce not incremented, blokli deduplicated the transaction to one already in flight"
+                        );
+                    } else if res.is_ok()
                         || res
                             .as_ref()
                             .is_err_and(|error| error.as_transaction_rejection_error().is_some())
@@ -199,6 +227,19 @@ where
         );
 
         Self { sender, client }
+    }
+}
+
+/// Records a tracking id returned by Blokli.
+///
+/// Returns `false` if the id had already been issued before, meaning Blokli deduplicated the
+/// submission to a transaction that is already in flight.
+fn record_issued_tx_id(issued: &moka::sync::Cache<blokli_client::api::TxId, ()>, tx_id: &blokli_client::api::TxId) -> bool {
+    if issued.contains_key(tx_id) {
+        false
+    } else {
+        issued.insert(tx_id.clone(), ());
+        true
     }
 }
 
@@ -243,5 +284,19 @@ impl<C, R> Drop for TransactionSequencer<C, R> {
     fn drop(&mut self) {
         // Causes the internally spawned task that drives the queue to terminate
         self.sender.close_channel();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn already_issued_tx_id_is_detected_as_deduplicated() {
+        let issued = moka::sync::Cache::new(16);
+
+        assert!(record_issued_tx_id(&issued, &"tx-1".to_string()));
+        assert!(record_issued_tx_id(&issued, &"tx-2".to_string()));
+        assert!(!record_issued_tx_id(&issued, &"tx-1".to_string()));
     }
 }
