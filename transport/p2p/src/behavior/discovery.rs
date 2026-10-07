@@ -8,7 +8,10 @@ use std::{
 };
 
 use backon::BackoffBuilder;
-use futures::stream::{BoxStream, Stream, StreamExt};
+use futures::{
+    FutureExt,
+    stream::{BoxStream, Stream, StreamExt},
+};
 use libp2p::{
     Multiaddr, PeerId,
     core::Endpoint,
@@ -80,6 +83,8 @@ pub struct Behaviour {
     connected_peers: HashMap<PeerId, usize>,
     next_dial_attempts: BinaryHeap<Reverse<Delayed<PeerId>>>,
     not_connected_peers: HashMap<PeerId, backon::ExponentialBackoff>,
+    /// Wakes `poll` when the earliest scheduled dial falls due; nothing else would.
+    next_dial_timer: Option<(std::time::Instant, futures_timer::Delay)>,
 }
 
 impl Behaviour {
@@ -95,6 +100,7 @@ impl Behaviour {
             connected_peers: HashMap::new(),
             next_dial_attempts: BinaryHeap::with_capacity(1500),
             not_connected_peers: HashMap::new(),
+            next_dial_timer: None,
         }
     }
 
@@ -108,6 +114,27 @@ impl Behaviour {
             release_at: std::time::Instant::now() + duration,
             item: peer,
         }));
+    }
+
+    fn arm_next_dial_timer(&mut self, cx: &mut std::task::Context<'_>) {
+        let Some(release_at) = self.next_dial_attempts.peek().map(|next| next.0.release_at) else {
+            self.next_dial_timer = None;
+            return;
+        };
+        if self
+            .next_dial_timer
+            .as_ref()
+            .is_none_or(|(armed_for, _)| *armed_for != release_at)
+        {
+            let delay = futures_timer::Delay::new(release_at.saturating_duration_since(std::time::Instant::now()));
+            self.next_dial_timer = Some((release_at, delay));
+        }
+        if let Some((_, delay)) = self.next_dial_timer.as_mut()
+            && delay.poll_unpin(cx).is_ready()
+        {
+            self.next_dial_timer = None;
+            cx.waker().wake_by_ref();
+        }
     }
 }
 
@@ -314,10 +341,11 @@ impl NetworkBehaviour for Behaviour {
         }
 
         if let Some(value) = self.pending_events.pop_front() {
-            std::task::Poll::Ready(value)
-        } else {
-            std::task::Poll::Pending
+            return std::task::Poll::Ready(value);
         }
+
+        self.arm_next_dial_timer(cx);
+        std::task::Poll::Pending
     }
 }
 
@@ -525,5 +553,42 @@ mod tests {
             !b.not_connected_peers.contains_key(&peer),
             "peer with remaining connections must not be queued for reconnect"
         );
+    }
+
+    #[tokio::test]
+    async fn scheduled_dial_wakes_the_behaviour_on_its_own() {
+        struct WakeFlag(std::sync::atomic::AtomicBool);
+        impl std::task::Wake for WakeFlag {
+            fn wake(self: std::sync::Arc<Self>) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let mut b = make_behaviour();
+        let backoff = backon::ExponentialBuilder::new()
+            .with_min_delay(std::time::Duration::from_millis(100))
+            .build();
+        b.schedule_dial_with(PeerId::random(), backoff);
+
+        let flag = std::sync::Arc::new(WakeFlag(false.into()));
+        let waker = std::task::Waker::from(flag.clone());
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(b.poll(&mut cx).is_pending());
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            flag.0.load(std::sync::atomic::Ordering::SeqCst),
+            "a due dial must wake the behaviour without any other event"
+        );
+        assert!(matches!(b.poll(&mut cx), std::task::Poll::Ready(ToSwarm::Dial { .. })));
+    }
+
+    #[test]
+    fn idle_behaviour_arms_no_dial_timer() {
+        let mut b = make_behaviour();
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+
+        assert!(b.poll(&mut cx).is_pending());
+        assert!(b.next_dial_timer.is_none(), "nothing scheduled, so nothing to wake for");
     }
 }
