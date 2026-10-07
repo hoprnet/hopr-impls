@@ -3989,7 +3989,7 @@ dependencies = [
 
 [[package]]
 name = "hopr-transport-p2p"
-version = "0.9.6"
+version = "0.9.7"
 dependencies = [
  "anyhow",
  "async-broadcast",
@@ -3999,6 +3999,7 @@ dependencies = [
  "bytes",
  "dashmap",
  "futures",
+ "futures-timer",
  "hopr-api",
  "hopr-utilities",
  "lazy_static",

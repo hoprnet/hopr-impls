@@ -11,7 +11,7 @@ name                   = "hopr-transport-p2p"
 readme                 = "README.md"
 repository.workspace   = true
 rust-version.workspace = true
-version                = "0.9.6"
+version                = "0.9.7"
 
 [lib]
 crate-type = ["rlib"]
@@ -28,6 +28,7 @@ async-broadcast = { workspace = true }
 async-trait = { workspace = true }
 backon = { workspace = true }
 futures = { workspace = true }
+futures-timer = { workspace = true }
 lazy_static = { workspace = true, optional = true }
 libp2p = { workspace = true, features = [
   "autonat",
