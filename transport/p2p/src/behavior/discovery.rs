@@ -116,7 +116,7 @@ impl Behaviour {
         }));
     }
 
-    fn arm_next_dial_timer(&mut self, now: std::time::Instant, cx: &mut std::task::Context<'_>) {
+    fn arm_next_dial_timer(&mut self, cx: &mut std::task::Context<'_>) {
         let Some(release_at) = self.next_dial_attempts.peek().map(|next| next.0.release_at) else {
             self.next_dial_timer = None;
             return;
@@ -126,7 +126,7 @@ impl Behaviour {
             .as_ref()
             .is_none_or(|(armed_for, _)| *armed_for != release_at)
         {
-            let delay = futures_timer::Delay::new(release_at.saturating_duration_since(now));
+            let delay = futures_timer::Delay::new(release_at.saturating_duration_since(std::time::Instant::now()));
             self.next_dial_timer = Some((release_at, delay));
         }
         if let Some((_, delay)) = self.next_dial_timer.as_mut()
@@ -344,7 +344,7 @@ impl NetworkBehaviour for Behaviour {
             return std::task::Poll::Ready(value);
         }
 
-        self.arm_next_dial_timer(now, cx);
+        self.arm_next_dial_timer(cx);
         std::task::Poll::Pending
     }
 }
@@ -581,5 +581,14 @@ mod tests {
             "a due dial must wake the behaviour without any other event"
         );
         assert!(matches!(b.poll(&mut cx), std::task::Poll::Ready(ToSwarm::Dial { .. })));
+    }
+
+    #[test]
+    fn idle_behaviour_arms_no_dial_timer() {
+        let mut b = make_behaviour();
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+
+        assert!(b.poll(&mut cx).is_pending());
+        assert!(b.next_dial_timer.is_none(), "nothing scheduled, so nothing to wake for");
     }
 }
