@@ -307,6 +307,8 @@ pub(crate) fn service_update_to_event(update: ServiceUpdate) -> Result<ServiceEv
             model_to_service_type(&service_type)?,
             model_to_registry_address("node", &node)?,
         ),
+        // never happens, still a case to cover
+        _ => return Err(ConnectorError::TypeConversion("invalid service update kind".into())),
     })
 }
 
@@ -384,6 +386,8 @@ pub(crate) fn service_type_update_to_event(update: ServiceTypeUpdate) -> Result<
         ServiceTypeUpdateKind::RegistryPointerChanged => ServiceEvent::RegistryPointerChanged(
             model_to_registry_address("node-Safe registry", &registry_config()?.node_safe_registry)?,
         ),
+        // never happens, still a case to cover
+        _ => return Err(ConnectorError::TypeConversion("invalid service type update kind".into())),
     })
 }
 

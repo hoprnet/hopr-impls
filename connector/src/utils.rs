@@ -97,6 +97,8 @@ pub(crate) fn model_to_graph_entry(
                     .into(),
             ),
             blokli_client::api::types::ChannelStatus::Closed => ChannelStatus::Closed,
+            // never happens, still a case to cover
+            _ => return Err(ConnectorError::TypeConversion("invalid channel status".into())),
         })
         .epoch(model.channel.epoch as u32)
         .build()?;
