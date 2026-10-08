@@ -387,7 +387,11 @@ pub(crate) fn service_type_update_to_event(update: ServiceTypeUpdate) -> Result<
             model_to_registry_address("node-Safe registry", &registry_config()?.node_safe_registry)?,
         ),
         // never happens, still a case to cover
-        _ => return Err(ConnectorError::TypeConversion("invalid service type update kind".into())),
+        _ => {
+            return Err(ConnectorError::TypeConversion(
+                "invalid service type update kind".into(),
+            ));
+        }
     })
 }
 
