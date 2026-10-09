@@ -348,7 +348,13 @@ where
             /// give the remaining seven. `ServiceEvent` rather than the whole `ChainEvent`, so a
             /// registry stream cannot smuggle an account or channel event through here.
             Service(ServiceEvent),
+            /// New wxHOPR allowance that the node's Safe grants to the Channels contract.
+            SafeAllowance((Address, HoprBalance)),
         }
+
+        let channels_contract = Address::from(<[u8; Address::SIZE]>::from(
+            initial_chain_values.info.contract_addresses.channels,
+        ));
 
         let ticket_values = self.ticket_values.clone();
         let health = self.health.clone();
@@ -608,6 +614,14 @@ where
                 .try_flatten()
                 .fuse();
 
+            // Unlike the subscriptions above, this stream never ends by itself, so it is stopped
+            // once all of them have ended, which keeps the end-of-subscription handling below working.
+            let (main_ended_tx, main_ended_rx) = futures::channel::oneshot::channel::<()>();
+            let safe_allowance_stream =
+                safe::safe_allowance_updates(client.clone(), me, channels_contract, safe::SAFE_ALLOWANCE_RETRY_DELAY)
+                    .map(|update| Ok(SubscribedEventType::SafeAllowance(update)))
+                    .take_until(main_ended_rx);
+
             let mut account_counter = 0;
             let mut channel_counter = 0;
             if min_accounts == 0 && min_channels == 0 {
@@ -615,16 +629,25 @@ where
                 let _ = connection_ready_tx.take().unwrap().send(Ok(()));
             }
 
+            let subscriptions = (
+                account_stream,
+                channel_stream,
+                ticket_params_stream,
+                service_stream,
+                service_type_stream,
+                service_registry_config_stream,
+            )
+                .merge()
+                .chain(
+                    futures::stream::once(async move {
+                        let _ = main_ended_tx.send(());
+                        None
+                    })
+                    .filter_map(futures::future::ready),
+                );
+
             futures::stream::Abortable::new(
-                (
-                    account_stream,
-                    channel_stream,
-                    ticket_params_stream,
-                    service_stream,
-                    service_type_stream,
-                    service_registry_config_stream,
-                )
-                    .merge(),
+                (subscriptions, safe_allowance_stream).merge(),
                 abort_reg,
             )
             .inspect_ok(move |event_type| {
@@ -711,6 +734,12 @@ where
                         Ok(SubscribedEventType::TicketPrice((new, old))) => {
                             tracing::debug!(%new, ?old, "ticket price changed");
                             let _ = event_tx.broadcast_direct(ChainEvent::TicketPriceChanged(new)).await;
+                        }
+                        Ok(SubscribedEventType::SafeAllowance((safe, allowance))) => {
+                            tracing::debug!(%safe, %allowance, "safe allowance changed");
+                            let _ = event_tx
+                                .broadcast_direct(ChainEvent::SafeAllowanceChanged(safe, allowance))
+                                .await;
                         }
                         Ok(SubscribedEventType::Service(event)) => {
                             let event = ChainEvent::from(event);
