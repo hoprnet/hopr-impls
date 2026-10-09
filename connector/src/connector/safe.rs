@@ -185,7 +185,7 @@ pub(crate) fn safe_allowance_updates<C>(
 where
     C: BlokliQueryClient + BlokliSubscriptionClient + Send + Sync + 'static,
 {
-    futures::stream::unfold(SafeAllowanceState::Resolve, move |mut state| {
+    let updates = futures::stream::unfold(SafeAllowanceState::Resolve, move |mut state| {
         let client = client.clone();
         async move {
             loop {
@@ -228,13 +228,20 @@ where
                 }
             }
         }
-    })
-    // Re-subscriptions start with the current allowance again: report only new values.
-    .scan(None, |previous: &mut Option<HoprBalance>, (safe, allowance)| {
-        let changed = previous.replace(allowance) != Some(allowance);
-        futures::future::ready(Some(changed.then_some((safe, allowance))))
-    })
-    .filter_map(futures::future::ready)
+    });
+    distinct_safe_allowances(updates)
+}
+
+/// A reconnect may resolve a different Safe with the same allowance.
+fn distinct_safe_allowances(
+    updates: impl futures::Stream<Item = (Address, HoprBalance)>,
+) -> impl futures::Stream<Item = (Address, HoprBalance)> {
+    updates
+        .scan(None, |previous: &mut Option<(Address, HoprBalance)>, update| {
+            let changed = previous.replace(update) != Some(update);
+            futures::future::ready(Some(changed.then_some(update)))
+        })
+        .filter_map(futures::future::ready)
 }
 
 #[cfg(test)]
@@ -254,6 +261,45 @@ mod tests {
     };
 
     const SAFE_1: [u8; Address::SIZE] = [1u8; Address::SIZE];
+
+    #[tokio::test]
+    async fn allowance_deduplication_preserves_safe_changes_and_zero_allowance() {
+        let first = Address::from(SAFE_1);
+        let second = Address::from([2u8; Address::SIZE]);
+        let amount = HoprBalance::new_base(100);
+        let zero = HoprBalance::zero();
+        let input = [
+            (first, amount),
+            (first, amount),
+            (second, amount),
+            (second, zero),
+            (second, zero),
+        ];
+        let updates: Vec<_> = distinct_safe_allowances(futures::stream::iter(input)).collect().await;
+        assert_eq!(updates, [(first, amount), (second, amount), (second, zero)]);
+    }
+
+    #[test]
+    fn allowance_conversion_rejects_invalid_owner_spender_and_amount() {
+        let valid = blokli_client::api::types::SafeHoprApproval {
+            owner: Address::from(SAFE_1).to_string(),
+            spender: Address::from([2u8; Address::SIZE]).to_string(),
+            allowance: blokli_client::api::types::TokenValueString("100 wxHOPR".into()),
+        };
+        assert!(model_to_safe_approval(valid.clone()).is_ok());
+        let mut invalid_owner = valid.clone();
+        invalid_owner.owner = "invalid".into();
+        let mut invalid_spender = valid.clone();
+        invalid_spender.spender = "invalid".into();
+        let mut invalid_amount = valid;
+        invalid_amount.allowance.0 = "invalid".into();
+        for invalid in [invalid_owner, invalid_spender, invalid_amount] {
+            assert!(matches!(
+                model_to_safe_approval(invalid),
+                Err(ConnectorError::TypeConversion(_))
+            ));
+        }
+    }
 
     /// Two accounts with Safes and an open channel from the first to the second.
     fn approval_test_state(allowance: HoprBalance) -> anyhow::Result<(BlokliTestStateBuilder, ChannelEntry)> {
