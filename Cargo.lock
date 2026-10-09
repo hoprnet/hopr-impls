@@ -8828,3 +8828,23 @@ dependencies = [
  "cc",
  "pkg-config",
 ]
+
+[[patch.unused]]
+name = "blokli-client"
+version = "0.35.1"
+source = "git+https://github.com/hoprnet/blokli-client?branch=q-core-1024-jura-prod-safes-wxhopr-allowance-exhausted-all-channel#3dee40324c5dbce6425a6b3b806139c09c3f0daf"
+
+[[patch.unused]]
+name = "hopr-api"
+version = "4.3.3"
+source = "git+https://github.com/hoprnet/hopr-api?branch=q-core-1024-jura-prod-safes-wxhopr-allowance-exhausted-all-channel#fed4c3e848c3a487b508dd30b9e63cffb632a83a"
+
+[[patch.unused]]
+name = "hopr-types"
+version = "4.1.1"
+source = "git+https://github.com/hoprnet/hopr-types?branch=q-core-1024-jura-prod-safes-wxhopr-allowance-exhausted-all-channel#5df6f2be99433dcb506b79fc11f49583784eab92"
+
+[[patch.unused]]
+name = "hopr-utilities"
+version = "0.18.0"
+source = "git+https://github.com/hoprnet/hopr-utilities?branch=q-core-1024-jura-prod-safes-wxhopr-allowance-exhausted-all-channel#33010402c6a6b1af243b6f1c7d33934034002cfd"
