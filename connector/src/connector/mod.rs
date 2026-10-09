@@ -804,8 +804,10 @@ where
     /// There are some notable exceptions that DO NOT require a prior call to `connect`:
     /// - all the [`ChainValues`](hopr_api::chain::ChainValues) methods,
     /// - all the [`ChainReadSafeOperations`](hopr_api::chain::ChainReadSafeOperations) methods,
-    /// - all the [`ChainWriteSafeOperations`](hopr_api::chain::ChainWriteSafeOperations) methods,
+    /// - [`deploy_safe`](hopr_api::chain::ChainWriteSafeOperations::deploy_safe),
     /// - [`me`](hopr_api::chain::ChainReadChannelOperations::me)
+    ///
+    /// Setting the Safe allowance requires a connection.
     ///
     /// If you wish to only call operations from the above Chain APIs, consider constructing
     /// the [`HoprBlockchainReader`](crate::HoprBlockchainReader) instead.
