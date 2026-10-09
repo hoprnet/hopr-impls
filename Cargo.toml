@@ -28,13 +28,13 @@ rust-version = "1.97"
 
 [workspace.dependencies]
 # In-repo crates (path + version so they are publishable)
-hopr-chain-connector = { path = "connector", version = "0.28.0" }
+hopr-chain-connector = { path = "connector", version = "0.29.0" }
 hopr-network-graph   = { path = "graph", version = "0.8.0", default-features = false }
 
 # HOPR crates published to crates.io
 blokli-client = "0.35.0"
 hopr-api      = "4.3.2"
-hopr-utils    = { package = "hopr-utilities", version = "0.17.3", default-features = false }
+hopr-utils    = { package = "hopr-utilities", version = "0.18.0", default-features = false }
 
 # Third-party dependencies (versions mirror hoprnet's workspace to preserve compatibility)
 ahash = "0.8.12"
@@ -105,7 +105,6 @@ tracing = { version = "0.1.44", features = ["release_max_level_debug"] }
 validator = { version = "0.21.0", features = ["derive"] }
 
 # Development only: build against the unreleased CORE-1024 branches of the upstream repos.
-# Run `fill-revs.sh` to set the revisions, and remove this section once the crates are released.
 [patch.crates-io]
 blokli-client  = { git = "https://github.com/hoprnet/blokli-client", branch = "q-core-1024-jura-prod-safes-wxhopr-allowance-exhausted-all-channel" }
 hopr-api       = { git = "https://github.com/hoprnet/hopr-api", branch = "q-core-1024-jura-prod-safes-wxhopr-allowance-exhausted-all-channel" }
