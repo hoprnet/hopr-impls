@@ -66,8 +66,22 @@ impl InactiveNetwork {
             )
             .map_err(|e| crate::errors::P2PError::Libp2p(e.to_string()))?;
 
+        // QUIC notices a silent peer only after `max_idle_timeout` without a packet from it (libp2p default
+        // 10 s, keep-alive every 5 s); every reaction to a dead relay waits for that, so a relay outage stalls
+        // traffic through it for those 10 s. Both are settable (HOPR_INTERNAL_QUIC_MAX_IDLE_TIMEOUT_MS,
+        // HOPR_INTERNAL_QUIC_KEEP_ALIVE_MS); the defaults are unchanged.
         #[cfg(feature = "transport-quic")]
-        let swarm = swarm.with_quic();
+        let swarm = swarm.with_quic_config(|mut cfg| {
+            let ms = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok());
+            if let Some(idle) = ms("HOPR_INTERNAL_QUIC_MAX_IDLE_TIMEOUT_MS") {
+                cfg.max_idle_timeout = idle.min(u32::MAX as u64) as u32;
+            }
+            if let Some(keep_alive) = ms("HOPR_INTERNAL_QUIC_KEEP_ALIVE_MS") {
+                cfg.keep_alive_interval = std::time::Duration::from_millis(keep_alive);
+            }
+            tracing::info!(max_idle_timeout_ms = cfg.max_idle_timeout, keep_alive = ?cfg.keep_alive_interval, "QUIC transport timeouts");
+            cfg
+        });
 
         // Nix test sandboxes do not provide /etc/resolv.conf, so use an explicit resolver configuration.
         #[cfg(any(feature = "testing", target_os = "android", target_os = "ios"))]
