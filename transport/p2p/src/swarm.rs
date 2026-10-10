@@ -44,33 +44,35 @@ fn swarm_dns_config() -> (libp2p::dns::ResolverConfig, libp2p::dns::ResolverOpts
     )
 }
 
-/// Sets QUIC's `max_idle_timeout`, in milliseconds.
+/// Sets QUIC's `max_idle_timeout`, as a duration (`2s`, `750ms`).
 #[cfg(feature = "transport-quic")]
-const QUIC_MAX_IDLE_TIMEOUT_ENV: &str = "HOPR_INTERNAL_QUIC_MAX_IDLE_TIMEOUT_MS";
-/// Sets QUIC's `keep_alive_interval`, in milliseconds.
+const QUIC_MAX_IDLE_TIMEOUT_ENV: &str = "HOPR_INTERNAL_QUIC_MAX_IDLE_TIMEOUT";
+/// Sets QUIC's `keep_alive_interval`, as a duration (`500ms`).
 #[cfg(feature = "transport-quic")]
-const QUIC_KEEP_ALIVE_ENV: &str = "HOPR_INTERNAL_QUIC_KEEP_ALIVE_MS";
+const QUIC_KEEP_ALIVE_ENV: &str = "HOPR_INTERNAL_QUIC_KEEP_ALIVE";
 
-/// Reads a positive number of milliseconds from `name`: unset is `None`; 0 or anything unparsable is
-/// warned about and `None`, so the default stays (0 would disable the idle timeout, or send a keep-alive
-/// on every poll).
+/// Reads a duration in humantime format (`2s`, `750ms`, `1s 500ms`) from `name`. Unset is `None`; a value
+/// that does not parse is warned about and `None`, so the default stays.
 #[cfg(feature = "transport-quic")]
-fn quic_ms_from_env(name: &str) -> Option<u64> {
-    let raw = std::env::var(name).ok()?;
-    match raw.trim().parse::<u64>() {
-        Ok(0) => {
-            warn!(name, "0 would disable this QUIC timer, keeping the default");
-            None
-        }
-        Ok(ms) => Some(ms),
+fn quic_duration_from_env(name: &str) -> Option<std::time::Duration> {
+    parse_quic_duration(name, &std::env::var(name).ok()?)
+}
+
+#[cfg(feature = "transport-quic")]
+fn parse_quic_duration(name: &str, raw: &str) -> Option<std::time::Duration> {
+    match humantime_serde::re::humantime::parse_duration(raw.trim()) {
+        Ok(duration) => Some(duration),
         Err(error) => {
-            warn!(name, value = %raw, %error, "not a number of milliseconds, keeping the default");
+            warn!(name, value = %raw, %error, "not a duration such as 2s or 750ms, keeping the default");
             None
         }
     }
 }
 
-/// Applies the QUIC idle timeout and keep-alive overrides (milliseconds, 0 ignored) to `cfg`.
+/// Applies the QUIC idle timeout and keep-alive overrides to `cfg`.
+///
+/// An idle timeout below 1 ms (QUIC counts it in whole milliseconds, and 0 disables it) and a zero
+/// keep-alive (a keep-alive on every poll) are ignored with a warning.
 ///
 /// The idle timeout in effect on a connection is the minimum of both ends' (RFC 9000 §10.1), so a short one
 /// here applies to every peer as well, and only this node's own keep-alive keeps a quiet but healthy
@@ -79,14 +81,25 @@ fn quic_ms_from_env(name: &str) -> Option<u64> {
 #[cfg(feature = "transport-quic")]
 fn quic_config_with(
     mut cfg: libp2p::quic::Config,
-    idle_ms: Option<u64>,
-    keep_alive_ms: Option<u64>,
+    idle: Option<std::time::Duration>,
+    keep_alive: Option<std::time::Duration>,
 ) -> libp2p::quic::Config {
-    if let Some(idle) = idle_ms.filter(|ms| *ms > 0) {
-        cfg.max_idle_timeout = idle.min(u32::MAX as u64) as u32;
+    match idle {
+        Some(idle) if idle.as_millis() == 0 => {
+            warn!(
+                ?idle,
+                "a QUIC idle timeout below 1 ms would disable it, keeping the default"
+            )
+        }
+        Some(idle) => cfg.max_idle_timeout = idle.as_millis().min(u32::MAX as u128) as u32,
+        None => {}
     }
-    if let Some(keep_alive) = keep_alive_ms.filter(|ms| *ms > 0) {
-        cfg.keep_alive_interval = std::time::Duration::from_millis(keep_alive);
+    match keep_alive {
+        Some(keep_alive) if keep_alive.is_zero() => {
+            warn!("a zero QUIC keep-alive would send one on every poll, keeping the default")
+        }
+        Some(keep_alive) => cfg.keep_alive_interval = keep_alive,
+        None => {}
     }
     let idle = std::time::Duration::from_millis(cfg.max_idle_timeout as u64);
     if cfg.keep_alive_interval >= idle {
@@ -132,8 +145,8 @@ impl InactiveNetwork {
         let swarm = swarm.with_quic_config(|cfg| {
             let cfg = quic_config_with(
                 cfg,
-                quic_ms_from_env(QUIC_MAX_IDLE_TIMEOUT_ENV),
-                quic_ms_from_env(QUIC_KEEP_ALIVE_ENV),
+                quic_duration_from_env(QUIC_MAX_IDLE_TIMEOUT_ENV),
+                quic_duration_from_env(QUIC_KEEP_ALIVE_ENV),
             );
             info!(max_idle_timeout_ms = cfg.max_idle_timeout, keep_alive = ?cfg.keep_alive_interval, "QUIC transport timeouts");
             cfg
@@ -546,10 +559,24 @@ mod tests {
     mod quic_config {
         use std::time::Duration;
 
-        use super::super::quic_config_with;
+        use super::super::{parse_quic_duration, quic_config_with};
 
         fn defaults() -> libp2p::quic::Config {
             libp2p::quic::Config::new(&libp2p::identity::Keypair::generate_ed25519())
+        }
+
+        fn ms(ms: u64) -> Option<Duration> {
+            Some(Duration::from_millis(ms))
+        }
+
+        #[test]
+        fn durations_parse_in_humantime_format() {
+            assert_eq!(ms(2_000), parse_quic_duration("T", "2s"));
+            assert_eq!(ms(750), parse_quic_duration("T", " 750ms "));
+            assert_eq!(ms(1_500), parse_quic_duration("T", "1s 500ms"));
+            assert_eq!(Some(Duration::from_micros(300)), parse_quic_duration("T", "300us"));
+            assert_eq!(None, parse_quic_duration("T", "2000"), "a bare number has no unit");
+            assert_eq!(None, parse_quic_duration("T", "soon"));
         }
 
         #[test]
@@ -561,34 +588,40 @@ mod tests {
 
         #[test]
         fn both_set_are_taken_as_given() {
-            let cfg = quic_config_with(defaults(), Some(2_000), Some(500));
+            let cfg = quic_config_with(defaults(), ms(2_000), ms(500));
             assert_eq!(2_000, cfg.max_idle_timeout);
             assert_eq!(Duration::from_millis(500), cfg.keep_alive_interval);
         }
 
         #[test]
-        fn zero_is_ignored() {
-            let cfg = quic_config_with(defaults(), Some(0), Some(0));
+        fn zero_and_sub_millisecond_idle_are_ignored() {
+            let cfg = quic_config_with(defaults(), ms(0), ms(0));
             assert_eq!(10_000, cfg.max_idle_timeout);
             assert_eq!(Duration::from_secs(5), cfg.keep_alive_interval);
+
+            let cfg = quic_config_with(defaults(), Some(Duration::from_micros(300)), None);
+            assert_eq!(
+                10_000, cfg.max_idle_timeout,
+                "QUIC counts whole milliseconds, 0 would disable it"
+            );
         }
 
         #[test]
         fn a_keep_alive_not_below_the_idle_timeout_is_lowered() {
             // Only the idle timeout lowered: the 5 s default keep-alive would let every quiet connection close.
-            let cfg = quic_config_with(defaults(), Some(2_000), None);
+            let cfg = quic_config_with(defaults(), ms(2_000), None);
             assert_eq!(Duration::from_millis(1_000), cfg.keep_alive_interval);
 
-            let cfg = quic_config_with(defaults(), Some(2_000), Some(2_000));
+            let cfg = quic_config_with(defaults(), ms(2_000), ms(2_000));
             assert_eq!(Duration::from_millis(1_000), cfg.keep_alive_interval);
 
-            let cfg = quic_config_with(defaults(), Some(1), None);
+            let cfg = quic_config_with(defaults(), ms(1), None);
             assert_eq!(Duration::from_millis(1), cfg.keep_alive_interval, "never lowered to 0");
         }
 
         #[test]
-        fn an_idle_timeout_beyond_u32_is_clamped() {
-            let cfg = quic_config_with(defaults(), Some(u64::MAX), None);
+        fn an_idle_timeout_beyond_u32_milliseconds_is_clamped() {
+            let cfg = quic_config_with(defaults(), Some(Duration::from_secs(u64::MAX / 1_000)), None);
             assert_eq!(u32::MAX, cfg.max_idle_timeout);
         }
     }

@@ -21,7 +21,7 @@ default        = []
 runtime-tokio  = ["libp2p/tokio"]
 telemetry      = ["dep:lazy_static", "hopr-api/types-telemetry"]
 testing        = []
-transport-quic = ["dep:quinn-udp", "libp2p/quic"]
+transport-quic = ["dep:quinn-udp", "libp2p/quic", "dep:humantime-serde"]
 
 [dependencies]
 async-broadcast = { workspace = true }
@@ -29,6 +29,7 @@ async-trait = { workspace = true }
 backon = { workspace = true }
 futures = { workspace = true }
 futures-timer = { workspace = true }
+humantime-serde = { workspace = true, optional = true }
 lazy_static = { workspace = true, optional = true }
 libp2p = { workspace = true, features = [
   "autonat",
