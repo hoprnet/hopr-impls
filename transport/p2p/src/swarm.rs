@@ -44,6 +44,64 @@ fn swarm_dns_config() -> (libp2p::dns::ResolverConfig, libp2p::dns::ResolverOpts
     )
 }
 
+/// Sets QUIC's `max_idle_timeout`, in milliseconds.
+#[cfg(feature = "transport-quic")]
+const QUIC_MAX_IDLE_TIMEOUT_ENV: &str = "HOPR_INTERNAL_QUIC_MAX_IDLE_TIMEOUT_MS";
+/// Sets QUIC's `keep_alive_interval`, in milliseconds.
+#[cfg(feature = "transport-quic")]
+const QUIC_KEEP_ALIVE_ENV: &str = "HOPR_INTERNAL_QUIC_KEEP_ALIVE_MS";
+
+/// Reads a positive number of milliseconds from `name`: unset is `None`; 0 or anything unparsable is
+/// warned about and `None`, so the default stays (0 would disable the idle timeout, or send a keep-alive
+/// on every poll).
+#[cfg(feature = "transport-quic")]
+fn quic_ms_from_env(name: &str) -> Option<u64> {
+    let raw = std::env::var(name).ok()?;
+    match raw.trim().parse::<u64>() {
+        Ok(0) => {
+            warn!(name, "0 would disable this QUIC timer, keeping the default");
+            None
+        }
+        Ok(ms) => Some(ms),
+        Err(error) => {
+            warn!(name, value = %raw, %error, "not a number of milliseconds, keeping the default");
+            None
+        }
+    }
+}
+
+/// Applies the QUIC idle timeout and keep-alive overrides (milliseconds, 0 ignored) to `cfg`.
+///
+/// The idle timeout in effect on a connection is the minimum of both ends' (RFC 9000 §10.1), so a short one
+/// here applies to every peer as well, and only this node's own keep-alive keeps a quiet but healthy
+/// connection open. A keep-alive at or above the idle timeout (say only the idle timeout was lowered) would
+/// close every quiet connection, so it is lowered to half the idle timeout.
+#[cfg(feature = "transport-quic")]
+fn quic_config_with(
+    mut cfg: libp2p::quic::Config,
+    idle_ms: Option<u64>,
+    keep_alive_ms: Option<u64>,
+) -> libp2p::quic::Config {
+    if let Some(idle) = idle_ms.filter(|ms| *ms > 0) {
+        cfg.max_idle_timeout = idle.min(u32::MAX as u64) as u32;
+    }
+    if let Some(keep_alive) = keep_alive_ms.filter(|ms| *ms > 0) {
+        cfg.keep_alive_interval = std::time::Duration::from_millis(keep_alive);
+    }
+    let idle = std::time::Duration::from_millis(cfg.max_idle_timeout as u64);
+    if cfg.keep_alive_interval >= idle {
+        let lowered = idle / 2;
+        warn!(
+            ?idle,
+            keep_alive = ?cfg.keep_alive_interval,
+            ?lowered,
+            "QUIC keep-alive not below the idle timeout would close quiet healthy connections, lowering it"
+        );
+        cfg.keep_alive_interval = lowered;
+    }
+    cfg
+}
+
 /// Build objects comprising an inactive p2p network.
 ///
 /// Returns a built [libp2p::Swarm] object implementing the HoprNetworkBehavior functionality.
@@ -68,18 +126,15 @@ impl InactiveNetwork {
 
         // QUIC notices a silent peer only after `max_idle_timeout` without a packet from it (libp2p default
         // 10 s, keep-alive every 5 s); every reaction to a dead relay waits for that, so a relay outage stalls
-        // traffic through it for those 10 s. Both are settable (HOPR_INTERNAL_QUIC_MAX_IDLE_TIMEOUT_MS,
-        // HOPR_INTERNAL_QUIC_KEEP_ALIVE_MS); the defaults are unchanged.
+        // traffic through it for those 10 s. Both are settable, the defaults are unchanged.
         #[cfg(feature = "transport-quic")]
-        let swarm = swarm.with_quic_config(|mut cfg| {
-            let ms = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok());
-            if let Some(idle) = ms("HOPR_INTERNAL_QUIC_MAX_IDLE_TIMEOUT_MS") {
-                cfg.max_idle_timeout = idle.min(u32::MAX as u64) as u32;
-            }
-            if let Some(keep_alive) = ms("HOPR_INTERNAL_QUIC_KEEP_ALIVE_MS") {
-                cfg.keep_alive_interval = std::time::Duration::from_millis(keep_alive);
-            }
-            tracing::info!(max_idle_timeout_ms = cfg.max_idle_timeout, keep_alive = ?cfg.keep_alive_interval, "QUIC transport timeouts");
+        let swarm = swarm.with_quic_config(|cfg| {
+            let cfg = quic_config_with(
+                cfg,
+                quic_ms_from_env(QUIC_MAX_IDLE_TIMEOUT_ENV),
+                quic_ms_from_env(QUIC_KEEP_ALIVE_ENV),
+            );
+            info!(max_idle_timeout_ms = cfg.max_idle_timeout, keep_alive = ?cfg.keep_alive_interval, "QUIC transport timeouts");
             cfg
         });
 
@@ -484,5 +539,53 @@ mod tests {
                 .iter()
                 .any(|server| server.socket_addr.ip() == IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)))
         );
+    }
+
+    #[cfg(feature = "transport-quic")]
+    mod quic_config {
+        use std::time::Duration;
+
+        use super::super::quic_config_with;
+
+        fn defaults() -> libp2p::quic::Config {
+            libp2p::quic::Config::new(&libp2p::identity::Keypair::generate_ed25519())
+        }
+
+        #[test]
+        fn unset_keeps_the_libp2p_defaults() {
+            let cfg = quic_config_with(defaults(), None, None);
+            assert_eq!(10_000, cfg.max_idle_timeout);
+            assert_eq!(Duration::from_secs(5), cfg.keep_alive_interval);
+        }
+
+        #[test]
+        fn both_set_are_taken_as_given() {
+            let cfg = quic_config_with(defaults(), Some(2_000), Some(500));
+            assert_eq!(2_000, cfg.max_idle_timeout);
+            assert_eq!(Duration::from_millis(500), cfg.keep_alive_interval);
+        }
+
+        #[test]
+        fn zero_is_ignored() {
+            let cfg = quic_config_with(defaults(), Some(0), Some(0));
+            assert_eq!(10_000, cfg.max_idle_timeout);
+            assert_eq!(Duration::from_secs(5), cfg.keep_alive_interval);
+        }
+
+        #[test]
+        fn a_keep_alive_not_below_the_idle_timeout_is_lowered() {
+            // Only the idle timeout lowered: the 5 s default keep-alive would let every quiet connection close.
+            let cfg = quic_config_with(defaults(), Some(2_000), None);
+            assert_eq!(Duration::from_millis(1_000), cfg.keep_alive_interval);
+
+            let cfg = quic_config_with(defaults(), Some(2_000), Some(2_000));
+            assert_eq!(Duration::from_millis(1_000), cfg.keep_alive_interval);
+        }
+
+        #[test]
+        fn an_idle_timeout_beyond_u32_is_clamped() {
+            let cfg = quic_config_with(defaults(), Some(u64::MAX), None);
+            assert_eq!(u32::MAX, cfg.max_idle_timeout);
+        }
     }
 }
