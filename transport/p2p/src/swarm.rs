@@ -103,7 +103,8 @@ fn quic_config_with(
     }
     let idle = std::time::Duration::from_millis(cfg.max_idle_timeout as u64);
     if cfg.keep_alive_interval >= idle {
-        // Never 0: that would send a keep-alive on every poll (an idle timeout of 1 ms halves to 0).
+        // At least 1 ms: half of a 1 ms idle timeout is 500 us, and a keep-alive far below a millisecond
+        // would send one on almost every poll.
         let lowered = (idle / 2).max(std::time::Duration::from_millis(1));
         warn!(
             ?idle,
