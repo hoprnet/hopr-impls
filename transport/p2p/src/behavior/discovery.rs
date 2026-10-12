@@ -83,6 +83,9 @@ pub struct Behaviour {
     bootstrap_peers: HashMap<PeerId, Vec<Multiaddr>>,
     connected_peers: HashMap<PeerId, usize>,
     next_dial_attempts: BinaryHeap<Reverse<Delayed<PeerId>>>,
+    /// Mirrors the peers currently in `next_dial_attempts` for O(1) membership
+    /// checks, so a batch of first announcements does not perform O(n²) heap scans.
+    queued_dials: std::collections::HashSet<PeerId>,
     not_connected_peers: HashMap<PeerId, backon::ExponentialBackoff>,
     /// Wakes `poll` when the earliest scheduled dial falls due; nothing else would.
     next_dial_timer: Option<(std::time::Instant, futures_timer::Delay)>,
@@ -100,6 +103,7 @@ impl Behaviour {
             pending_events: VecDeque::new(),
             connected_peers: HashMap::new(),
             next_dial_attempts: BinaryHeap::with_capacity(1500),
+            queued_dials: std::collections::HashSet::with_capacity(1500),
             not_connected_peers: HashMap::new(),
             next_dial_timer: None,
         }
@@ -112,11 +116,12 @@ impl Behaviour {
     }
 
     fn has_scheduled_dial(&self, peer: &PeerId) -> bool {
-        self.next_dial_attempts.iter().any(|entry| entry.0.item == *peer)
+        self.queued_dials.contains(peer)
     }
 
     fn cancel_dial(&mut self, peer: &PeerId) {
         self.not_connected_peers.remove(peer);
+        self.queued_dials.remove(peer);
         self.next_dial_attempts.retain(|entry| entry.0.item != *peer);
     }
 
@@ -130,6 +135,7 @@ impl Behaviour {
             std::time::Duration::from_secs(10)
         });
         self.not_connected_peers.insert(peer, backoff);
+        self.queued_dials.insert(peer);
         self.next_dial_attempts.push(Reverse(Delayed {
             release_at: std::time::Instant::now() + duration,
             item: peer,
@@ -353,6 +359,8 @@ impl NetworkBehaviour for Behaviour {
                 .expect("The value should be present within the same access")
                 .0
                 .item;
+            // The entry has left the heap: dispatched, skipped, or cancelled below.
+            self.queued_dials.remove(&peer);
 
             // Skip stale entries (peer reconnected or was otherwise unscheduled)
             if !self.not_connected_peers.contains_key(&peer) {
