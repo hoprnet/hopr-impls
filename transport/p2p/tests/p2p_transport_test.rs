@@ -360,24 +360,15 @@ async fn disconnected_peer_reconnects_via_announced_address() -> anyhow::Result<
     // on the loopback QUIC handshake, which is a libp2p artefact unrelated to
     // this fix.
     //
-    // Re-announce on a ticker: in production HOPR's network graph pushes
-    // announcements continuously, which wakes discovery to fire its backed-off
-    // dial attempts. A quiet test has no such wakeups, so a scheduled dial would
-    // otherwise wait for an unrelated swarm event. The re-announce is idempotent
-    // (discovery de-duplicates a peer already queued/connected).
-    let announce_b = PeerDiscovery::Announce(b_id, b_announced.clone());
-    let _nudge = {
-        let a_tx = a_tx.clone();
-        let announce_b = announce_b.clone();
-        SelfClosingJoinHandle::new(async move {
-            loop {
-                if a_tx.unbounded_send(announce_b.clone()).is_err() {
-                    break;
-                }
-                sleep(std::time::Duration::from_millis(500)).await;
-            }
-        })
-    };
+    // A single announcement is enough. Discovery dials only addresses announced
+    // via `PeerDiscovery::Announce`, so this is what populates A's `bootstrap_peers`
+    // for B and lets any dial be scheduled. The entry then persists, so after B
+    // disconnects the `ConnectionClosed` handler reschedules the redial from the
+    // same stored address and `next_dial_timer` self-wakes `poll` when it falls
+    // due, with no further swarm event. Relying on that path keeps this test
+    // discriminating for the close-triggered retry rather than a fresh announce.
+    a_tx.unbounded_send(PeerDiscovery::Announce(b_id, b_announced.clone()))
+        .context("failed to announce B to A")?;
 
     wait_until_connected(&a_net, b_id, connect_timeout)
         .await

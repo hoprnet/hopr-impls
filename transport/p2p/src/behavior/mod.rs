@@ -87,3 +87,20 @@ impl From<libp2p::autonat::Event> for HoprNetworkBehaviorEvent {
         Self::Autonat(event)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use futures::stream;
+
+    use super::*;
+
+    #[test]
+    fn new_builds_the_aggregate_behaviour() {
+        // Exercises the constructor, including the curated identify config
+        // (`with_cache_size(0)` / `with_hide_listen_addrs(true)`) that the
+        // same-port dial fix relies on (#31).
+        let keypair = libp2p::identity::Keypair::generate_ed25519();
+        let behaviour = HoprNetworkBehavior::new(keypair.public(), stream::empty());
+        assert_eq!(format!("{behaviour:?}"), "HoprNetworkBehavior");
+    }
+}
