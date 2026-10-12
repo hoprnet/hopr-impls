@@ -739,10 +739,13 @@ mod tests {
         }
 
         let mut b = make_behaviour();
+        let peer = PeerId::random();
+        b.bootstrap_peers
+            .insert(peer, vec!["/ip4/127.0.0.1/tcp/9000".parse().unwrap()]);
         let backoff = backon::ExponentialBuilder::new()
             .with_min_delay(std::time::Duration::from_millis(100))
             .build();
-        b.schedule_dial_with(PeerId::random(), backoff);
+        b.schedule_dial_with(peer, backoff);
 
         let flag = std::sync::Arc::new(WakeFlag(false.into()));
         let waker = std::task::Waker::from(flag.clone());
