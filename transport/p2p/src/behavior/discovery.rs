@@ -8,12 +8,15 @@ use std::{
 };
 
 use backon::BackoffBuilder;
-use futures::stream::{BoxStream, Stream, StreamExt};
+use futures::{
+    FutureExt,
+    stream::{BoxStream, Stream, StreamExt},
+};
 use libp2p::{
     Multiaddr, PeerId,
     core::Endpoint,
     swarm::{
-        ConnectionDenied, ConnectionId, DialFailure, NetworkBehaviour, ToSwarm, dial_opts::DialOpts,
+        ConnectionDenied, ConnectionId, DialError, DialFailure, NetworkBehaviour, ToSwarm, dial_opts::DialOpts,
         dummy::ConnectionHandler,
     },
 };
@@ -64,6 +67,7 @@ fn initial_backoff() -> backon::ExponentialBackoff {
         .with_max_delay(std::time::Duration::from_secs(120))
         .with_factor(1.5)
         .with_jitter()
+        .without_max_times()
         .build()
 }
 
@@ -79,7 +83,12 @@ pub struct Behaviour {
     bootstrap_peers: HashMap<PeerId, Vec<Multiaddr>>,
     connected_peers: HashMap<PeerId, usize>,
     next_dial_attempts: BinaryHeap<Reverse<Delayed<PeerId>>>,
+    /// Mirrors the peers currently in `next_dial_attempts` for O(1) membership
+    /// checks, so a batch of first announcements does not perform O(n²) heap scans.
+    queued_dials: std::collections::HashSet<PeerId>,
     not_connected_peers: HashMap<PeerId, backon::ExponentialBackoff>,
+    /// Wakes `poll` when the earliest scheduled dial falls due; nothing else would.
+    next_dial_timer: Option<(std::time::Instant, futures_timer::Delay)>,
 }
 
 impl Behaviour {
@@ -94,20 +103,64 @@ impl Behaviour {
             pending_events: VecDeque::new(),
             connected_peers: HashMap::new(),
             next_dial_attempts: BinaryHeap::with_capacity(1500),
+            queued_dials: std::collections::HashSet::with_capacity(1500),
             not_connected_peers: HashMap::new(),
+            next_dial_timer: None,
         }
     }
 
+    fn has_known_address(&self, peer: &PeerId) -> bool {
+        self.bootstrap_peers
+            .get(peer)
+            .is_some_and(|addresses| !addresses.is_empty())
+    }
+
+    fn has_scheduled_dial(&self, peer: &PeerId) -> bool {
+        self.queued_dials.contains(peer)
+    }
+
+    fn cancel_dial(&mut self, peer: &PeerId) {
+        self.not_connected_peers.remove(peer);
+        self.queued_dials.remove(peer);
+        self.next_dial_attempts.retain(|entry| entry.0.item != *peer);
+    }
+
     fn schedule_dial_with(&mut self, peer: PeerId, mut backoff: backon::ExponentialBackoff) {
+        if !self.has_known_address(&peer) || self.has_scheduled_dial(&peer) {
+            return;
+        }
+
         let duration = backoff.next().unwrap_or_else(|| {
             tracing::debug!(%peer, "failed to get next backoff duration, using 10s");
             std::time::Duration::from_secs(10)
         });
         self.not_connected_peers.insert(peer, backoff);
+        self.queued_dials.insert(peer);
         self.next_dial_attempts.push(Reverse(Delayed {
             release_at: std::time::Instant::now() + duration,
             item: peer,
         }));
+    }
+
+    fn arm_next_dial_timer(&mut self, cx: &mut std::task::Context<'_>) {
+        let Some(release_at) = self.next_dial_attempts.peek().map(|next| next.0.release_at) else {
+            self.next_dial_timer = None;
+            return;
+        };
+        if self
+            .next_dial_timer
+            .as_ref()
+            .is_none_or(|(armed_for, _)| *armed_for != release_at)
+        {
+            let delay = futures_timer::Delay::new(release_at.saturating_duration_since(std::time::Instant::now()));
+            self.next_dial_timer = Some((release_at, delay));
+        }
+        if let Some((_, delay)) = self.next_dial_timer.as_mut()
+            && delay.poll_unpin(cx).is_ready()
+        {
+            self.next_dial_timer = None;
+            cx.waker().wake_by_ref();
+        }
     }
 }
 
@@ -190,7 +243,7 @@ impl NetworkBehaviour for Behaviour {
         match event {
             libp2p::swarm::FromSwarm::ConnectionEstablished(data) => {
                 *self.connected_peers.entry(data.peer_id).or_insert(0) += 1;
-                self.not_connected_peers.remove(&data.peer_id);
+                self.cancel_dial(&data.peer_id);
             }
             libp2p::swarm::FromSwarm::ConnectionClosed(data) => {
                 let v = self.connected_peers.entry(data.peer_id).or_insert(0);
@@ -214,12 +267,17 @@ impl NetworkBehaviour for Behaviour {
                 tracing::debug!(?peer_id, %error, "Failed to dial peer");
 
                 // on a failed dial get the next scheduled dial using the backoff,
-                // but only if the peer hasn't already connected via an inbound
-                // connection that raced with our outbound dial attempt.
+                // but only if the peer isn't connected, has a known address, the
+                // failure is transient (not `DialError::NoAddresses`), and no dial
+                // is already queued; otherwise cancel any pending retry until the
+                // peer is announced again.
                 if let Some(peer) = peer_id {
-                    if self.connected_peers.contains_key(&peer) {
-                        self.not_connected_peers.remove(&peer);
-                    } else {
+                    if self.connected_peers.contains_key(&peer)
+                        || matches!(error, DialError::NoAddresses)
+                        || !self.has_known_address(&peer)
+                    {
+                        self.cancel_dial(&peer);
+                    } else if !self.has_scheduled_dial(&peer) {
                         let backoff = self.not_connected_peers.remove(&peer).unwrap_or_else(|| {
                             tracing::debug!(%peer, "no backoff for a failed dial, creating new backoff");
                             initial_backoff()
@@ -301,23 +359,41 @@ impl NetworkBehaviour for Behaviour {
                 .expect("The value should be present within the same access")
                 .0
                 .item;
+            // The entry has left the heap: dispatched, skipped, or cancelled below.
+            self.queued_dials.remove(&peer);
 
             // Skip stale entries (peer reconnected or was otherwise unscheduled)
             if !self.not_connected_peers.contains_key(&peer) {
                 continue;
             }
 
+            // Dial only the addresses HOPR discovery announced for this peer. Passing
+            // explicit addresses leaves `extend_addresses_through_behaviour` at its
+            // default of `false`, so other behaviours (e.g. autonat's address cache,
+            // which may hold a peer-advertised loopback address pointing at us) cannot
+            // inject additional dial targets.
+            //
+            // A scheduled peer always has a non-empty `bootstrap_peers` entry
+            // (`schedule_dial_with` enforces `has_known_address`). Guard the invariant
+            // anyway: dialing with an empty address set would fail `NoAddresses` and be
+            // silently cancelled, so surface it as a warning and drop the schedule.
+            let Some(addresses) = self.bootstrap_peers.get(&peer).cloned().filter(|a| !a.is_empty()) else {
+                tracing::warn!(%peer, "scheduled dial for a peer without a known address, dropping schedule");
+                self.cancel_dial(&peer);
+                continue;
+            };
             tracing::trace!(%peer, "attempting a new dial attempt item");
             self.pending_events.push_back(ToSwarm::Dial {
-                opts: DialOpts::peer_id(peer).build(),
+                opts: DialOpts::peer_id(peer).addresses(addresses).build(),
             });
         }
 
         if let Some(value) = self.pending_events.pop_front() {
-            std::task::Poll::Ready(value)
-        } else {
-            std::task::Poll::Pending
+            return std::task::Poll::Ready(value);
         }
+
+        self.arm_next_dial_timer(cx);
+        std::task::Poll::Pending
     }
 }
 
@@ -328,7 +404,7 @@ mod tests {
         Multiaddr,
         core::{ConnectedPoint, Endpoint},
         swarm::{
-            ConnectionId, DialError, FromSwarm,
+            ConnectionId, FromSwarm,
             behaviour::{ConnectionClosed, ConnectionEstablished, DialFailure},
         },
     };
@@ -369,11 +445,10 @@ mod tests {
         }));
     }
 
-    fn simulate_dial_failure(b: &mut Behaviour, peer: PeerId) {
-        let error = DialError::NoAddresses;
+    fn simulate_dial_failure(b: &mut Behaviour, peer: PeerId, error: &DialError) {
         b.on_swarm_event(FromSwarm::DialFailure(DialFailure {
             peer_id: Some(peer),
-            error: &error,
+            error,
             connection_id: ConnectionId::new_unchecked(0),
         }));
     }
@@ -386,6 +461,29 @@ mod tests {
         if !b.connected_peers.contains_key(&peer) && !b.not_connected_peers.contains_key(&peer) {
             b.schedule_dial_with(peer, initial_backoff());
         }
+    }
+
+    #[test]
+    fn initial_backoff_continues_at_max_delay() {
+        let max_delay = std::time::Duration::from_secs(120);
+        let delays = initial_backoff().take(20).collect::<Vec<_>>();
+
+        assert_eq!(
+            delays.len(),
+            20,
+            "peer discovery backoff must not stop producing delays"
+        );
+
+        let mut base_delay = std::time::Duration::from_secs(3);
+        for (attempt, delay) in delays.into_iter().enumerate() {
+            assert!(
+                delay >= base_delay && delay < base_delay.saturating_mul(2),
+                "attempt {attempt} delay {delay:?} must include jitter based on {base_delay:?}"
+            );
+            base_delay = base_delay.mul_f32(1.5).min(max_delay);
+        }
+
+        assert_eq!(base_delay, max_delay);
     }
 
     // ── regression: announce must not re-enqueue dial for a connected peer ──
@@ -440,28 +538,126 @@ mod tests {
         // Peer connects inbound while our outbound dial is in flight.
         simulate_established(&mut b, peer);
         // Outbound dial fails after the inbound connection is up.
-        simulate_dial_failure(&mut b, peer);
+        simulate_dial_failure(&mut b, peer, &DialError::NoAddresses);
 
         assert!(
             !b.not_connected_peers.contains_key(&peer),
             "DialFailure for an already-connected peer must not re-enqueue a dial"
         );
+        assert!(
+            b.next_dial_attempts.iter().all(|entry| entry.0.item != peer),
+            "DialFailure for an already-connected peer must cancel queued dials"
+        );
     }
 
-    /// A dial failure for a peer that is genuinely not connected must reschedule.
+    /// A transient dial failure for a known peer that is genuinely not connected must reschedule.
     #[test]
     fn dial_failure_reschedules_genuinely_disconnected_peer() {
         let mut b = make_behaviour();
         let peer = PeerId::random();
+        let address = "/ip4/127.0.0.1/tcp/9000".parse().unwrap();
 
-        // Queue the peer for dialing (as if it was announced but never connected).
+        b.bootstrap_peers.insert(peer, vec![address]);
+        // Keep the backoff as it would be while the emitted dial is in flight.
         b.not_connected_peers.insert(peer, initial_backoff());
-        simulate_dial_failure(&mut b, peer);
+        simulate_dial_failure(&mut b, peer, &DialError::Transport(vec![]));
 
         assert!(
             b.not_connected_peers.contains_key(&peer),
             "DialFailure for a disconnected peer must reschedule a dial attempt"
         );
+        assert_eq!(b.next_dial_attempts.len(), 1);
+    }
+
+    #[test]
+    fn dial_failure_without_address_does_not_schedule_retry() {
+        let mut b = make_behaviour();
+        let peer = PeerId::random();
+
+        simulate_dial_failure(&mut b, peer, &DialError::Transport(vec![]));
+
+        assert!(!b.not_connected_peers.contains_key(&peer));
+        assert!(b.next_dial_attempts.is_empty());
+    }
+
+    #[test]
+    fn no_addresses_dial_failure_cancels_retry_until_announce() {
+        let peer = PeerId::random();
+        let address: Multiaddr = "/ip4/127.0.0.1/tcp/9000".parse().unwrap();
+        let (announcements_tx, announcements_rx) = futures::channel::mpsc::unbounded();
+        let mut b = Behaviour::new(PeerId::random(), announcements_rx);
+
+        b.not_connected_peers.insert(peer, initial_backoff());
+        b.next_dial_attempts.push(Reverse(Delayed {
+            release_at: std::time::Instant::now(),
+            item: peer,
+        }));
+
+        simulate_dial_failure(&mut b, peer, &DialError::NoAddresses);
+
+        assert!(!b.not_connected_peers.contains_key(&peer));
+        assert!(b.next_dial_attempts.is_empty());
+
+        announcements_tx
+            .unbounded_send(PeerDiscovery::Announce(peer, vec![address]))
+            .unwrap();
+        let waker = futures::task::noop_waker_ref();
+        let mut cx = std::task::Context::from_waker(waker);
+        let _ = b.poll(&mut cx);
+
+        assert!(b.not_connected_peers.contains_key(&peer));
+        assert_eq!(b.next_dial_attempts.len(), 1);
+    }
+
+    // ── regression #31: dials carry only announced addresses ────────────────
+
+    /// Smoke test: a scheduled dial for a peer with a known announced address is
+    /// emitted for that peer.
+    ///
+    /// This does not, on its own, guard the #31 fix: `DialOpts` addresses and the
+    /// `extend_addresses_through_behaviour` flag are `pub(crate)` to libp2p-swarm,
+    /// so the address set this test cares about is not inspectable here. The fix's
+    /// guarantee rests on that flag defaulting to `false` when explicit addresses
+    /// are supplied (libp2p-swarm 0.47.1); the reconnection path is covered
+    /// end-to-end by `disconnected_peer_reconnects_via_announced_address`.
+    #[test]
+    fn scheduled_dial_with_address_emits_dial_for_peer() {
+        let mut b = make_behaviour();
+        let peer = PeerId::random();
+        let address: Multiaddr = "/ip4/127.0.0.1/tcp/9000".parse().unwrap();
+
+        b.bootstrap_peers.insert(peer, vec![address]);
+        b.not_connected_peers.insert(peer, initial_backoff());
+        b.next_dial_attempts.push(Reverse(Delayed {
+            release_at: std::time::Instant::now(),
+            item: peer,
+        }));
+
+        let waker = futures::task::noop_waker_ref();
+        let mut cx = std::task::Context::from_waker(waker);
+
+        match b.poll(&mut cx) {
+            std::task::Poll::Ready(ToSwarm::Dial { opts }) => {
+                assert_eq!(opts.get_peer_id(), Some(peer));
+            }
+            _ => panic!("expected a Dial for the scheduled peer"),
+        }
+    }
+
+    #[test]
+    fn repeated_dial_failures_leave_one_pending_retry() {
+        let mut b = make_behaviour();
+        let peer = PeerId::random();
+        let address = "/ip4/127.0.0.1/tcp/9000".parse().unwrap();
+
+        b.bootstrap_peers.insert(peer, vec![address]);
+        b.not_connected_peers.insert(peer, initial_backoff());
+
+        simulate_dial_failure(&mut b, peer, &DialError::Transport(vec![]));
+        simulate_dial_failure(&mut b, peer, &DialError::Transport(vec![]));
+
+        assert!(b.not_connected_peers.contains_key(&peer));
+        assert_eq!(b.next_dial_attempts.len(), 1);
     }
 
     // ── regression: repeated announces for disconnected peer must not accumulate ──
@@ -500,7 +696,9 @@ mod tests {
     fn connection_closed_schedules_reconnect() {
         let mut b = make_behaviour();
         let peer = PeerId::random();
+        let address = "/ip4/127.0.0.1/tcp/9000".parse().unwrap();
 
+        b.bootstrap_peers.insert(peer, vec![address]);
         simulate_established(&mut b, peer);
         simulate_closed(&mut b, peer, 0);
 
@@ -508,6 +706,18 @@ mod tests {
             b.not_connected_peers.contains_key(&peer),
             "after disconnect with no remaining connections, peer must be queued for reconnect"
         );
+    }
+
+    #[test]
+    fn connection_closed_without_address_does_not_schedule_reconnect() {
+        let mut b = make_behaviour();
+        let peer = PeerId::random();
+
+        simulate_established(&mut b, peer);
+        simulate_closed(&mut b, peer, 0);
+
+        assert!(!b.not_connected_peers.contains_key(&peer));
+        assert!(b.next_dial_attempts.is_empty());
     }
 
     #[test]
@@ -525,5 +735,45 @@ mod tests {
             !b.not_connected_peers.contains_key(&peer),
             "peer with remaining connections must not be queued for reconnect"
         );
+    }
+
+    #[tokio::test]
+    async fn scheduled_dial_wakes_the_behaviour_on_its_own() {
+        struct WakeFlag(std::sync::atomic::AtomicBool);
+        impl std::task::Wake for WakeFlag {
+            fn wake(self: std::sync::Arc<Self>) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let mut b = make_behaviour();
+        let peer = PeerId::random();
+        b.bootstrap_peers
+            .insert(peer, vec!["/ip4/127.0.0.1/tcp/9000".parse().unwrap()]);
+        let backoff = backon::ExponentialBuilder::new()
+            .with_min_delay(std::time::Duration::from_millis(100))
+            .build();
+        b.schedule_dial_with(peer, backoff);
+
+        let flag = std::sync::Arc::new(WakeFlag(false.into()));
+        let waker = std::task::Waker::from(flag.clone());
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(b.poll(&mut cx).is_pending());
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            flag.0.load(std::sync::atomic::Ordering::SeqCst),
+            "a due dial must wake the behaviour without any other event"
+        );
+        assert!(matches!(b.poll(&mut cx), std::task::Poll::Ready(ToSwarm::Dial { .. })));
+    }
+
+    #[test]
+    fn idle_behaviour_arms_no_dial_timer() {
+        let mut b = make_behaviour();
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+
+        assert!(b.poll(&mut cx).is_pending());
+        assert!(b.next_dial_timer.is_none(), "nothing scheduled, so nothing to wake for");
     }
 }

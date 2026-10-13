@@ -1,5 +1,6 @@
 //! HOPR session server that bridges TCP/UDP sockets from the Session Exit node to a destination.
 
+mod allow_list;
 pub mod config;
 pub mod target_pattern;
 
@@ -11,7 +12,7 @@ use hopr_api::{
 };
 use hopr_utils::{
     network_types::{
-        prelude::{ForeignDataMode, IpOrHostExt, ServiceId, SessionTarget},
+        prelude::{ForeignDataMode, IpOrHost, IpOrHostExt, ServiceId, SessionTarget},
         udp::{ConnectedUdpStream, UdpStreamParallelism},
         utils::{transfer_session, transfer_session_datagram},
     },
@@ -109,17 +110,9 @@ impl<S> HoprServerIpForwardingReactor<S> {
         }
     }
 
-    fn all_ips_allowed(&self, addrs: &[SocketAddr]) -> bool {
-        if self.cfg.use_target_allow_list {
-            for addr in addrs {
-                if !self.cfg.target_allow_list.contains(addr) {
-                    tracing::error!(%addr, "address not allowed by the target allow list, denying the target");
-                    return false;
-                }
-                tracing::debug!(%addr, "address allowed by the target allow list, accepting the target");
-            }
-        }
-        true
+    /// Whether the target allow list admits `target`, which `process` has already resolved to `resolved`.
+    async fn target_allowed(&self, target: &IpOrHost, resolved: &[SocketAddr]) -> bool {
+        allow_list::is_allowed(&self.cfg, target, resolved, |name| name.resolve_tokio()).await
     }
 }
 
@@ -236,9 +229,9 @@ where
                     "UDP target resolved"
                 );
 
-                if !self.all_ips_allowed(&[resolved_udp_target]) {
-                    return Err(ForwarderError::general(format!(
-                        "denied target address {resolved_udp_target}"
+                if !self.target_allowed(&udp_target, &[resolved_udp_target]).await {
+                    return Err(ForwarderError::denied(format!(
+                        "{resolved_udp_target} is not allowed by the target allow list"
                     )));
                 }
 
@@ -318,9 +311,9 @@ where
                     "TCP target resolved"
                 );
 
-                if !self.all_ips_allowed(&resolved_tcp_targets) {
-                    return Err(ForwarderError::general(format!(
-                        "denied target address {resolved_tcp_targets:?}"
+                if !self.target_allowed(&tcp_target, &resolved_tcp_targets).await {
+                    return Err(ForwarderError::denied(format!(
+                        "not all of {resolved_tcp_targets:?} are allowed by the target allow list"
                     )));
                 }
 
@@ -437,7 +430,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
+    use std::{str::FromStr, time::Duration};
 
     use anyhow::Context;
     use hopr_api::{
@@ -493,6 +486,44 @@ mod tests {
 
     fn service(id: ServiceId) -> SessionAdmissionRequest {
         SessionAdmissionRequest::new(SessionId::random(), SessionTarget::ExitNode(id), 0)
+    }
+
+    fn allow_list_config(entries: &[&str]) -> anyhow::Result<SessionIpForwardingConfig> {
+        Ok(SessionIpForwardingConfig {
+            target_allow_list: entries
+                .iter()
+                .map(|entry| IpOrHost::from_str(entry).with_context(|| format!("parsing allow list entry {entry}")))
+                .collect::<anyhow::Result<_>>()?,
+            ..Default::default()
+        })
+    }
+
+    /// A reactor enforcing exactly the given allow list.
+    fn reactor_allowing(entries: &[&str]) -> anyhow::Result<Reactor> {
+        Ok(HoprServerIpForwardingReactor::new(
+            OffchainKeypair::random(),
+            allow_list_config(entries)?,
+        ))
+    }
+
+    fn plain(host: &str) -> anyhow::Result<SealedHost> {
+        Ok(SealedHost::Plain(
+            IpOrHost::from_str(host).context("parsing target host")?,
+        ))
+    }
+
+    /// A Session arriving for `target`. The far end of its byte-stream is returned so that the caller
+    /// decides how long it stays open.
+    fn incoming(target: SessionTarget) -> (IncomingSession<tokio::io::DuplexStream>, tokio::io::DuplexStream) {
+        let (session, far_end) = tokio::io::duplex(1024);
+        (
+            IncomingSession {
+                id: SessionId::random(),
+                session,
+                target,
+            },
+            far_end,
+        )
     }
 
     #[tokio::test]
@@ -702,6 +733,177 @@ mod tests {
             cfg.validate().is_err(),
             "a range admitting nothing is a typo, not a policy"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn an_allow_list_of_addresses_and_names_deserializes_and_is_written_back_unchanged() -> anyhow::Result<()> {
+        let entries = [
+            "10.0.0.1:8000",
+            "[fd00::1]:443",
+            "gnosisvpnserver:8000",
+            "wgserver:52820",
+        ];
+        let cfg: SessionIpForwardingConfig =
+            serde_json::from_value(serde_json::json!({ "target_allow_list": entries }))
+                .context("deserializing forwarding config")?;
+
+        assert_eq!(cfg.target_allow_list.len(), entries.len());
+        assert!(
+            cfg.target_allow_list.contains(&IpOrHost::Ip("10.0.0.1:8000".parse()?)),
+            "an address keeps meaning that address"
+        );
+        assert!(
+            cfg.target_allow_list
+                .contains(&IpOrHost::Dns("gnosisvpnserver".into(), 8000))
+        );
+        cfg.validate().context("validating forwarding config")?;
+
+        // What is written back is what was written in, so a config that predates names round-trips.
+        let mut written: Vec<String> = serde_json::from_value(
+            serde_json::to_value(&cfg).context("serializing forwarding config")?["target_allow_list"].clone(),
+        )
+        .context("reading the written list")?;
+        written.sort();
+        let mut expected = entries.map(String::from);
+        expected.sort();
+        assert_eq!(written, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn an_allow_list_entry_without_a_port_is_rejected_at_deserialization() {
+        for entry in ["gnosisvpnserver", "gnosisvpnserver:http", "10.0.0.1"] {
+            assert!(
+                serde_json::from_value::<SessionIpForwardingConfig>(
+                    serde_json::json!({ "target_allow_list": [entry] })
+                )
+                .is_err(),
+                "{entry} names no port"
+            );
+        }
+    }
+
+    #[test]
+    fn an_allow_list_name_that_no_host_can_have_is_rejected_at_load() -> anyhow::Result<()> {
+        for entry in [
+            ":80",
+            "exa mple.com:80",
+            "*.example.com:80",
+            "172.30.0:8000",
+            "127.1:80",
+            "a..b:80",
+            ".example.com:80",
+        ] {
+            assert!(
+                allow_list_config(&[entry])?.validate().is_err(),
+                "{entry} can never match a host"
+            );
+        }
+
+        for entry in [
+            "gnosisvpnserver:8000",
+            "wgserver:52820",
+            "Mixed.Case.example:443",
+            "root.dot.:80",
+            "_sip._tcp.example:5060",
+            "1.example.com:80",
+            "10.0.0.1:8000",
+            "[2001:db8::1]:443",
+        ] {
+            allow_list_config(&[entry])?
+                .validate()
+                .with_context(|| format!("{entry} is a usable entry"))?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_rejected_allow_list_entry_is_named_in_the_error() -> anyhow::Result<()> {
+        let message = allow_list_config(&["gnosisvpnserver:8000", "172.30.0:8000"])?
+            .validate()
+            .expect_err("a mistyped address is rejected")
+            .to_string();
+
+        assert!(message.contains("172.30.0:8000"), "{message}");
+        assert!(
+            !message.contains("gnosisvpnserver"),
+            "only the entry at fault is named: {message}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_target_off_the_allow_list_is_refused_over_either_protocol() -> anyhow::Result<()> {
+        let reactor = reactor_allowing(&["10.0.0.5:8000"])?;
+
+        for target in [
+            SessionTarget::TcpStream(plain("10.0.0.6:8000")?),
+            SessionTarget::UdpStream(plain("10.0.0.6:8000")?),
+        ] {
+            let (session, _far_end) = incoming(target);
+            let result = reactor.process(session).await;
+            assert!(matches!(result, Err(ForwarderError::Denied(_))), "{result:?}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_tcp_target_on_the_allow_list_is_forwarded_to() -> anyhow::Result<()> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .context("binding the target")?;
+        let target = listener
+            .local_addr()
+            .context("reading the target's address")?
+            .to_string();
+
+        let (session, _far_end) = incoming(SessionTarget::TcpStream(plain(&target)?));
+        reactor_allowing(&[&target])?.process(session).await?;
+
+        tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .context("nothing connected to the target")?
+            .context("accepting the connection")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_udp_target_on_the_allow_list_is_forwarded_to() -> anyhow::Result<()> {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .context("binding the target")?;
+        let target = socket.local_addr().context("reading the target's address")?.to_string();
+
+        let (session, _far_end) = incoming(SessionTarget::UdpStream(plain(&target)?));
+        reactor_allowing(&[&target])?.process(session).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_allow_list_does_not_stand_in_the_way_when_it_is_off() -> anyhow::Result<()> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .context("binding the target")?;
+        let target = listener
+            .local_addr()
+            .context("reading the target's address")?
+            .to_string();
+        let reactor = HoprServerIpForwardingReactor::new(
+            OffchainKeypair::random(),
+            SessionIpForwardingConfig {
+                use_target_allow_list: false,
+                ..allow_list_config(&["10.0.0.5:8000"])?
+            },
+        );
+
+        let (session, _far_end) = incoming(SessionTarget::TcpStream(plain(&target)?));
+        reactor.process(session).await?;
+
+        tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .context("nothing connected to the target")?
+            .context("accepting the connection")?;
         Ok(())
     }
 }

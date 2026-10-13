@@ -218,7 +218,7 @@ where
         + 'static,
 {
     let info = client.query_chain_info().await?;
-    let contract_addrs = serde_json::from_str(&info.contract_addresses.0)
+    let contract_addrs = utils::parse_contract_addresses(&info.contract_addresses.0)
         .map_err(|e| errors::ConnectorError::TypeConversion(format!("contract addresses not a valid JSON: {e}")))?;
 
     let payload_gen = SafePayloadGenerator::new(chain_key, contract_addrs, module_address);
@@ -257,7 +257,7 @@ where
         + 'static,
 {
     let info = client.query_chain_info().await?;
-    let contract_addrs = serde_json::from_str(&info.contract_addresses.0)
+    let contract_addrs = utils::parse_contract_addresses(&info.contract_addresses.0)
         .map_err(|e| errors::ConnectorError::TypeConversion(format!("contract addresses not a valid JSON: {e}")))?;
 
     let payload_gen = BasicPayloadGenerator::new(chain_key.public().to_address(), contract_addrs);
