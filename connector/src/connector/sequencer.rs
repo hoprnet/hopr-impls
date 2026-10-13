@@ -24,6 +24,15 @@ type TxRequest<T> = (
     futures::channel::oneshot::Sender<errors::Result<blokli_client::api::TxId>>,
 );
 
+/// A processed [`TxRequest`], carrying what the nonce bookkeeping needs after the submission.
+struct SequencedTx {
+    res: errors::Result<blokli_client::api::TxId>,
+    /// `false` if it failed before reaching Blokli, so its nonce cannot have been used.
+    submitted: bool,
+    signer_addr: Address,
+    notifier: futures::channel::oneshot::Sender<errors::Result<blokli_client::api::TxId>>,
+}
+
 /// Takes care of sequencing transactions, nonce management, and submitting the transactions to the blockchain in-order.
 ///
 /// This object is meant to be a singleton and cannot be cloned.
@@ -132,48 +141,48 @@ where
                     let current_nonce = current_nonce.clone();
                     let nonce_gaps = nonce_gaps.clone();
                     async move {
-                        let chain_info = match client.query_chain_info().map_err(ConnectorError::from).await {
-                            Ok(chain_info) => {
-                                tracing::debug!(chain_id = chain_info.chain_id, "chain info retrieved for tx");
-                                chain_info
-                            }
-                            Err(e) => return (Err(e), false, signer_addr, notifier),
-                        };
+                        let signed_tx = async {
+                            let chain_info = client.query_chain_info().map_err(ConnectorError::from).await?;
+                            tracing::debug!(chain_id = chain_info.chain_id, "chain info retrieved for tx");
 
-                        let parsed_chain_info = match model_to_chain_info(chain_info) {
-                            Ok(parsed_chain_info) => parsed_chain_info,
-                            Err(error) => return (Err(error), false, signer_addr, notifier),
-                        };
-                        let chain_id = parsed_chain_info.info.chain_id;
-                        let gas_estimation = GasEstimation::from(parsed_chain_info);
-                        tracing::debug!(?gas_estimation, "gas estimation used for tx");
+                            let parsed_chain_info = model_to_chain_info(chain_info)?;
+                            let chain_id = parsed_chain_info.info.chain_id;
+                            let gas_estimation = GasEstimation::from(parsed_chain_info);
+                            tracing::debug!(?gas_estimation, "gas estimation used for tx");
 
-                        let pending = match client
-                            .query_transaction_count(&signer_addr.into())
-                            .map_err(ConnectorError::from)
-                            .await
-                        {
-                            Ok(pending) => pending,
-                            Err(e) => return (Err(e), false, signer_addr, notifier),
-                        };
-                        let local_nonce = current_nonce.entry(signer_addr).or_default().into_value();
-                        let nonce = sync_nonce(&local_nonce, &nonce_gaps, signer_addr, pending, NONCE_GAP_TOLERANCE);
-                        tracing::debug!(nonce, signer = %signer_addr, "nonce used for the tx");
+                            let pending = client
+                                .query_transaction_count(&signer_addr.into())
+                                .map_err(ConnectorError::from)
+                                .await?;
+                            let local_nonce = current_nonce.entry(signer_addr).or_default().into_value();
+                            let nonce =
+                                sync_nonce(&local_nonce, &nonce_gaps, signer_addr, pending, NONCE_GAP_TOLERANCE);
+                            tracing::debug!(nonce, signer = %signer_addr, "nonce used for the tx");
 
-                        let tx = match tx
-                            .sign_and_encode_to_eip2718(nonce, chain_id, gas_estimation.into(), &signer)
-                            .await
-                        {
-                            Ok(tx) => tx,
-                            Err(e) => return (Err(e.into()), false, signer_addr, notifier),
-                        };
+                            let tx = tx
+                                .sign_and_encode_to_eip2718(nonce, chain_id, gas_estimation.into(), &signer)
+                                .await?;
+                            tracing::debug!(nonce, signer = %signer_addr, "submitting transaction");
+                            Ok::<_, ConnectorError>(tx)
+                        }
+                        .await;
 
-                        tracing::debug!(nonce, signer = %signer_addr, "submitting transaction");
-                        let res = client.submit_and_track_transaction(&tx).map_err(ConnectorError::from).await;
-                        (res, true, signer_addr, notifier)
+                        let (res, submitted) = match signed_tx {
+                            Ok(tx) => (
+                                client.submit_and_track_transaction(&tx).map_err(ConnectorError::from).await,
+                                true,
+                            ),
+                            Err(e) => (Err(e), false),
+                        };
+                        SequencedTx {
+                            res,
+                            submitted,
+                            signer_addr,
+                            notifier,
+                        }
                     }
                 })
-                .for_each(move |(res, submitted, signer_addr, notifier)| {
+                .for_each(move |SequencedTx { res, submitted, signer_addr, notifier }| {
                     let deduplicated = res
                         .as_ref()
                         .is_ok_and(|tx_id| !record_issued_tx_id(&issued_tx_ids, tx_id));
