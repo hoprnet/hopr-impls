@@ -105,7 +105,27 @@ impl ConnectorError {
     /// Indicates whether Blokli refused the transaction *before* broadcasting it, so that it
     /// did not consume a nonce.
     pub fn is_refused_before_broadcast(&self) -> bool {
-        self.as_hopr_action_rejection().is_some() || self.retry_after().is_some()
+        self.as_hopr_action_rejection().is_some()
+            || self.retry_after().is_some()
+            || matches!(
+                self.client_error_kind(),
+                Some(ErrorKind::BlokliError {
+                    kind: "contract not allowed" | "function not allowed",
+                    ..
+                })
+            )
+    }
+
+    /// Returns Blokli's classification of the RPC node's refusal to broadcast, such as `NONCE_TOO_LOW`.
+    pub fn rpc_rejection_code(&self) -> Option<&str> {
+        match self.client_error_kind()? {
+            ErrorKind::BlokliError {
+                kind: "rpc error",
+                code,
+                ..
+            } => Some(code.as_str()),
+            _ => None,
+        }
     }
 
     /// The underlying Blokli client error kind, looking through cached errors.
@@ -193,6 +213,33 @@ mod tests {
         assert!(!error.is_refused_before_broadcast());
         assert!(error.as_transaction_rejection_error().is_some());
         assert!(!ConnectorError::InvalidTicket.is_refused_before_broadcast());
+    }
+
+    #[test]
+    fn contract_and_function_policy_refusals_are_not_broadcast() {
+        for kind in ["contract not allowed", "function not allowed"] {
+            let error = client_error(ErrorKind::BlokliError {
+                kind,
+                code: "NOT_ALLOWED".into(),
+                message: "not allowed".into(),
+            });
+
+            assert!(error.is_refused_before_broadcast(), "{kind}");
+            assert_eq!(None, error.rpc_rejection_code(), "{kind}");
+        }
+    }
+
+    #[test]
+    fn rpc_refusal_code_is_seen_through_cached_errors() {
+        let error = ConnectorError::CacheError(std::sync::Arc::new(client_error(ErrorKind::BlokliError {
+            kind: "rpc error",
+            code: "NONCE_TOO_HIGH".into(),
+            message: "nonce too high".into(),
+        })));
+
+        assert_eq!(Some("NONCE_TOO_HIGH"), error.rpc_rejection_code());
+        assert!(!error.is_refused_before_broadcast());
+        assert_eq!(None, client_error(ErrorKind::Timeout).rpc_rejection_code());
     }
 
     #[test]
