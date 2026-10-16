@@ -226,6 +226,7 @@ impl HoprLibp2pNetworkBuilder {
         let liveness: crate::liveness::LivenessRegistry = Default::default();
 
         let (notifier, event_rx) = async_broadcast::broadcast(1000);
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<crate::SwarmCommand>(128);
 
         let network = HoprNetwork {
             tracker: tracker.clone(),
@@ -234,6 +235,7 @@ impl HoprLibp2pNetworkBuilder {
             protocol: libp2p::StreamProtocol::new(protocol),
             event_rx: event_rx.deactivate(),
             liveness: liveness.clone(),
+            cmd_tx,
         };
 
         #[cfg(all(feature = "telemetry", not(test)))]
@@ -250,7 +252,25 @@ impl HoprLibp2pNetworkBuilder {
                 }
             };
 
-            while let Some(event) = swarm.next().await {
+            loop {
+                let event = tokio::select! {
+                    Some(cmd) = cmd_rx.recv() => {
+                        match cmd {
+                            crate::SwarmCommand::Disconnect(peer_id) => {
+                                debug!(%peer_id, transport = "libp2p", "disconnect command received, terminating connection to peer");
+                                let _ = swarm.disconnect_peer_id(peer_id);
+                            }
+                        }
+                        continue;
+                    }
+                    event = swarm.next() => {
+                        match event {
+                            Some(event) => event,
+                            None => break,
+                        }
+                    }
+                };
+
                 match event {
                     SwarmEvent::Behaviour(HoprNetworkBehaviorEvent::Discovery(_)) => {}
                     SwarmEvent::Behaviour(

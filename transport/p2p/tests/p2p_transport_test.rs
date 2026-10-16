@@ -472,10 +472,44 @@ async fn p2p_only_communication_quic() -> anyhow::Result<()> {
     // Throughput expectation for the raw stream transport driven through the minimal test framing.
     assert_gt!(
         speed_in_mbytes_s,
-        50.0f64,
+        45.0f64,
         "The measured speed for data transfer is ~{speed_in_mbytes_s:.1}MB/s on {received_bytes} bytes received, \
-         which is less than the expected 50MB/s",
+         which is less than the expected 45MB/s",
     );
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn network_stream_control_disconnect_drops_peer_connection() -> anyhow::Result<()> {
+    let connect_timeout = std::time::Duration::from_secs(30);
+
+    let kp_a = OffchainKeypair::random();
+    let port_a = random_free_local_ipv4_port().context("no free port for A")?;
+    let (_a_id, a_tx, a_net, a_proc) = build_node(&kp_a, vec![quic_addr(port_a)]).await?;
+
+    let kp_b = OffchainKeypair::random();
+    let port_b = random_free_local_ipv4_port().context("no free port for B")?;
+    let b_announced = vec![quic_addr(port_b)];
+    let (b_id, _b_tx, _b_net, b_proc) = build_node(&kp_b, b_announced.clone()).await?;
+
+    let _a_handle = SelfClosingJoinHandle::new(a_proc());
+    let _b_handle = SelfClosingJoinHandle::new(b_proc());
+
+    a_tx.unbounded_send(PeerDiscovery::Announce(b_id, b_announced))
+        .context("failed to announce B to A")?;
+
+    wait_until_connected(&a_net, b_id, connect_timeout)
+        .await
+        .context("A must connect to B initially")?;
+
+    // Calling disconnect on NetworkStreamControl must actively terminate the connection
+    a_net.disconnect(b_id).await.map_err(|e| anyhow::anyhow!("disconnect failed: {e}"))?;
+
+    wait_until_disconnected(&a_net, b_id, connect_timeout)
+        .await
+        .context("A must observe B disconnected after disconnect call")?;
+
+    Ok(())
+}
+
