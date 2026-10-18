@@ -62,6 +62,11 @@ pub enum PeerDiscovery {
     Announce(PeerId, Vec<Multiaddr>),
 }
 
+#[derive(Debug, Clone)]
+pub(crate) enum SwarmCommand {
+    Disconnect(PeerId),
+}
+
 #[derive(Clone)]
 pub struct HoprNetwork {
     tracker: Arc<DashSet<PeerId>>,
@@ -73,6 +78,7 @@ pub struct HoprNetwork {
     /// on `ConnectionClosed` / `OutgoingConnectionError` so that wrapped
     /// substreams for that peer self-error on their next poll.
     liveness: LivenessRegistry,
+    cmd_tx: tokio::sync::mpsc::Sender<SwarmCommand>,
 }
 
 impl std::fmt::Debug for HoprNetwork {
@@ -149,5 +155,12 @@ impl NetworkStreamControl for HoprNetwork {
             .open_stream(peer, self.protocol)
             .await
             .map(|inner| LivenessStream::new(inner, flag))
+    }
+
+    async fn disconnect(&self, peer: PeerId) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.cmd_tx
+            .send(SwarmCommand::Disconnect(peer))
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
     }
 }

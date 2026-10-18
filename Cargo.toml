@@ -33,7 +33,7 @@ hopr-network-graph   = { path = "graph", version = "0.8.0", default-features = f
 
 # HOPR crates published to crates.io
 blokli-client = "0.35.0"
-hopr-api      = "4.3.2"
+hopr-api      = "4.4.1"
 hopr-utils    = { package = "hopr-utilities", version = "0.17.3", default-features = false }
 
 # Third-party dependencies (versions mirror hoprnet's workspace to preserve compatibility)
@@ -103,3 +103,8 @@ tokio = { version = "1.53.1", features = [
 tokio-retry = "0.3.2"
 tracing = { version = "0.1.44", features = ["release_max_level_debug"] }
 validator = { version = "0.21.0", features = ["derive"] }
+
+[patch.crates-io]
+hopr-api = { path = "../hopr-api" }
+libp2p-quic = { path = "patches/libp2p-quic" }
+quinn-proto = { path = "patches/quinn-proto" }
