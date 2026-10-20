@@ -59,6 +59,21 @@ const DEFAULT_SYNC_TOLERANCE_PCT: usize = 90;
 const CHANNEL_CUSTOM_TIMEMOUT_MULTIPLIER: u32 = 4;
 const TICKET_CUSTOM_TIMEOUT_MULTIPLIER: u32 = 4;
 
+/// An error from one of the chain subscriptions, together with the name of that subscription.
+///
+/// The names match the ones blokli-client uses for the subscription's health, so log lines from both can be matched.
+#[derive(Debug)]
+struct SubscriptionError {
+    subscription: &'static str,
+    error: ConnectorError,
+}
+
+impl SubscriptionError {
+    fn new(subscription: &'static str, error: ConnectorError) -> Self {
+        Self { subscription, error }
+    }
+}
+
 /// Connector health states.
 ///
 /// Each value maps to a `ComponentStatus` variant plus a fixed detail message.
@@ -456,6 +471,7 @@ where
                             .map(SubscribedEventType::Account)
                     })
                 })
+                .map_err(|error| SubscriptionError::new("accounts", error))
                 .fuse();
 
             // Stream of channel graph updates
@@ -486,6 +502,7 @@ where
                         futures::future::ready(res.map(SubscribedEventType::Channel).map_err(ConnectorError::backend))
                     })
                 })
+                .map_err(|error| SubscriptionError::new("graph", error))
                 .fuse();
 
             // Stream of ticket parameter updates (ticket price, minimum winning probability)
@@ -557,6 +574,7 @@ where
                     }
                 })
                 .try_flatten()
+                .map_err(|error| SubscriptionError::new("ticket_params", error))
                 .fuse();
 
             // Stream of service registry entry changes (registrations, updates, deregistrations)
@@ -568,6 +586,7 @@ where
                 // established, so a delivered registration always means it happened afterwards.
                 .try_filter(move |event| futures::future::ready(!replayed_services.consumes(event)))
                 .map_ok(SubscribedEventType::Service)
+                .map_err(|error| SubscriptionError::new("services", error))
                 .fuse();
 
             // Stream of service type and registry-wide configuration changes
@@ -581,6 +600,7 @@ where
                 // established.
                 .try_filter(move |event| futures::future::ready(!replayed_service_types.consumes(event)))
                 .map_ok(SubscribedEventType::Service)
+                .map_err(|error| SubscriptionError::new("service_types", error))
                 .fuse();
 
             // The first configuration initializes both registry-wide values. Later complete-state
@@ -606,6 +626,7 @@ where
                 })
                 .map_ok(|events| futures::stream::iter(events).map(Ok::<_, ConnectorError>))
                 .try_flatten()
+                .map_err(|error| SubscriptionError::new("service_registry_config", error))
                 .fuse();
 
             let mut account_counter = 0;
@@ -717,11 +738,8 @@ where
                             tracing::debug!(%event, "service registry changed");
                             let _ = event_tx.broadcast_direct(event).await;
                         }
-                        Err(error) => {
-                            tracing::error!(
-                                %error,
-                                "error processing account/graph/ticket params/service registry subscription"
-                            );
+                        Err(SubscriptionError { subscription, error }) => {
+                            tracing::error!(subscription, %error, "error in chain subscription");
                         }
                     }
                 }
