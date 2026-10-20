@@ -102,3 +102,7 @@ tokio = { version = "1.53.1", features = [
 tokio-retry = "0.3.2"
 tracing = { version = "0.1.44", features = ["release_max_level_debug"] }
 validator = { version = "0.21.0", features = ["derive"] }
+
+# Subscription health is not released yet. Remove this once a blokli-client release contains it.
+[patch.crates-io]
+blokli-client = { git = "https://github.com/hoprnet/blokli-client", branch = "feature/core-1106-blokli-client-sse-subscriptions-retry-forever-with-no-health" }
