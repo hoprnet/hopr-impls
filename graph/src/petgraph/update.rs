@@ -184,6 +184,19 @@ impl hopr_api::graph::NetworkGraphUpdate for ChannelGraph {
         *self.ticket_face_value.write() = Some(ticket_face_value);
     }
 
+    fn record_node_health(&self, node: &hopr_api::OffchainPublicKey, health: f64) {
+        self.record_nodes_health(&[(*node, health)]);
+    }
+
+    fn record_nodes_health(&self, healths: &[(hopr_api::OffchainPublicKey, f64)]) {
+        let mut inner = self.inner.write();
+        for (node, health) in healths {
+            if let Some(idx) = inner.indices.get_by_left(node).copied() {
+                inner.set_node_health(idx, *health);
+            }
+        }
+    }
+
     #[tracing::instrument(level = "debug", skip(self, update))]
     fn record_edge<N, P>(&self, update: MeasurableEdge<N, P>)
     where

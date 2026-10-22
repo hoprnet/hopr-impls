@@ -20,9 +20,36 @@ pub(crate) struct InnerGraph {
     /// principle be claimed twice; the entry keeps every claimant rather than the first, which is
     /// what lets resolution keep failing closed on an ambiguous slot instead of guessing.
     pub(crate) slots: std::collections::HashMap<u64, Vec<NodeIndex>>,
+    /// Relayer health recorded per node, below `1.0` only; copied onto every edge into the node.
+    pub(crate) node_health: std::collections::HashMap<NodeIndex, f64>,
 }
 
 impl InnerGraph {
+    /// Adds an edge carrying the health already recorded for its destination.
+    pub(crate) fn add_edge(&mut self, src: NodeIndex, dest: NodeIndex) -> petgraph::graph::EdgeIndex {
+        let mut observations = Observations::default();
+        observations.set_health(self.node_health.get(&dest).copied());
+        self.graph.add_edge(src, dest, observations)
+    }
+
+    /// Records a node's health and copies it onto every edge into the node.
+    pub(crate) fn set_node_health(&mut self, idx: NodeIndex, health: f64) {
+        let health = (health < 1.0).then_some(health.max(0.0));
+        match health {
+            Some(health) => self.node_health.insert(idx, health),
+            None => self.node_health.remove(&idx),
+        };
+        let mut incoming = self
+            .graph
+            .neighbors_directed(idx, petgraph::Direction::Incoming)
+            .detach();
+        while let Some((edge, _)) = incoming.next(&self.graph) {
+            if let Some(observations) = self.graph.edge_weight_mut(edge) {
+                observations.set_health(health);
+            }
+        }
+    }
+
     /// Registers a node's slot claim. Idempotent for a key already registered at that index.
     pub(crate) fn claim_slot(&mut self, key: &OffchainPublicKey, idx: NodeIndex) {
         let claimants = self.slots.entry(crate::petgraph::path_id::encode(key)).or_default();
@@ -125,7 +152,12 @@ impl ChannelGraph {
             min_ack_rate,
             max_plausible_loopback_rtt,
             ticket_face_value: Arc::new(RwLock::new(None)),
-            inner: Arc::new(RwLock::new(InnerGraph { graph, indices, slots })),
+            inner: Arc::new(RwLock::new(InnerGraph {
+                graph,
+                indices,
+                slots,
+                node_health: Default::default(),
+            })),
         }
     }
 
@@ -240,6 +272,7 @@ impl hopr_api::graph::NetworkGraphWrite for ChannelGraph {
         let mut inner = self.inner.write();
         if let Some((_, idx)) = inner.indices.remove_by_left(key) {
             inner.release_slot(key, idx);
+            inner.node_health.remove(&idx);
             let incident: Vec<_> = {
                 use petgraph::visit::EdgeRef;
 
@@ -271,7 +304,7 @@ impl hopr_api::graph::NetworkGraphWrite for ChannelGraph {
             .ok_or(ChannelGraphError::PublicKeyNodeNotFound(*dest))?;
 
         if inner.graph.find_edge(src_idx, dest_idx).is_none() {
-            inner.graph.add_edge(src_idx, dest_idx, Observations::default());
+            inner.add_edge(src_idx, dest_idx);
         }
 
         Ok(())
@@ -323,7 +356,7 @@ impl hopr_api::graph::NetworkGraphWrite for ChannelGraph {
         let edge_idx = inner
             .graph
             .find_edge(src_idx, dest_idx)
-            .unwrap_or_else(|| inner.graph.add_edge(src_idx, dest_idx, Observations::default()));
+            .unwrap_or_else(|| inner.add_edge(src_idx, dest_idx));
 
         if let Some(weight) = inner.graph.edge_weight_mut(edge_idx) {
             f(weight);
