@@ -207,7 +207,7 @@ impl hopr_api::graph::NetworkGraphTraverse for ChannelGraph {
                 // low-scoring edges probed *more* urgently; applying the production `min_ack_rate`
                 // here would instead prune them, so they would stop being probed, never be
                 // resampled, and stay excluded permanently.
-                let value_fn = EdgeValueFn::forward_without_self_loopback(
+                let value_fn = EdgeValueFn::loopback_probe(
                     // The closing edge back to `me` is appended after path-finding.
                     std::num::NonZeroUsize::new(hops + 1).expect("hop range is non-zero"),
                     self.edge_penalty,
@@ -401,6 +401,101 @@ mod tests {
             ),
         );
         assert_eq!(routes.len(), 2, "diamond topology should yield two 2-edge routes");
+        Ok(())
+    }
+
+    fn diamond(me: OffchainPublicKey) -> anyhow::Result<(ChannelGraph, [OffchainPublicKey; 3])> {
+        //   me -> a -> dest
+        //   me -> b -> dest
+        let [a, b, dest] = [&SECRET_1, &SECRET_2, &SECRET_3].map(pubkey_from);
+        let graph = ChannelGraph::new(me);
+        for node in [a, b, dest] {
+            graph.add_node(node);
+        }
+        for (src, dst) in [(me, a), (me, b), (a, dest), (b, dest)] {
+            graph.add_edge(&src, &dst)?;
+        }
+        mark_edge_loopback_ready(&graph, &me, &a);
+        mark_edge_loopback_ready(&graph, &me, &b);
+        mark_edge_connected(&graph, &a, &dest);
+        mark_edge_connected(&graph, &b, &dest);
+        Ok((graph, [a, b, dest]))
+    }
+
+    fn two_hop_forward() -> anyhow::Result<EdgeValueFn<f64, crate::Observations>> {
+        Ok(EdgeValueFn::forward(
+            std::num::NonZeroUsize::new(2).context("should be non-zero")?,
+            TEST_EDGE_PENALTY,
+            TEST_MIN_ACK_RATE,
+            None,
+        ))
+    }
+
+    #[test]
+    fn an_unusable_relayer_should_be_pruned_without_crowding_out_healthy_paths() -> anyhow::Result<()> {
+        use hopr_api::graph::NetworkGraphUpdate;
+
+        let me = pubkey_from(&SECRET_0);
+        let (graph, [a, b, dest]) = diamond(me)?;
+        graph.record_node_health(&a, 0.0);
+
+        for _ in 0..20 {
+            let routes = graph.simple_paths(&me, &dest, 2, Some(1), two_hop_forward()?);
+            assert_eq!(
+                1,
+                routes.len(),
+                "the healthy path must be found whatever the search order"
+            );
+            assert_eq!(
+                vec![b],
+                routes[0].0,
+                "only the path through the healthy relayer survives"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_degraded_relayer_should_cost_its_paths_by_its_health() -> anyhow::Result<()> {
+        use hopr_api::graph::NetworkGraphUpdate;
+
+        let me = pubkey_from(&SECRET_0);
+        let (graph, [a, b, dest]) = diamond(me)?;
+        graph.record_node_health(&a, 0.5);
+
+        let routes = graph.simple_paths(&me, &dest, 2, None, two_hop_forward()?);
+        let cost_via = |relayer| {
+            routes
+                .iter()
+                .find(|(path, ..)| path == &vec![relayer])
+                .map(|(.., cost)| *cost)
+        };
+        let (via_a, via_b) = (cost_via(a).context("path via a")?, cost_via(b).context("path via b")?);
+        assert!((via_a - via_b * 0.5).abs() < 1e-12, "{via_a} vs {via_b}");
+
+        graph.record_node_health(&a, 1.0);
+        let routes = graph.simple_paths(&me, &dest, 2, None, two_hop_forward()?);
+        let restored = routes
+            .iter()
+            .find(|(path, ..)| path == &vec![a])
+            .map(|(.., cost)| *cost);
+        assert_eq!(Some(via_b), restored, "full health restores the cost");
+        Ok(())
+    }
+
+    #[test]
+    fn an_edge_added_after_a_health_verdict_should_carry_it() -> anyhow::Result<()> {
+        use hopr_api::graph::{NetworkGraphUpdate, NetworkGraphView};
+
+        let me = pubkey_from(&SECRET_0);
+        let a = pubkey_from(&SECRET_1);
+        let graph = ChannelGraph::new(me);
+        graph.add_node(a);
+        graph.record_node_health(&a, 0.0);
+        graph.add_edge(&me, &a)?;
+
+        let edge = graph.edge(&me, &a).context("edge exists")?;
+        assert_eq!(0.0, edge.health());
         Ok(())
     }
 
