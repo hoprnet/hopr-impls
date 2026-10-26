@@ -71,22 +71,32 @@ pub(crate) fn model_to_graph_entry(
 ) -> Result<(AccountEntry, AccountEntry, ChannelEntry), ConnectorError> {
     let src = model_to_account_entry(model.source)?;
     let dst = model_to_account_entry(model.destination)?;
-    let channel = ChannelBuilder::default()
-        .between(src.chain_addr, dst.chain_addr)
-        .balance(model.channel.balance.0.parse()?)
+    let channel = model_to_channel_entry(&model.channel, src.chain_addr, dst.chain_addr)?;
+
+    Ok((src, dst, channel))
+}
+
+/// Converts a channel read from Blokli, whose ends are given as key ids, into a [`ChannelEntry`] between `source`
+/// and `destination`.
+pub(crate) fn model_to_channel_entry(
+    model: &blokli_client::api::types::Channel,
+    source: Address,
+    destination: Address,
+) -> Result<ChannelEntry, ConnectorError> {
+    Ok(ChannelBuilder::default()
+        .between(source, destination)
+        .balance(model.balance.0.parse()?)
         .ticket_index(
             model
-                .channel
                 .ticket_index
                 .0
                 .parse()
                 .map_err(|e| ConnectorError::TypeConversion(format!("invalid ticket index: {e}")))?,
         )
-        .status(match model.channel.status {
+        .status(match model.status {
             blokli_client::api::types::ChannelStatus::Open => ChannelStatus::Open,
             blokli_client::api::types::ChannelStatus::PendingToClose => ChannelStatus::PendingToClose(
                 model
-                    .channel
                     .closure_time
                     .as_ref()
                     .ok_or(ConnectorError::TypeConversion("invalid closure time".into()))
@@ -100,10 +110,8 @@ pub(crate) fn model_to_graph_entry(
             // never happens, still a case to cover
             _ => return Err(ConnectorError::TypeConversion("invalid channel status".into())),
         })
-        .epoch(model.channel.epoch as u32)
-        .build()?;
-
-    Ok((src, dst, channel))
+        .epoch(model.epoch as u32)
+        .build()?)
 }
 
 pub(crate) fn model_to_redeemed_stats(
