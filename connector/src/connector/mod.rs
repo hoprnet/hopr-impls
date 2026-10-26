@@ -15,6 +15,7 @@ use crate::{
     HoprBlockchainReader,
     backend::Backend,
     connector::{
+        channel_sync::OWN_CHANNELS_SYNC_INTERVAL,
         keys::HoprKeyMapper,
         sequencer::TransactionSequencer,
         services::{
@@ -31,6 +32,7 @@ use crate::{
 };
 
 mod accounts;
+mod channel_sync;
 mod channels;
 mod events;
 mod keys;
@@ -207,6 +209,8 @@ pub struct HoprBlockchainConnector<C, B, P, R> {
     channel_by_id: moka::sync::Cache<ChannelId, Option<ChannelEntry>, ahash::RandomState>,
     // Fast retrieval of channel entries by parties
     channel_by_parties: moka::sync::Cache<ChannelParties, Option<ChannelEntry>, ahash::RandomState>,
+    // Held while a channel is read and written back, so channel updates from different sources do not interleave
+    channel_write_lock: std::sync::Arc<parking_lot::Mutex<()>>,
     // Contains chain info (no TTL - kept fresh by subscription handler)
     values: moka::future::Cache<u32, ParsedChainInfo>,
     // Ticket values (winning probability, price), kept fresh by subscription handler
@@ -276,6 +280,7 @@ where
             channel_by_parties: moka::sync::CacheBuilder::new(EXPECTED_NUM_CHANNELS as u64)
                 .time_to_idle(DEFAULT_CACHE_TIMEOUT)
                 .build_with_hasher(ahash::RandomState::default()),
+            channel_write_lock: Default::default(),
             // No TTL: kept fresh by the Blokli subscription handler
             values: moka::future::CacheBuilder::new(1).build(),
             ticket_values: Default::default(),
@@ -327,6 +332,8 @@ where
 
         let channel_by_id = self.channel_by_id.clone();
         let channel_by_parties = self.channel_by_parties.clone();
+        let channel_write_lock = self.channel_write_lock.clone();
+        let channel_sync = self.channel_sync();
 
         // Query chain info to populate the cache
         let initial_chain_values = self.query_cached_chain_info().await?;
@@ -348,6 +355,8 @@ where
             /// give the remaining seven. `ServiceEvent` rather than the whole `ChainEvent`, so a
             /// registry stream cannot smuggle an account or channel event through here.
             Service(ServiceEvent),
+            /// Time to read the node's own channels from Blokli again.
+            SyncOwnChannels,
         }
 
         let ticket_values = self.ticket_values.clone();
@@ -468,7 +477,9 @@ where
                     let backend = backend.clone();
                     let channel_by_id = channel_by_id.clone();
                     let channel_by_parties = channel_by_parties.clone();
+                    let channel_write_lock = channel_write_lock.clone();
                     hopr_utils::runtime::prelude::spawn_blocking(move || {
+                        let _guard = channel_write_lock.lock();
                         graph.write().add_edge(src.key_id, dst.key_id, *channel.get_id());
                         backend
                             .insert_channel(channel)
@@ -615,18 +626,34 @@ where
                 let _ = connection_ready_tx.take().unwrap().send(Ok(()));
             }
 
-            futures::stream::Abortable::new(
-                (
-                    account_stream,
-                    channel_stream,
-                    ticket_params_stream,
-                    service_stream,
-                    service_type_stream,
-                    service_registry_config_stream,
-                )
-                    .merge(),
-                abort_reg,
+            // Signals when every subscription has ended, so the sync timer below stops with them and the merged
+            // stream can still end.
+            let (subscriptions_ended_tx, subscriptions_ended_rx) = futures::channel::oneshot::channel::<()>();
+            let subscriptions = (
+                account_stream,
+                channel_stream,
+                ticket_params_stream,
+                service_stream,
+                service_type_stream,
+                service_registry_config_stream,
             )
+                .merge()
+                .chain(
+                    futures::stream::once(async move {
+                        let _ = subscriptions_ended_tx.send(());
+                    })
+                    .filter_map(|_| futures::future::ready(None::<Result<SubscribedEventType, ConnectorError>>)),
+                );
+
+            // Updates missed by the channel graph subscription are not replayed for closed channels, so the own
+            // channels are read from Blokli again on a timer.
+            let own_channel_syncs =
+                futures_time::stream::interval(futures_time::time::Duration::from(OWN_CHANNELS_SYNC_INTERVAL))
+                    .take_until(subscriptions_ended_rx)
+                    .map(|_| Ok::<_, ConnectorError>(SubscribedEventType::SyncOwnChannels));
+
+            let sync_client = client.clone();
+            futures::stream::Abortable::new((subscriptions, own_channel_syncs).merge(), abort_reg)
             .inspect_ok(move |event_type| {
                 if connection_ready_tx.is_some() {
                     match event_type {
@@ -656,8 +683,10 @@ where
                     }
                 }
             })
-            .for_each(|event_type| {
+            .for_each(move |event_type| {
                 let event_tx = event_tx.clone();
+                let own_channels_sync_job = matches!(event_type, Ok(SubscribedEventType::SyncOwnChannels))
+                    .then(|| (channel_sync.clone(), sync_client.clone()));
                 async move {
                     match event_type {
                         Ok(SubscribedEventType::Account((new_account, old_account))) => {
@@ -716,6 +745,13 @@ where
                             let event = ChainEvent::from(event);
                             tracing::debug!(%event, "service registry changed");
                             let _ = event_tx.broadcast_direct(event).await;
+                        }
+                        Ok(SubscribedEventType::SyncOwnChannels) => {
+                            if let Some((channel_sync, client)) = own_channels_sync_job
+                                && let Err(error) = channel_sync.sync_own_channels(client.as_ref()).await
+                            {
+                                tracing::warn!(%error, "cannot sync own channels with Blokli, trying again later");
+                            }
                         }
                         Err(error) => {
                             tracing::error!(

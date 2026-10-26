@@ -7,7 +7,7 @@ use hopr_api::{
 
 use crate::{
     backend::Backend,
-    connector::{CHANNEL_CUSTOM_TIMEMOUT_MULTIPLIER, HoprBlockchainConnector},
+    connector::{CHANNEL_CUSTOM_TIMEMOUT_MULTIPLIER, HoprBlockchainConnector, channel_sync::ChannelSync},
     errors::ConnectorError,
 };
 
@@ -15,6 +15,19 @@ impl<B, C, P, R> HoprBlockchainConnector<C, B, P, R>
 where
     B: Backend + Send + Sync + 'static,
 {
+    /// Writes channel states read from Blokli into this connector.
+    pub(crate) fn channel_sync(&self) -> ChannelSync<B> {
+        ChannelSync {
+            backend: self.backend.clone(),
+            graph: self.graph.clone(),
+            channel_by_id: self.channel_by_id.clone(),
+            channel_by_parties: self.channel_by_parties.clone(),
+            write_lock: self.channel_write_lock.clone(),
+            event_tx: self.events.0.clone(),
+            me: self.chain_key.public().to_address(),
+        }
+    }
+
     pub(crate) fn build_channel_stream(
         &self,
         selector: ChannelSelector,
