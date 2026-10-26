@@ -393,6 +393,14 @@ pub(crate) async fn process_channel_changes_into_events(
                 tracing::debug!(id = %new_channel.get_id(), "channel closed");
                 let _ = event_tx.broadcast_direct(ChainEvent::ChannelClosed(new_channel)).await;
             }
+            // Both closure steps happened while the node was not receiving updates.
+            ChannelChange::Status {
+                left: ChannelStatus::Open,
+                right: ChannelStatus::Closed,
+            } => {
+                tracing::debug!(id = %new_channel.get_id(), "channel closed without its closure notice being seen");
+                let _ = event_tx.broadcast_direct(ChainEvent::ChannelClosed(new_channel)).await;
+            }
             ChannelChange::Status {
                 left: ChannelStatus::Closed,
                 right: ChannelStatus::Open,
