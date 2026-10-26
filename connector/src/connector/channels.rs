@@ -1,14 +1,18 @@
 use blokli_client::api::{BlokliQueryClient, BlokliTransactionClient};
 use futures::{FutureExt, StreamExt, future::BoxFuture, stream::BoxStream};
 use hopr_api::{
-    chain::{ChainReceipt, ChannelSelector},
+    chain::{ChainReceipt, ChannelSelector, HoprKeyIdent},
     types::{chain::prelude::*, crypto::prelude::Keypair, internal::prelude::*, primitive::prelude::*},
 };
 
 use crate::{
     backend::Backend,
-    connector::{CHANNEL_CUSTOM_TIMEMOUT_MULTIPLIER, HoprBlockchainConnector, channel_sync::ChannelSync},
+    connector::{
+        CHANNEL_CUSTOM_TIMEMOUT_MULTIPLIER, HoprBlockchainConnector,
+        channel_sync::{ChannelSync, FreshChannel},
+    },
     errors::ConnectorError,
+    utils::model_to_channel_entry,
 };
 
 impl<B, C, P, R> HoprBlockchainConnector<C, B, P, R>
@@ -135,6 +139,39 @@ where
     }
 }
 
+impl<B, C, P, R> HoprBlockchainConnector<C, B, P, R>
+where
+    B: Backend + Send + Sync + 'static,
+    C: BlokliQueryClient + Send + Sync + 'static,
+{
+    /// Reads the current state of the `stored` channel from Blokli and stores it if it is newer.
+    ///
+    /// Returns the latest known state of the channel. Fails if Blokli cannot be asked, so that no transaction is sent
+    /// based on a state that might be out of date.
+    async fn read_channel_from_blokli(&self, stored: &ChannelEntry) -> Result<ChannelEntry, ConnectorError> {
+        let channel_id = *stored.get_id();
+        let model = self
+            .client
+            .query_channels(blokli_client::api::ChannelSelector {
+                filter: Some(blokli_client::api::ChannelFilter::ChannelId(channel_id.into())),
+                status: None,
+                ..Default::default()
+            })
+            .await?
+            .channels
+            .into_iter()
+            .next()
+            .ok_or(ConnectorError::ChannelDoesNotExist(channel_id))?;
+
+        let fresh = FreshChannel {
+            source: HoprKeyIdent::from(model.source as u32),
+            destination: HoprKeyIdent::from(model.destination as u32),
+            channel: model_to_channel_entry(&model, stored.source, stored.destination)?,
+        };
+        Ok(self.channel_sync().apply(fresh).await?.channel)
+    }
+}
+
 #[async_trait::async_trait]
 impl<B, C, P> hopr_api::chain::ChainWriteChannelOperations for HoprBlockchainConnector<C, B, P, P::TxRequest>
 where
@@ -189,13 +226,18 @@ where
 
         use hopr_api::chain::ChainReadChannelOperations;
 
-        let channel = channel_by_id_async(self.channel_by_id.clone(), self.backend.clone(), *channel_id)
+        let stored = channel_by_id_async(self.channel_by_id.clone(), self.backend.clone(), *channel_id)
             .await?
             .ok_or_else(|| ConnectorError::ChannelDoesNotExist(*channel_id))?;
 
-        let direction = channel.direction(self.me()).ok_or(ConnectorError::InvalidArguments(
+        let direction = stored.direction(self.me()).ok_or(ConnectorError::InvalidArguments(
             "cannot close channels that is not own",
         ))?;
+
+        // The same call starts and finishes a closure, depending on the channel status. A stored status that missed
+        // an update picks the wrong step: starting a closure again on a channel already pending to close restarts
+        // its notice period. So the status is read from Blokli first.
+        let channel = self.read_channel_from_blokli(&stored).await?;
 
         let tx_req = match channel.status {
             ChannelStatus::Closed => return Err(ConnectorError::ChannelClosed(*channel_id)),
