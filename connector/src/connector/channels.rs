@@ -621,6 +621,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connector_should_finalize_a_closure_the_subscription_missed() -> anyhow::Result<()> {
+        let offchain_key_1 = OffchainKeypair::from_secret(&hex!(
+            "60741b83b99e36aa0c1331578156e16b8e21166d01834abb6c64b103f885734d"
+        ))?;
+        let account_1 = AccountEntry {
+            public_key: *offchain_key_1.public(),
+            chain_addr: ChainKeypair::from_secret(&PRIVATE_KEY_1)?.public().to_address(),
+            entry_type: AccountType::NotAnnounced,
+            safe_address: Some([1u8; Address::SIZE].into()),
+            key_id: 1.into(),
+        };
+        let offchain_key_2 = OffchainKeypair::from_secret(&hex!(
+            "71bf1f42ebbfcd89c3e197a3fd7cda79b92499e509b6fefa0fe44d02821d146a"
+        ))?;
+        let account_2 = AccountEntry {
+            public_key: *offchain_key_2.public(),
+            chain_addr: ChainKeypair::from_secret(&PRIVATE_KEY_2)?.public().to_address(),
+            entry_type: AccountType::NotAnnounced,
+            safe_address: Some([2u8; Address::SIZE].into()),
+            key_id: 2.into(),
+        };
+
+        let channel_1 = ChannelEntry::builder()
+            .between(
+                &ChainKeypair::from_secret(&PRIVATE_KEY_1)?,
+                &ChainKeypair::from_secret(&PRIVATE_KEY_2)?,
+            )
+            .amount(10)
+            .ticket_index(1)
+            .status(ChannelStatus::Open)
+            .epoch(1)
+            .build()?;
+
+        let blokli_client = BlokliTestStateBuilder::default()
+            .with_accounts([
+                (account_1, HoprBalance::new_base(100), XDaiBalance::new_base(1)),
+                (account_2, HoprBalance::new_base(100), XDaiBalance::new_base(1)),
+            ])
+            .with_channels([channel_1])
+            .with_hopr_network_chain_info("piz-palu-staging")
+            .build_dynamic_client(MODULE_ADDR.into());
+
+        let mut connector = create_connector(blokli_client)?;
+        connector.connect().await?;
+
+        // The closure was started on-chain, but the subscription did not deliver it: the node still sees the
+        // channel as open.
+        let notice_period_end = blokli_client::api::types::DateTime(
+            hopr_api::chain::DateTime::from(std::time::SystemTime::now() - Duration::from_secs(60)).to_rfc3339(),
+        );
+        connector.client().hidden_state_update(|state| {
+            if let Some(channel) = state.get_channel_by_id_mut(&(*channel_1.get_id()).into()) {
+                channel.status = blokli_client::api::types::ChannelStatus::PendingToClose;
+                channel.closure_time = Some(notice_period_end.clone());
+            }
+        });
+        assert_eq!(
+            connector.channel_by_id(channel_1.get_id())?.map(|c| c.status),
+            Some(ChannelStatus::Open)
+        );
+
+        connector.close_channel(channel_1.get_id()).await?.await?;
+
+        // Starting the closure again would have moved the closure time instead of closing the channel.
+        let snapshot = connector.client().snapshot();
+        let on_chain = snapshot
+            .channels
+            .get(&const_hex::encode(channel_1.get_id()))
+            .expect("channel exists");
+        assert_eq!(on_chain.status, blokli_client::api::types::ChannelStatus::Closed);
+        assert_eq!(on_chain.closure_time, Some(notice_period_end));
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn connector_should_close_incoming_channel() -> anyhow::Result<()> {
         let offchain_key_1 = OffchainKeypair::from_secret(&hex!(
             "60741b83b99e36aa0c1331578156e16b8e21166d01834abb6c64b103f885734d"

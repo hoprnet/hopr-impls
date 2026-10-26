@@ -259,3 +259,158 @@ where
         Ok(updated)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, SystemTime};
+
+    use futures::StreamExt;
+    use hex_literal::hex;
+    use hopr_api::{
+        chain::{ChainEvents, ChainReadChannelOperations},
+        types::crypto::{
+            keypairs::{ChainKeypair, OffchainKeypair},
+            prelude::Keypair,
+        },
+    };
+
+    use super::*;
+    use crate::{
+        connector::tests::{MODULE_ADDR, PRIVATE_KEY_1, PRIVATE_KEY_2, create_connector},
+        testing::BlokliTestStateBuilder,
+    };
+
+    fn channel(status: ChannelStatus, epoch: u32) -> anyhow::Result<ChannelEntry> {
+        Ok(ChannelEntry::builder()
+            .between(
+                &ChainKeypair::from_secret(&PRIVATE_KEY_1)?,
+                &ChainKeypair::from_secret(&PRIVATE_KEY_2)?,
+            )
+            .amount(10)
+            .ticket_index(1)
+            .status(status)
+            .epoch(epoch)
+            .build()?)
+    }
+
+    fn pending_since(secs: u64) -> ChannelStatus {
+        ChannelStatus::PendingToClose(SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
+    }
+
+    #[test]
+    fn only_later_states_replace_the_stored_channel() -> anyhow::Result<()> {
+        let cases = [
+            (ChannelStatus::Open, 1, pending_since(10), 1, true),
+            (ChannelStatus::Open, 1, ChannelStatus::Closed, 1, true),
+            (pending_since(10), 1, ChannelStatus::Closed, 1, true),
+            (pending_since(10), 1, pending_since(20), 1, true),
+            (ChannelStatus::Closed, 1, ChannelStatus::Open, 2, true),
+            (pending_since(10), 1, ChannelStatus::Open, 1, false),
+            (ChannelStatus::Closed, 1, pending_since(10), 1, false),
+            (pending_since(20), 1, pending_since(10), 1, false),
+            (ChannelStatus::Open, 2, ChannelStatus::Closed, 1, false),
+            (ChannelStatus::Open, 1, ChannelStatus::Open, 1, false),
+        ];
+
+        for (stored_status, stored_epoch, fresh_status, fresh_epoch, expected) in cases {
+            let stored = channel(stored_status, stored_epoch)?;
+            let fresh = channel(fresh_status, fresh_epoch)?;
+            assert_eq!(
+                is_later_state(&stored, &fresh),
+                expected,
+                "{stored_status} (epoch {stored_epoch}) -> {fresh_status} (epoch {fresh_epoch})"
+            );
+        }
+        Ok(())
+    }
+
+    fn test_state(channel: ChannelEntry) -> anyhow::Result<BlokliTestStateBuilder> {
+        let account_1 = AccountEntry {
+            public_key: *OffchainKeypair::from_secret(&hex!(
+                "60741b83b99e36aa0c1331578156e16b8e21166d01834abb6c64b103f885734d"
+            ))?
+            .public(),
+            chain_addr: ChainKeypair::from_secret(&PRIVATE_KEY_1)?.public().to_address(),
+            entry_type: AccountType::NotAnnounced,
+            safe_address: Some([1u8; Address::SIZE].into()),
+            key_id: 1.into(),
+        };
+        let account_2 = AccountEntry {
+            public_key: *OffchainKeypair::from_secret(&hex!(
+                "71bf1f42ebbfcd89c3e197a3fd7cda79b92499e509b6fefa0fe44d02821d146a"
+            ))?
+            .public(),
+            chain_addr: ChainKeypair::from_secret(&PRIVATE_KEY_2)?.public().to_address(),
+            entry_type: AccountType::NotAnnounced,
+            safe_address: Some([2u8; Address::SIZE].into()),
+            key_id: 2.into(),
+        };
+
+        Ok(BlokliTestStateBuilder::default()
+            .with_accounts([
+                (account_1, HoprBalance::new_base(100), XDaiBalance::new_base(1)),
+                (account_2, HoprBalance::new_base(100), XDaiBalance::new_base(1)),
+            ])
+            .with_channels([channel])
+            .with_hopr_network_chain_info("piz-palu-staging"))
+    }
+
+    #[tokio::test]
+    async fn a_closure_missed_by_the_subscription_is_recovered() -> anyhow::Result<()> {
+        let open = channel(ChannelStatus::Open, 1)?;
+        let mut connector = create_connector(test_state(open)?.build_dynamic_client(MODULE_ADDR.into()))?;
+        connector.connect().await?;
+        let events = connector.subscribe()?;
+
+        // Both closure steps happen on-chain without the subscription delivering them.
+        connector.client().hidden_state_update(|state| {
+            if let Some(channel) = state.get_channel_by_id_mut(&(*open.get_id()).into()) {
+                channel.status = blokli_client::api::types::ChannelStatus::Closed;
+            }
+        });
+
+        let updated = connector.channel_sync().sync_own_channels(connector.client()).await?;
+
+        assert_eq!(updated, 1);
+        assert_eq!(
+            connector.channel_by_id(open.get_id())?.map(|c| c.status),
+            Some(ChannelStatus::Closed)
+        );
+        let event = tokio::time::timeout(Duration::from_secs(1), events.boxed().next()).await?;
+        assert!(
+            matches!(event, Some(ChainEvent::ChannelClosed(c)) if c.get_id() == open.get_id()),
+            "expected ChannelClosed, got {event:?}"
+        );
+
+        assert_eq!(
+            connector.channel_sync().sync_own_channels(connector.client()).await?,
+            0,
+            "nothing is left to update"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_older_state_from_blokli_does_not_replace_a_newer_stored_one() -> anyhow::Result<()> {
+        let pending = channel(pending_since(10), 1)?;
+        let mut connector = create_connector(test_state(pending)?.build_dynamic_client(MODULE_ADDR.into()))?;
+        connector.connect().await?;
+
+        let synced = connector
+            .channel_sync()
+            .apply(FreshChannel {
+                source: 1.into(),
+                destination: 2.into(),
+                channel: channel(ChannelStatus::Open, 1)?,
+            })
+            .await?;
+
+        assert!(!synced.updated);
+        assert_eq!(synced.channel.status, pending.status);
+        assert_eq!(
+            connector.channel_by_id(pending.get_id())?.map(|c| c.status),
+            Some(pending.status)
+        );
+        Ok(())
+    }
+}
