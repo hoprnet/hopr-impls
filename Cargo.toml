@@ -73,7 +73,6 @@ libp2p = { version = "0.56.0", default-features = false }
 libp2p-stream = { version = "0.4.0-alpha" }
 moka = { version = "0.12.16", features = ["future", "sync"] }
 more-asserts = "0.3.1"
-multiaddr = "0.18.2"
 parking_lot = "0.12.5"
 petgraph = { version = "0.8.3", default-features = false, features = [
   "rayon",

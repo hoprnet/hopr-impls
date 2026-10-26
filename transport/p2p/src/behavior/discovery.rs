@@ -12,8 +12,8 @@ use futures::{
     FutureExt,
     stream::{BoxStream, Stream, StreamExt},
 };
+use hopr_api::{Multiaddr, PeerId};
 use libp2p::{
-    Multiaddr, PeerId,
     core::Endpoint,
     swarm::{
         ConnectionDenied, ConnectionId, DialError, DialFailure, NetworkBehaviour, ToSwarm, dial_opts::DialOpts,
@@ -178,9 +178,9 @@ impl NetworkBehaviour for Behaviour {
     fn handle_established_inbound_connection(
         &mut self,
         connection_id: libp2p::swarm::ConnectionId,
-        peer: libp2p::PeerId,
-        local_addr: &libp2p::Multiaddr,
-        remote_addr: &libp2p::Multiaddr,
+        peer: PeerId,
+        local_addr: &Multiaddr,
+        remote_addr: &Multiaddr,
     ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
         Some(Self::ConnectionHandler {}).ok_or_else(|| {
             libp2p::swarm::ConnectionDenied::new(crate::errors::P2PError::Logic(format!(
@@ -225,8 +225,8 @@ impl NetworkBehaviour for Behaviour {
     fn handle_established_outbound_connection(
         &mut self,
         connection_id: libp2p::swarm::ConnectionId,
-        peer: libp2p::PeerId,
-        addr: &libp2p::Multiaddr,
+        peer: PeerId,
+        addr: &Multiaddr,
         role_override: libp2p::core::Endpoint,
         port_use: libp2p::core::transport::PortUse,
     ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
@@ -292,7 +292,7 @@ impl NetworkBehaviour for Behaviour {
 
     fn on_connection_handler_event(
         &mut self,
-        _peer_id: libp2p::PeerId,
+        _peer_id: PeerId,
         _connection_id: libp2p::swarm::ConnectionId,
         _event: libp2p::swarm::THandlerOutEvent<Self>,
     ) {
@@ -401,7 +401,6 @@ impl NetworkBehaviour for Behaviour {
 mod tests {
     use futures::stream;
     use libp2p::{
-        Multiaddr,
         core::{ConnectedPoint, Endpoint},
         swarm::{
             ConnectionId, FromSwarm,
