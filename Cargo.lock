@@ -4011,7 +4011,6 @@ dependencies = [
  "libp2p",
  "libp2p-stream",
  "more-asserts",
- "multiaddr",
  "pin-project",
  "quinn-udp 0.6.1",
  "thiserror 2.0.20",
