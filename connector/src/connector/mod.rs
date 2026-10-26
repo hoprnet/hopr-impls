@@ -147,7 +147,7 @@ enum ChainHealthState {
     ServerNotHealthy = 5,
     ConnectionFailed = 6,
     Dropped = 7,
-    /// A subscription has been stalled, rejected or ended; it is still being retried.
+    /// A subscription has been stalled, rejected or ended. Stalled and rejected ones are still retried.
     SubscriptionDegraded = 8,
 }
 
