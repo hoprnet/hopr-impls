@@ -1,11 +1,34 @@
 use std::sync::Arc;
 
 use bimap::BiHashMap;
-use hopr_api::OffchainPublicKey;
+use hopr_api::{
+    OffchainPublicKey,
+    graph::{EdgeImmediateProtocolObservable, traits::EdgeObservableRead},
+};
 use parking_lot::RwLock;
-use petgraph::{graph::NodeIndex, stable_graph::StableDiGraph};
+use petgraph::{graph::NodeIndex, stable_graph::StableDiGraph, visit::EdgeRef};
 
-use crate::{Observations, errors::ChannelGraphError};
+use crate::{EdgeHealth, GraphHealthSummary, Observations, errors::ChannelGraphError};
+
+/// Logs that an edge changed health. Changes on the node's own edges decide which peers data
+/// paths can use, so they are logged at INFO; changes elsewhere in the graph at DEBUG.
+fn log_health_change(
+    own: bool,
+    src: &OffchainPublicKey,
+    dest: &OffchainPublicKey,
+    before: EdgeHealth,
+    after: EdgeHealth,
+    observations: &Observations,
+) {
+    let score = observations.score();
+    let ack_rate = observations.immediate_qos().and_then(|imm| imm.ack_rate());
+
+    if own {
+        tracing::info!(peer = %dest, from = %before, to = %after, ?score, ?ack_rate, "own edge health changed");
+    } else {
+        tracing::debug!(%src, %dest, from = %before, to = %after, ?score, ?ack_rate, "edge health changed");
+    }
+}
 
 /// Internal mutable state of a [`ChannelGraph`], protected by a lock.
 #[derive(Debug, Clone, Default)]
@@ -146,6 +169,26 @@ impl ChannelGraph {
     pub fn min_ack_rate(&self) -> f64 {
         self.min_ack_rate
     }
+
+    /// Counts nodes and edges, and the node's own edges by [`EdgeHealth`].
+    ///
+    /// Meant for a periodic state line: the result has a fixed size whatever the graph size.
+    pub fn health_summary(&self) -> GraphHealthSummary {
+        let inner = self.inner.read();
+        let mut summary = GraphHealthSummary {
+            nodes: inner.graph.node_count(),
+            edges: inner.graph.edge_count(),
+            ..Default::default()
+        };
+
+        if let Some(me_idx) = inner.indices.get_by_left(&self.me) {
+            for weight in inner.graph.edges(*me_idx).map(|edge| edge.weight()) {
+                summary.add_own_edge(EdgeHealth::of(weight, self.min_ack_rate));
+            }
+        }
+
+        summary
+    }
 }
 
 impl hopr_api::graph::NetworkGraphView for ChannelGraph {
@@ -241,8 +284,6 @@ impl hopr_api::graph::NetworkGraphWrite for ChannelGraph {
         if let Some((_, idx)) = inner.indices.remove_by_left(key) {
             inner.release_slot(key, idx);
             let incident: Vec<_> = {
-                use petgraph::visit::EdgeRef;
-
                 inner
                     .graph
                     .edges_directed(idx, petgraph::Direction::Outgoing)
@@ -293,7 +334,7 @@ impl hopr_api::graph::NetworkGraphWrite for ChannelGraph {
     /// If the edge does not exist, it gets created first.
     ///
     /// If the nodes do not exist, they are added as well.
-    #[tracing::instrument(level = "debug", skip(self, f))]
+    #[tracing::instrument(level = "trace", skip(self, f))]
     fn upsert_edge<F>(&self, src: &OffchainPublicKey, dest: &OffchainPublicKey, f: F)
     where
         F: FnOnce(&mut Observations),
@@ -326,8 +367,14 @@ impl hopr_api::graph::NetworkGraphWrite for ChannelGraph {
             .unwrap_or_else(|| inner.graph.add_edge(src_idx, dest_idx, Observations::default()));
 
         if let Some(weight) = inner.graph.edge_weight_mut(edge_idx) {
+            let before = EdgeHealth::of(weight, self.min_ack_rate);
             f(weight);
-            tracing::debug!(%src, %dest, ?weight, "updated edge weight with an observation");
+            let after = EdgeHealth::of(weight, self.min_ack_rate);
+            tracing::trace!(%src, %dest, ?weight, "updated edge weight with an observation");
+
+            if before != after {
+                log_health_change(src == &self.me, src, dest, before, after, weight);
+            }
         }
     }
 }
@@ -909,6 +956,40 @@ mod tests {
 
         let edges = graph.connected_edges();
         assert_eq!(edges.len(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn health_summary_should_count_own_edges_by_health() -> anyhow::Result<()> {
+        let me = *OffchainKeypair::random().public();
+        let good = *OffchainKeypair::random().public();
+        let gone = *OffchainKeypair::random().public();
+        let graph = ChannelGraph::new(me);
+
+        graph.upsert_edge(&me, &good, |obs| {
+            obs.record(EdgeWeightType::Immediate(Ok(std::time::Duration::from_millis(50))))
+        });
+        graph.upsert_edge(&me, &gone, |obs| {
+            obs.record(EdgeWeightType::Immediate(Ok(std::time::Duration::from_millis(50))));
+            obs.record(EdgeWeightType::Connected(false));
+        });
+        // An edge between two other nodes is counted in `edges`, but not as an own edge
+        graph.upsert_edge(&good, &gone, |obs| {
+            obs.record(EdgeWeightType::Immediate(Ok(std::time::Duration::from_millis(50))))
+        });
+
+        assert_eq!(
+            graph.health_summary(),
+            GraphHealthSummary {
+                nodes: 3,
+                edges: 3,
+                own_edges: 2,
+                own_usable: 1,
+                own_unreachable: 1,
+                ..Default::default()
+            }
+        );
+
         Ok(())
     }
 }
