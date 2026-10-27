@@ -1,7 +1,7 @@
 use blokli_client::api::{BlokliQueryClient, BlokliTransactionClient};
 use futures::{FutureExt, StreamExt, future::BoxFuture, stream::BoxStream};
 use hopr_api::{
-    chain::{ChainReceipt, ChannelSelector, HoprKeyIdent},
+    chain::{ChainReceipt, ChannelSelector},
     types::{chain::prelude::*, crypto::prelude::Keypair, internal::prelude::*, primitive::prelude::*},
 };
 
@@ -9,7 +9,7 @@ use crate::{
     backend::Backend,
     connector::{
         CHANNEL_CUSTOM_TIMEMOUT_MULTIPLIER, HoprBlockchainConnector,
-        channel_sync::{ChannelSync, FreshChannel},
+        channel_sync::{ChannelSync, is_later_state},
     },
     errors::ConnectorError,
     utils::model_to_channel_entry,
@@ -23,7 +23,6 @@ where
     pub(crate) fn channel_sync(&self) -> ChannelSync<B> {
         ChannelSync {
             backend: self.backend.clone(),
-            graph: self.graph.clone(),
             channel_by_id: self.channel_by_id.clone(),
             channel_by_parties: self.channel_by_parties.clone(),
             write_lock: self.channel_write_lock.clone(),
@@ -163,12 +162,9 @@ where
             .next()
             .ok_or(ConnectorError::ChannelDoesNotExist(channel_id))?;
 
-        let fresh = FreshChannel {
-            source: HoprKeyIdent::from(model.source as u32),
-            destination: HoprKeyIdent::from(model.destination as u32),
-            channel: model_to_channel_entry(&model, stored.source, stored.destination)?,
-        };
-        Ok(self.channel_sync().apply(fresh).await?.channel)
+        let fresh = model_to_channel_entry(&model, stored.source, stored.destination)?;
+        self.channel_sync().apply(fresh).await?;
+        Ok(if is_later_state(stored, &fresh) { fresh } else { *stored })
     }
 }
 

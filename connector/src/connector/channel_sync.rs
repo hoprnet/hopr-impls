@@ -6,7 +6,10 @@
 //! a closure keeps the channel as open, and then sends the wrong closure transaction for it.
 //!
 //! [`ChannelSync`] therefore reads the node's own channels from Blokli again, every
-//! [`OWN_CHANNELS_SYNC_INTERVAL`], and stores the ones that moved on.
+//! [`OWN_CHANNELS_SYNC_INTERVAL`], and updates the stored ones that moved on.
+//!
+//! It only updates channels the node has already stored. It never adds a channel, so the channel graph, which is
+//! built from the channel graph subscription only, is left as it is.
 
 use std::{cmp::Ordering, time::Duration};
 
@@ -15,7 +18,6 @@ use hopr_api::{
     chain::{ChainEvent, HoprKeyIdent},
     types::{internal::prelude::*, primitive::prelude::*},
 };
-use petgraph::prelude::DiGraphMap;
 
 use crate::{
     backend::Backend,
@@ -60,27 +62,9 @@ pub(crate) fn is_later_state(stored: &ChannelEntry, fresh: &ChannelEntry) -> boo
     }
 }
 
-/// A channel as read from Blokli, with the key ids of its ends.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct FreshChannel {
-    pub(crate) source: HoprKeyIdent,
-    pub(crate) destination: HoprKeyIdent,
-    pub(crate) channel: ChannelEntry,
-}
-
-/// The state of a channel after [`ChannelSync::apply`].
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct SyncedChannel {
-    /// The latest known state: the fresh one if it was stored, otherwise the stored one.
-    pub(crate) channel: ChannelEntry,
-    /// Whether the fresh state replaced the stored one.
-    pub(crate) updated: bool,
-}
-
-/// Writes channel states read from Blokli into the connector's backend, caches and graph.
+/// Writes channel states read from Blokli into the connector's backend and caches.
 pub(crate) struct ChannelSync<B> {
     pub(crate) backend: std::sync::Arc<B>,
-    pub(crate) graph: std::sync::Arc<parking_lot::RwLock<DiGraphMap<HoprKeyIdent, ChannelId, ahash::RandomState>>>,
     pub(crate) channel_by_id: moka::sync::Cache<ChannelId, Option<ChannelEntry>, ahash::RandomState>,
     pub(crate) channel_by_parties: moka::sync::Cache<ChannelParties, Option<ChannelEntry>, ahash::RandomState>,
     /// Shared with the channel graph subscription, so a stored channel is never replaced between reading and writing
@@ -94,7 +78,6 @@ impl<B> Clone for ChannelSync<B> {
     fn clone(&self) -> Self {
         Self {
             backend: self.backend.clone(),
-            graph: self.graph.clone(),
             channel_by_id: self.channel_by_id.clone(),
             channel_by_parties: self.channel_by_parties.clone(),
             write_lock: self.write_lock.clone(),
@@ -108,82 +91,52 @@ impl<B> ChannelSync<B>
 where
     B: Backend + Send + Sync + 'static,
 {
-    /// Stores `fresh` if it is a [later state](is_later_state) than the stored channel, and sends the chain events for
-    /// the change.
+    /// Replaces the stored channel with `fresh` if `fresh` is a [later state](is_later_state), and sends the chain
+    /// events for the change.
     ///
-    /// A closed channel the node has never seen is not stored: it would only add a channel that does not exist any
-    /// more.
-    pub(crate) async fn apply(&self, fresh: FreshChannel) -> Result<SyncedChannel, ConnectorError> {
+    /// Returns the stored channel after the update, or `None` when nothing was changed: the channel is not stored, or
+    /// `fresh` is not a later state.
+    pub(crate) async fn apply(&self, fresh: ChannelEntry) -> Result<Option<ChannelEntry>, ConnectorError> {
         let sync = self.clone();
-        let (synced, previous) = hopr_utils::runtime::prelude::spawn_blocking(move || {
+        let replaced = hopr_utils::runtime::prelude::spawn_blocking(move || {
             let _guard = sync.write_lock.lock();
-            let channel = fresh.channel;
             let stored = sync
                 .backend
-                .get_channel_by_id(channel.get_id())
+                .get_channel_by_id(fresh.get_id())
                 .map_err(ConnectorError::backend)?;
-
-            let replace = match &stored {
-                Some(stored) => is_later_state(stored, &channel),
-                None => channel.status != ChannelStatus::Closed,
+            let Some(stored) = stored.filter(|stored| is_later_state(stored, &fresh)) else {
+                return Ok::<_, ConnectorError>(None);
             };
-            if !replace {
-                let latest = stored.unwrap_or(channel);
-                return Ok::<_, ConnectorError>((
-                    SyncedChannel {
-                        channel: latest,
-                        updated: false,
-                    },
-                    None,
-                ));
-            }
 
-            sync.graph
-                .write()
-                .add_edge(fresh.source, fresh.destination, *channel.get_id());
-            sync.backend.insert_channel(channel).map_err(ConnectorError::backend)?;
-            sync.channel_by_id.insert(*channel.get_id(), Some(channel));
+            sync.backend.insert_channel(fresh).map_err(ConnectorError::backend)?;
+            sync.channel_by_id.insert(*fresh.get_id(), Some(fresh));
             sync.channel_by_parties
-                .insert(ChannelParties::from(&channel), Some(channel));
-
-            Ok((SyncedChannel { channel, updated: true }, Some(stored)))
+                .insert(ChannelParties::from(&fresh), Some(fresh));
+            Ok(Some(stored))
         })
         .await
         .map_err(ConnectorError::backend)??;
 
-        if let Some(stored) = previous {
-            let channel = synced.channel;
-            match stored {
-                Some(stored) => {
-                    tracing::warn!(
-                        channel_id = %channel.get_id(),
-                        stored_status = %stored.status,
-                        stored_epoch = stored.channel_epoch,
-                        status = %channel.status,
-                        epoch = channel.channel_epoch,
-                        "own channel was out of date, updated it from Blokli"
-                    );
-                    process_channel_changes_into_events(channel, stored.diff(&channel), &self.me, &self.event_tx).await;
-                }
-                None => {
-                    tracing::warn!(
-                        channel_id = %channel.get_id(),
-                        status = %channel.status,
-                        epoch = channel.channel_epoch,
-                        "own channel was missing, added it from Blokli"
-                    );
-                    let _ = self.event_tx.broadcast_direct(ChainEvent::ChannelOpened(channel)).await;
-                }
-            }
-        }
+        let Some(stored) = replaced else {
+            return Ok(None);
+        };
+        tracing::warn!(
+            channel_id = %fresh.get_id(),
+            stored_status = %stored.status,
+            stored_epoch = stored.channel_epoch,
+            status = %fresh.status,
+            epoch = fresh.channel_epoch,
+            "own channel was out of date, updated it from Blokli"
+        );
+        process_channel_changes_into_events(fresh, stored.diff(&fresh), &self.me, &self.event_tx).await;
 
-        Ok(synced)
+        Ok(Some(fresh))
     }
 
-    /// Turns a channel read from Blokli into a [`FreshChannel`], looking up the addresses of its ends.
+    /// Turns a channel read from Blokli into a [`ChannelEntry`], looking up the addresses of its ends.
     ///
     /// Returns `None` when an end is an account the node does not know yet.
-    pub(crate) async fn resolve(&self, model: Channel) -> Result<Option<FreshChannel>, ConnectorError> {
+    pub(crate) async fn resolve(&self, model: Channel) -> Result<Option<ChannelEntry>, ConnectorError> {
         let source = HoprKeyIdent::from(model.source as u32);
         let destination = HoprKeyIdent::from(model.destination as u32);
         let backend = self.backend.clone();
@@ -208,14 +161,14 @@ where
             return Ok(None);
         };
 
-        Ok(Some(FreshChannel {
-            source,
-            destination,
-            channel: model_to_channel_entry(&model, source_account.chain_addr, destination_account.chain_addr)?,
-        }))
+        Ok(Some(model_to_channel_entry(
+            &model,
+            source_account.chain_addr,
+            destination_account.chain_addr,
+        )?))
     }
 
-    /// Reads all the node's own channels from Blokli, closed ones included, and stores those that moved on.
+    /// Reads all the node's own channels from Blokli, closed ones included, and updates the stored ones that moved on.
     ///
     /// Returns how many channels were updated.
     pub(crate) async fn sync_own_channels<C>(&self, client: &C) -> Result<usize, ConnectorError>
@@ -252,7 +205,7 @@ where
         let mut updated = 0;
         for model in models {
             if let Some(fresh) = self.resolve(model).await?
-                && self.apply(fresh).await?.updated
+                && self.apply(fresh).await?.is_some()
             {
                 updated += 1;
             }
@@ -399,21 +352,35 @@ mod tests {
         let mut connector = create_connector(test_state(pending)?.build_dynamic_client(MODULE_ADDR.into()))?;
         connector.connect().await?;
 
-        let synced = connector
-            .channel_sync()
-            .apply(FreshChannel {
-                source: 1.into(),
-                destination: 2.into(),
-                channel: channel(ChannelStatus::Open, 1)?,
-            })
-            .await?;
+        let updated = connector.channel_sync().apply(channel(ChannelStatus::Open, 1)?).await?;
 
-        assert!(!synced.updated);
-        assert_eq!(synced.channel.status, pending.status);
+        assert_eq!(updated, None);
         assert_eq!(
             connector.channel_by_id(pending.get_id())?.map(|c| c.status),
             Some(pending.status)
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_channel_the_node_has_not_stored_is_not_added() -> anyhow::Result<()> {
+        let open = channel(ChannelStatus::Open, 1)?;
+        let mut connector = create_connector(test_state(open)?.build_dynamic_client(MODULE_ADDR.into()))?;
+        connector.connect().await?;
+
+        let unknown = ChannelEntry::builder()
+            .between(
+                &ChainKeypair::from_secret(&PRIVATE_KEY_2)?,
+                &ChainKeypair::from_secret(&PRIVATE_KEY_1)?,
+            )
+            .amount(10)
+            .ticket_index(1)
+            .status(ChannelStatus::Open)
+            .epoch(1)
+            .build()?;
+
+        assert_eq!(connector.channel_sync().apply(unknown).await?, None);
+        assert_eq!(connector.channel_by_id(unknown.get_id())?, None);
         Ok(())
     }
 }
