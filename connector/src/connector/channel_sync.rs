@@ -29,12 +29,21 @@ use crate::{
 /// Blokli dropped while the subscription stayed connected.
 pub(crate) const OWN_CHANNELS_SYNC_INTERVAL: Duration = Duration::from_mins(10);
 
-/// Position of a status in the life of a channel within one epoch.
-fn status_rank(status: &ChannelStatus) -> u8 {
-    match status {
-        ChannelStatus::Open => 0,
-        ChannelStatus::PendingToClose(_) => 1,
-        ChannelStatus::Closed => 2,
+/// Whether a channel can move from `stored` to `fresh` within one epoch.
+///
+/// A channel only moves forward: open, pending to close, closed. Starting the closure again keeps it pending to
+/// close, with a later closure time.
+fn is_later_status(stored: &ChannelStatus, fresh: &ChannelStatus) -> bool {
+    match (stored, fresh) {
+        (ChannelStatus::Open, ChannelStatus::PendingToClose(_) | ChannelStatus::Closed)
+        | (ChannelStatus::PendingToClose(_), ChannelStatus::Closed) => true,
+        (ChannelStatus::PendingToClose(stored_time), ChannelStatus::PendingToClose(fresh_time)) => {
+            fresh_time > stored_time
+        }
+        // Listed one by one, so a new status does not compile until it is placed here.
+        (ChannelStatus::Open, ChannelStatus::Open)
+        | (ChannelStatus::PendingToClose(_), ChannelStatus::Open)
+        | (ChannelStatus::Closed, _) => false,
     }
 }
 
@@ -47,13 +56,7 @@ pub(crate) fn is_later_state(stored: &ChannelEntry, fresh: &ChannelEntry) -> boo
     match fresh.channel_epoch.cmp(&stored.channel_epoch) {
         Ordering::Greater => true,
         Ordering::Less => false,
-        Ordering::Equal => match (stored.status, fresh.status) {
-            // The closure was started again, which moves the closure time.
-            (ChannelStatus::PendingToClose(stored_time), ChannelStatus::PendingToClose(fresh_time)) => {
-                fresh_time > stored_time
-            }
-            (stored_status, fresh_status) => status_rank(&fresh_status) > status_rank(&stored_status),
-        },
+        Ordering::Equal => is_later_status(&stored.status, &fresh.status),
     }
 }
 
