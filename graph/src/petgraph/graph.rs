@@ -293,7 +293,7 @@ impl hopr_api::graph::NetworkGraphWrite for ChannelGraph {
     /// If the edge does not exist, it gets created first.
     ///
     /// If the nodes do not exist, they are added as well.
-    #[tracing::instrument(level = "debug", skip(self, f))]
+    #[tracing::instrument(level = "trace", skip(self, f))]
     fn upsert_edge<F>(&self, src: &OffchainPublicKey, dest: &OffchainPublicKey, f: F)
     where
         F: FnOnce(&mut Observations),
@@ -327,7 +327,7 @@ impl hopr_api::graph::NetworkGraphWrite for ChannelGraph {
 
         if let Some(weight) = inner.graph.edge_weight_mut(edge_idx) {
             f(weight);
-            tracing::debug!(%src, %dest, ?weight, "updated edge weight with an observation");
+            tracing::trace!(%src, %dest, ?weight, "updated edge weight with an observation");
         }
     }
 }
