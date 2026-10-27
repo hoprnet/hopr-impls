@@ -9,8 +9,9 @@
 //! [`own_channels_sync_interval`](crate::BlockchainConnectorConfig::own_channels_sync_interval), and updates the
 //! stored ones that moved on.
 //!
-//! It only updates channels the node has already stored. It never adds a channel, so the channel graph, which is
-//! built from the channel graph subscription only, is left as it is.
+//! Query reconciliation only updates channels the node has already stored. Subscription writes use the same lock
+//! and caches, but may discover channels. Only the subscription caller maintains the topology index; this helper
+//! never reads or writes the graph.
 
 use std::{cmp::Ordering, time::Duration};
 
@@ -64,6 +65,9 @@ pub(crate) fn is_later_state(stored: &ChannelEntry, fresh: &ChannelEntry) -> boo
     }
 }
 
+/// A stored subscription record and the changes from its predecessor, if one existed.
+pub(crate) type StoredChannelUpdate = (ChannelEntry, Option<Vec<ChannelChange>>);
+
 /// Writes channel states read from Blokli into the connector's backend and caches.
 pub(crate) struct ChannelSync<B> {
     pub(crate) backend: std::sync::Arc<B>,
@@ -93,6 +97,53 @@ impl<B> ChannelSync<B>
 where
     B: Backend + Send + Sync + 'static,
 {
+    /// Stores a subscription update unless its epoch, status or closure deadline is older than the stored one.
+    ///
+    /// Unlike query reconciliation, a subscription can discover a channel and update its balance or ticket index
+    /// without changing its status. Backend and cache publication share the reconciliation lock. The caller owns
+    /// topology updates and event delivery; this helper never accesses the graph.
+    pub(crate) async fn store_subscription(
+        &self,
+        channel: ChannelEntry,
+    ) -> Result<Option<StoredChannelUpdate>, ConnectorError> {
+        let sync = self.clone();
+        hopr_utils::runtime::prelude::spawn_blocking(move || {
+            let _guard = sync.write_lock.lock();
+            let stored = sync
+                .backend
+                .get_channel_by_id(channel.get_id())
+                .map_err(ConnectorError::backend)?;
+            if stored.as_ref().is_some_and(|stored| is_later_state(&channel, stored)) {
+                return Ok(None);
+            }
+
+            let old = sync.backend.insert_channel(channel).map_err(ConnectorError::backend)?;
+            sync.channel_by_id.insert(*channel.get_id(), Some(channel));
+            sync.channel_by_parties
+                .insert(ChannelParties::from(&channel), Some(channel));
+            Ok(Some((channel, old.map(|old| old.diff(&channel)))))
+        })
+        .await
+        .map_err(ConnectorError::backend)?
+    }
+
+    /// Applies a query response and returns the latest stored record, including when that response was rejected.
+    ///
+    /// A subscription can advance the record while the query is in flight. Returning the query response or the
+    /// caller's pre-query copy would then choose the wrong closure transaction.
+    pub(crate) async fn refresh(&self, fresh: ChannelEntry) -> Result<Option<ChannelEntry>, ConnectorError> {
+        self.apply(fresh).await?;
+        let sync = self.clone();
+        hopr_utils::runtime::prelude::spawn_blocking(move || {
+            let _guard = sync.write_lock.lock();
+            sync.backend
+                .get_channel_by_id(fresh.get_id())
+                .map_err(ConnectorError::backend)
+        })
+        .await
+        .map_err(ConnectorError::backend)?
+    }
+
     /// Replaces the stored channel with `fresh` if `fresh` is a [later state](is_later_state), and sends the chain
     /// events for the change.
     ///
@@ -219,7 +270,7 @@ where
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::time::{Duration, SystemTime};
 
     use futures::StreamExt;
@@ -238,7 +289,7 @@ mod tests {
         testing::BlokliTestStateBuilder,
     };
 
-    fn channel(status: ChannelStatus, epoch: u32) -> anyhow::Result<ChannelEntry> {
+    pub(crate) fn channel(status: ChannelStatus, epoch: u32) -> anyhow::Result<ChannelEntry> {
         Ok(ChannelEntry::builder()
             .between(
                 &ChainKeypair::from_secret(&PRIVATE_KEY_1)?,
@@ -251,7 +302,7 @@ mod tests {
             .build()?)
     }
 
-    fn pending_since(secs: u64) -> ChannelStatus {
+    pub(crate) fn pending_since(secs: u64) -> ChannelStatus {
         ChannelStatus::PendingToClose(SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
     }
 
@@ -282,7 +333,7 @@ mod tests {
         Ok(())
     }
 
-    fn test_state(channel: ChannelEntry) -> anyhow::Result<BlokliTestStateBuilder> {
+    pub(crate) fn test_state(channel: ChannelEntry) -> anyhow::Result<BlokliTestStateBuilder> {
         let account_1 = AccountEntry {
             public_key: *OffchainKeypair::from_secret(&hex!(
                 "60741b83b99e36aa0c1331578156e16b8e21166d01834abb6c64b103f885734d"
@@ -311,6 +362,76 @@ mod tests {
             ])
             .with_channels([channel])
             .with_hopr_network_chain_info("piz-palu-staging"))
+    }
+
+    #[tokio::test]
+    async fn delayed_subscription_states_cannot_undo_reconciliation() -> anyhow::Result<()> {
+        let cases = [
+            (channel(pending_since(10), 1)?, channel(ChannelStatus::Open, 1)?),
+            (channel(ChannelStatus::Closed, 1)?, channel(pending_since(10), 1)?),
+            (channel(pending_since(20), 1)?, channel(pending_since(10), 1)?),
+            (channel(ChannelStatus::Open, 2)?, channel(ChannelStatus::Closed, 1)?),
+        ];
+        for (current, delayed) in cases {
+            let open = channel(ChannelStatus::Open, 1)?;
+            let mut connector = create_connector(test_state(open)?.build_dynamic_client(MODULE_ADDR.into()))?;
+            connector.connect().await?;
+            let sync = connector.channel_sync();
+            sync.apply(current).await?;
+
+            assert!(sync.store_subscription(delayed).await?.is_none());
+            assert_eq!(connector.channel_by_id(current.get_id())?, Some(current));
+            assert_eq!(
+                connector.channel_by_parties(&current.source, &current.destination)?,
+                Some(current)
+            );
+            assert_eq!(sync.backend.get_channel_by_id(current.get_id())?, Some(current));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn subscription_updates_keep_balance_and_ticket_changes_within_one_status() -> anyhow::Result<()> {
+        let open = channel(ChannelStatus::Open, 1)?;
+        let mut connector = create_connector(test_state(open)?.build_dynamic_client(MODULE_ADDR.into()))?;
+        connector.connect().await?;
+        let updated = ChannelEntry::builder()
+            .between(open.source, open.destination)
+            .balance(HoprBalance::new_base(77))
+            .ticket_index(2u32.into())
+            .status(ChannelStatus::Open)
+            .epoch(1)
+            .build()?;
+
+        let sync = connector.channel_sync();
+        assert!(sync.store_subscription(updated).await?.is_some());
+        assert_eq!(sync.backend.get_channel_by_id(open.get_id())?, Some(updated));
+        assert_eq!(connector.channel_by_id(open.get_id())?, Some(updated));
+        assert_eq!(
+            connector.channel_by_parties(&open.source, &open.destination)?,
+            Some(updated)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn subscription_can_discover_a_channel_without_query_reconciliation_adding_it() -> anyhow::Result<()> {
+        let open = channel(ChannelStatus::Open, 1)?;
+        let mut connector = create_connector(test_state(open)?.build_dynamic_client(MODULE_ADDR.into()))?;
+        connector.connect().await?;
+        let incoming = ChannelEntry::builder()
+            .between(open.destination, open.source)
+            .amount(10)
+            .ticket_index(1)
+            .status(ChannelStatus::Open)
+            .epoch(1)
+            .build()?;
+        let sync = connector.channel_sync();
+        assert_eq!(sync.refresh(incoming).await?, None);
+        let update = sync.store_subscription(incoming).await?;
+        assert!(matches!(update, Some((channel, None)) if channel == incoming));
+        assert_eq!(connector.channel_by_id(incoming.get_id())?, Some(incoming));
+        Ok(())
     }
 
     #[tokio::test]

@@ -327,7 +327,6 @@ where
 
         let client = self.client.clone();
         let mapper = self.mapper.clone();
-        let backend = self.backend.clone();
         let graph = self.graph.clone();
         let event_tx = self.events.0.clone();
         let me = self.chain_key.public().to_address();
@@ -336,9 +335,6 @@ where
         let chain_to_packet = self.chain_to_packet.clone();
         let packet_to_chain = self.packet_to_chain.clone();
 
-        let channel_by_id = self.channel_by_id.clone();
-        let channel_by_parties = self.channel_by_parties.clone();
-        let channel_write_lock = self.channel_write_lock.clone();
         let channel_sync = self.channel_sync();
         let own_channels_sync_interval = self.cfg.own_channels_sync_interval.max(MIN_OWN_CHANNELS_SYNC_INTERVAL);
 
@@ -474,36 +470,25 @@ where
                 })
                 .fuse();
 
-            // Stream of channel graph updates
+            // Both reconciliation and subscription updates serialize backend and cache publication.
+            // Topology ownership stays here, outside ChannelSync.
+            let subscription_channel_sync = channel_sync.clone();
             let channel_stream = channel_stream
                 .map_err(ConnectorError::from)
                 .inspect_ok(|entry| tracing::trace!(?entry, "new graph event"))
                 .try_filter_map(|graph_event| futures::future::ready(model_to_graph_entry(graph_event).map(Some)))
                 .and_then(move |(src, dst, channel)| {
                     let graph = graph.clone();
-                    let backend = backend.clone();
-                    let channel_by_id = channel_by_id.clone();
-                    let channel_by_parties = channel_by_parties.clone();
-                    let channel_write_lock = channel_write_lock.clone();
-                    hopr_utils::runtime::prelude::spawn_blocking(move || {
-                        let _guard = channel_write_lock.lock();
+                    let channel_sync = subscription_channel_sync.clone();
+                    async move {
+                        // The topology holds IDs, not channel state. Index the ID before making the record visible
+                        // through the backend and caches, as stream_channels enumerates this index first.
                         graph.write().add_edge(src.key_id, dst.key_id, *channel.get_id());
-                        backend
-                            .insert_channel(channel)
-                            .map(|old| (channel, old.map(|old| old.diff(&channel))))
-                    })
-                    .map_err(ConnectorError::backend)
-                    .and_then(move |res| {
-                        let channel_by_id = channel_by_id.clone();
-                        let channel_by_parties = channel_by_parties.clone();
-                        if let Ok((upserted_channel, _)) = &res {
-                            // Rather update the cached entry than invalidating it
-                            channel_by_id.insert(*upserted_channel.get_id(), Some(*upserted_channel));
-                            channel_by_parties.insert(ChannelParties::from(upserted_channel), Some(*upserted_channel));
-                        }
-                        futures::future::ready(res.map(SubscribedEventType::Channel).map_err(ConnectorError::backend))
-                    })
+                        channel_sync.store_subscription(channel).await
+                    }
                 })
+                .try_filter_map(futures::future::ok)
+                .map_ok(SubscribedEventType::Channel)
                 .fuse();
 
             // Stream of ticket parameter updates (ticket price, minimum winning probability)

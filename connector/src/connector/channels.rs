@@ -7,10 +7,7 @@ use hopr_api::{
 
 use crate::{
     backend::Backend,
-    connector::{
-        CHANNEL_CUSTOM_TIMEMOUT_MULTIPLIER, HoprBlockchainConnector,
-        channel_sync::{ChannelSync, is_later_state},
-    },
+    connector::{CHANNEL_CUSTOM_TIMEMOUT_MULTIPLIER, HoprBlockchainConnector, channel_sync::ChannelSync},
     errors::ConnectorError,
     utils::model_to_channel_entry,
 };
@@ -163,8 +160,10 @@ where
             .ok_or(ConnectorError::ChannelDoesNotExist(channel_id))?;
 
         let fresh = model_to_channel_entry(&model, stored.source, stored.destination)?;
-        self.channel_sync().apply(fresh).await?;
-        Ok(if is_later_state(stored, &fresh) { fresh } else { *stored })
+        self.channel_sync()
+            .refresh(fresh)
+            .await?
+            .ok_or(ConnectorError::ChannelDoesNotExist(channel_id))
     }
 }
 
@@ -279,9 +278,46 @@ mod tests {
 
     use super::*;
     use crate::{
-        connector::tests::{MODULE_ADDR, PRIVATE_KEY_1, PRIVATE_KEY_2, create_connector},
+        connector::{
+            channel_sync::tests::{channel, pending_since, test_state},
+            tests::{MODULE_ADDR, PRIVATE_KEY_1, PRIVATE_KEY_2, create_connector},
+        },
         testing::BlokliTestStateBuilder,
     };
+
+    #[tokio::test]
+    async fn a_pre_close_query_returns_the_newer_stored_pending_state() -> anyhow::Result<()> {
+        let open = channel(ChannelStatus::Open, 1)?;
+        let mut connector = create_connector(test_state(open)?.build_dynamic_client(MODULE_ADDR.into()))?;
+        connector.connect().await?;
+
+        // The caller captured Open before querying. The subscription advances the backend while the query's
+        // snapshot still says Open. The rejected response must not be returned to transaction selection.
+        let pending = channel(pending_since(10), 1)?;
+        connector.channel_sync().apply(pending).await?;
+        assert_eq!(
+            Some(connector.read_channel_from_blokli(&open).await?.status),
+            Some(pending.status)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_pre_close_query_returns_the_newer_stored_closed_state() -> anyhow::Result<()> {
+        let pending = channel(pending_since(10), 1)?;
+        let mut connector = create_connector(test_state(pending)?.build_dynamic_client(MODULE_ADDR.into()))?;
+        connector.connect().await?;
+
+        connector
+            .channel_sync()
+            .apply(channel(ChannelStatus::Closed, 1)?)
+            .await?;
+        assert_eq!(
+            Some(connector.read_channel_from_blokli(&pending).await?.status),
+            Some(ChannelStatus::Closed)
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn connector_should_get_and_stream_channels() -> anyhow::Result<()> {
