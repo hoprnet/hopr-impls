@@ -6,7 +6,8 @@
 //! a closure keeps the channel as open, and then sends the wrong closure transaction for it.
 //!
 //! [`ChannelSync`] therefore reads the node's own channels from Blokli again, every
-//! [`OWN_CHANNELS_SYNC_INTERVAL`], and updates the stored ones that moved on.
+//! [`own_channels_sync_interval`](crate::BlockchainConnectorConfig::own_channels_sync_interval), and updates the
+//! stored ones that moved on.
 //!
 //! It only updates channels the node has already stored. It never adds a channel, so the channel graph, which is
 //! built from the channel graph subscription only, is left as it is.
@@ -25,11 +26,12 @@ use crate::{
     utils::{model_to_channel_entry, process_channel_changes_into_events},
 };
 
-/// How often the node's own channels are read from Blokli again.
-///
-/// This covers updates missed while the channel graph subscription was disconnected or had ended, and updates that
-/// Blokli dropped while the subscription stayed connected.
-pub(crate) const OWN_CHANNELS_SYNC_INTERVAL: Duration = Duration::from_mins(10);
+/// Default of [`own_channels_sync_interval`](crate::BlockchainConnectorConfig::own_channels_sync_interval).
+pub(crate) const DEFAULT_OWN_CHANNELS_SYNC_INTERVAL: Duration = Duration::from_mins(10);
+
+/// Shortest allowed [`own_channels_sync_interval`](crate::BlockchainConnectorConfig::own_channels_sync_interval),
+/// so the node does not query Blokli in a tight loop.
+pub(crate) const MIN_OWN_CHANNELS_SYNC_INTERVAL: Duration = Duration::from_mins(1);
 
 /// Whether a channel can move from `stored` to `fresh` within one epoch.
 ///

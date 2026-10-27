@@ -15,7 +15,7 @@ use crate::{
     HoprBlockchainReader,
     backend::Backend,
     connector::{
-        channel_sync::OWN_CHANNELS_SYNC_INTERVAL,
+        channel_sync::{DEFAULT_OWN_CHANNELS_SYNC_INTERVAL, MIN_OWN_CHANNELS_SYNC_INTERVAL},
         keys::HoprKeyMapper,
         sequencer::TransactionSequencer,
         services::{
@@ -181,6 +181,12 @@ pub struct BlockchainConnectorConfig {
     /// Default is 2, minimum is 1.
     #[default(TX_TIMEOUT_MULTIPLIER)]
     pub tx_timeout_multiplier: u32,
+    /// How often the node reads its own channels from Blokli again, to catch channel updates the channel graph
+    /// subscription missed.
+    ///
+    /// Default is 10 minutes, minimum is 1 minute.
+    #[default(DEFAULT_OWN_CHANNELS_SYNC_INTERVAL)]
+    pub own_channels_sync_interval: Duration,
 }
 
 /// A connector acting as middleware between the HOPR APIs (see the [`hopr_api`] crate) and the Blokli Client API (see
@@ -334,6 +340,7 @@ where
         let channel_by_parties = self.channel_by_parties.clone();
         let channel_write_lock = self.channel_write_lock.clone();
         let channel_sync = self.channel_sync();
+        let own_channels_sync_interval = self.cfg.own_channels_sync_interval.max(MIN_OWN_CHANNELS_SYNC_INTERVAL);
 
         // Query chain info to populate the cache
         let initial_chain_values = self.query_cached_chain_info().await?;
@@ -648,7 +655,7 @@ where
             // Updates missed by the channel graph subscription are not replayed for closed channels, so the own
             // channels are read from Blokli again on a timer.
             let own_channel_syncs =
-                futures_time::stream::interval(futures_time::time::Duration::from(OWN_CHANNELS_SYNC_INTERVAL))
+                futures_time::stream::interval(futures_time::time::Duration::from(own_channels_sync_interval))
                     .take_until(subscriptions_ended_rx)
                     .map(|_| Ok::<_, ConnectorError>(SubscribedEventType::SyncOwnChannels));
 
