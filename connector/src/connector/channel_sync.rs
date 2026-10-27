@@ -385,4 +385,59 @@ mod tests {
         assert_eq!(connector.channel_by_id(unknown.get_id())?, None);
         Ok(())
     }
+
+    #[tokio::test]
+    async fn a_node_without_an_account_has_nothing_to_sync() -> anyhow::Result<()> {
+        let account_2 = AccountEntry {
+            public_key: *OffchainKeypair::from_secret(&hex!(
+                "71bf1f42ebbfcd89c3e197a3fd7cda79b92499e509b6fefa0fe44d02821d146a"
+            ))?
+            .public(),
+            chain_addr: ChainKeypair::from_secret(&PRIVATE_KEY_2)?.public().to_address(),
+            entry_type: AccountType::NotAnnounced,
+            safe_address: Some([2u8; Address::SIZE].into()),
+            key_id: 2.into(),
+        };
+        let blokli_client = BlokliTestStateBuilder::default()
+            .with_accounts([(account_2, HoprBalance::new_base(100), XDaiBalance::new_base(1))])
+            .with_hopr_network_chain_info("piz-palu-staging")
+            .build_dynamic_client(MODULE_ADDR.into());
+        let mut connector = create_connector(blokli_client)?;
+        connector.connect().await?;
+
+        assert_eq!(connector.channel_sync().sync_own_channels(connector.client()).await?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_channel_to_an_unknown_account_is_skipped() -> anyhow::Result<()> {
+        let open = channel(ChannelStatus::Open, 1)?;
+        let mut connector = create_connector(test_state(open)?.build_dynamic_client(MODULE_ADDR.into()))?;
+        connector.connect().await?;
+
+        // A channel whose other end is an account the node has not received yet.
+        let unknown_id = const_hex::encode([7u8; 32]);
+        connector.client().hidden_state_update(|state| {
+            state.channels.insert(
+                unknown_id.clone(),
+                blokli_client::api::types::Channel {
+                    balance: blokli_client::api::types::TokenValueString("10 wxHOPR".into()),
+                    closure_time: None,
+                    concrete_channel_id: unknown_id.clone(),
+                    destination: 99,
+                    epoch: 1,
+                    source: 1,
+                    status: blokli_client::api::types::ChannelStatus::Closed,
+                    ticket_index: blokli_client::api::types::Uint64("0".into()),
+                },
+            );
+        });
+
+        assert_eq!(connector.channel_sync().sync_own_channels(connector.client()).await?, 0);
+        assert_eq!(
+            connector.channel_by_id(open.get_id())?.map(|c| c.status),
+            Some(ChannelStatus::Open)
+        );
+        Ok(())
+    }
 }
