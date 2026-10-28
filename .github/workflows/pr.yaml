@@ -84,7 +84,7 @@ jobs:
   # ── Cargo dependency policy ────────────────────────────────────────────────
   cargo-policy:
     name: Cargo policy
-    runs-on: depot-ubuntu-24.04-2
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
