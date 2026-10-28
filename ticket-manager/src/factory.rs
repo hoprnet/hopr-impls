@@ -37,7 +37,9 @@ use crate::{
 ///
 /// The outgoing indices are **not** automatically synchronized back to the underlying store for performance reasons.
 /// The user is responsible for calling [`save_outgoing_indices`](HoprTicketFactory::save_outgoing_indices) to save
-/// the outgoing indices to the store.
+/// the outgoing indices to the store, typically periodically and once more on shutdown. The store itself must
+/// outlive the process (e.g. a [`RedbStore`](crate::RedbStore) opened on a kept file): indices that never reached
+/// a durable store are issued again after a restart, because the factory then resumes from the on-chain ticket index.
 ///
 /// This usage is typical for all kinds of nodes (Entry/Relay/Exit).
 ///
@@ -605,6 +607,36 @@ mod tests {
 
             assert_eq!((10..10 + THREADS).collect::<Vec<_>>(), indices);
         }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "redb")]
+    #[test]
+    fn ticket_factory_should_resume_saved_outgoing_indices_after_reopening_the_store() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("tickets.redb");
+
+        let channel = ChannelEntry::builder()
+            .between(&ChainKeypair::random(), &ChainKeypair::random())
+            .amount(10)
+            .ticket_index(1)
+            .status(ChannelStatus::Open)
+            .epoch(1)
+            .build()?;
+
+        let factory = HoprTicketFactory::new(crate::RedbStore::new(&path)?);
+        factory.sync_from_outgoing_channels(&[channel])?;
+        for expected in 1..=5 {
+            assert_eq!(expected, factory.next_outgoing_ticket_index(&channel));
+        }
+        factory.save_outgoing_indices()?;
+        drop(factory);
+
+        // None of the issued tickets were redeemed, so the on-chain ticket index did not move
+        let factory = HoprTicketFactory::new(crate::RedbStore::new(&path)?);
+        factory.sync_from_outgoing_channels(&[channel])?;
+        assert_eq!(6, factory.next_outgoing_ticket_index(&channel));
 
         Ok(())
     }
