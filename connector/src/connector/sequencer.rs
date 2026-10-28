@@ -12,6 +12,7 @@ use hopr_api::{
         crypto::prelude::*,
     },
 };
+use tracing::Instrument;
 
 use crate::{
     errors::{self, ConnectorError},
@@ -23,15 +24,6 @@ type TxRequest<T> = (
     Option<ChainKeypair>,
     futures::channel::oneshot::Sender<errors::Result<blokli_client::api::TxId>>,
 );
-
-/// A processed [`TxRequest`], carrying what the nonce bookkeeping needs after the submission.
-struct SequencedTx {
-    res: errors::Result<blokli_client::api::TxId>,
-    /// `false` if it failed before reaching Blokli, so its nonce cannot have been used.
-    submitted: bool,
-    signer_addr: Address,
-    notifier: futures::channel::oneshot::Sender<errors::Result<blokli_client::api::TxId>>,
-}
 
 /// Takes care of sequencing transactions, nonce management, and submitting the transactions to the blockchain in-order.
 ///
@@ -49,10 +41,6 @@ const OTHER_SIGNER_NONCE_EXPIRATION: Duration = Duration::from_mins(5);
 // How long a tracking id handed out by Blokli is remembered to detect deduplicated submissions.
 // Must outlive the time a transaction can stay in flight, i.e. the longest tracking timeout.
 const ISSUED_TX_ID_RETENTION: Duration = Duration::from_mins(5);
-
-// How long the local nonce may stay ahead of an unchanging pending count before it is resynced.
-// Matches Blokli's tracking timeout, after which Blokli has given up on the transaction too.
-const NONCE_GAP_TOLERANCE: Duration = Duration::from_mins(5);
 
 struct FixedTti {
     fixed: Address,
@@ -102,7 +90,7 @@ where
     C: BlokliQueryClient + BlokliTransactionClient + Send + Sync + 'static,
     R: SignableTransaction + Send + Sync + 'static,
 {
-    pub fn new(signer: ChainKeypair, client: std::sync::Arc<C>) -> Self {
+    pub fn new(signer: ChainKeypair, client: std::sync::Arc<C>, nonce_gap_tolerance: Duration) -> Self {
         tracing::debug!(signer = %signer.public().to_address(), "starting transaction sequencer");
 
         let client_clone = client.clone();
@@ -131,17 +119,18 @@ where
 
         let nonce_gaps = moka::sync::Cache::new(1024);
 
-        let current_nonce_clone = current_nonce.clone();
         hopr_utils::runtime::prelude::spawn(
             receiver
-                .then(move |(tx, tx_signer, notifier): (R, _, _)| {
+                .for_each(move |(tx, tx_signer, notifier): (R, Option<ChainKeypair>, _)| {
                     let client = client_clone.clone();
                     let signer = tx_signer.unwrap_or_else(|| signer.clone());
                     let signer_addr = signer.public().to_address();
                     let current_nonce = current_nonce.clone();
                     let nonce_gaps = nonce_gaps.clone();
+                    let issued_tx_ids = issued_tx_ids.clone();
                     async move {
-                        let signed_tx = async {
+                        // Outer `Err`: the transaction never reached Blokli, inner: Blokli's outcome
+                        let submission = async {
                             let chain_info = client.query_chain_info().map_err(ConnectorError::from).await?;
                             tracing::debug!(chain_id = chain_info.chain_id, "chain info retrieved for tx");
 
@@ -156,63 +145,62 @@ where
                                 .await?;
                             let local_nonce = current_nonce.entry(signer_addr).or_default().into_value();
                             let nonce =
-                                sync_nonce(&local_nonce, &nonce_gaps, signer_addr, pending, NONCE_GAP_TOLERANCE);
-                            tracing::debug!(nonce, signer = %signer_addr, "nonce used for the tx");
+                                sync_nonce(&local_nonce, &nonce_gaps, signer_addr, pending, nonce_gap_tolerance);
+                            tracing::Span::current().record("nonce", nonce);
 
                             let tx = tx
                                 .sign_and_encode_to_eip2718(nonce, chain_id, gas_estimation.into(), &signer)
                                 .await?;
-                            tracing::debug!(nonce, signer = %signer_addr, "submitting transaction");
-                            Ok::<_, ConnectorError>(tx)
+                            tracing::debug!("submitting transaction");
+                            Ok(client
+                                .submit_and_track_transaction(&tx)
+                                .map_err(ConnectorError::from)
+                                .await)
                         }
                         .await;
 
-                        let (res, submitted) = match signed_tx {
-                            Ok(tx) => (
-                                client.submit_and_track_transaction(&tx).map_err(ConnectorError::from).await,
-                                true,
-                            ),
-                            Err(e) => (Err(e), false),
-                        };
-                        SequencedTx {
-                            res,
-                            submitted,
-                            signer_addr,
-                            notifier,
-                        }
-                    }
-                })
-                .for_each(move |SequencedTx { res, submitted, signer_addr, notifier }| {
-                    let deduplicated = res
-                        .as_ref()
-                        .is_ok_and(|tx_id| !record_issued_tx_id(&issued_tx_ids, tx_id));
-                    match nonce_consumed(&res, submitted, deduplicated) {
-                        Some(true) => {
-                            let prev_nonce = current_nonce_clone
-                                .entry(signer_addr)
-                                .or_default()
-                                .value()
-                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let deduplicated = matches!(
+                            &submission,
+                            Ok(Ok(tx_id)) if !record_issued_tx_id(&issued_tx_ids, tx_id)
+                        );
+                        match nonce_consumed(&submission, deduplicated) {
+                            Some(true) => {
+                                let prev_nonce = current_nonce
+                                    .entry(signer_addr)
+                                    .or_default()
+                                    .value()
+                                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-                            tracing::debug!(prev_nonce, signer = %signer_addr, ?res, "nonce incremented due to tx success or rejection");
+                                tracing::debug!(
+                                    prev_nonce,
+                                    ?submission,
+                                    "nonce incremented due to tx success or rejection"
+                                );
+                            }
+                            Some(false) => tracing::debug!(deduplicated, ?submission, "nonce not consumed"),
+                            None => {
+                                current_nonce.invalidate(&signer_addr);
+                                tracing::warn!(
+                                    ?submission,
+                                    "unknown whether the nonce was consumed, re-reading it from the chain"
+                                );
+                            }
                         }
-                        Some(false) => tracing::debug!(signer = %signer_addr, deduplicated, ?res, "nonce not consumed"),
-                        None => {
-                            current_nonce_clone.invalidate(&signer_addr);
-                            tracing::warn!(
-                                signer = %signer_addr,
-                                ?res,
-                                "unknown whether the nonce was consumed, re-reading it from the chain"
+                        submission.and_then(|res| res)
+                    }
+                    .instrument(tracing::debug_span!(
+                        "sequence_transaction",
+                        signer = %signer_addr,
+                        nonce = tracing::field::Empty
+                    ))
+                    .map(move |res| {
+                        if notifier.send(res).is_err() {
+                            tracing::debug!(
+                                "failed to notify transaction result - the caller may not want to await the result \
+                                 anymore."
                             );
                         }
-                    }
-                    if notifier.send(res).is_err() {
-                        tracing::debug!(
-                            "failed to notify transaction result - the caller may not want to await the result \
-                             anymore."
-                        );
-                    }
-                    futures::future::ready(())
+                    })
                 })
                 .inspect(|_| tracing::warn!("transaction sequencer queue stopped")),
         );
@@ -288,11 +276,14 @@ fn nonce_gap_age(
 
 /// Whether the nonce the transaction was signed with is now used up, by it or by another
 /// transaction. `None` when the result does not tell.
-fn nonce_consumed(res: &errors::Result<blokli_client::api::TxId>, submitted: bool, deduplicated: bool) -> Option<bool> {
-    let error = match res {
-        Ok(_) => return Some(!deduplicated),
-        Err(_) if !submitted => return Some(false),
-        Err(error) => error,
+fn nonce_consumed(
+    submission: &errors::Result<errors::Result<blokli_client::api::TxId>>,
+    deduplicated: bool,
+) -> Option<bool> {
+    let error = match submission {
+        Err(_) => return Some(false),
+        Ok(Ok(_)) => return Some(!deduplicated),
+        Ok(Err(error)) => error,
     };
     if error.is_refused_before_broadcast() {
         return Some(false);
@@ -355,11 +346,11 @@ mod tests {
 
     use super::*;
 
-    fn failed(kind: ErrorKind) -> errors::Result<blokli_client::api::TxId> {
-        Err(ConnectorError::ClientError(kind.into()))
+    fn failed(kind: ErrorKind) -> errors::Result<errors::Result<blokli_client::api::TxId>> {
+        Ok(Err(ConnectorError::ClientError(kind.into())))
     }
 
-    fn rpc_refusal(code: &str) -> errors::Result<blokli_client::api::TxId> {
+    fn rpc_refusal(code: &str) -> errors::Result<errors::Result<blokli_client::api::TxId>> {
         failed(ErrorKind::BlokliError {
             kind: "rpc error",
             code: code.into(),
@@ -369,11 +360,11 @@ mod tests {
 
     #[test]
     fn nonce_is_consumed_by_a_broadcast_tx_or_a_competing_one() {
-        assert_eq!(Some(true), nonce_consumed(&Ok("tx-1".into()), true, false));
-        assert_eq!(Some(true), nonce_consumed(&rpc_refusal("NONCE_TOO_LOW"), true, false));
+        assert_eq!(Some(true), nonce_consumed(&Ok(Ok("tx-1".into())), false));
+        assert_eq!(Some(true), nonce_consumed(&rpc_refusal("NONCE_TOO_LOW"), false));
         assert_eq!(
             Some(true),
-            nonce_consumed(&rpc_refusal("REPLACEMENT_UNDERPRICED"), true, false)
+            nonce_consumed(&rpc_refusal("REPLACEMENT_UNDERPRICED"), false)
         );
     }
 
@@ -381,37 +372,30 @@ mod tests {
     fn nonce_is_not_consumed_when_nothing_got_into_the_mempool() {
         assert_eq!(
             Some(false),
-            nonce_consumed(&Ok("tx-1".into()), true, true),
+            nonce_consumed(&Ok(Ok("tx-1".into())), true),
             "deduplicated"
         );
         assert_eq!(
             Some(false),
-            nonce_consumed(&Err(ConnectorError::ServerNotHealthy), false, false),
+            nonce_consumed(&Err(ConnectorError::ServerNotHealthy), false),
             "failed before submission"
         );
-        assert_eq!(Some(false), nonce_consumed(&rpc_refusal("FEE_TOO_LOW"), true, false));
-        assert_eq!(
-            Some(false),
-            nonce_consumed(&rpc_refusal("INSUFFICIENT_FUNDS"), true, false)
-        );
+        assert_eq!(Some(false), nonce_consumed(&rpc_refusal("FEE_TOO_LOW"), false));
+        assert_eq!(Some(false), nonce_consumed(&rpc_refusal("INSUFFICIENT_FUNDS"), false));
         let overloaded = failed(ErrorKind::BlokliError {
             kind: "overloaded",
             code: "OVERLOADED".into(),
             message: "too many tracked transactions".into(),
         });
-        assert_eq!(Some(false), nonce_consumed(&overloaded, true, false));
+        assert_eq!(Some(false), nonce_consumed(&overloaded, false));
     }
 
     #[test]
     fn nonce_consumption_is_unknown_when_the_result_does_not_tell() {
         for code in ["NONCE_TOO_HIGH", "ALREADY_KNOWN", "RPC_ERROR"] {
-            assert_eq!(None, nonce_consumed(&rpc_refusal(code), true, false), "{code}");
+            assert_eq!(None, nonce_consumed(&rpc_refusal(code), false), "{code}");
         }
-        assert_eq!(
-            None,
-            nonce_consumed(&failed(ErrorKind::Timeout), true, false),
-            "transport"
-        );
+        assert_eq!(None, nonce_consumed(&failed(ErrorKind::Timeout), false), "transport");
     }
 
     #[test]
