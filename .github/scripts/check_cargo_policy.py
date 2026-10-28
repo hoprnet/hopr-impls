@@ -32,7 +32,7 @@ BARE_KEY_CHARACTERS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTU
 
 @dataclass(frozen=True)
 class Violation:
-    """A single manifest declaration that violates the dependency policy."""
+    """A single policy violation in a manifest: a disallowed declaration or an unparseable file."""
 
     manifest: str
     message: str
