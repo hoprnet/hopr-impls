@@ -29,11 +29,20 @@ impl OutgoingIndexEntry {
         }
     }
 
-    /// Increments the index and marks it as dirty if within bounds.
+    /// Takes the next index that is at least `min` and marks it as dirty if within bounds.
     ///
-    /// The value returned is the value before the increment, saturating at [`TicketBuilder::MAX_TICKET_INDEX`].
-    fn increment(&self) -> u64 {
-        let v = self.index.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    /// Every returned value comes from a single increment of the counter, so concurrent callers never
+    /// receive the same index, even when some of them have to lift the counter to `min`.
+    ///
+    /// The value returned saturates at [`TicketBuilder::MAX_TICKET_INDEX`].
+    fn increment_at_least(&self, min: u64) -> u64 {
+        let mut v = self.index.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if v < min {
+            // The counter never decreases, so once it is lifted to `min`, the next increment
+            // yields at least `min`. The value taken above is below `min` and therefore skipped.
+            self.index.fetch_max(min, std::sync::atomic::Ordering::Relaxed);
+            v = self.index.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         if v <= TicketBuilder::MAX_TICKET_INDEX {
             self.is_dirty.store(true, std::sync::atomic::Ordering::Release);
         }
@@ -80,9 +89,14 @@ pub struct OutgoingIndexCache {
 }
 
 impl OutgoingIndexCache {
-    /// Returns the next outgoing index for the given channel and epoch.
-    pub fn next(&self, channel_id: &ChannelId, epoch: u32) -> u64 {
-        self.cache.entry((*channel_id, epoch)).or_default().increment()
+    /// Returns the next outgoing index for the given channel and epoch that is at least `min`.
+    ///
+    /// The returned index is consumed, so it is never returned again for the same channel and epoch.
+    pub fn next_at_least(&self, channel_id: &ChannelId, epoch: u32, min: u64) -> u64 {
+        self.cache
+            .entry((*channel_id, epoch))
+            .or_default()
+            .increment_at_least(min)
     }
 
     /// Inserts the index for the given channel and `epoch`, or updates
@@ -273,7 +287,7 @@ mod tests {
     #[test]
     fn increment_saturates_return_value_at_max() {
         let e = OutgoingIndexEntry::new(MAX);
-        assert_eq!(e.increment(), MAX);
+        assert_eq!(e.increment_at_least(0), MAX);
         assert_eq!(e.get(), MAX);
     }
 
@@ -315,9 +329,9 @@ mod tests {
         let channel_id = Default::default();
         let epoch = 1;
 
-        assert_eq!(cache.next(&channel_id, epoch), 0);
-        assert_eq!(cache.next(&channel_id, epoch), 1);
-        assert_eq!(cache.next(&channel_id, epoch), 2);
+        assert_eq!(cache.next_at_least(&channel_id, epoch, 0), 0);
+        assert_eq!(cache.next_at_least(&channel_id, epoch, 0), 1);
+        assert_eq!(cache.next_at_least(&channel_id, epoch, 0), 2);
     }
 
     #[test]
@@ -326,10 +340,10 @@ mod tests {
         let channel_a = Default::default();
         let channel_b = ChannelId::create(&[b"other"]);
 
-        assert_eq!(cache.next(&channel_a, 1), 0);
-        assert_eq!(cache.next(&channel_a, 2), 0);
-        assert_eq!(cache.next(&channel_b, 1), 0);
-        assert_eq!(cache.next(&channel_a, 1), 1);
+        assert_eq!(cache.next_at_least(&channel_a, 1, 0), 0);
+        assert_eq!(cache.next_at_least(&channel_a, 2, 0), 0);
+        assert_eq!(cache.next_at_least(&channel_b, 1, 0), 0);
+        assert_eq!(cache.next_at_least(&channel_a, 1, 0), 1);
     }
 
     #[test]
@@ -338,8 +352,8 @@ mod tests {
         let channel_id = Default::default();
 
         assert_eq!(cache.upsert(&channel_id, 1, 17), 17);
-        assert_eq!(cache.next(&channel_id, 1), 17);
-        assert_eq!(cache.next(&channel_id, 1), 18);
+        assert_eq!(cache.next_at_least(&channel_id, 1, 0), 17);
+        assert_eq!(cache.next_at_least(&channel_id, 1, 0), 18);
     }
 
     #[test]
@@ -349,8 +363,8 @@ mod tests {
 
         assert_eq!(cache.upsert(&channel_id, 1, 10), 10);
         assert_eq!(cache.upsert(&channel_id, 1, 7), 10);
-        assert_eq!(cache.next(&channel_id, 1), 10);
-        assert_eq!(cache.next(&channel_id, 1), 11);
+        assert_eq!(cache.next_at_least(&channel_id, 1, 0), 10);
+        assert_eq!(cache.next_at_least(&channel_id, 1, 0), 11);
     }
 
     #[test]
@@ -359,8 +373,8 @@ mod tests {
         let channel_id = Default::default();
 
         assert_eq!(cache.upsert(&channel_id, 1, MAX), MAX);
-        assert_eq!(cache.next(&channel_id, 1), MAX);
-        assert_eq!(cache.next(&channel_id, 1), MAX);
+        assert_eq!(cache.next_at_least(&channel_id, 1, 0), MAX);
+        assert_eq!(cache.next_at_least(&channel_id, 1, 0), MAX);
     }
 
     #[test]
@@ -410,7 +424,7 @@ mod tests {
         assert_eq!(store.read().load_outgoing_index(&channel_a, 1)?, Some(10));
         assert_eq!(store.read().load_outgoing_index(&channel_b, 2)?, Some(20));
 
-        cache.next(&channel_a, 1);
+        cache.next_at_least(&channel_a, 1, 0);
         cache.save(store.clone())?;
         assert_eq!(store.read().load_outgoing_index(&channel_a, 1)?, Some(11));
         assert_eq!(store.read().load_outgoing_index(&channel_b, 2)?, Some(20));
@@ -451,7 +465,7 @@ mod tests {
         cache.save(store.clone())?;
         assert_eq!(store.read().load_outgoing_index(&channel_id, 1)?, Some(9));
 
-        cache.next(&channel_id, 1);
+        cache.next_at_least(&channel_id, 1, 0);
         cache.save(store.clone())?;
         assert_eq!(store.read().load_outgoing_index(&channel_id, 1)?, Some(10));
 
@@ -469,7 +483,7 @@ mod tests {
         let mut handles = vec![];
         for _ in 0..8 {
             let cache = Arc::clone(&cache);
-            handles.push(thread::spawn(move || cache.next(&channel_id, epoch)));
+            handles.push(thread::spawn(move || cache.next_at_least(&channel_id, epoch, 0)));
         }
 
         let mut values = handles
@@ -480,7 +494,66 @@ mod tests {
         values.sort_unstable();
 
         assert_eq!(values, (0..8).collect::<Vec<_>>());
-        assert_eq!(cache.next(&channel_id, epoch), 8);
+        assert_eq!(cache.next_at_least(&channel_id, epoch, 0), 8);
+
+        Ok(())
+    }
+
+    #[test]
+    fn increment_at_least_lifts_the_counter_to_min() {
+        let e = OutgoingIndexEntry::new(3);
+        e.mark_clean();
+
+        assert_eq!(e.increment_at_least(10), 10);
+        assert!(e.is_dirty());
+        assert_eq!(e.increment_at_least(10), 11);
+        assert_eq!(e.get(), 12);
+    }
+
+    #[test]
+    fn increment_at_least_ignores_min_below_the_counter() {
+        let e = OutgoingIndexEntry::new(20);
+
+        assert_eq!(e.increment_at_least(10), 20);
+        assert_eq!(e.increment_at_least(0), 21);
+        assert_eq!(e.get(), 22);
+    }
+
+    #[test]
+    fn concurrent_next_at_least_hands_out_distinct_indices_when_lifting_the_counter() -> anyhow::Result<()> {
+        const THREADS: usize = 16;
+        const PER_THREAD: usize = 64;
+        const MIN: u64 = 1000;
+
+        let cache = Arc::new(OutgoingIndexCache::default());
+        let channel_id = Default::default();
+        cache.upsert(&channel_id, 1, 3);
+
+        let barrier = Arc::new(std::sync::Barrier::new(THREADS));
+        let handles = (0..THREADS)
+            .map(|_| {
+                let cache = Arc::clone(&cache);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    (0..PER_THREAD)
+                        .map(|_| cache.next_at_least(&channel_id, 1, MIN))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let mut values = Vec::with_capacity(THREADS * PER_THREAD);
+        for handle in handles {
+            values.extend(handle.join().map_err(|_| anyhow::anyhow!("join error"))?);
+        }
+
+        assert!(values.iter().all(|&v| v >= MIN), "all indices must be at least {MIN}");
+
+        let total = values.len();
+        values.sort_unstable();
+        values.dedup();
+        assert_eq!(values.len(), total, "indices must be distinct");
 
         Ok(())
     }
@@ -497,7 +570,7 @@ mod tests {
         cache.save(store.clone())?;
 
         assert!(cache.remove(&channel_a, 1));
-        cache.next(&channel_b, 2);
+        cache.next_at_least(&channel_b, 2, 0);
         cache.save(store.clone())?;
 
         assert_eq!(store.read().load_outgoing_index(&channel_a, 1)?, None);
