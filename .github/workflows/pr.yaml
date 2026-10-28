@@ -108,10 +108,18 @@ jobs:
       - name: Select the policy check revision
         # Falls back to this branch while the check is being introduced.
         run: |
-          scripts=.policy-check/.github/scripts
-          [ -d "$scripts" ] || scripts=.github/scripts
+          base=.policy-check/.github/scripts
+          scripts=$base
+          [ -d "$base" ] || scripts=.github/scripts
           echo "POLICY_SCRIPTS=$scripts" >> "$GITHUB_ENV"
+          # The tests only matter when the check itself changed.
+          if cmp -s "$base/check_cargo_policy.py" .github/scripts/check_cargo_policy.py; then
+            echo "POLICY_CHECK_CHANGED=false" >> "$GITHUB_ENV"
+          else
+            echo "POLICY_CHECK_CHANGED=true" >> "$GITHUB_ENV"
+          fi
       - name: Test the dependency policy check
+        if: env.POLICY_CHECK_CHANGED == 'true'
         run: python3 -m unittest discover -s "$POLICY_SCRIPTS" -p 'test_*.py'
       # Protected branches must not depend on Cargo [patch] sections or git
       # sources; see https://github.com/hoprnet/hopr-devops/issues/345.
