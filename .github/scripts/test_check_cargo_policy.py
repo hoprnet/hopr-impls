@@ -149,6 +149,44 @@ blokli-client = { git = "https://github.com/hoprnet/blokli-client" }
             "[target.x86_64-unknown-linux-gnu.build-dependencies]",
         )
 
+    def test_underscore_development_dependency_alias_is_rejected(self) -> None:
+        self.assert_rejected(
+            """
+[dev_dependencies]
+blokli-client = { git = "https://github.com/hoprnet/blokli-client" }
+""",
+            "[dev_dependencies]",
+        )
+
+    def test_underscore_build_dependency_alias_is_rejected(self) -> None:
+        self.assert_rejected(
+            """
+[target.'cfg(unix)'.build_dependencies]
+blokli-client = { git = "https://github.com/hoprnet/blokli-client" }
+""",
+            '[target."cfg(unix)".build_dependencies]',
+        )
+
+    def test_git_replace_override_is_rejected(self) -> None:
+        messages = violations_for(
+            """
+[replace]
+"blokli-client:0.35.0" = { git = "https://github.com/hoprnet/blokli-client" }
+"""
+        )
+        self.assertEqual(len(messages), 1, messages)
+        self.assertIn("[replace]", messages[0])
+        self.assertIn("'blokli-client:0.35.0'", messages[0])
+
+    def test_path_replace_override_passes(self) -> None:
+        messages = violations_for(
+            """
+[replace]
+"blokli-client:0.35.0" = { path = "../blokli-client" }
+"""
+        )
+        self.assertEqual(messages, [])
+
     def test_every_violation_is_reported(self) -> None:
         messages = violations_for(
             """
@@ -264,6 +302,27 @@ class MainTest(unittest.TestCase):
             subprocess.run(["git", "-C", str(root), "add", "Cargo.toml"], check=True)
 
             self.assertEqual(policy.main(root), 1)
+
+    def test_main_checks_the_root_it_is_given(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            git_init(root)
+            (root / "Cargo.toml").write_text(
+                '[dependencies]\nserde = { git = "https://github.com/serde-rs/serde" }\n',
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "-C", str(root), "add", "Cargo.toml"], check=True)
+
+            script = Path(__file__).resolve().parent / "check_cargo_policy.py"
+            result = subprocess.run(
+                [sys.executable, str(script), str(root)], capture_output=True, text=True
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn(
+                "Cargo.toml: [dependencies] dependency 'serde' uses a git source",
+                result.stdout,
+            )
 
     def test_main_passes_without_manifests(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

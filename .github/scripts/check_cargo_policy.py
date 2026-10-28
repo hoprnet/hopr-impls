@@ -22,8 +22,15 @@ from typing import Any, Iterator
 MANIFEST_NAME = "Cargo.toml"
 
 # Tables Cargo resolves dependencies from. The same names appear under
-# `[workspace]` and under `[target.<cfg>]`.
-DEPENDENCY_SECTIONS = ("dependencies", "dev-dependencies", "build-dependencies")
+# `[workspace]` and under `[target.<cfg>]`. The underscore spellings are
+# deprecated aliases that Cargo still accepts before Edition 2024.
+DEPENDENCY_SECTIONS = (
+    "dependencies",
+    "dev-dependencies",
+    "dev_dependencies",
+    "build-dependencies",
+    "build_dependencies",
+)
 
 GIT_KEY = "git"
 
@@ -110,6 +117,16 @@ def dependency_tables(
                     yield section_name("target", target, section), table
 
 
+def replace_dependencies(
+    manifest: dict[str, Any],
+) -> Iterator[tuple[str, Any]]:
+    """Yield ``(package id, specification)`` for the deprecated ``[replace]`` table."""
+    replace = manifest.get("replace")
+    if isinstance(replace, dict):
+        for package_id, spec in replace.items():
+            yield package_id, spec
+
+
 def find_violations(manifest_name: str, manifest: dict[str, Any]) -> list[Violation]:
     """Return every policy violation in an already-parsed manifest."""
     violations = [
@@ -127,6 +144,17 @@ def find_violations(manifest_name: str, manifest: dict[str, Any]) -> list[Violat
                     )
                 )
 
+    # `[replace]` is deprecated but still honoured; path-only replacements stay
+    # allowed because they point at in-repository code.
+    for package_id, spec in replace_dependencies(manifest):
+        if isinstance(spec, dict) and GIT_KEY in spec:
+            violations.append(
+                Violation(
+                    manifest_name,
+                    f"[replace] override '{package_id}' uses a git source ({spec[GIT_KEY]})",
+                )
+            )
+
     return violations
 
 
@@ -142,7 +170,7 @@ def check_manifest(path: Path, root: Path) -> list[Violation]:
 
 def main(root: Path | None = None) -> int:
     """Check every tracked manifest below *root* and report violations."""
-    root = root if root is not None else Path(__file__).resolve().parents[2]
+    root = root.resolve() if root is not None else Path(__file__).resolve().parents[2]
 
     manifests = tracked_manifests(root)
     if not manifests:
@@ -175,4 +203,4 @@ def main(root: Path | None = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(Path(sys.argv[1]) if len(sys.argv) > 1 else None))
