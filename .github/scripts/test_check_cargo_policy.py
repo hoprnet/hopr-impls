@@ -16,7 +16,9 @@ import check_cargo_policy as policy
 
 def violations_for(manifest: str) -> list[str]:
     """Return the messages reported for a manifest given as TOML text."""
-    return [v.message for v in policy.find_violations("Cargo.toml", tomllib.loads(manifest))]
+    return [
+        v.message for v in policy.find_violations("Cargo.toml", tomllib.loads(manifest))
+    ]
 
 
 def git_init(path: Path) -> None:
@@ -57,7 +59,9 @@ serde = { version = "1.0.0" }
 
 
 class GitDependencyTest(unittest.TestCase):
-    def assert_rejected(self, manifest: str, section: str, name: str = "blokli-client") -> None:
+    def assert_rejected(
+        self, manifest: str, section: str, name: str = "blokli-client"
+    ) -> None:
         messages = violations_for(manifest)
         self.assertEqual(len(messages), 1, messages)
         self.assertIn(section, messages[0])
@@ -133,7 +137,7 @@ blokli-client = { git = "https://github.com/hoprnet/blokli-client" }
 [target.'cfg(unix)'.dependencies]
 blokli-client = { git = "https://github.com/hoprnet/blokli-client" }
 """,
-            "[target.\"cfg(unix)\".dependencies]",
+            '[target."cfg(unix)".dependencies]',
         )
 
     def test_target_triple_build_dependency_is_rejected(self) -> None:
@@ -211,18 +215,27 @@ class ManifestDiscoveryTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             git_init(root)
-            (root / "Cargo.toml").write_text('[package]\nname = "root"\n', encoding="utf-8")
+            (root / "Cargo.toml").write_text(
+                '[package]\nname = "root"\n', encoding="utf-8"
+            )
             crate = root / "crate"
             crate.mkdir()
-            (crate / "Cargo.toml").write_text('[package]\nname = "crate"\n', encoding="utf-8")
+            (crate / "Cargo.toml").write_text(
+                '[package]\nname = "crate"\n', encoding="utf-8"
+            )
             (crate / "ignored.toml").write_text("", encoding="utf-8")
             (root / "untracked").mkdir()
             (root / "untracked" / "Cargo.toml").write_text(
                 '[patch.crates-io]\nserde = { version = "1.0.0" }\n', encoding="utf-8"
             )
-            subprocess.run(["git", "-C", str(root), "add", "Cargo.toml", "crate"], check=True)
+            subprocess.run(
+                ["git", "-C", str(root), "add", "Cargo.toml", "crate"], check=True
+            )
 
-            manifests = sorted(path.relative_to(root).as_posix() for path in policy.tracked_manifests(root))
+            manifests = sorted(
+                path.relative_to(root).as_posix()
+                for path in policy.tracked_manifests(root)
+            )
 
             self.assertEqual(manifests, ["Cargo.toml", "crate/Cargo.toml"])
 

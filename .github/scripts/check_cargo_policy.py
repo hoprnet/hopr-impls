@@ -27,7 +27,9 @@ DEPENDENCY_SECTIONS = ("dependencies", "dev-dependencies", "build-dependencies")
 
 GIT_KEY = "git"
 
-BARE_KEY_CHARACTERS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")
+BARE_KEY_CHARACTERS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+)
 
 
 @dataclass(frozen=True)
@@ -148,10 +150,14 @@ def main(root: Path | None = None) -> int:
         return 0
 
     violations = [
-        violation for manifest in manifests for violation in check_manifest(manifest, root)
+        violation
+        for manifest in manifests
+        for violation in check_manifest(manifest, root)
     ]
     if not violations:
-        print(f"Checked {len(manifests)} Cargo manifest(s): no [patch] sections or git dependencies.")
+        print(
+            f"Checked {len(manifests)} Cargo manifest(s): no [patch] sections or git dependencies."
+        )
         return 0
 
     for violation in violations:
