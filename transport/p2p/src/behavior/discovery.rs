@@ -124,7 +124,7 @@ impl Behaviour {
             .filter(|multiaddress| {
                 let keep = self.allow_private_addresses || is_public_address(multiaddress);
                 if !keep {
-                    tracing::debug!(%peer, %multiaddress, "Private/local announced peer address ignored");
+                    tracing::trace!(%peer, %multiaddress, "Private/local announced peer address ignored");
                 }
                 keep
             })
