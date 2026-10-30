@@ -69,22 +69,27 @@ fn a_drained_channel_is_rejected_rather_than_scored() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A path `me -> r1 -> {r2 ->} exit` whose first edge holds `first_balance`, at face value 1000.
+fn funded_path(first_balance: u64) -> anyhow::Result<Net> {
+    Net::from_json(&format!(
+        r#"{{
+      "me": "me",
+      "ticket_face_value": 1000,
+      "edges": [
+        {{ "from": "me", "to": "r1",   "connected": true, "latency_ms": 20, "balance": {first_balance}, "relayed_ms": 30 }},
+        {{ "from": "r1", "to": "r2",   "connected": true, "latency_ms": 20, "balance": 100000, "relayed_ms": 30 }},
+        {{ "from": "r1", "to": "exit", "connected": true, "latency_ms": 20, "balance": 100000, "relayed_ms": 30 }},
+        {{ "from": "r2", "to": "exit", "connected": true, "latency_ms": 20, "balance": 100000, "relayed_ms": 30 }}
+      ]
+    }}"#
+    ))
+}
+
 #[test]
 fn funding_must_cover_every_remaining_hop() -> anyhow::Result<()> {
     // A first edge funds the whole downstream path, not just the next hop, so the same balance can
     // be enough for a short path and not for a long one.
-    let net = Net::from_json(
-        r#"{
-      "me": "me",
-      "ticket_face_value": 1000,
-      "edges": [
-        { "from": "me", "to": "r1",   "connected": true, "latency_ms": 20, "balance": 2500, "relayed_ms": 30 },
-        { "from": "r1", "to": "r2",   "connected": true, "latency_ms": 20, "balance": 100000, "relayed_ms": 30 },
-        { "from": "r1", "to": "exit", "connected": true, "latency_ms": 20, "balance": 100000, "relayed_ms": 30 },
-        { "from": "r2", "to": "exit", "connected": true, "latency_ms": 20, "balance": 100000, "relayed_ms": 30 }
-      ]
-    }"#,
-    )?;
+    let net = funded_path(1500)?;
 
     assert_eq!(
         net.forward("exit", 1).len(),
@@ -94,6 +99,22 @@ fn funding_must_cover_every_remaining_hop() -> anyhow::Result<()> {
     assert!(
         net.forward("exit", 2).is_empty(),
         "two remaining hops are not, so the longer path must be rejected"
+    );
+    Ok(())
+}
+
+#[test]
+fn funding_needs_exactly_remaining_hops_times_face_value() -> anyhow::Result<()> {
+    // The check is the bare `remaining_hops * face_value`, with no safety margin on top: a channel
+    // funded to exactly that amount is usable, and one wei less is not.
+    assert_eq!(
+        funded_path(2000)?.forward("exit", 2).len(),
+        1,
+        "a balance equal to two tickets funds two remaining hops"
+    );
+    assert!(
+        funded_path(1999)?.forward("exit", 2).is_empty(),
+        "a balance one below two tickets cannot fund two remaining hops"
     );
     Ok(())
 }

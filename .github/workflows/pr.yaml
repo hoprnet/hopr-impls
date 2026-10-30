@@ -124,7 +124,7 @@ jobs:
           - architecture: aarch64-darwin
             runner: depot-macos-15
             required_label: "binary:aarch64-darwin"
-    uses: hoprnet/hopr-workflows/.github/workflows/build-library.yaml@45221eb1aadfc5c46751306c5c7d6d291c8a24b3 # build-library-v3.1.2
+    uses: hoprnet/hopr-workflows/.github/workflows/build-library.yaml@build-library-v3.1.4
     permissions:
       contents: read
       id-token: write
