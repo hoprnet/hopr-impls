@@ -40,3 +40,6 @@ wasm-pack.log
 
 # nested test workspace build artifacts
 /tests/integration/target
+
+# Python bytecode from repository scripts
+__pycache__/
