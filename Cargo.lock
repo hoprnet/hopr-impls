@@ -1751,9 +1751,8 @@ dependencies = [
 
 [[package]]
 name = "blokli-client"
-version = "0.35.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8478d012a20a01bd39c6b0033e6794f6a98d5ac2819d8c89264db02fc251e84c"
+version = "0.35.1"
+source = "git+https://github.com/hoprnet/blokli-client?branch=feature%2Fcore-1106-blokli-client-sse-subscriptions-retry-forever-with-no-health#a2d2a2a12c3abf71d7a5eb36cd1ceb7315017f8d"
 dependencies = [
  "anyhow",
  "async-broadcast",
