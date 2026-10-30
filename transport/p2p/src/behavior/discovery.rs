@@ -13,6 +13,7 @@ use futures::{
     stream::{BoxStream, Stream, StreamExt},
 };
 use hopr_api::{Multiaddr, PeerId};
+use hopr_utils::network_types::prelude::is_public_address;
 use libp2p::{
     core::Endpoint,
     swarm::{
@@ -81,6 +82,8 @@ pub struct Behaviour {
         >,
     >,
     bootstrap_peers: HashMap<PeerId, Vec<Multiaddr>>,
+    /// When `false`, announced addresses that are not publicly routable are dropped.
+    allow_private_addresses: bool,
     connected_peers: HashMap<PeerId, usize>,
     next_dial_attempts: BinaryHeap<Reverse<Delayed<PeerId>>>,
     /// Mirrors the peers currently in `next_dial_attempts` for O(1) membership
@@ -92,7 +95,7 @@ pub struct Behaviour {
 }
 
 impl Behaviour {
-    pub fn new<T>(me: PeerId, external_discovery_events: T) -> Self
+    pub fn new<T>(me: PeerId, external_discovery_events: T, allow_private_addresses: bool) -> Self
     where
         T: Stream<Item = PeerDiscovery> + Send + 'static,
     {
@@ -100,6 +103,7 @@ impl Behaviour {
             me,
             events: Box::pin(external_discovery_events),
             bootstrap_peers: HashMap::new(),
+            allow_private_addresses,
             pending_events: VecDeque::new(),
             connected_peers: HashMap::new(),
             next_dial_attempts: BinaryHeap::with_capacity(1500),
@@ -107,6 +111,24 @@ impl Behaviour {
             not_connected_peers: HashMap::new(),
             next_dial_timer: None,
         }
+    }
+
+    /// Drops announced addresses this node must not dial.
+    ///
+    /// Announcements arrive from the chain and are therefore attacker-controlled: dialing
+    /// a loopback, link-local, or private address turns connect success or failure into an
+    /// internal reachability oracle for that `host:port`.
+    fn dialable_addresses(&self, peer: PeerId, multiaddresses: Vec<Multiaddr>) -> Vec<Multiaddr> {
+        multiaddresses
+            .into_iter()
+            .filter(|multiaddress| {
+                let keep = self.allow_private_addresses || is_public_address(multiaddress);
+                if !keep {
+                    tracing::trace!(%peer, %multiaddress, "Private/local announced peer address ignored");
+                }
+                keep
+            })
+            .collect()
     }
 
     fn has_known_address(&self, peer: &PeerId) -> bool {
@@ -319,6 +341,8 @@ impl NetworkBehaviour for Behaviour {
             {
                 tracing::debug!(%peer, addresses = ?&multiaddresses, "Announcement");
 
+                let multiaddresses = self.dialable_addresses(peer, multiaddresses);
+
                 for multiaddress in &multiaddresses {
                     self.pending_events.push_back(ToSwarm::NewExternalAddrOfPeer {
                         peer_id: peer,
@@ -399,6 +423,7 @@ impl NetworkBehaviour for Behaviour {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context;
     use futures::stream;
     use libp2p::{
         core::{ConnectedPoint, Endpoint},
@@ -410,8 +435,28 @@ mod tests {
 
     use super::*;
 
+    const PUBLIC_ADDRESS: &str = "/ip4/8.8.8.8/tcp/9000";
+    const LOOPBACK_ADDRESS: &str = "/ip4/127.0.0.1/tcp/9000";
+    const LINK_LOCAL_ADDRESS: &str = "/ip4/169.254.169.254/tcp/9000";
+
     fn make_behaviour() -> Behaviour {
-        Behaviour::new(PeerId::random(), stream::empty())
+        Behaviour::new(PeerId::random(), stream::empty(), false)
+    }
+
+    /// Behaviour that accepts private addresses, as configured for local test clusters.
+    fn make_permissive_behaviour<T>(events: T) -> Behaviour
+    where
+        T: Stream<Item = PeerDiscovery> + Send + 'static,
+    {
+        Behaviour::new(PeerId::random(), events, true)
+    }
+
+    fn parse_multiaddress(multiaddress: &str) -> Multiaddr {
+        multiaddress.parse().expect("valid multiaddress literal")
+    }
+
+    fn noop_context() -> std::task::Context<'static> {
+        std::task::Context::from_waker(std::task::Waker::noop())
     }
 
     fn connected_point() -> ConnectedPoint {
@@ -584,7 +629,7 @@ mod tests {
         let peer = PeerId::random();
         let address: Multiaddr = "/ip4/127.0.0.1/tcp/9000".parse().unwrap();
         let (announcements_tx, announcements_rx) = futures::channel::mpsc::unbounded();
-        let mut b = Behaviour::new(PeerId::random(), announcements_rx);
+        let mut b = make_permissive_behaviour(announcements_rx);
 
         b.not_connected_peers.insert(peer, initial_backoff());
         b.next_dial_attempts.push(Reverse(Delayed {
@@ -606,6 +651,154 @@ mod tests {
 
         assert!(b.not_connected_peers.contains_key(&peer));
         assert_eq!(b.next_dial_attempts.len(), 1);
+    }
+
+    // ── regression hoprnet/hoprnet#8588: private announced addresses must not be dialed ──
+
+    /// Chain announcements are attacker-controlled, so a private-only announcement must
+    /// leave no trace: the dial outcome would otherwise reveal internal reachability.
+    #[test]
+    fn discovery_should_ignore_private_announcement_when_private_addresses_disallowed() -> anyhow::Result<()> {
+        let (announcements_tx, announcements_rx) = futures::channel::mpsc::unbounded();
+        let mut b = Behaviour::new(PeerId::random(), announcements_rx, false);
+        let peer = PeerId::random();
+
+        announcements_tx
+            .unbounded_send(PeerDiscovery::Announce(
+                peer,
+                vec![
+                    parse_multiaddress(LOOPBACK_ADDRESS),
+                    parse_multiaddress(LINK_LOCAL_ADDRESS),
+                ],
+            ))
+            .context("announcement channel must accept the event")?;
+
+        let mut cx = noop_context();
+        assert!(
+            b.poll(&mut cx).is_pending(),
+            "a private-only announcement must not emit any swarm event"
+        );
+        assert!(
+            !b.has_known_address(&peer),
+            "a private-only announcement must not be stored"
+        );
+        assert!(
+            !b.not_connected_peers.contains_key(&peer),
+            "a private-only announcement must not schedule a dial"
+        );
+        assert!(b.next_dial_attempts.is_empty(), "no dial attempt may be queued");
+        Ok(())
+    }
+
+    /// A mixed announcement keeps and dials only the public addresses.
+    #[test]
+    fn discovery_should_keep_only_public_addresses_when_announcement_is_mixed() -> anyhow::Result<()> {
+        let (announcements_tx, announcements_rx) = futures::channel::mpsc::unbounded();
+        let mut b = Behaviour::new(PeerId::random(), announcements_rx, false);
+        let peer = PeerId::random();
+        let public_address = parse_multiaddress(PUBLIC_ADDRESS);
+
+        announcements_tx
+            .unbounded_send(PeerDiscovery::Announce(
+                peer,
+                vec![parse_multiaddress(LOOPBACK_ADDRESS), public_address.clone()],
+            ))
+            .context("announcement channel must accept the event")?;
+
+        let mut cx = noop_context();
+        match b.poll(&mut cx) {
+            std::task::Poll::Ready(ToSwarm::NewExternalAddrOfPeer { peer_id, address }) => {
+                assert_eq!(peer_id, peer);
+                assert_eq!(
+                    address, public_address,
+                    "only the public address may be announced to the swarm"
+                );
+            }
+            _ => panic!("expected the public address to be announced to the swarm"),
+        }
+
+        assert_eq!(
+            b.bootstrap_peers.get(&peer),
+            Some(&vec![public_address]),
+            "only the public address may be stored for dialing"
+        );
+        assert!(
+            b.not_connected_peers.contains_key(&peer),
+            "a peer with a public address must be queued for dialing"
+        );
+        assert!(
+            b.pending_events.is_empty(),
+            "the private address must not be emitted as a peer address"
+        );
+        Ok(())
+    }
+
+    /// Local test clusters allow private addresses, so announcements must still be dialed.
+    #[test]
+    fn discovery_should_dial_private_announcement_when_private_addresses_allowed() -> anyhow::Result<()> {
+        let (announcements_tx, announcements_rx) = futures::channel::mpsc::unbounded();
+        let mut b = make_permissive_behaviour(announcements_rx);
+        let peer = PeerId::random();
+        let loopback_address = parse_multiaddress(LOOPBACK_ADDRESS);
+
+        announcements_tx
+            .unbounded_send(PeerDiscovery::Announce(peer, vec![loopback_address.clone()]))
+            .context("announcement channel must accept the event")?;
+
+        let mut cx = noop_context();
+        assert!(
+            matches!(
+                b.poll(&mut cx),
+                std::task::Poll::Ready(ToSwarm::NewExternalAddrOfPeer { .. })
+            ),
+            "the private address must be announced to the swarm"
+        );
+        assert_eq!(
+            b.bootstrap_peers.get(&peer),
+            Some(&vec![loopback_address]),
+            "the private address must be stored for dialing"
+        );
+
+        // Make the scheduled dial due immediately instead of waiting out the backoff.
+        let mut next_dial = b.next_dial_attempts.pop().context("a dial must be scheduled")?.0;
+        next_dial.release_at = std::time::Instant::now();
+        b.next_dial_attempts.push(Reverse(next_dial));
+
+        match b.poll(&mut cx) {
+            std::task::Poll::Ready(ToSwarm::Dial { opts }) => assert_eq!(opts.get_peer_id(), Some(peer)),
+            _ => panic!("expected a dial for the announced private peer"),
+        }
+        Ok(())
+    }
+
+    /// Stream protocols asking for a peer's addresses must not receive filtered ones either.
+    #[test]
+    fn discovery_should_offer_only_public_addresses_when_private_addresses_disallowed() -> anyhow::Result<()> {
+        let (announcements_tx, announcements_rx) = futures::channel::mpsc::unbounded();
+        let mut b = Behaviour::new(PeerId::random(), announcements_rx, false);
+        let peer = PeerId::random();
+        let public_address = parse_multiaddress(PUBLIC_ADDRESS);
+
+        announcements_tx
+            .unbounded_send(PeerDiscovery::Announce(
+                peer,
+                vec![parse_multiaddress(LOOPBACK_ADDRESS), public_address.clone()],
+            ))
+            .context("announcement channel must accept the event")?;
+
+        let mut cx = noop_context();
+        let _ = b.poll(&mut cx);
+
+        let offered = b
+            .handle_pending_outbound_connection(ConnectionId::new_unchecked(0), Some(peer), &[], Endpoint::Dialer)
+            .expect("outbound connections are not denied by discovery");
+
+        assert_eq!(
+            offered,
+            vec![public_address],
+            "only the public address may be offered for outbound connections"
+        );
+        Ok(())
     }
 
     // ── regression #31: dials carry only announced addresses ────────────────

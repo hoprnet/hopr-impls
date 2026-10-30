@@ -29,7 +29,7 @@ impl Debug for HoprNetworkBehavior {
 }
 
 impl HoprNetworkBehavior {
-    pub fn new<T>(me: PublicKey, external_discovery_events: T) -> Self
+    pub fn new<T>(me: PublicKey, external_discovery_events: T, allow_private_addresses: bool) -> Self
     where
         T: Stream<Item = PeerDiscovery> + Send + 'static,
     {
@@ -37,7 +37,7 @@ impl HoprNetworkBehavior {
 
         Self {
             streams: libp2p_stream::Behaviour::new(),
-            discovery: discovery::Behaviour::new(my_peer_id, external_discovery_events),
+            discovery: discovery::Behaviour::new(my_peer_id, external_discovery_events, allow_private_addresses),
             identify: libp2p::identify::Behaviour::new(
                 libp2p::identify::Config::new("/hopr/identify/1.0.0".to_string(), me)
                     // Disable identify's passive peer-address cache. Otherwise identify
@@ -100,7 +100,7 @@ mod tests {
         // (`with_cache_size(0)` / `with_hide_listen_addrs(true)`) that the
         // same-port dial fix relies on (#31).
         let keypair = libp2p::identity::Keypair::generate_ed25519();
-        let behaviour = HoprNetworkBehavior::new(keypair.public(), stream::empty());
+        let behaviour = HoprNetworkBehavior::new(keypair.public(), stream::empty(), false);
         assert_eq!(format!("{behaviour:?}"), "HoprNetworkBehavior");
     }
 }
