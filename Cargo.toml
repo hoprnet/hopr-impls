@@ -102,7 +102,3 @@ tokio = { version = "1.53.1", features = [
 tokio-retry = "0.3.2"
 tracing = { version = "0.1.44", features = ["release_max_level_debug"] }
 validator = { version = "0.21.0", features = ["derive"] }
-
-# Local until hopr-api 4.5.0 is published.
-[patch.crates-io]
-hopr-api = { path = "../hopr-api" }
