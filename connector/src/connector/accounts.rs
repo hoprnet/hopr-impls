@@ -181,13 +181,13 @@ where
         Ok(self.send_tx(tx_req, None, None).await?.boxed())
     }
 
-    async fn send(
+    async fn send_erc777(
         &self,
         balance: HoprBalance,
         recipient: &Address,
-        data: &[u8],
+        payload: &Erc777Payload,
     ) -> Result<BoxFuture<'_, Result<ChainReceipt, Self::Error>>, Self::Error> {
-        let tx_req = self.payload_generator.send(*recipient, balance, data)?;
+        let tx_req = self.payload_generator.send_erc777(*recipient, balance, payload)?;
 
         Ok(self.send_tx(tx_req, None, None).await?.boxed())
     }
@@ -559,15 +559,15 @@ mod tests {
         Ok(())
     }
 
-    /// `send` moves the funds out of the Safe: the snapshot shows the Safe debited, the recipient
-    /// credited and a single transaction submitted.
+    /// `send_erc777` moves the funds out of the Safe: the snapshot shows the Safe debited, the
+    /// recipient credited and a single transaction submitted.
     ///
     /// That is all it shows. The emulator settles an ERC777 `send` as a plain token withdrawal,
-    /// so this snapshot would be the same for an ERC20 `transfer` and says nothing about `data`.
-    /// The calldata encoding is pinned by hopr-types' reference-vector test
-    /// `send_matches_the_reference_encoding`.
+    /// so this snapshot would be the same for an ERC20 `transfer` and says nothing about the
+    /// payload. The calldata encoding is pinned by hopr-types' reference-vector test
+    /// `send_erc777_matches_the_reference_encoding`.
     #[tokio::test]
-    async fn connector_should_send_with_data() -> anyhow::Result<()> {
+    async fn connector_should_send_erc777_with_a_payload() -> anyhow::Result<()> {
         let me = ChainKeypair::from_secret(&PRIVATE_KEY_1)?.public().to_address();
         let safe: Address = [2u8; Address::SIZE].into();
 
@@ -590,8 +590,18 @@ mod tests {
         let mut connector = create_connector(blokli_client)?;
         connector.connect().await?;
 
+        let payload = Erc777Payload::Curvy(CurvyErc777Payload::DirectShield {
+            aggregator: [0xcc; Address::SIZE].into(),
+            note: CurvyNote {
+                owner_hash: 1.into(),
+                token: 2.into(),
+                amount: 1000.into(),
+                ephemeral_key: [4.into(), 5.into()],
+                view_tag: 6,
+            },
+        });
         connector
-            .send(HoprBalance::new_base(10), &[1u8; Address::SIZE].into(), &[0xab; 70])
+            .send_erc777(HoprBalance::new_base(10), &[1u8; Address::SIZE].into(), &payload)
             .await?
             .await?;
 
