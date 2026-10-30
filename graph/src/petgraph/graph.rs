@@ -23,6 +23,21 @@ pub(crate) struct InnerGraph {
 }
 
 impl InnerGraph {
+    /// Records a node's health on every edge into it; `1.0` clears it. An edge added later starts
+    /// unjudged until the owner records again.
+    pub(crate) fn set_node_health(&mut self, idx: NodeIndex, health: f64) {
+        let health = (health < 1.0).then_some(health.max(0.0));
+        let mut incoming = self
+            .graph
+            .neighbors_directed(idx, petgraph::Direction::Incoming)
+            .detach();
+        while let Some((edge, _)) = incoming.next(&self.graph) {
+            if let Some(observations) = self.graph.edge_weight_mut(edge) {
+                observations.set_health(health);
+            }
+        }
+    }
+
     /// Registers a node's slot claim. Idempotent for a key already registered at that index.
     pub(crate) fn claim_slot(&mut self, key: &OffchainPublicKey, idx: NodeIndex) {
         let claimants = self.slots.entry(crate::petgraph::path_id::encode(key)).or_default();

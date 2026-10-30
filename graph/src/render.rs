@@ -69,6 +69,10 @@ pub fn render_edges_as_dot(
             attrs.push(format!("bal={balance}"));
         }
 
+        if let Some(health) = obs.health() {
+            attrs.push(format!("health={health:.2}"));
+        }
+
         let label = attrs.join(" ");
         let _ = writeln!(out, "  \"{src_label}\" -> \"{dst_label}\" [label=\"{label}\"];");
     }
@@ -166,6 +170,14 @@ mod tests {
         assert!(dot.contains("lat=50ms"), "should contain latency: {dot}");
         assert!(dot.contains("bal=1000"), "should contain balance: {dot}");
         assert!(dot.contains("score="), "should contain score: {dot}");
+        assert!(
+            !dot.contains("health="),
+            "an unjudged relayer has no health label: {dot}"
+        );
+
+        hopr_api::graph::NetworkGraphUpdate::record_node_health(&graph, &peer, 0.25);
+        let dot = render_dot(&graph);
+        assert!(dot.contains("health=0.25"), "should contain health: {dot}");
     }
 
     #[test]
