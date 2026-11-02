@@ -173,12 +173,11 @@ fn focused_candidates<U>(
 where
     U: NetworkGraphTraverse<NodeId = OffchainPublicKey> + FocusedLoopback,
 {
-    let default = graph.simple_loopback_to_self(hops, Some(100));
-
     let Some(exits) = focus else {
-        return default.into_iter().map(|path| (path, base)).collect();
+        return default_candidates(graph, hops, base);
     };
 
+    let default = default_candidates(graph, hops, base);
     let focused: Vec<_> = graph
         .focused_loopback(hops, Some(100), exits)
         .into_iter()
@@ -190,10 +189,23 @@ where
             ((path, path_id), weight)
         })
         .collect();
-    let taken: HashSet<_> = focused.iter().map(|(path, _)| path.clone()).collect();
+    let rest: Vec<_> = {
+        let taken: HashSet<_> = focused.iter().map(|(path, _)| path).collect();
+        default.into_iter().filter(|(path, _)| !taken.contains(path)).collect()
+    };
+    focused.into_iter().chain(rest).collect()
+}
 
-    let rest = default.into_iter().filter(|path| !taken.contains(path));
-    focused.into_iter().chain(rest.map(|path| (path, base))).collect()
+/// The unfocused loopback sample, every path at `base` weight.
+fn default_candidates<U>(graph: &U, hops: usize, base: f64) -> Vec<((Vec<OffchainPublicKey>, PathId), f64)>
+where
+    U: NetworkGraphTraverse<NodeId = OffchainPublicKey>,
+{
+    graph
+        .simple_loopback_to_self(hops, Some(100))
+        .into_iter()
+        .map(|path| (path, base))
+        .collect()
 }
 
 impl<U> CoverTrafficGeneration for FullNetworkDiscovery<U>
@@ -210,13 +222,7 @@ where
 
                 // Cover traffic follows the noise switch only, never the probing level.
                 let ticks = paced_ticks(self.control.subscribe(), move |s| s.noise.then_some(interval));
-                let candidates = move |hops| {
-                    graph
-                        .simple_loopback_to_self(hops, Some(100))
-                        .into_iter()
-                        .map(|path| (path, base))
-                        .collect()
-                };
+                let candidates = move |hops| default_candidates(&graph, hops, base);
 
                 loopback_path_stream(ticks, candidates)
                     .filter_map(move |(path, _)| {
