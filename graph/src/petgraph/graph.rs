@@ -956,8 +956,9 @@ mod tests {
 
     #[test]
     fn health_logs_use_consistent_fields_and_numeric_measurements() {
-        use serde_json::{Value, json};
         use std::{collections::BTreeMap, sync::Mutex};
+
+        use serde_json::{Value, json};
         use tracing::{
             Event, Level, Metadata, Subscriber,
             field::{Field, Visit},
@@ -971,22 +972,30 @@ mod tests {
             fn enabled(&self, metadata: &Metadata<'_>) -> bool {
                 *metadata.level() <= Level::DEBUG
             }
+
             fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
                 span::Id::from_u64(1)
             }
+
             fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+
             fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+
             fn enter(&self, _: &span::Id) {}
+
             fn exit(&self, _: &span::Id) {}
+
             fn event(&self, event: &Event<'_>) {
                 struct Fields(BTreeMap<String, Value>);
                 impl Visit for Fields {
                     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
                         self.0.insert(field.name().into(), json!(format!("{value:?}")));
                     }
+
                     fn record_str(&mut self, field: &Field, value: &str) {
                         self.0.insert(field.name().into(), json!(value));
                     }
+
                     fn record_f64(&mut self, field: &Field, value: f64) {
                         self.0.insert(field.name().into(), json!(value));
                     }
