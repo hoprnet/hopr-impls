@@ -69,6 +69,7 @@ const SUBSCRIPTION_HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 ///
 /// Short outages ([`Degraded`](SubscriptionStatus::Degraded)) do not count: blokli-client reconnects on its own and
 /// reports a [`Stalled`](SubscriptionStatus::Stalled) subscription once an outage has lasted its stall threshold.
+#[inline]
 fn subscription_is_failing(health: &SubscriptionHealth) -> bool {
     matches!(
         health.status,
