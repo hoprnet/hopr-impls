@@ -179,6 +179,12 @@ pub struct BlockchainConnectorConfig {
     /// Default is 2, minimum is 1.
     #[default(TX_TIMEOUT_MULTIPLIER)]
     pub tx_timeout_multiplier: u32,
+    /// How long the local nonce may stay ahead of an unchanging on-chain pending count before
+    /// it is resynced, so a lost transaction does not block the signer for good.
+    ///
+    /// Default is 5 minutes, matching Blokli's transaction tracking timeout.
+    #[default(Duration::from_mins(5))]
+    pub nonce_gap_tolerance: Duration,
 }
 
 /// A connector acting as middleware between the HOPR APIs (see the [`hopr_api`] crate) and the Blokli Client API (see
@@ -250,7 +256,7 @@ where
             ))),
             backend: backend.clone(),
             connection_handle: None,
-            sequencer: TransactionSequencer::new(chain_key.clone(), client.clone()),
+            sequencer: TransactionSequencer::new(chain_key.clone(), client.clone(), cfg.nonce_gap_tolerance),
             events: (events_tx, events_rx.deactivate()),
             client,
             chain_key,

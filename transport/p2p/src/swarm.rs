@@ -48,10 +48,15 @@ fn swarm_dns_config() -> (libp2p::dns::ResolverConfig, libp2p::dns::ResolverOpts
 ///
 /// Returns a built [libp2p::Swarm] object implementing the HoprNetworkBehavior functionality.
 impl InactiveNetwork {
+    /// Build an inactive network.
+    ///
+    /// With `allow_private_addresses` set to `false`, announced addresses that are not
+    /// publicly routable are never stored or dialed.
     #[cfg(feature = "runtime-tokio")]
     pub async fn build(
         me: libp2p::identity::Keypair,
         external_discovery_events: futures::stream::BoxStream<'static, PeerDiscovery>,
+        allow_private_addresses: bool,
     ) -> Result<Self> {
         let me_public: libp2p::identity::PublicKey = me.public();
 
@@ -83,7 +88,9 @@ impl InactiveNetwork {
 
         Ok(Self {
             swarm: swarm
-                .with_behaviour(|_key| HoprNetworkBehavior::new(me_public, external_discovery_events))
+                .with_behaviour(|_key| {
+                    HoprNetworkBehavior::new(me_public, external_discovery_events, allow_private_addresses)
+                })
                 .map_err(|e| crate::errors::P2PError::Libp2p(e.to_string()))?
                 .with_swarm_config(|cfg| {
                     cfg.with_dial_concurrency_factor(
@@ -113,7 +120,11 @@ impl InactiveNetwork {
     }
 
     #[cfg(not(feature = "runtime-tokio"))]
-    pub async fn build<T>(_me: libp2p::identity::Keypair, _external_discovery_events: T) -> Result<Self>
+    pub async fn build<T>(
+        _me: libp2p::identity::Keypair,
+        _external_discovery_events: T,
+        _allow_private_addresses: bool,
+    ) -> Result<Self>
     where
         T: Stream<Item = PeerDiscovery> + Send + 'static,
     {
@@ -212,7 +223,7 @@ impl HoprLibp2pNetworkBuilder {
 
         let identity_p2p: libp2p::identity::Keypair = identity.into();
         let me = identity_p2p.public().to_peer_id();
-        let swarm = InactiveNetwork::build(identity_p2p, self.bootstrap)
+        let swarm = InactiveNetwork::build(identity_p2p, self.bootstrap, allow_private_addresses)
             .await
             .expect("swarm must be constructible");
 

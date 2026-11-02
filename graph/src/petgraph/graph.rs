@@ -24,9 +24,9 @@ fn log_health_change(
     let ack_rate = observations.immediate_qos().and_then(|imm| imm.ack_rate());
 
     if own {
-        tracing::info!(peer = %dest, from = %before, to = %after, ?score, ?ack_rate, "own edge health changed");
+        tracing::info!(%dest, from = before.as_str(), to = after.as_str(), score, ack_rate, "own edge health changed");
     } else {
-        tracing::debug!(%src, %dest, from = %before, to = %after, ?score, ?ack_rate, "edge health changed");
+        tracing::debug!(%src, %dest, from = before.as_str(), to = after.as_str(), score, ack_rate, "edge health changed");
     }
 }
 
@@ -46,6 +46,21 @@ pub(crate) struct InnerGraph {
 }
 
 impl InnerGraph {
+    /// Records a node's health on every edge into it; `1.0` clears it. An edge added later starts
+    /// unjudged until the owner records again.
+    pub(crate) fn set_node_health(&mut self, idx: NodeIndex, health: f64) {
+        let health = (health < 1.0).then_some(health.max(0.0));
+        let mut incoming = self
+            .graph
+            .neighbors_directed(idx, petgraph::Direction::Incoming)
+            .detach();
+        while let Some((edge, _)) = incoming.next(&self.graph) {
+            if let Some(observations) = self.graph.edge_weight_mut(edge) {
+                observations.set_health(health);
+            }
+        }
+    }
+
     /// Registers a node's slot claim. Idempotent for a key already registered at that index.
     pub(crate) fn claim_slot(&mut self, key: &OffchainPublicKey, idx: NodeIndex) {
         let claimants = self.slots.entry(crate::petgraph::path_id::encode(key)).or_default();
@@ -172,11 +187,23 @@ impl ChannelGraph {
 
     /// Counts nodes and edges, and the node's own edges by [`EdgeHealth`].
     ///
-    /// Meant for a periodic state line: the result has a fixed size whatever the graph size.
+    /// The application owns the periodic state-dump schedule and calls this public snapshot API
+    /// from that schedule. The graph library does not start a background task or emit periodic logs.
+    /// The result has a fixed size whatever the graph size; collection visits only the node's own edges.
+    ///
+    /// ```
+    /// use hopr_network_graph::ChannelGraph;
+    ///
+    /// // Call from the application's existing periodic state-dump task.
+    /// fn log_graph_health(graph: &ChannelGraph) {
+    ///     let summary = graph.health_summary();
+    ///     tracing::info!(%summary, "graph health summary");
+    /// }
+    /// ```
     pub fn health_summary(&self) -> GraphHealthSummary {
         let inner = self.inner.read();
         let mut summary = GraphHealthSummary {
-            nodes: inner.graph.node_count(),
+            nodes: inner.indices.len(),
             edges: inner.graph.edge_count(),
             ..Default::default()
         };
@@ -957,6 +984,102 @@ mod tests {
         let edges = graph.connected_edges();
         assert_eq!(edges.len(), 4);
         Ok(())
+    }
+
+    #[test]
+    fn health_summary_excludes_retired_nodes_and_their_edges() -> anyhow::Result<()> {
+        let me = pubkey_from(&SECRET_0);
+        let other = pubkey_from(&SECRET_1);
+        let graph = ChannelGraph::new(me);
+        graph.add_node(other);
+        graph.add_edge(&me, &other)?;
+        graph.remove_node(&other);
+        assert_eq!(
+            graph.health_summary(),
+            GraphHealthSummary {
+                nodes: 1,
+                ..Default::default()
+            }
+        );
+        graph.remove_node(&me);
+        assert_eq!(graph.health_summary(), GraphHealthSummary::default());
+        Ok(())
+    }
+
+    #[test]
+    fn health_logs_use_consistent_fields_and_numeric_measurements() {
+        use serde_json::{Value, json};
+        use std::{collections::BTreeMap, sync::Mutex};
+        use tracing::{
+            Event, Level, Metadata, Subscriber,
+            field::{Field, Visit},
+            span,
+        };
+
+        type CapturedEvent = (Level, BTreeMap<String, Value>);
+        #[derive(Clone, Default)]
+        struct Logs(Arc<Mutex<Vec<CapturedEvent>>>);
+        impl Subscriber for Logs {
+            fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+                *metadata.level() <= Level::DEBUG
+            }
+            fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+                span::Id::from_u64(1)
+            }
+            fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+            fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+            fn enter(&self, _: &span::Id) {}
+            fn exit(&self, _: &span::Id) {}
+            fn event(&self, event: &Event<'_>) {
+                struct Fields(BTreeMap<String, Value>);
+                impl Visit for Fields {
+                    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                        self.0.insert(field.name().into(), json!(format!("{value:?}")));
+                    }
+                    fn record_str(&mut self, field: &Field, value: &str) {
+                        self.0.insert(field.name().into(), json!(value));
+                    }
+                    fn record_f64(&mut self, field: &Field, value: f64) {
+                        self.0.insert(field.name().into(), json!(value));
+                    }
+                }
+                let mut fields = Fields(BTreeMap::new());
+                event.record(&mut fields);
+                self.0.lock().unwrap().push((*event.metadata().level(), fields.0));
+            }
+        }
+        let me = pubkey_from(&SECRET_0);
+        let other = pubkey_from(&SECRET_1);
+        let dest = pubkey_from(&SECRET_2);
+        let graph = ChannelGraph::new(me);
+        let logs = Logs::default();
+        tracing::subscriber::with_default(logs.clone(), || {
+            graph.upsert_edge(&me, &other, |obs| {
+                obs.record(EdgeWeightType::Immediate(Ok(std::time::Duration::from_millis(50))));
+                obs.record(EdgeWeightType::ImmediateProtocolConformance {
+                    num_packets: 10,
+                    num_acks: 10,
+                });
+            });
+            // An unchanged health state must not emit another transition line.
+            graph.upsert_edge(&me, &other, |_| {});
+            graph.upsert_edge(&other, &dest, |obs| obs.record(EdgeWeightType::Connected(false)));
+        });
+        let events = logs.0.lock().unwrap();
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0].0, Level::INFO);
+        let own = &events[0].1;
+        assert!(own.contains_key("dest"));
+        assert!(!own.contains_key("peer"));
+        assert_eq!(own["from"], json!("unknown"));
+        assert_eq!(own["to"], json!("usable"));
+        assert!(own["score"].is_number());
+        assert_eq!(own["ack_rate"], json!(1.0));
+        assert_eq!(events[1].0, Level::DEBUG);
+        let remote = &events[1].1;
+        assert!(remote.contains_key("src") && remote.contains_key("dest"));
+        assert_eq!(remote["to"], json!("unreachable"));
+        assert!(!remote.contains_key("score") && !remote.contains_key("ack_rate"));
     }
 
     #[test]

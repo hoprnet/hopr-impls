@@ -14,9 +14,9 @@ use crate::Observations;
 /// Health of a single edge, as seen by path selection.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum EdgeHealth {
-    /// Nothing has been observed on this edge yet.
+    /// Not enough observed to score this edge yet.
     Unknown,
-    /// The last probe found the peer not connected.
+    /// The peer was last reported as not connected.
     Unreachable,
     /// The peer acknowledges too few packets, so data paths skip it.
     LowAckRate,
@@ -123,6 +123,54 @@ mod tests {
     }
 
     #[test]
+    fn connection_or_balance_without_quality_evidence_should_be_unknown() {
+        for observation in [
+            EdgeWeightType::Connected(true),
+            EdgeWeightType::Balance(Some(10.into())),
+        ] {
+            let mut obs = Observations::default();
+            obs.record(observation);
+            assert_eq!(EdgeHealth::of(&obs, MIN_ACK_RATE), EdgeHealth::Unknown);
+        }
+    }
+
+    #[test]
+    fn disconnected_report_should_take_precedence_over_low_ack_rate() {
+        let mut obs = Observations::default();
+        obs.record(EdgeWeightType::ImmediateProtocolConformance {
+            num_packets: 10,
+            num_acks: 0,
+        });
+        obs.record(EdgeWeightType::Connected(false));
+        assert_eq!(EdgeHealth::of(&obs, MIN_ACK_RATE), EdgeHealth::Unreachable);
+    }
+
+    #[test]
+    fn acknowledgement_floor_is_inclusive() {
+        let mut obs = Observations::default();
+        obs.record(EdgeWeightType::Immediate(Ok(std::time::Duration::from_millis(50))));
+        obs.record(EdgeWeightType::ImmediateProtocolConformance {
+            num_packets: 10,
+            num_acks: 1,
+        });
+        assert_eq!(EdgeHealth::of(&obs, MIN_ACK_RATE), EdgeHealth::Usable);
+        assert_eq!(EdgeHealth::of(&obs, MIN_ACK_RATE + 0.01), EdgeHealth::LowAckRate);
+    }
+
+    #[test]
+    fn health_names_are_stable() {
+        for (health, name) in [
+            (EdgeHealth::Unknown, "unknown"),
+            (EdgeHealth::Unreachable, "unreachable"),
+            (EdgeHealth::LowAckRate, "low_ack_rate"),
+            (EdgeHealth::Usable, "usable"),
+        ] {
+            assert_eq!(health.as_str(), name);
+            assert_eq!(health.to_string(), name);
+        }
+    }
+
+    #[test]
     fn edge_with_a_successful_probe_should_be_usable() {
         let mut obs = Observations::default();
         obs.record(EdgeWeightType::Immediate(Ok(std::time::Duration::from_millis(50))));
@@ -156,13 +204,17 @@ mod tests {
         summary.add_own_edge(EdgeHealth::Usable);
         summary.add_own_edge(EdgeHealth::Usable);
         summary.add_own_edge(EdgeHealth::Unreachable);
+        summary.add_own_edge(EdgeHealth::LowAckRate);
+        summary.add_own_edge(EdgeHealth::Unknown);
 
-        assert_eq!(summary.own_edges, 3);
+        assert_eq!(summary.own_edges, 5);
         assert_eq!(summary.own_usable, 2);
         assert_eq!(summary.own_unreachable, 1);
+        assert_eq!(summary.own_low_ack_rate, 1);
+        assert_eq!(summary.own_unknown, 1);
         assert_eq!(
             summary.to_string(),
-            "nodes=0 edges=0 own_edges=3 own_usable=2 own_low_ack_rate=0 own_unreachable=1 own_unknown=0"
+            "nodes=0 edges=0 own_edges=5 own_usable=2 own_low_ack_rate=1 own_unreachable=1 own_unknown=1"
         );
     }
 }

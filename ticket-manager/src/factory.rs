@@ -37,7 +37,9 @@ use crate::{
 ///
 /// The outgoing indices are **not** automatically synchronized back to the underlying store for performance reasons.
 /// The user is responsible for calling [`save_outgoing_indices`](HoprTicketFactory::save_outgoing_indices) to save
-/// the outgoing indices to the store.
+/// the outgoing indices to the store, typically periodically and once more on shutdown. The store itself must
+/// outlive the process (e.g. a [`RedbStore`](crate::RedbStore) opened on a kept file): indices that never reached
+/// a durable store are issued again after a restart, because the factory then resumes from the on-chain ticket index.
 ///
 /// This usage is typical for all kinds of nodes (Entry/Relay/Exit).
 ///
@@ -123,20 +125,17 @@ where
     ///
     /// This operation is fast and does not immediately put the index into the [`OutgoingIndexStore`].
     ///
-    /// The returned value is always guaranteed to be greater or equal to the ticket index on the given `channel`.
+    /// The returned value is always guaranteed to be greater or equal to the ticket index on the given `channel`,
+    /// and it is never returned again for the same channel and epoch, even to concurrent callers.
     pub fn next_outgoing_ticket_index(&self, channel: &ChannelEntry) -> u64 {
-        let mut next_index = self.out_idx_tracker.next(channel.get_id(), channel.channel_epoch);
-        tracing::trace!(%channel, next_index, "next outgoing ticket index");
-
         let epoch = channel.channel_epoch;
 
-        if next_index < channel.ticket_index {
-            // Correct the value in the cache if it was lower than the ticket index on the channel.
-            // This sets the value in the cache to the next index after the ticket index on the channel.
-            self.out_idx_tracker
-                .upsert(channel.get_id(), epoch, channel.ticket_index + 1);
-            next_index = channel.ticket_index; // Still, use the channel's ticket index as the next index.
-        }
+        // Lifting the counter to the channel's ticket index (if it is behind) and taking the index
+        // must be a single operation, otherwise concurrent callers could all receive the channel's ticket index.
+        let next_index = self
+            .out_idx_tracker
+            .next_at_least(channel.get_id(), epoch, channel.ticket_index);
+        tracing::trace!(%channel, next_index, "next outgoing ticket index");
 
         // If this is the first index in this epoch,
         // remove the previous epoch from the map if any.
@@ -564,6 +563,80 @@ mod tests {
         assert_eq!(Some(1), factory.store.read().load_outgoing_index(channel.get_id(), 2)?);
 
         assert_eq!(1, factory.next_outgoing_ticket_index(&channel));
+
+        Ok(())
+    }
+
+    #[test]
+    fn ticket_factory_should_hand_out_distinct_indices_to_concurrent_callers_when_behind_the_chain()
+    -> anyhow::Result<()> {
+        const THREADS: u64 = 16;
+        // The collision depends on thread interleaving, so give it many chances to show up
+        const ROUNDS: usize = 50;
+
+        let mut channel = ChannelEntry::builder()
+            .between(&ChainKeypair::random(), &ChainKeypair::random())
+            .amount(10)
+            .ticket_index(3)
+            .status(ChannelStatus::Open)
+            .epoch(1)
+            .build()?;
+
+        for _ in 0..ROUNDS {
+            let factory = create_factory()?;
+            channel.ticket_index = 3;
+            factory.sync_from_outgoing_channels(&[channel])?;
+
+            // The on-chain index moves past the local counter, as when tickets issued before a restart get redeemed
+            channel.ticket_index = 10;
+
+            let barrier = std::sync::Barrier::new(THREADS as usize);
+            let mut indices = std::thread::scope(|s| {
+                let handles = (0..THREADS)
+                    .map(|_| {
+                        s.spawn(|| {
+                            barrier.wait();
+                            factory.next_outgoing_ticket_index(&channel)
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                handles.into_iter().map(|h| h.join()).collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(|_| anyhow::anyhow!("join error"))?;
+            indices.sort_unstable();
+
+            assert_eq!((10..10 + THREADS).collect::<Vec<_>>(), indices);
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "redb")]
+    #[test]
+    fn ticket_factory_should_resume_saved_outgoing_indices_after_reopening_the_store() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("tickets.redb");
+
+        let channel = ChannelEntry::builder()
+            .between(&ChainKeypair::random(), &ChainKeypair::random())
+            .amount(10)
+            .ticket_index(1)
+            .status(ChannelStatus::Open)
+            .epoch(1)
+            .build()?;
+
+        let factory = HoprTicketFactory::new(crate::RedbStore::new(&path)?);
+        factory.sync_from_outgoing_channels(&[channel])?;
+        for expected in 1..=5 {
+            assert_eq!(expected, factory.next_outgoing_ticket_index(&channel));
+        }
+        factory.save_outgoing_indices()?;
+        drop(factory);
+
+        // None of the issued tickets were redeemed, so the on-chain ticket index did not move
+        let factory = HoprTicketFactory::new(crate::RedbStore::new(&path)?);
+        factory.sync_from_outgoing_channels(&[channel])?;
+        assert_eq!(6, factory.next_outgoing_ticket_index(&channel));
 
         Ok(())
     }
