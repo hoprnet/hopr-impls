@@ -1494,6 +1494,7 @@ pub(crate) mod tests {
     #[test]
     fn subscription_logs_include_additional_failures_and_individual_recovery() {
         use std::sync::{Arc, Mutex};
+
         use tracing::{Event, Metadata, Subscriber, field::Visit, span};
 
         #[derive(Clone, Default)]
@@ -1502,13 +1503,19 @@ pub(crate) mod tests {
             fn enabled(&self, _: &Metadata<'_>) -> bool {
                 true
             }
+
             fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
                 span::Id::from_u64(1)
             }
+
             fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+
             fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+
             fn enter(&self, _: &span::Id) {}
+
             fn exit(&self, _: &span::Id) {}
+
             fn event(&self, event: &Event<'_>) {
                 struct Fields(String);
                 impl Visit for Fields {
