@@ -307,3 +307,90 @@ fn the_configured_edge_penalty_should_govern_unmeasured_edges() -> anyhow::Resul
     );
     Ok(())
 }
+
+// ── Relayer health ───────────────────────────────────────────────────────
+
+fn record_health(net: &Net, name: &str, health: f64) {
+    use hopr_api::graph::NetworkGraphUpdate;
+    net.graph.record_nodes_health(&[(net.key(name), health)]);
+}
+
+fn healthy_relays() -> anyhow::Result<Net> {
+    Net::from_json(&two_relays(
+        r#"{ "from": "me", "to": "ra", "connected": true, "latency_ms": 20, "balance": 100000, "relayed_ms": 30 }"#,
+        r#"{ "from": "me", "to": "rb", "connected": true, "latency_ms": 20, "balance": 100000, "relayed_ms": 30 }"#,
+    ))
+}
+
+#[test]
+fn a_dead_relayer_is_pruned_from_forward_paths() -> anyhow::Result<()> {
+    let net = healthy_relays()?;
+    assert_eq!(net.forward("exit", 1).len(), 2, "precondition: both relays usable");
+
+    record_health(&net, "rb", 0.0);
+
+    assert_eq!(net.forward("exit", 1).names(), vec![vec!["ra"]]);
+    Ok(())
+}
+
+#[test]
+fn a_degraded_relayer_draws_its_health_share_of_the_value() -> anyhow::Result<()> {
+    let net = healthy_relays()?;
+    let before = net.forward("exit", 1).value_of(&["rb"]).expect("rb is a candidate");
+
+    record_health(&net, "rb", 0.25);
+
+    let routes = net.forward("exit", 1);
+    let after = routes.value_of(&["rb"]).expect("a degraded relay stays a candidate");
+    assert!((after - before * 0.25).abs() < 1e-9, "{after} vs {before} * 0.25");
+    assert_eq!(routes.value_of(&["ra"]), Some(before), "the other relay is untouched");
+    Ok(())
+}
+
+#[test]
+fn a_recovered_relayer_regains_its_full_value() -> anyhow::Result<()> {
+    let net = healthy_relays()?;
+    let before = net.forward("exit", 1).value_of(&["rb"]);
+
+    record_health(&net, "rb", 0.0);
+    record_health(&net, "rb", 1.0);
+
+    assert_eq!(net.forward("exit", 1).value_of(&["rb"]), before);
+    Ok(())
+}
+
+#[test]
+fn the_destination_stays_reachable_whatever_its_health_as_a_relayer() -> anyhow::Result<()> {
+    let net = healthy_relays()?;
+    let before = net.forward("exit", 1);
+
+    record_health(&net, "exit", 0.0);
+
+    let after = net.forward("exit", 1);
+    for relay in ["ra", "rb"] {
+        assert_eq!(after.value_of(&[relay]), before.value_of(&[relay]), "via {relay}");
+    }
+    Ok(())
+}
+
+#[test]
+fn a_dead_relayer_is_pruned_from_return_paths() -> anyhow::Result<()> {
+    let net = Net::from_json(
+        r#"{
+      "me": "me",
+      "ticket_face_value": 100,
+      "edges": [
+        { "from": "exit", "to": "ra", "connected": true, "latency_ms": 20, "balance": 100000, "relayed_ms": 30 },
+        { "from": "exit", "to": "rb", "connected": true, "latency_ms": 20, "balance": 100000, "relayed_ms": 30 },
+        { "from": "ra",   "to": "me", "connected": true, "latency_ms": 20, "balance": 100000, "relayed_ms": 30 },
+        { "from": "rb",   "to": "me", "connected": true, "latency_ms": 20, "balance": 100000, "relayed_ms": 30 }
+      ]
+    }"#,
+    )?;
+    assert_eq!(net.returning("exit", 1).len(), 2, "precondition: both relays usable");
+
+    record_health(&net, "rb", 0.0);
+
+    assert_eq!(net.returning("exit", 1).names(), vec![vec!["ra"]]);
+    Ok(())
+}

@@ -78,6 +78,14 @@ pub struct Observations {
     last_update: std::time::Duration,
     immediate_probe: Option<TransportImmediates>,
     intermediate_probe: Option<TransportIntermediates>,
+    /// Health of the edge's destination as a relayer; `None` is not judged.
+    health: Option<f64>,
+}
+
+impl Observations {
+    pub(crate) fn set_health(&mut self, health: Option<f64>) {
+        self.health = health;
+    }
 }
 
 impl EdgeObservableWrite for Observations {
@@ -386,6 +394,10 @@ impl EdgeObservableRead for Observations {
 
     fn intermediate_qos(&self) -> Option<&Self::IntermediateMeasurement> {
         self.intermediate_probe.as_ref()
+    }
+
+    fn health(&self) -> Option<f64> {
+        self.health
     }
 
     /// Combines the two streams per RFC-0014 §4.2: average when both are present, else the single
