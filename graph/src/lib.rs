@@ -23,12 +23,10 @@
 pub mod petgraph;
 
 pub mod errors;
-pub mod health;
 #[cfg(feature = "graph-api")]
 pub mod render;
 pub mod weight;
 
-pub use health::EdgeHealth;
 use hopr_api::OffchainPublicKey;
 #[cfg(feature = "petgraph")]
 pub use petgraph::traverse::{MAX_LOOPBACK_HOPS, MIN_LOOPBACK_HOPS};

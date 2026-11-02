@@ -1,34 +1,11 @@
 use std::sync::Arc;
 
 use bimap::BiHashMap;
-use hopr_api::{
-    OffchainPublicKey,
-    graph::{EdgeImmediateProtocolObservable, traits::EdgeObservableRead},
-};
+use hopr_api::OffchainPublicKey;
 use parking_lot::RwLock;
-use petgraph::{graph::NodeIndex, stable_graph::StableDiGraph, visit::EdgeRef};
+use petgraph::{graph::NodeIndex, stable_graph::StableDiGraph};
 
-use crate::{EdgeHealth, Observations, errors::ChannelGraphError};
-
-/// Logs that an edge changed health. Changes on the node's own edges decide which peers data
-/// paths can use, so they are logged at INFO; changes elsewhere in the graph at DEBUG.
-fn log_health_change(
-    own: bool,
-    src: &OffchainPublicKey,
-    dest: &OffchainPublicKey,
-    before: EdgeHealth,
-    after: EdgeHealth,
-    observations: &Observations,
-) {
-    let score = observations.score();
-    let ack_rate = observations.immediate_qos().and_then(|imm| imm.ack_rate());
-
-    if own {
-        tracing::info!(%dest, from = before.as_str(), to = after.as_str(), score, ack_rate, "own edge health changed");
-    } else {
-        tracing::debug!(%src, %dest, from = before.as_str(), to = after.as_str(), score, ack_rate, "edge health changed");
-    }
-}
+use crate::{Observations, errors::ChannelGraphError};
 
 /// Internal mutable state of a [`ChannelGraph`], protected by a lock.
 #[derive(Debug, Clone, Default)]
@@ -279,6 +256,8 @@ impl hopr_api::graph::NetworkGraphWrite for ChannelGraph {
         if let Some((_, idx)) = inner.indices.remove_by_left(key) {
             inner.release_slot(key, idx);
             let incident: Vec<_> = {
+                use petgraph::visit::EdgeRef;
+
                 inner
                     .graph
                     .edges_directed(idx, petgraph::Direction::Outgoing)
@@ -362,14 +341,8 @@ impl hopr_api::graph::NetworkGraphWrite for ChannelGraph {
             .unwrap_or_else(|| inner.graph.add_edge(src_idx, dest_idx, Observations::default()));
 
         if let Some(weight) = inner.graph.edge_weight_mut(edge_idx) {
-            let before = EdgeHealth::of(weight, self.min_ack_rate);
             f(weight);
-            let after = EdgeHealth::of(weight, self.min_ack_rate);
             tracing::trace!(%src, %dest, ?weight, "updated edge weight with an observation");
-
-            if before != after {
-                log_health_change(src == &self.me, src, dest, before, after, weight);
-            }
         }
     }
 }
@@ -952,90 +925,5 @@ mod tests {
         let edges = graph.connected_edges();
         assert_eq!(edges.len(), 4);
         Ok(())
-    }
-
-    #[test]
-    fn health_logs_use_consistent_fields_and_numeric_measurements() {
-        use std::{collections::BTreeMap, sync::Mutex};
-
-        use serde_json::{Value, json};
-        use tracing::{
-            Event, Level, Metadata, Subscriber,
-            field::{Field, Visit},
-            span,
-        };
-
-        type CapturedEvent = (Level, BTreeMap<String, Value>);
-        #[derive(Clone, Default)]
-        struct Logs(Arc<Mutex<Vec<CapturedEvent>>>);
-        impl Subscriber for Logs {
-            fn enabled(&self, metadata: &Metadata<'_>) -> bool {
-                *metadata.level() <= Level::DEBUG
-            }
-
-            fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
-                span::Id::from_u64(1)
-            }
-
-            fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
-
-            fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
-
-            fn enter(&self, _: &span::Id) {}
-
-            fn exit(&self, _: &span::Id) {}
-
-            fn event(&self, event: &Event<'_>) {
-                struct Fields(BTreeMap<String, Value>);
-                impl Visit for Fields {
-                    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-                        self.0.insert(field.name().into(), json!(format!("{value:?}")));
-                    }
-
-                    fn record_str(&mut self, field: &Field, value: &str) {
-                        self.0.insert(field.name().into(), json!(value));
-                    }
-
-                    fn record_f64(&mut self, field: &Field, value: f64) {
-                        self.0.insert(field.name().into(), json!(value));
-                    }
-                }
-                let mut fields = Fields(BTreeMap::new());
-                event.record(&mut fields);
-                self.0.lock().unwrap().push((*event.metadata().level(), fields.0));
-            }
-        }
-        let me = pubkey_from(&SECRET_0);
-        let other = pubkey_from(&SECRET_1);
-        let dest = pubkey_from(&SECRET_2);
-        let graph = ChannelGraph::new(me);
-        let logs = Logs::default();
-        tracing::subscriber::with_default(logs.clone(), || {
-            graph.upsert_edge(&me, &other, |obs| {
-                obs.record(EdgeWeightType::Immediate(Ok(std::time::Duration::from_millis(50))));
-                obs.record(EdgeWeightType::ImmediateProtocolConformance {
-                    num_packets: 10,
-                    num_acks: 10,
-                });
-            });
-            // An unchanged health state must not emit another transition line.
-            graph.upsert_edge(&me, &other, |_| {});
-            graph.upsert_edge(&other, &dest, |obs| obs.record(EdgeWeightType::Connected(false)));
-        });
-        let events = logs.0.lock().unwrap();
-        assert_eq!(events.len(), 2, "{events:?}");
-        assert_eq!(events[0].0, Level::INFO);
-        let own = &events[0].1;
-        assert!(own.contains_key("dest"));
-        assert!(!own.contains_key("peer"));
-        assert_eq!(own["from"], json!("unknown"));
-        assert_eq!(own["to"], json!("usable"));
-        assert!(own["score"].is_number());
-        assert_eq!(own["ack_rate"], json!(1.0));
-        assert_eq!(events[1].0, Level::DEBUG);
-        let remote = &events[1].1;
-        assert!(remote.contains_key("src") && remote.contains_key("dest"));
-        assert_eq!(remote["to"], json!("unreachable"));
-        assert!(!remote.contains_key("score") && !remote.contains_key("ack_rate"));
     }
 }
