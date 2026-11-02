@@ -197,6 +197,9 @@
             ];
           };
 
+          # Formatting needs only rustfmt, not a full nightly compiler and its documentation.
+          nightlyRustfmt = pkgs.rust-bin.selectLatestNightlyWith (toolchain: toolchain.rustfmt);
+
           # Development shells using nix-lib
           shellArgs = {
             treefmtWrapper = config.treefmt.build.wrapper;
@@ -265,6 +268,8 @@
           nix-lib.treefmt = {
             extraFormatters = {
               programs.nixfmt.package = pkgs.nixfmt;
+              programs.rustfmt.package = nightlyRustfmt;
+              settings.formatter.rustfmt.command = "${nightlyRustfmt}/bin/rustfmt";
               settings.formatter.shfmt.includes = [
                 "*.sh"
                 ".github/scripts/*.sh"
