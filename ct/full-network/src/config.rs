@@ -5,7 +5,7 @@ use validator::{Validate, ValidationError, ValidationErrors};
 /// Configuration for the probing mechanism
 #[derive(Debug, Clone, Copy, PartialEq, smart_default::SmartDefault)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(deny_unknown_fields))]
-pub struct ProberConfig {
+pub struct EgressConfig {
     /// The delay between individual probing rounds for neighbor discovery
     #[cfg_attr(
         feature = "serde",
@@ -62,7 +62,7 @@ pub struct ProberConfig {
 
     /// Factor by which loopbacks ending at a focus exit outweigh other loopbacks (>= 1.0).
     ///
-    /// Applies only while a focus is set with `ProbingControl::set_focus`. Loopbacks are emitted in
+    /// Applies only while a focus is set with `EgressControl::set_focus`. Loopbacks are emitted in
     /// a weighted shuffle, so a higher factor makes focused loops lead each round more often.
     /// `1.0` gives focused loops no advantage.
     #[cfg_attr(feature = "serde", serde(default = "default_focus_boost"))]
@@ -70,17 +70,17 @@ pub struct ProberConfig {
     pub focus_boost: f64,
 }
 
-impl ProberConfig {
+impl EgressConfig {
     /// Validates the config, additionally ensuring `self.interval >= probe_timeout`.
     ///
     /// Pinging more frequently than the probe timeout would cause probes to overlap;
     /// this check prevents that misconfiguration.
     pub fn validate_against_probe_timeout(&self, probe_timeout: std::time::Duration) -> anyhow::Result<()> {
         self.validate()
-            .map_err(|e| anyhow::anyhow!("invalid ProberConfig: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("invalid EgressConfig: {e}"))?;
         anyhow::ensure!(
             self.interval >= probe_timeout,
-            "ProberConfig.interval ({:?}) must be >= probe_timeout ({:?})",
+            "EgressConfig.interval ({:?}) must be >= probe_timeout ({:?})",
             self.interval,
             probe_timeout,
         );
@@ -88,7 +88,7 @@ impl ProberConfig {
     }
 }
 
-impl Validate for ProberConfig {
+impl Validate for EgressConfig {
     fn validate(&self) -> Result<(), ValidationErrors> {
         let mut errors = ValidationErrors::new();
 
@@ -171,28 +171,28 @@ mod tests {
 
     #[test]
     fn interval_less_than_probe_timeout_is_invalid() {
-        let cfg = ProberConfig::default(); // interval = 30s
+        let cfg = EgressConfig::default(); // interval = 30s
         let timeout = std::time::Duration::from_secs(60);
         assert!(cfg.validate_against_probe_timeout(timeout).is_err());
     }
 
     #[test]
     fn interval_equal_to_probe_timeout_is_valid() {
-        let cfg = ProberConfig::default(); // interval = 30s
+        let cfg = EgressConfig::default(); // interval = 30s
         let timeout = std::time::Duration::from_secs(30);
         assert!(cfg.validate_against_probe_timeout(timeout).is_ok());
     }
 
     #[test]
     fn default_config_is_valid() {
-        let cfg = ProberConfig::default();
+        let cfg = EgressConfig::default();
         assert!(cfg.validate().is_ok());
         assert!(cfg.probe_connected_only, "probe_connected_only should default to true");
     }
 
     #[test]
     fn all_zero_weights_are_invalid() {
-        let cfg = ProberConfig {
+        let cfg = EgressConfig {
             staleness_weight: 0.0,
             quality_weight: 0.0,
             base_priority: 0.0,
@@ -204,7 +204,7 @@ mod tests {
 
     #[test]
     fn zero_staleness_weight_alone_is_valid() {
-        let cfg = ProberConfig {
+        let cfg = EgressConfig {
             staleness_weight: 0.0,
             ..Default::default()
         };
@@ -213,7 +213,7 @@ mod tests {
 
     #[test]
     fn zero_quality_weight_alone_is_valid() {
-        let cfg = ProberConfig {
+        let cfg = EgressConfig {
             quality_weight: 0.0,
             ..Default::default()
         };
@@ -222,7 +222,7 @@ mod tests {
 
     #[test]
     fn zero_base_priority_alone_is_valid() {
-        let cfg = ProberConfig {
+        let cfg = EgressConfig {
             base_priority: 0.0,
             ..Default::default()
         };
@@ -231,7 +231,7 @@ mod tests {
 
     #[test]
     fn staleness_weight_above_one_is_invalid() {
-        let cfg = ProberConfig {
+        let cfg = EgressConfig {
             staleness_weight: 1.1,
             ..Default::default()
         };
@@ -241,7 +241,7 @@ mod tests {
 
     #[test]
     fn quality_weight_above_one_is_invalid() {
-        let cfg = ProberConfig {
+        let cfg = EgressConfig {
             quality_weight: 1.1,
             ..Default::default()
         };
@@ -251,7 +251,7 @@ mod tests {
 
     #[test]
     fn base_priority_above_one_is_invalid() {
-        let cfg = ProberConfig {
+        let cfg = EgressConfig {
             base_priority: 1.1,
             ..Default::default()
         };
@@ -262,7 +262,7 @@ mod tests {
     #[test]
     fn focus_boost_below_one_nan_or_infinite_is_invalid() {
         for focus_boost in [0.99, 0.0, -1.0, f64::NAN, f64::INFINITY] {
-            let cfg = ProberConfig {
+            let cfg = EgressConfig {
                 focus_boost,
                 ..Default::default()
             };
@@ -273,7 +273,7 @@ mod tests {
 
     #[test]
     fn focus_boost_of_one_is_valid() {
-        let cfg = ProberConfig {
+        let cfg = EgressConfig {
             focus_boost: 1.0,
             ..Default::default()
         };
@@ -282,7 +282,7 @@ mod tests {
 
     #[test]
     fn negative_staleness_weight_is_invalid() {
-        let cfg = ProberConfig {
+        let cfg = EgressConfig {
             staleness_weight: -0.1,
             quality_weight: 0.5,
             base_priority: 0.5,
@@ -294,7 +294,7 @@ mod tests {
 
     #[test]
     fn negative_quality_weight_is_invalid() {
-        let cfg = ProberConfig {
+        let cfg = EgressConfig {
             staleness_weight: 0.5,
             quality_weight: -0.1,
             base_priority: 0.5,
@@ -306,7 +306,7 @@ mod tests {
 
     #[test]
     fn negative_base_priority_is_invalid() {
-        let cfg = ProberConfig {
+        let cfg = EgressConfig {
             staleness_weight: 0.5,
             quality_weight: 0.5,
             base_priority: -0.1,

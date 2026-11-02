@@ -33,8 +33,8 @@ use hopr_api::{
     types::crypto::prelude::{Keypair, OffchainKeypair},
 };
 use hopr_network_graph::{
-    ChannelGraph, DEFAULT_EDGE_PENALTY, DEFAULT_MAX_PLAUSIBLE_LOOPBACK_RTT, DEFAULT_MIN_ACK_RATE, FocusedLoopback,
-    Observations,
+    ChannelGraph, DEFAULT_EDGE_PENALTY, DEFAULT_MAX_PLAUSIBLE_LOOPBACK_RTT, DEFAULT_MIN_ACK_RATE, FocusRelevance,
+    FocusedLoopback, Observations,
 };
 
 /// A whole network, as one JSON object.
@@ -304,14 +304,27 @@ impl Net {
         out
     }
 
-    /// Loops of exactly `hops` relays whose last relay is one of `exits`, by name, sorted.
-    pub fn loopback_ending_at(&self, hops: usize, exits: &[&str]) -> Vec<Vec<String>> {
-        let exits: HashSet<OffchainPublicKey> = exits.iter().map(|name| self.key(name)).collect();
-        let mut out: Vec<Vec<String>> = self
-            .graph
-            .loopback_ending_at(hops, None, &exits)
+    /// Focused loops of exactly `hops` relays around `exits`, by name with their relevance, sorted.
+    pub fn focused(&self, hops: usize, exits: &[&str]) -> Vec<(Vec<String>, FocusRelevance)> {
+        self.focused_with(hops, None, exits)
             .into_iter()
-            .map(|(nodes, _)| nodes.iter().map(|key| self.name(key)).collect())
+            .map(|(names, _, relevance)| (names, relevance))
+            .collect()
+    }
+
+    /// Like [`Self::focused`], with the bound on each underlying search and the `PathId` slots.
+    pub fn focused_with(
+        &self,
+        hops: usize,
+        take_count: Option<usize>,
+        exits: &[&str],
+    ) -> Vec<(Vec<String>, [u64; 5], FocusRelevance)> {
+        let exits: HashSet<OffchainPublicKey> = exits.iter().map(|name| self.key(name)).collect();
+        let mut out: Vec<(Vec<String>, [u64; 5], FocusRelevance)> = self
+            .graph
+            .focused_loopback(hops, take_count, &exits)
+            .into_iter()
+            .map(|(nodes, path_id, relevance)| (nodes.iter().map(|key| self.name(key)).collect(), path_id, relevance))
             .collect();
         out.sort();
         out

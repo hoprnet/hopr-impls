@@ -4,17 +4,17 @@ Full implementation of the Telemetry functionality as specified in the HOPR RFCs
 
 Part of the [HOPR](https://hoprnet.org/) protocol implementation.
 
-## Steering probing at runtime
+## Steering egress traffic at runtime
 
-`FullNetworkDiscovery::control()` returns a cloneable `ProbingControl`. Take a clone before the prober
-is handed to the node. Changes reach streams that are already running.
+`FullNetworkDiscovery::control()` returns a cloneable `EgressControl`. Take a clone before the prober is handed to the node. Changes reach
+streams that are already running.
 
-- `set_level(Off | Low | Medium | High)`: scales the probing pace to 0, 0.1, 0.5 or 1.0 of
-  `ProberConfig::interval`. `Off` leaves the stream pending. Default `High`.
-- `set_focus(exits)` / `clear_focus()`: loopbacks whose last relay is a focus exit lead each round
-  (`ProberConfig::focus_boost`, default 10). Other loops are still probed. An exit needs an
-  observed closing edge to this node, or it yields no focused loop. Neighbor probes ignore focus.
-- `set_noise(bool)`: switches cover traffic (`noise` feature, on by default). Default off. Independent of the level.
+- `set_level(Some(Low | Medium | High))` scales the probing pace to 0.1, 0.5 or 1.0 of `EgressConfig::interval`. `set_level(None)` stops
+  probing and leaves the streams pending. Default `Some(High)`.
+- `set_focus(exits)` / `clear_focus()` probe the subgraph around the exits. Loops that form a path to an exit (forward) get
+  `EgressConfig::focus_boost` times the weight, default 10. Loops that cover a return path from an exit to this node get half of that. Other
+  loops keep the base weight, and neighbor probes ignore focus. An exit needs no channel and no edge back to this node.
+- `set_noise(bool)` switches cover traffic (`noise` feature, on by default). Default off. Independent of the level.
 
 ## Specification
 

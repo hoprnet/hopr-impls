@@ -1,4 +1,4 @@
-use crate::ProberConfig;
+use crate::EgressConfig;
 
 /// Maximum staleness (in seconds) used to cap the staleness factor.
 const MAX_STALENESS_SECS: f64 = 300.0;
@@ -15,7 +15,7 @@ pub(crate) fn immediate_probe_priority(
     score: f64,
     last_update: std::time::Duration,
     now: std::time::Duration,
-    cfg: &ProberConfig,
+    cfg: &EgressConfig,
 ) -> f64 {
     let staleness_secs = if last_update.is_zero() {
         MAX_STALENESS_SECS
@@ -34,7 +34,7 @@ mod tests {
 
     #[test]
     fn maximal_for_unobserved_peers() {
-        let cfg = ProberConfig::default();
+        let cfg = EgressConfig::default();
         let now = std::time::Duration::from_secs(1000);
 
         let priority = immediate_probe_priority(0.0, std::time::Duration::ZERO, now, &cfg);
@@ -48,7 +48,7 @@ mod tests {
 
     #[test]
     fn increases_with_staleness() {
-        let cfg = ProberConfig::default();
+        let cfg = EgressConfig::default();
         let now = std::time::Duration::from_secs(10000);
         let score = 0.5;
 
@@ -63,7 +63,7 @@ mod tests {
 
     #[test]
     fn increases_with_lower_score() {
-        let cfg = ProberConfig::default();
+        let cfg = EgressConfig::default();
         let now = std::time::Duration::from_secs(1000);
         let last_update = now - std::time::Duration::from_secs(100);
 
