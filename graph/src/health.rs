@@ -64,48 +64,6 @@ impl std::fmt::Display for EdgeHealth {
     }
 }
 
-/// Counts of nodes and edges, and of the node's own edges by [`EdgeHealth`].
-///
-/// Its size does not depend on the size of the graph, so it fits in one log line.
-#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
-pub struct GraphHealthSummary {
-    pub nodes: usize,
-    pub edges: usize,
-    pub own_edges: usize,
-    pub own_usable: usize,
-    pub own_low_ack_rate: usize,
-    pub own_unreachable: usize,
-    pub own_unknown: usize,
-}
-
-impl GraphHealthSummary {
-    pub(crate) fn add_own_edge(&mut self, health: EdgeHealth) {
-        self.own_edges += 1;
-        match health {
-            EdgeHealth::Usable => self.own_usable += 1,
-            EdgeHealth::LowAckRate => self.own_low_ack_rate += 1,
-            EdgeHealth::Unreachable => self.own_unreachable += 1,
-            EdgeHealth::Unknown => self.own_unknown += 1,
-        }
-    }
-}
-
-impl std::fmt::Display for GraphHealthSummary {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "nodes={} edges={} own_edges={} own_usable={} own_low_ack_rate={} own_unreachable={} own_unknown={}",
-            self.nodes,
-            self.edges,
-            self.own_edges,
-            self.own_usable,
-            self.own_low_ack_rate,
-            self.own_unreachable,
-            self.own_unknown
-        )
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use hopr_api::graph::traits::{EdgeObservableWrite, EdgeWeightType};
@@ -196,25 +154,5 @@ mod tests {
             });
         }
         assert_eq!(EdgeHealth::of(&obs, MIN_ACK_RATE), EdgeHealth::LowAckRate);
-    }
-
-    #[test]
-    fn summary_should_count_own_edges_by_health() {
-        let mut summary = GraphHealthSummary::default();
-        summary.add_own_edge(EdgeHealth::Usable);
-        summary.add_own_edge(EdgeHealth::Usable);
-        summary.add_own_edge(EdgeHealth::Unreachable);
-        summary.add_own_edge(EdgeHealth::LowAckRate);
-        summary.add_own_edge(EdgeHealth::Unknown);
-
-        assert_eq!(summary.own_edges, 5);
-        assert_eq!(summary.own_usable, 2);
-        assert_eq!(summary.own_unreachable, 1);
-        assert_eq!(summary.own_low_ack_rate, 1);
-        assert_eq!(summary.own_unknown, 1);
-        assert_eq!(
-            summary.to_string(),
-            "nodes=0 edges=0 own_edges=5 own_usable=2 own_low_ack_rate=1 own_unreachable=1 own_unknown=1"
-        );
     }
 }

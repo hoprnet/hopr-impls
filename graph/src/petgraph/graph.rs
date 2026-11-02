@@ -8,7 +8,7 @@ use hopr_api::{
 use parking_lot::RwLock;
 use petgraph::{graph::NodeIndex, stable_graph::StableDiGraph, visit::EdgeRef};
 
-use crate::{EdgeHealth, GraphHealthSummary, Observations, errors::ChannelGraphError};
+use crate::{EdgeHealth, Observations, errors::ChannelGraphError};
 
 /// Logs that an edge changed health. Changes on the node's own edges decide which peers data
 /// paths can use, so they are logged at INFO; changes elsewhere in the graph at DEBUG.
@@ -183,38 +183,6 @@ impl ChannelGraph {
     /// to loopback probe generation, which must reach edges data selection rejects.
     pub fn min_ack_rate(&self) -> f64 {
         self.min_ack_rate
-    }
-
-    /// Counts nodes and edges, and the node's own edges by [`EdgeHealth`].
-    ///
-    /// The application owns the periodic state-dump schedule and calls this public snapshot API
-    /// from that schedule. The graph library does not start a background task or emit periodic logs.
-    /// The result has a fixed size whatever the graph size; collection visits only the node's own edges.
-    ///
-    /// ```
-    /// use hopr_network_graph::ChannelGraph;
-    ///
-    /// // Call from the application's existing periodic state-dump task.
-    /// fn log_graph_health(graph: &ChannelGraph) {
-    ///     let summary = graph.health_summary();
-    ///     tracing::info!(%summary, "graph health summary");
-    /// }
-    /// ```
-    pub fn health_summary(&self) -> GraphHealthSummary {
-        let inner = self.inner.read();
-        let mut summary = GraphHealthSummary {
-            nodes: inner.indices.len(),
-            edges: inner.graph.edge_count(),
-            ..Default::default()
-        };
-
-        if let Some(me_idx) = inner.indices.get_by_left(&self.me) {
-            for weight in inner.graph.edges(*me_idx).map(|edge| edge.weight()) {
-                summary.add_own_edge(EdgeHealth::of(weight, self.min_ack_rate));
-            }
-        }
-
-        summary
     }
 }
 
@@ -987,26 +955,6 @@ mod tests {
     }
 
     #[test]
-    fn health_summary_excludes_retired_nodes_and_their_edges() -> anyhow::Result<()> {
-        let me = pubkey_from(&SECRET_0);
-        let other = pubkey_from(&SECRET_1);
-        let graph = ChannelGraph::new(me);
-        graph.add_node(other);
-        graph.add_edge(&me, &other)?;
-        graph.remove_node(&other);
-        assert_eq!(
-            graph.health_summary(),
-            GraphHealthSummary {
-                nodes: 1,
-                ..Default::default()
-            }
-        );
-        graph.remove_node(&me);
-        assert_eq!(graph.health_summary(), GraphHealthSummary::default());
-        Ok(())
-    }
-
-    #[test]
     fn health_logs_use_consistent_fields_and_numeric_measurements() {
         use serde_json::{Value, json};
         use std::{collections::BTreeMap, sync::Mutex};
@@ -1080,39 +1028,5 @@ mod tests {
         assert!(remote.contains_key("src") && remote.contains_key("dest"));
         assert_eq!(remote["to"], json!("unreachable"));
         assert!(!remote.contains_key("score") && !remote.contains_key("ack_rate"));
-    }
-
-    #[test]
-    fn health_summary_should_count_own_edges_by_health() -> anyhow::Result<()> {
-        let me = *OffchainKeypair::random().public();
-        let good = *OffchainKeypair::random().public();
-        let gone = *OffchainKeypair::random().public();
-        let graph = ChannelGraph::new(me);
-
-        graph.upsert_edge(&me, &good, |obs| {
-            obs.record(EdgeWeightType::Immediate(Ok(std::time::Duration::from_millis(50))))
-        });
-        graph.upsert_edge(&me, &gone, |obs| {
-            obs.record(EdgeWeightType::Immediate(Ok(std::time::Duration::from_millis(50))));
-            obs.record(EdgeWeightType::Connected(false));
-        });
-        // An edge between two other nodes is counted in `edges`, but not as an own edge
-        graph.upsert_edge(&good, &gone, |obs| {
-            obs.record(EdgeWeightType::Immediate(Ok(std::time::Duration::from_millis(50))))
-        });
-
-        assert_eq!(
-            graph.health_summary(),
-            GraphHealthSummary {
-                nodes: 3,
-                edges: 3,
-                own_edges: 2,
-                own_usable: 1,
-                own_unreachable: 1,
-                ..Default::default()
-            }
-        );
-
-        Ok(())
     }
 }
