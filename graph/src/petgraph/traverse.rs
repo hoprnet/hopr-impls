@@ -175,6 +175,58 @@ impl hopr_api::graph::NetworkGraphTraverse for ChannelGraph {
     ///
     /// Requests outside [`MIN_LOOPBACK_HOPS`]`..=`[`MAX_LOOPBACK_HOPS`] yield no paths.
     fn simple_loopback_to_self(&self, hops: usize, take_count: Option<usize>) -> Vec<(Vec<Self::NodeId>, PathId)> {
+        self.loopbacks(hops, take_count, None)
+    }
+}
+
+/// Loopback probe generation that can be steered towards chosen last relays.
+///
+/// Lets a caller that knows which exits it will use probe the subgraph leading to them, instead of
+/// sampling every loop in the network.
+pub trait FocusedLoopback {
+    /// Generates loopback paths of exactly `hops` relays whose last relay is one of `exits`.
+    ///
+    /// Shares every rule of `simple_loopback_to_self`, including the requirement that the closing
+    /// edge `exit → me` exists and is not known to be down. An exit with no such edge yields no
+    /// loop. An empty `exits` set yields nothing.
+    fn loopback_ending_at(
+        &self,
+        hops: usize,
+        take_count: Option<usize>,
+        exits: &HashSet<OffchainPublicKey>,
+    ) -> Vec<(Vec<OffchainPublicKey>, PathId)>;
+}
+
+impl FocusedLoopback for ChannelGraph {
+    fn loopback_ending_at(
+        &self,
+        hops: usize,
+        take_count: Option<usize>,
+        exits: &HashSet<OffchainPublicKey>,
+    ) -> Vec<(Vec<OffchainPublicKey>, PathId)> {
+        self.loopbacks(hops, take_count, Some(exits))
+    }
+}
+
+impl<T: FocusedLoopback> FocusedLoopback for Arc<T> {
+    fn loopback_ending_at(
+        &self,
+        hops: usize,
+        take_count: Option<usize>,
+        exits: &HashSet<OffchainPublicKey>,
+    ) -> Vec<(Vec<OffchainPublicKey>, PathId)> {
+        (**self).loopback_ending_at(hops, take_count, exits)
+    }
+}
+
+impl ChannelGraph {
+    /// Loopback paths of `hops` relays, optionally restricted to those whose last relay is in `last_relays`.
+    fn loopbacks(
+        &self,
+        hops: usize,
+        take_count: Option<usize>,
+        last_relays: Option<&HashSet<OffchainPublicKey>>,
+    ) -> Vec<(Vec<OffchainPublicKey>, PathId)> {
         if (MIN_LOOPBACK_HOPS..=MAX_LOOPBACK_HOPS).contains(&hops) {
             let inner = self.inner.read();
 
@@ -202,6 +254,19 @@ impl hopr_api::graph::NetworkGraphTraverse for ChannelGraph {
                             })
                     })
                     .collect::<HashSet<_>>();
+
+                let connected_neighbors = match last_relays {
+                    Some(last_relays) => connected_neighbors
+                        .into_iter()
+                        .filter(|idx| {
+                            inner
+                                .indices
+                                .get_by_right(idx)
+                                .is_some_and(|key| last_relays.contains(key))
+                        })
+                        .collect::<HashSet<_>>(),
+                    None => connected_neighbors,
+                };
 
                 // Deliberately more permissive than data path selection. RFC-0010 §4.2.1.4 wants
                 // low-scoring edges probed *more* urgently; applying the production `min_ack_rate`

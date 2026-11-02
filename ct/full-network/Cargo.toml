@@ -11,13 +11,13 @@ name                   = "hopr-ct-full-network"
 readme                 = "README.md"
 repository.workspace   = true
 rust-version.workspace = true
-version                = "0.7.0"
+version                = "0.7.1"
 
 [lib]
 crate-type = ["rlib"]
 
 [features]
-default = []
+default = ["noise"]
 noise   = []
 serde   = ["dep:humantime-serde", "dep:serde", "hopr-api/serde"]
 
@@ -29,6 +29,7 @@ futures-time    = { workspace = true }
 humantime-serde = { workspace = true, optional = true }
 serde           = { workspace = true, optional = true, features = ["derive"] }
 smart-default   = { workspace = true }
+tokio           = { workspace = true, features = ["sync"] }
 tracing         = { workspace = true }
 validator       = { workspace = true }
 

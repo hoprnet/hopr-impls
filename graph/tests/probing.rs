@@ -7,6 +7,7 @@
 mod common;
 
 use common::Net;
+use hopr_api::graph::traits::{EdgeObservableWrite, EdgeWeightType};
 use hopr_network_graph::{MAX_LOOPBACK_HOPS, MIN_LOOPBACK_HOPS};
 
 /// A ring big enough for both permitted loop lengths, with the closing edges every loop needs.
@@ -271,5 +272,70 @@ fn a_node_with_no_edges_still_has_a_slot() -> anyhow::Result<()> {
     let net = Net::from_json(r#"{ "me": "me", "nodes": ["known"], "edges": [] }"#)?;
 
     assert!(net.slot("known").is_some(), "a known node has a slot");
+    Ok(())
+}
+
+// ── Loops ending at chosen exits ─────────────────────────────────────────
+
+#[test]
+fn loops_ending_at_an_exit_should_keep_only_loops_whose_last_relay_is_that_exit() -> anyhow::Result<()> {
+    let net = Net::from_json(RING)?;
+
+    assert_eq!(
+        net.loopback_ending_at(3, &["c"]),
+        vec![vec!["a", "b", "c", "me"]],
+        "c is the last relay of the only 3-relay loop"
+    );
+    assert!(
+        net.loopback_ending_at(2, &["c"]).is_empty(),
+        "no 2-relay loop ends at c"
+    );
+    assert_eq!(
+        net.loopback_ending_at(2, &["b"]),
+        vec![vec!["a", "b", "me"]],
+        "b is the last relay of the only 2-relay loop"
+    );
+    Ok(())
+}
+
+#[test]
+fn loops_ending_at_no_exit_should_yield_nothing() -> anyhow::Result<()> {
+    let net = Net::from_json(RING)?;
+
+    assert!(
+        net.loopback_ending_at(2, &[]).is_empty(),
+        "an empty exit set matches no loop"
+    );
+    assert!(
+        net.loopback_ending_at(2, &["a"]).is_empty(),
+        "a has no closing edge to me, so it cannot end a loop"
+    );
+    Ok(())
+}
+
+#[test]
+fn loops_ending_at_an_exit_should_stay_within_the_permitted_range() -> anyhow::Result<()> {
+    let net = Net::from_json(RING)?;
+
+    for hops in [0, 1, MAX_LOOPBACK_HOPS + 1] {
+        assert!(
+            net.loopback_ending_at(hops, &["b", "c"]).is_empty(),
+            "{hops} relays is out of range"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn loops_ending_at_an_exit_observed_down_should_be_excluded() -> anyhow::Result<()> {
+    let net = Net::from_json(RING)?;
+    net.observe("c", "me", |obs| {
+        obs.record(EdgeWeightType::Connected(false));
+    });
+
+    assert!(
+        net.loopback_ending_at(3, &["c"]).is_empty(),
+        "a closing edge known to be down excludes the loop, as for default loopbacks"
+    );
     Ok(())
 }

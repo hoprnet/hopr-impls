@@ -59,6 +59,15 @@ pub struct ProberConfig {
     #[cfg_attr(feature = "serde", serde(default = "just_true"))]
     #[default(just_true())]
     pub probe_connected_only: bool,
+
+    /// Factor by which loopbacks ending at a focus exit outweigh other loopbacks (>= 1.0).
+    ///
+    /// Applies only while a focus is set with `ProbingControl::set_focus`. Loopbacks are emitted in
+    /// a weighted shuffle, so a higher factor makes focused loops lead each round more often.
+    /// `1.0` gives focused loops no advantage.
+    #[cfg_attr(feature = "serde", serde(default = "default_focus_boost"))]
+    #[default(default_focus_boost())]
+    pub focus_boost: f64,
 }
 
 impl ProberConfig {
@@ -102,6 +111,14 @@ impl Validate for ProberConfig {
             );
         }
 
+        // Also rejects NaN, which no comparison satisfies.
+        if !(self.focus_boost >= 1.0 && self.focus_boost.is_finite()) {
+            errors.add(
+                "focus_boost",
+                ValidationError::new("focus_boost must be finite and at least 1.0"),
+            );
+        }
+
         if self.staleness_weight + self.quality_weight + self.base_priority <= 0.0 {
             errors.add(
                 "weights",
@@ -126,6 +143,11 @@ const fn default_quality_weight() -> f64 {
 #[inline]
 const fn default_base_priority() -> f64 {
     0.3
+}
+
+#[inline]
+const fn default_focus_boost() -> f64 {
+    10.0
 }
 
 #[inline]
@@ -235,6 +257,27 @@ mod tests {
         };
         let err = cfg.validate().unwrap_err();
         assert!(err.field_errors().contains_key("base_priority"));
+    }
+
+    #[test]
+    fn focus_boost_below_one_nan_or_infinite_is_invalid() {
+        for focus_boost in [0.99, 0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let cfg = ProberConfig {
+                focus_boost,
+                ..Default::default()
+            };
+            let err = cfg.validate().unwrap_err();
+            assert!(err.field_errors().contains_key("focus_boost"), "{focus_boost}");
+        }
+    }
+
+    #[test]
+    fn focus_boost_of_one_is_valid() {
+        let cfg = ProberConfig {
+            focus_boost: 1.0,
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

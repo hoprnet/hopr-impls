@@ -21,7 +21,7 @@
 
 #![allow(dead_code)] // Each integration test binary uses a different subset of the harness.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use hopr_api::{
     OffchainPublicKey,
@@ -33,7 +33,8 @@ use hopr_api::{
     types::crypto::prelude::{Keypair, OffchainKeypair},
 };
 use hopr_network_graph::{
-    ChannelGraph, DEFAULT_EDGE_PENALTY, DEFAULT_MAX_PLAUSIBLE_LOOPBACK_RTT, DEFAULT_MIN_ACK_RATE, Observations,
+    ChannelGraph, DEFAULT_EDGE_PENALTY, DEFAULT_MAX_PLAUSIBLE_LOOPBACK_RTT, DEFAULT_MIN_ACK_RATE, FocusedLoopback,
+    Observations,
 };
 
 /// A whole network, as one JSON object.
@@ -298,6 +299,19 @@ impl Net {
             .simple_loopback_to_self(hops, None)
             .into_iter()
             .map(|(nodes, path_id)| (nodes.iter().map(|key| self.name(key)).collect(), path_id))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Loops of exactly `hops` relays whose last relay is one of `exits`, by name, sorted.
+    pub fn loopback_ending_at(&self, hops: usize, exits: &[&str]) -> Vec<Vec<String>> {
+        let exits: HashSet<OffchainPublicKey> = exits.iter().map(|name| self.key(name)).collect();
+        let mut out: Vec<Vec<String>> = self
+            .graph
+            .loopback_ending_at(hops, None, &exits)
+            .into_iter()
+            .map(|(nodes, _)| nodes.iter().map(|key| self.name(key)).collect())
             .collect();
         out.sort();
         out
