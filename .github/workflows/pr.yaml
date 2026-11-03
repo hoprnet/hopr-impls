@@ -81,6 +81,50 @@ jobs:
           if [[ "$HEAD_REPO" != "$BASE_REPO" ]]; then
             gh pr edit "$PR_NUMBER" --add-label "external"
           fi
+  # ── Cargo dependency policy ────────────────────────────────────────────────
+  cargo-policy:
+    name: Cargo policy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          disable-sudo: true
+          egress-policy: audit
+      - name: Checkout repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      # The check itself comes from the base revision, so a pull request cannot
+      # weaken the check it has to pass.
+      - name: Checkout base revision of the policy check
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          path: .policy-check
+          persist-credentials: false
+      - name: Select the policy check revision
+        # Falls back to this branch while the check is being introduced.
+        run: |
+          base=.policy-check/.github/scripts
+          scripts=$base
+          [ -d "$base" ] || scripts=.github/scripts
+          echo "POLICY_SCRIPTS=$scripts" >> "$GITHUB_ENV"
+          # The tests only matter when the check itself changed.
+          if cmp -s "$base/check_cargo_policy.py" .github/scripts/check_cargo_policy.py; then
+            echo "POLICY_CHECK_CHANGED=false" >> "$GITHUB_ENV"
+          else
+            echo "POLICY_CHECK_CHANGED=true" >> "$GITHUB_ENV"
+          fi
+      - name: Test the dependency policy check
+        if: env.POLICY_CHECK_CHANGED == 'true'
+        run: python3 -m unittest discover -s "$POLICY_SCRIPTS" -p 'test_*.py'
+      # Protected branches must not depend on Cargo [patch] sections or git
+      # sources; see https://github.com/hoprnet/hopr-devops/issues/345.
+      - name: Reject Cargo patches and git dependencies
+        run: python3 "$POLICY_SCRIPTS/check_cargo_policy.py" .
   # ── Shared checks (lint, pre-commit, audit) ─────────────────────────────────
   checks:
     name: Check
