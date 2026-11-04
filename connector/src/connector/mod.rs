@@ -42,6 +42,7 @@ mod sequencer;
 #[cfg(test)]
 pub(crate) mod service_fixtures;
 mod services;
+pub(crate) mod state_reads;
 mod tickets;
 mod values;
 
@@ -349,6 +350,8 @@ pub struct HoprBlockchainConnector<C, B, P, R> {
     client: std::sync::Arc<C>,
     graph: std::sync::Arc<parking_lot::RwLock<DiGraphMap<HoprKeyIdent, ChannelId, ahash::RandomState>>>,
     backend: std::sync::Arc<B>,
+    // Public remote accounts observed by this connection; independent of backend scans.
+    announced: std::sync::Arc<parking_lot::RwLock<std::collections::HashSet<HoprKeyIdent>>>,
     connection_handle: Option<AbortHandle>,
     sequencer: TransactionSequencer<C, R>,
     events: EventsChannel,
@@ -407,6 +410,7 @@ where
                 ahash::RandomState::default(),
             ))),
             backend: backend.clone(),
+            announced: Default::default(),
             connection_handle: None,
             sequencer: TransactionSequencer::new(chain_key.clone(), client.clone(), cfg.nonce_gap_tolerance),
             events: (events_tx, events_rx.deactivate()),
@@ -476,6 +480,7 @@ where
         let mapper = self.mapper.clone();
         let backend = self.backend.clone();
         let graph = self.graph.clone();
+        let announced = self.announced.clone();
         let event_tx = self.events.0.clone();
         let me = self.chain_key.public().to_address();
         let values_cache = self.values.clone();
@@ -592,6 +597,7 @@ where
                 .and_then(move |account| {
                     let graph = graph_clone.clone();
                     let mapper = mapper.clone();
+                    let announced = announced.clone();
                     let chain_to_packet = chain_to_packet.clone();
                     let packet_to_chain = packet_to_chain.clone();
                     hopr_utils::runtime::prelude::spawn_blocking(move || {
@@ -604,6 +610,7 @@ where
                             .backend
                             .insert_account(account.clone())
                             .map_err(ConnectorError::backend)?;
+                        accounts::update_announced(&announced, &account, &me);
                         if let Some(old_account) = &old {
                             if old_account.chain_addr != account.chain_addr {
                                 chain_to_packet.invalidate(&old_account.chain_addr);
@@ -958,6 +965,7 @@ where
             return Err(ConnectorError::InvalidState("connector is already connected"));
         }
 
+        self.announced.write().clear();
         self.health.store(ChainHealthState::Connecting, AtomicOrdering::Relaxed);
 
         let abort_handle = match self

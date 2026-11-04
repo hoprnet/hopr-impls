@@ -11,7 +11,7 @@ name                   = "hopr-chain-connector"
 readme                 = "README.md"
 repository.workspace   = true
 rust-version.workspace = true
-version                = "0.31.0"
+version                = "0.31.1"
 
 [features]
 runtime-tokio = ["hopr-utils/runtime-tokio"]
@@ -34,6 +34,7 @@ parking_lot         = { workspace = true }
 petgraph            = { workspace = true, features = ["graphmap", "rayon"] }
 postcard            = { workspace = true }
 redb                = { workspace = true }
+serde               = { workspace = true }
 serde_json          = { workspace = true }
 smart-default       = { workspace = true }
 tempfile            = { workspace = true }
@@ -54,6 +55,7 @@ hopr-utils = { workspace = true, features = ["runtime-tokio"] }
 blokli-client = { workspace = true, features = ["testing"] }
 const-hex = { workspace = true }
 hex-literal = { workspace = true }
+hopr-network-graph = { path = "../graph", version = "0.10.1" }
 hopr-utils = { workspace = true, features = [
   "runtime-tokio",
   "testing-blokli",

@@ -20,6 +20,20 @@ use crate::{
     backend::Backend, connector::HoprBlockchainConnector, errors::ConnectorError, utils::model_to_account_entry,
 };
 
+/// Subscription replays replace membership rather than incrementing a counter twice.
+pub(super) fn update_announced(
+    announced: &parking_lot::RwLock<std::collections::HashSet<hopr_api::chain::HoprKeyIdent>>,
+    account: &AccountEntry,
+    me: &Address,
+) {
+    let mut public = announced.write();
+    if account.chain_addr != *me && account.has_announced_with_routing_info() {
+        public.insert(account.key_id);
+    } else {
+        public.remove(&account.key_id);
+    }
+}
+
 impl<B, C, P, R> HoprBlockchainConnector<C, B, P, R>
 where
     B: Backend + Send + Sync + 'static,
