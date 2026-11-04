@@ -6,7 +6,7 @@ Part of the [HOPR](https://hoprnet.org/) protocol implementation.
 
 ## Compact operational state dump
 
-`state_dump` provides the reusable part of [issue #46](https://github.com/hoprnet/hopr-impls/issues/46), using chain, graph and network read
+Enable the `state-dump` feature to get the `state_dump` module. It provides the reusable part of [issue #46](https://github.com/hoprnet/hopr-impls/issues/46), using chain, graph and network read
 traits plus the connector's error-preserving `StateRead` diagnostic interface. The embedding node supplies the views, connects the routing,
 SURB and probe producers, and starts the reporter.
 

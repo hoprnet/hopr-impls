@@ -42,6 +42,7 @@ mod sequencer;
 #[cfg(test)]
 pub(crate) mod service_fixtures;
 mod services;
+#[cfg(feature = "state-dump")]
 pub(crate) mod state_reads;
 mod tickets;
 mod values;
