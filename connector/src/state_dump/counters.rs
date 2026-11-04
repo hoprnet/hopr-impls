@@ -1,5 +1,11 @@
 //! Bounded inputs recorded at routing/SURB producers. This module knows no transport implementation.
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Instant,
+};
 
 use hopr_api::{OffchainPublicKey, graph::ForwardAndReturnPath, types::internal::NodeId};
 use parking_lot::Mutex;
@@ -177,20 +183,41 @@ impl Default for Window {
         }
     }
 }
+/// Events recorded while another thread held the window lock. Path resolutions and SURB mints run on
+/// the packet path, so a routine success never waits for the lock: it is counted here and added to the
+/// totals and the overflow when the window is taken.
+#[derive(Default)]
+struct Busy {
+    resolutions: AtomicU64,
+    minted: AtomicU64,
+    returned: AtomicU64,
+}
+
+#[derive(Default)]
+struct Shared {
+    window: Mutex<Window>,
+    busy: Busy,
+}
+
 /// A shareable producer handle. Wire it only when reporting is enabled; use one consumer per node.
 #[derive(Clone, Default)]
-pub struct IntervalCounters(Arc<Mutex<Window>>);
+pub struct IntervalCounters(Arc<Shared>);
 impl IntervalCounters {
     /// Register a probe producer before it starts. Idle windows then report real zeros.
     /// Without registration (or any probe observation), `probes` is null/unavailable.
     pub fn enable_probes(&self) {
-        self.0.lock().data.probes.get_or_insert_with(ProbeSnapshot::default);
+        self.0
+            .window
+            .lock()
+            .data
+            .probes
+            .get_or_insert_with(ProbeSnapshot::default);
     }
 
     /// Record one completed neighbor probe: true is a received reply, false an actual timeout.
     /// Failed peers displace healthy samples; evicted observations remain in overflow.
     pub fn neighbor_probe(&self, peer: NodeId, succeeded: bool) {
-        let mut window = self.0.lock();
+        let mut window = self.0.window.lock();
         let probes = window.data.probes.get_or_insert_with(ProbeSnapshot::default);
         probes.neighbor.record(succeeded);
         if let Some(row) = probes.peers.iter_mut().find(|row| row.peer == peer) {
@@ -222,6 +249,7 @@ impl IntervalCounters {
     /// Record a successful loopback return or an actual loopback expiry.
     pub fn loopback_probe(&self, succeeded: bool) {
         self.0
+            .window
             .lock()
             .data
             .probes
@@ -231,16 +259,22 @@ impl IntervalCounters {
     }
 
     /// Record a resolver call, including cache hits; this does not fabricate a search.
+    ///
+    /// A success never waits for the lock: when another thread holds it, the success is only counted
+    /// in the totals and the overflow. A failure always reaches its destination row.
     pub fn resolution(&self, direction: Direction, destination: NodeId, succeeded: bool) {
-        self.record(
-            direction,
-            destination,
-            PathCounts {
-                succeeded: u64::from(succeeded),
-                failed: u64::from(!succeeded),
-                ..Default::default()
-            },
-        );
+        let counts = PathCounts {
+            succeeded: u64::from(succeeded),
+            failed: u64::from(!succeeded),
+            ..Default::default()
+        };
+        if !succeeded {
+            self.record(direction, destination, counts);
+        } else if let Some(mut window) = self.0.window.try_lock() {
+            record_path(&mut window.data, direction, destination, counts);
+        } else {
+            self.0.busy.resolutions.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Record an actual selector query, including an empty result and optional phase 2.
@@ -263,88 +297,163 @@ impl IntervalCounters {
     }
 
     fn record(&self, direction: Direction, destination: NodeId, counts: PathCounts) {
-        let mut window = self.0.lock();
-        let data = &mut window.data;
-        data.totals.add(counts);
-        let mut index = data
-            .destinations
-            .iter()
-            .position(|r| r.direction == direction && r.destination == destination);
-        if index.is_none() {
-            let partial = data.destinations.len() == MAX_DESTINATIONS;
-            if partial {
-                let victim = counts
-                    .problematic()
-                    .then(|| data.destinations.iter().position(|r| !r.counts.problematic()))
-                    .flatten();
-                if let Some(i) = victim {
-                    let row = data.destinations.remove(i);
-                    data.destinations_overflow.add(row.counts);
-                } else {
-                    data.destinations_overflow.add(counts);
-                    return;
-                }
-            }
-            data.destinations.push(Destination {
-                direction,
-                destination,
-                counts: PathCounts::default(),
-                partial_window: partial,
-            });
-            index = Some(data.destinations.len() - 1);
-        }
-        if let Some(i) = index {
-            data.destinations[i].counts.add(counts);
-        }
+        record_path(&mut self.0.window.lock().data, direction, destination, counts);
     }
 
-    /// Count mint or return events independently of the graph telemetry consumer.
+    /// Count mint or return events independently of the graph telemetry consumer. This never waits
+    /// for the lock: when another thread holds it, the events are only counted in the totals and the
+    /// overflow.
     pub fn surb(&self, destination: OffchainPublicKey, paths: ForwardAndReturnPath, counts: SurbCounts) {
-        let mut window = self.0.lock();
-        let data = &mut window.data;
-        data.surb_totals.add(counts);
-        let mut index = data.surbs.iter().position(|r| r.destination == destination);
-        if index.is_none() {
-            if data.surbs.len() == MAX_SURB_DESTINATIONS {
-                data.surbs_overflow.add(counts);
-                return;
-            }
-            data.surbs.push(SurbDestination {
-                destination,
-                pairs: Vec::new(),
-                overflow: SurbCounts::default(),
-            });
-            index = Some(data.surbs.len() - 1);
-        }
-        if let Some(i) = index {
-            let group = &mut data.surbs[i];
-            if let Some(row) = group
-                .pairs
-                .iter_mut()
-                .find(|r| r.forward == paths.forward && r.reply == paths.reply)
-            {
-                row.counts.add(counts);
-            } else if group.pairs.len() < MAX_SURB_PAIRS {
-                group.pairs.push(SurbPair {
-                    forward: paths.forward,
-                    reply: paths.reply,
-                    counts,
-                });
-            } else {
-                group.overflow.add(counts);
-            }
+        if let Some(mut window) = self.0.window.try_lock() {
+            record_surb(&mut window.data, destination, paths, counts);
+        } else {
+            self.0.busy.minted.fetch_add(counts.minted, Ordering::Relaxed);
+            self.0.busy.returned.fetch_add(counts.returned, Ordering::Relaxed);
         }
     }
 
     /// Atomically take/reset only these counters. No graph, routing cache, or SURB state is touched.
     pub fn take_snapshot(&self) -> IntervalSnapshot {
-        let mut guard = self.0.lock();
+        let mut guard = self.0.window.lock();
         let probes_enabled = guard.data.probes.is_some();
         let mut w = std::mem::take(&mut *guard);
         if probes_enabled {
             guard.data.probes = Some(ProbeSnapshot::default());
         }
+        // Taken under the lock, so an event counted after this belongs to the next window.
+        let busy = PathCounts {
+            succeeded: self.0.busy.resolutions.swap(0, Ordering::Relaxed),
+            ..Default::default()
+        };
+        w.data.totals.add(busy);
+        w.data.destinations_overflow.add(busy);
+        let busy = SurbCounts {
+            minted: self.0.busy.minted.swap(0, Ordering::Relaxed),
+            returned: self.0.busy.returned.swap(0, Ordering::Relaxed),
+        };
+        w.data.surb_totals.add(busy);
+        w.data.surbs_overflow.add(busy);
         w.data.window_ms = w.started.elapsed().as_millis().min(u64::MAX as u128) as u64;
         w.data
+    }
+}
+
+fn record_path(data: &mut IntervalSnapshot, direction: Direction, destination: NodeId, counts: PathCounts) {
+    data.totals.add(counts);
+    let mut index = data
+        .destinations
+        .iter()
+        .position(|r| r.direction == direction && r.destination == destination);
+    if index.is_none() {
+        let partial = data.destinations.len() == MAX_DESTINATIONS;
+        if partial {
+            let victim = counts
+                .problematic()
+                .then(|| data.destinations.iter().position(|r| !r.counts.problematic()))
+                .flatten();
+            if let Some(i) = victim {
+                let row = data.destinations.remove(i);
+                data.destinations_overflow.add(row.counts);
+            } else {
+                data.destinations_overflow.add(counts);
+                return;
+            }
+        }
+        data.destinations.push(Destination {
+            direction,
+            destination,
+            counts: PathCounts::default(),
+            partial_window: partial,
+        });
+        index = Some(data.destinations.len() - 1);
+    }
+    if let Some(i) = index {
+        data.destinations[i].counts.add(counts);
+    }
+}
+
+fn record_surb(
+    data: &mut IntervalSnapshot,
+    destination: OffchainPublicKey,
+    paths: ForwardAndReturnPath,
+    counts: SurbCounts,
+) {
+    data.surb_totals.add(counts);
+    let mut index = data.surbs.iter().position(|r| r.destination == destination);
+    if index.is_none() {
+        if data.surbs.len() == MAX_SURB_DESTINATIONS {
+            data.surbs_overflow.add(counts);
+            return;
+        }
+        data.surbs.push(SurbDestination {
+            destination,
+            pairs: Vec::new(),
+            overflow: SurbCounts::default(),
+        });
+        index = Some(data.surbs.len() - 1);
+    }
+    if let Some(i) = index {
+        let group = &mut data.surbs[i];
+        if let Some(row) = group
+            .pairs
+            .iter_mut()
+            .find(|r| r.forward == paths.forward && r.reply == paths.reply)
+        {
+            row.counts.add(counts);
+        } else if group.pairs.len() < MAX_SURB_PAIRS {
+            group.pairs.push(SurbPair {
+                forward: paths.forward,
+                reply: paths.reply,
+                counts,
+            });
+        } else {
+            group.overflow.add(counts);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use hopr_api::types::{
+        crypto::prelude::{Keypair, OffchainKeypair},
+        primitive::prelude::Address,
+    };
+
+    use super::*;
+
+    #[test]
+    fn a_success_never_waits_for_the_window_lock() -> anyhow::Result<()> {
+        let counters = IntervalCounters::default();
+        let destination = NodeId::Chain(Address::from([1; 20]));
+        let surb_destination = *OffchainKeypair::from_secret(&[1; 32])?.public();
+        let paths = ForwardAndReturnPath {
+            forward: [1; 5],
+            reply: [2; 5],
+        };
+        {
+            // Held as if the reporter were taking the window: these calls must return at once.
+            let _held = counters.0.window.lock();
+            counters.resolution(Direction::Forward, destination, true);
+            counters.surb(surb_destination, paths, SurbCounts { minted: 2, returned: 1 });
+        }
+        counters.resolution(Direction::Forward, destination, false);
+
+        let snapshot = counters.take_snapshot();
+        assert_eq!((snapshot.totals.succeeded, snapshot.totals.failed), (1, 1));
+        assert_eq!(
+            snapshot.destinations_overflow.succeeded, 1,
+            "the busy success is counted, not lost"
+        );
+        assert_eq!(
+            snapshot.destinations()[0].counts.failed,
+            1,
+            "a failure always reaches its row"
+        );
+        assert_eq!((snapshot.surb_totals.minted, snapshot.surb_totals.returned), (2, 1));
+        assert_eq!(snapshot.surbs_overflow.minted, 2);
+
+        let next = counters.take_snapshot();
+        assert_eq!(next.totals.succeeded, 0, "busy counts belong to one window only");
+        Ok(())
     }
 }
