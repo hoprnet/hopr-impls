@@ -15,7 +15,6 @@ version                = "0.31.1"
 
 [features]
 runtime-tokio = ["hopr-utils/runtime-tokio"]
-state-dump    = []
 testing       = ["hopr-utils/testing-blokli"]
 
 [dependencies]

@@ -22,7 +22,6 @@ use crate::{
 
 /// Apply a successful backend replacement to the public remote-account count.
 /// The backend's previous value makes replayed announcements idempotent.
-#[cfg(feature = "state-dump")]
 pub(super) fn update_announced(
     announced: &std::sync::atomic::AtomicU64,
     account: &AccountEntry,
