@@ -25,8 +25,10 @@ SURB and probe producers, and starts the reporter.
 Each interval, including idle intervals, emits one INFO event with `event=node_state` and a JSON `state` field containing:
 
 - Exact Safe balance and allowance in decimal token base units.
-- Source-visible local channel totals by direction/status, open-channel funding histogram and up to four problematic channels, including
-  counterparty, balance, below-face-value flag, graph `is_connected`, transport connectivity and probe success rate.
+- Source-visible local channel totals by direction/status, a funding histogram of open outgoing channels, up to sixteen underfunded
+  outgoing channels (lowest balance first, the rest counted in `underfunded_omitted`) and up to four problematic channels, including
+  counterparty, balance, below-face-value flag, graph `is_connected`, transport connectivity and probe success rate. Incoming channels are
+  funded by their counterparty, so they are not counted as underfunded.
 - Connected, publicly announced and distinct open-channel peer counts (excluding the local announcement).
 - Resolution/search totals and up to eight destination/direction samples with phase-1/phase-2 counts. Failures and empty searches displace
   healthy samples; overflow preserves aggregate counts and replacement samples mark `partial_window`.

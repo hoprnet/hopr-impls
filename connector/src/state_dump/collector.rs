@@ -25,6 +25,8 @@ use super::{Amount, ChannelDirection, ChannelSample, Channels, IntervalCounters,
 
 /// Cap per-node channel detail independently of network size.
 pub const MAX_CHANNEL_SAMPLES: usize = 4;
+/// Most underfunded outgoing channels listed by name; the rest are only counted.
+pub const MAX_UNDERFUNDED_SAMPLES: usize = 16;
 /// Bound the serialized snapshot payload, excluding the embedding logger's envelope.
 pub const MAX_SNAPSHOT_BYTES: usize = 32 * 1024;
 /// Most extra sections one collector accepts; later ones are ignored.
@@ -334,6 +336,7 @@ where
             && summary.reads.join_errors == 0
             && summary.reads.identity_errors == 0;
         summary.omitted = summary.problematic.saturating_sub(summary.sample.len() as u64);
+        summary.underfunded_omitted = summary.funding.below.saturating_sub(summary.underfunded.len() as u64);
         if summary.reads.complete {
             Section::Ok { value: summary }
         } else {
@@ -384,8 +387,12 @@ impl Channels {
         if status == "closed" {
             return;
         }
-        let below = self.funding_value.map(|f| c.balance.amount() < f.0);
-        if open {
+        // Only outgoing channels are this node's to fund.
+        let outgoing = direction == ChannelDirection::Outgoing;
+        let below = outgoing
+            .then(|| self.funding_value.map(|f| c.balance.amount() < f.0))
+            .flatten();
+        if open && outgoing {
             match self.funding_value {
                 None => self.funding.unknown += 1,
                 Some(face) => match c.balance.amount().cmp(&face.0) {
@@ -406,30 +413,36 @@ impl Channels {
             self.peers.poor_probe += u64::from(poor);
             self.peers.probe_unknown += u64::from(probe.is_none());
         }
+        let peer = if outgoing { c.destination } else { c.source };
+        let row = || ChannelSample {
+            counterparty: peer,
+            direction,
+            status,
+            balance: Amount(c.balance.amount()),
+            below_funding_value: below,
+            is_connected: connected,
+            transport_connected,
+            probe_success_rate: probe,
+        };
+        if open && below == Some(true) {
+            self.underfunded.push(row());
+            self.underfunded.sort_by(|a, b| {
+                a.balance
+                    .cmp(&b.balance)
+                    .then_with(|| a.counterparty.as_ref().cmp(b.counterparty.as_ref()))
+            });
+            self.underfunded.truncate(MAX_UNDERFUNDED_SAMPLES);
+        }
         if !open
             || below == Some(true)
             || connected != Some(true)
-            || below.is_none()
+            || (outgoing && below.is_none())
             || transport_connected != Some(true)
             || poor
             || probe.is_none()
         {
             self.problematic += 1;
-            let peer = if direction == ChannelDirection::Outgoing {
-                c.destination
-            } else {
-                c.source
-            };
-            self.sample.push(ChannelSample {
-                counterparty: peer,
-                direction,
-                status,
-                balance: Amount(c.balance.amount()),
-                below_funding_value: below,
-                is_connected: connected,
-                transport_connected,
-                probe_success_rate: probe,
-            });
+            self.sample.push(row());
             self.sample.sort_by(|a, b| {
                 priority(b)
                     .cmp(&priority(a))
@@ -509,6 +522,53 @@ mod tests {
             true,
         );
         assert!(observed.sample().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn only_outgoing_channels_count_as_underfunded_and_the_lowest_are_listed() -> anyhow::Result<()> {
+        let me = Address::from([1; 20]);
+        let mut channels = Channels {
+            funding_value: Some(Amount(10u32.into())),
+            ..Default::default()
+        };
+        let healthy = |c: &mut Channels, channel: &ChannelEntry, direction| {
+            c.record(channel, direction, Some(true), Some(true), Some(1.0), true)
+        };
+        // An incoming channel below the face value is the counterparty's to fund.
+        let incoming = ChannelEntry::builder()
+            .between(Address::from([2; 20]), me)
+            .amount(1)
+            .status(ChannelStatus::Open)
+            .build()?;
+        healthy(&mut channels, &incoming, ChannelDirection::Incoming);
+        assert_eq!(channels.funding.below, 0);
+        assert!(channels.underfunded().is_empty());
+        assert!(
+            channels.sample().is_empty(),
+            "a healthy incoming channel is not a problem"
+        );
+
+        for i in 0..(MAX_UNDERFUNDED_SAMPLES as u8 + 3) {
+            let outgoing = ChannelEntry::builder()
+                .between(me, Address::from([100 + i; 20]))
+                .amount(u32::from(i % 9) + 1)
+                .status(ChannelStatus::Open)
+                .build()?;
+            healthy(&mut channels, &outgoing, ChannelDirection::Outgoing);
+        }
+        assert_eq!(channels.funding.below, MAX_UNDERFUNDED_SAMPLES as u64 + 3);
+        assert_eq!(channels.underfunded().len(), MAX_UNDERFUNDED_SAMPLES);
+        assert!(
+            channels.underfunded().windows(2).all(|w| w[0].balance <= w[1].balance),
+            "lowest balance first"
+        );
+        assert!(
+            channels
+                .underfunded()
+                .iter()
+                .all(|c| c.direction == ChannelDirection::Outgoing && c.below_funding_value == Some(true))
+        );
         Ok(())
     }
 }

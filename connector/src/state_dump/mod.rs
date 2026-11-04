@@ -8,7 +8,7 @@ mod counters;
 mod model;
 pub use collector::{
     Collector, Config, ConfigError, EncodeError, MAX_CHANNEL_SAMPLES, MAX_SECTION_BYTES, MAX_SECTIONS,
-    MAX_SNAPSHOT_BYTES,
+    MAX_SNAPSHOT_BYTES, MAX_UNDERFUNDED_SAMPLES,
 };
 pub use counters::{
     Direction, IntervalCounters, IntervalSnapshot, MAX_DESTINATIONS, MAX_PROBE_PEERS, MAX_SURB_DESTINATIONS,

@@ -61,7 +61,8 @@ pub struct StatusCounts {
     pub open: u64,
     pub pending_to_close: u64,
 }
-/// Open-channel funding relative to one winning-ticket face value.
+/// Open outgoing-channel funding relative to one winning-ticket face value. Incoming channels are
+/// funded by their counterparty, so they are not counted.
 #[derive(Debug, Default, Serialize)]
 pub struct FundingCounts {
     pub below: u64,
@@ -86,6 +87,8 @@ pub struct ChannelSample {
     pub direction: ChannelDirection,
     pub status: &'static str,
     pub balance: Amount,
+    /// Whether an outgoing channel holds less than one winning ticket. Always `None` for incoming
+    /// channels, which this node does not fund.
     pub below_funding_value: Option<bool>,
     /// Last graph connectivity observation, as present in edge-observation logs.
     pub is_connected: Option<bool>,
@@ -126,11 +129,20 @@ pub struct Channels {
     pub problematic: u64,
     pub omitted: u64,
     pub(crate) sample: Vec<ChannelSample>,
+    /// Open outgoing channels below the funding value that did not fit in `underfunded`.
+    pub underfunded_omitted: u64,
+    pub(crate) underfunded: Vec<ChannelSample>,
 }
 impl Channels {
     /// At most four retained problematic channels.
     pub fn sample(&self) -> &[ChannelSample] {
         &self.sample
+    }
+
+    /// Open outgoing channels below the funding value, lowest balance first. At most
+    /// [`MAX_UNDERFUNDED_SAMPLES`](super::MAX_UNDERFUNDED_SAMPLES).
+    pub fn underfunded(&self) -> &[ChannelSample] {
+        &self.underfunded
     }
 }
 /// One compact node snapshot. Source reads are not an atomic chain snapshot.

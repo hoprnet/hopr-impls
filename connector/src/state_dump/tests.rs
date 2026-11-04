@@ -281,8 +281,17 @@ async fn real_sources_are_collected_and_info_reporter_emits_idle_ticks() -> anyh
     assert_eq!(first["channels"]["value"]["outgoing"]["open"], 101);
     assert_eq!(first["channels"]["value"]["incoming"]["open"], 1);
     assert_eq!(first["channels"]["value"]["funding"]["below"], 1);
-    assert_eq!(first["channels"]["value"]["funding"]["equal"], 1);
+    assert_eq!(
+        first["channels"]["value"]["funding"]["equal"], 0,
+        "the open incoming channel is funded by its counterparty, not counted here"
+    );
     assert_eq!(first["channels"]["value"]["funding"]["above"], 100);
+    assert_eq!(
+        first["channels"]["value"]["underfunded"].as_array().map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(first["channels"]["value"]["underfunded"][0]["balance"], "0");
+    assert_eq!(first["channels"]["value"]["underfunded_omitted"], 0);
     assert_eq!(first["channels"]["value"]["sample"].as_array().map(Vec::len), Some(4));
     assert_eq!(first["channels"]["value"]["sample"][0]["balance"], "0");
     assert_eq!(first["channels"]["value"]["sample"][0]["below_funding_value"], true);
@@ -507,6 +516,19 @@ fn saturated_payload_keeps_sibling_details_and_exact_amounts_within_budget() -> 
                 probe_success_rate: Some(0.0),
             })
             .collect(),
+        underfunded: (0..MAX_UNDERFUNDED_SAMPLES)
+            .map(|i| ChannelSample {
+                counterparty: Address::from([i as u8; 20]),
+                direction: ChannelDirection::Outgoing,
+                status: "open",
+                balance: amount,
+                below_funding_value: Some(true),
+                is_connected: Some(false),
+                transport_connected: Some(false),
+                probe_success_rate: Some(0.0),
+            })
+            .collect(),
+        underfunded_omitted: u64::MAX,
         ..Default::default()
     };
     let snapshot = Snapshot {
