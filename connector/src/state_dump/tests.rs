@@ -528,6 +528,12 @@ fn saturated_payload_keeps_sibling_details_and_exact_amounts_within_budget() -> 
         routing: Section::Ok {
             value: counters.take_snapshot(),
         },
+        // Every extra section as large as one may be.
+        sections: ["a", "b", "c", "d"]
+            .into_iter()
+            .take(MAX_SECTIONS)
+            .map(|name| (name, Value::String("x".repeat(MAX_SECTION_BYTES - 2))))
+            .collect(),
     };
     let json = snapshot.to_json()?;
     assert!(json.len() <= MAX_SNAPSHOT_BYTES);
@@ -585,6 +591,43 @@ async fn failing_or_hung_sources_do_not_hide_other_collected_sections() -> anyho
     assert_eq!(snapshot.safe_allowance.value().map(|a| a.value()), Some(7u32.into()));
     Ok(())
 }
+#[tokio::test]
+async fn extra_sections_are_read_per_record_and_capped() -> anyhow::Result<()> {
+    use crate::testing::create_test_blokli_connector;
+    let me = ChainKeypair::from_secret(&[1; 32])?;
+    let safe = Address::from([88; 20]);
+    let client = BlokliTestStateBuilder::default().build_static_client();
+    let chain = create_test_blokli_connector(&me, client, Address::from([99; 20])).await?;
+    let reads = Arc::new(AtomicUsize::new(0));
+    let collector = Collector::new(
+        chain,
+        ChannelGraph::new(packet(11)?),
+        Network::default(),
+        safe,
+        Config::default().with_source_timeout(Duration::from_millis(10))?,
+    )
+    .with_section("strategies", {
+        let reads = reads.clone();
+        move || {
+            reads.fetch_add(1, Ordering::Relaxed);
+            serde_json::json!([{ "name": "auto_funding", "state": "Degraded" }])
+        }
+    })
+    .with_section("huge", || Value::String("x".repeat(MAX_SECTION_BYTES)))
+    .with_section("c", || Value::Null)
+    .with_section("d", || Value::Null)
+    .with_section("ignored", || Value::Null);
+
+    let first: Value = serde_json::from_str(&collector.collect(None).await.to_json()?)?;
+    let second = collector.collect(None).await;
+    assert_eq!(reads.load(Ordering::Relaxed), 2, "a section is read once per record");
+    assert_eq!(first["sections"]["strategies"][0]["state"], "Degraded");
+    assert_eq!(first["sections"]["huge"]["status"], "too_large");
+    assert_eq!(second.sections.len(), MAX_SECTIONS, "a fifth section is ignored");
+    assert!(!second.sections.contains_key("ignored"));
+    Ok(())
+}
+
 #[test]
 fn concurrent_producers_and_resets_preserve_total_events() -> anyhow::Result<()> {
     let counters = IntervalCounters::default();

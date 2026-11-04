@@ -26,7 +26,14 @@ use super::{Amount, ChannelDirection, ChannelSample, Channels, IntervalCounters,
 /// Cap per-node channel detail independently of network size.
 pub const MAX_CHANNEL_SAMPLES: usize = 4;
 /// Bound the serialized snapshot payload, excluding the embedding logger's envelope.
-pub const MAX_SNAPSHOT_BYTES: usize = 24 * 1024;
+pub const MAX_SNAPSHOT_BYTES: usize = 32 * 1024;
+/// Most extra sections one collector accepts; later ones are ignored.
+pub const MAX_SECTIONS: usize = 4;
+/// Largest serialized extra section; a larger one is replaced by a `too_large` marker.
+pub const MAX_SECTION_BYTES: usize = 2 * 1024;
+
+/// Produces one extra section per record.
+type SectionSource = Box<dyn Fn() -> serde_json::Value + Send + Sync>;
 const LOW_PROBE_RATE: f64 = 0.9;
 
 /// Validated reporter timing. No global environment mutation or runtime is needed.
@@ -126,6 +133,7 @@ pub struct Collector<C, G, N> {
     safe_address: Address,
     config: Config,
     sequence: AtomicU64,
+    sections: Vec<(&'static str, SectionSource)>,
 }
 impl<C, G, N> Collector<C, G, N>
 where
@@ -148,7 +156,44 @@ where
             safe_address,
             config,
             sequence: AtomicU64::new(0),
+            sections: Vec::new(),
         }
+    }
+
+    /// Adds a named section to every record, for state only the embedding node knows, such as the
+    /// states of its strategies. `source` is called once per record and must not block. At most
+    /// [`MAX_SECTIONS`] are kept, and each is capped at [`MAX_SECTION_BYTES`].
+    pub fn with_section(
+        mut self,
+        name: &'static str,
+        source: impl Fn() -> serde_json::Value + Send + Sync + 'static,
+    ) -> Self {
+        if self.sections.len() < MAX_SECTIONS {
+            self.sections.push((name, Box::new(source)));
+        } else {
+            tracing::warn!(
+                name,
+                max = MAX_SECTIONS,
+                "state dump section ignored: too many sections"
+            );
+        }
+        self
+    }
+
+    fn extra_sections(&self) -> std::collections::BTreeMap<&'static str, serde_json::Value> {
+        self.sections
+            .iter()
+            .map(|(name, source)| {
+                let value = source();
+                let bytes = serde_json::to_string(&value).map_or(usize::MAX, |json| json.len());
+                let value = if bytes <= MAX_SECTION_BYTES {
+                    value
+                } else {
+                    serde_json::json!({ "status": "too_large", "bytes": bytes })
+                };
+                (*name, value)
+            })
+            .collect()
     }
 
     /// Collect one snapshot on demand. None explicitly marks routing/SURB producers unavailable.
@@ -196,6 +241,7 @@ where
             routing: routing
                 .map(|value| Section::Ok { value })
                 .unwrap_or(Section::Unavailable),
+            sections: self.extra_sections(),
         }
     }
 

@@ -12,7 +12,8 @@ SURB and probe producers, and starts the reporter.
 
 - Read `state_dump::Config::from_env()`: `HOPR_STATE_DUMP_INTERVAL` defaults to 60 seconds; `0` disables reporting; enabled intervals are
   5–86400 seconds. `Config::new(seconds)` avoids environment access.
-- Create one `IntervalCounters` handle when enabled. Clone it into the resolver (`resolution`), selector (`search`, with actual phase
+- Create one `IntervalCounters` handle when enabled. Successful resolutions and SURB counts never wait for its lock: when it is busy,
+  they are added to the totals and overflow only. Clone it into the resolver (`resolution`), selector (`search`, with actual phase
   outcomes) and SURB producer (`surb`, with destination and sibling forward/reply paths). Use the same destination identity at the resolver
   and selector. For probes, call `enable_probes()` before starting the producer, then `neighbor_probe(peer, succeeded)` on a matched reply
   or actual expiry, and `loopback_probe(succeeded)` on a loopback return or expiry. These counters do not drain graph telemetry or alter
@@ -35,11 +36,13 @@ Each interval, including idle intervals, emits one INFO event with `event=node_s
   samples. Named rows and overflow sum to the aggregate neighbor counts. `partial_window` marks replacement samples. `routing.value.probes`
   is null until a producer registers or records an outcome; registration survives interval resets, so subsequent idle intervals report zero.
   This preserves timeout frequency independently of sampled graph probe success rates.
+- Up to four extra named sections from the embedding node (`Collector::with_section`), for example strategy states. Each is read once
+  per record and capped at 2 KiB; a larger one is replaced by `{"status":"too_large"}`. The `sections` key is omitted when there are none.
 
 Problem-channel sampling prioritizes underfunded open channels, then disconnection and poor probes. The 0.9 probe threshold only affects
 sampling. Unknown observations and pending closures also qualify; omitted counts expose incomplete named coverage.
 
-The payload is capped at 24 KiB, independently of peer/channel count. Each asynchronous source has a five-second deadline; failures,
+The payload is capped at 32 KiB, independently of peer/channel count. Each asynchronous source has a five-second deadline; failures,
 timeouts, unavailable inputs and real zeros remain distinct. Sources are read independently: `chain_freshness=unverified` and
 `channels.scope=source_visible` do not imply an atomic snapshot or complete historical closed-channel inventory. The connector enumerates
 only graph edges adjacent to the local account, once per dump, and reads records in batches of at most 64 per blocking task. Temporary

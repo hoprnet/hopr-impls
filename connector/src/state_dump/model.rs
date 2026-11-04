@@ -1,4 +1,6 @@
 //! Stable serializable snapshot schema. Monetary values use decimal base units.
+use std::collections::BTreeMap;
+
 use hopr_api::{OffchainPublicKey, types::primitive::prelude::Address};
 use serde::{Serialize, Serializer};
 
@@ -148,4 +150,8 @@ pub struct Snapshot {
     pub connected_peers: u64,
     pub announced_peers: Section<u64>,
     pub routing: Section<super::IntervalSnapshot>,
+    /// Extra named sections supplied by the embedding node, such as strategy states. Each one is
+    /// capped at [`MAX_SECTION_BYTES`](super::MAX_SECTION_BYTES); a larger one is replaced by a marker.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub sections: BTreeMap<&'static str, serde_json::Value>,
 }
