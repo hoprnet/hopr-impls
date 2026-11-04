@@ -59,8 +59,7 @@ source-visible, not a verified full-chain inventory. Funding-strategy pass outco
 channel reads, missing records, backend errors, join failures, identity-lookup errors, timeout and completion. Up to four error samples
 retain the failing entity and a capped message; larger error sets retain counts. A timeout keeps observations already consumed; counts
 describe observed failures, not how many unread entries might also fail. The diagnostic reader returns errors before the legacy best-effort
-streams would discard them, without changing those streams’ behavior. JSON is a representation choice: its benefit here is allowing
-operators and queries to distinguish partial totals from complete ones, not reducing read cost.
+streams would discard them, without changing those streams’ behavior.
 
 Sampled channels identify their full counterparty and direction. SURB path pairs use compact numeric forward/reply slot arrays; mapping
 those slots to peer identities requires the corresponding graph view.
@@ -73,7 +72,7 @@ jq 'select(.fields.event == "node_state") | (.fields.state? // empty) | fromjson
 
 Encoding errors emit an INFO event with `status=encoding_error` instead of a `state` payload. Logger envelopes are outside the payload
 budget. Node startup and producer wiring belong to the embedding hoprnet application. End-to-end record emission and representative runtime
-and log-volume validation remain necessary before #46 can be closed.
+and log-volume validation remain necessary before the state dump can be considered complete.
 
 ## License
 
