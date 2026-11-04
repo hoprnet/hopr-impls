@@ -20,17 +20,25 @@ use crate::{
     backend::Backend, connector::HoprBlockchainConnector, errors::ConnectorError, utils::model_to_account_entry,
 };
 
-/// Subscription replays replace membership rather than incrementing a counter twice.
+/// Apply a successful backend replacement to the public remote-account count.
+/// The backend's previous value makes replayed announcements idempotent.
+#[cfg(feature = "state-dump")]
 pub(super) fn update_announced(
-    announced: &parking_lot::RwLock<std::collections::HashSet<hopr_api::chain::HoprKeyIdent>>,
+    announced: &std::sync::atomic::AtomicU64,
     account: &AccountEntry,
+    old: Option<&AccountEntry>,
     me: &Address,
 ) {
-    let mut public = announced.write();
-    if account.chain_addr != *me && account.has_announced_with_routing_info() {
-        public.insert(account.key_id);
-    } else {
-        public.remove(&account.key_id);
+    use std::sync::atomic::Ordering;
+    let public = |a: &AccountEntry| a.chain_addr != *me && a.has_announced_with_routing_info();
+    match (old.is_some_and(public), public(account)) {
+        (false, true) => {
+            announced.fetch_add(1, Ordering::Relaxed);
+        }
+        (true, false) => {
+            announced.fetch_sub(1, Ordering::Relaxed);
+        }
+        _ => {}
     }
 }
 

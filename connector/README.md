@@ -50,8 +50,9 @@ timeouts, unavailable inputs and real zeros remain distinct. Sources are read in
 `channels.scope=source_visible` do not imply an atomic snapshot or complete historical closed-channel inventory. The connector enumerates
 only graph edges adjacent to the local account, once per dump, and reads records in batches of at most 64 per blocking task. Temporary
 channel IDs and peer deduplication use memory proportional to local channels/peers, rather than all network channels. It does not scan
-remote channels. Public remote account IDs are maintained as subscription updates arrive (one set entry per announced remote account);
-reading their count needs no backend/account scan. Replays are idempotent and a new connection rebuilds the set. These observations remain
+remote channels. An atomic counter tracks public remote accounts, using the backend’s previous account value to handle repeated updates.
+Connection startup seeds it with one backend scan; periodic reads allocate no identity set and perform no account scan. Reconnects reseed
+the counter before subscription replay. Custom `Backend` implementations must provide `count_announced_accounts`. These observations remain
 source-visible, not a verified full-chain inventory. Funding-strategy pass outcomes remain external to this module.
 
 `channels.status=partial` means collected observations remain useful but coverage is incomplete. `channels.value.reads` reports successful

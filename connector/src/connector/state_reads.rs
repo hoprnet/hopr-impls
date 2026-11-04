@@ -15,7 +15,7 @@ pub struct ReadFailure {
 /// Implementations must enumerate each local channel once and preserve individual failures.
 pub trait StateRead: Sync {
     fn local_channels(&self) -> Result<BoxStream<'_, Result<ChannelEntry, ReadFailure>>, String>;
-    /// Public remote accounts observed by the connector, excluding the local account.
+    /// Public remote accounts stored by the connector, excluding the local account.
     fn announced_count(&self) -> Result<u64, String>;
 }
 impl<T: StateRead + ?Sized> StateRead for &T {
@@ -48,7 +48,7 @@ where
 {
     fn announced_count(&self) -> Result<u64, String> {
         self.check_connection_state().map_err(|e| e.to_string())?;
-        Ok(self.announced.read().len() as u64)
+        Ok(self.announced.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     fn local_channels(&self) -> Result<BoxStream<'_, Result<ChannelEntry, ReadFailure>>, String> {
@@ -169,6 +169,10 @@ mod tests {
     }
     impl Backend for BackendProbe {
         type Error = std::io::Error;
+
+        fn count_announced_accounts(&self, me: &Address) -> Result<u64, Self::Error> {
+            Ok(self.inner.count_announced_accounts(me).unwrap())
+        }
 
         fn insert_account(&self, a: AccountEntry) -> Result<Option<AccountEntry>, Self::Error> {
             Ok(self.inner.insert_account(a).unwrap())
@@ -297,8 +301,16 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn announced_index_handles_replay_replacement_and_local_exclusion() -> anyhow::Result<()> {
-        let index = parking_lot::RwLock::new(std::collections::HashSet::new());
+    fn announced_counter_handles_replay_replacement_and_reconnect() -> anyhow::Result<()> {
+        check_announced_counter(InMemoryBackend::default())?;
+        check_announced_counter(crate::backend::TempDbBackend::new()?)
+    }
+
+    fn check_announced_counter<B: Backend>(backend: B) -> anyhow::Result<()>
+    where
+        B::Error: Send + Sync + 'static,
+    {
+        use std::sync::atomic::{AtomicU64, Ordering};
         let me = Address::from([1; 20]);
         let mut account = AccountEntry {
             public_key: *OffchainKeypair::from_secret(&[2; 32])?.public(),
@@ -307,29 +319,34 @@ mod tests {
             safe_address: None,
             entry_type: AccountType::Announced(vec!["/ip4/1.2.3.4/tcp/1234".parse()?]),
         };
+        // A pre-populated backend is counted before its subscription replay.
+        backend.insert_account(account.clone())?;
+        let count = AtomicU64::new(backend.count_announced_accounts(&me)?);
+        let update = |account: &AccountEntry| {
+            let old = backend.insert_account(account.clone()).unwrap();
+            super::super::accounts::update_announced(&count, account, old.as_ref(), &me);
+        };
         for _ in 0..10 {
-            super::super::accounts::update_announced(&index, &account, &me);
+            update(&account);
         }
-        assert_eq!(index.read().len(), 1, "replay must not double-count");
+        assert_eq!(count.load(Ordering::Relaxed), 1);
         account.entry_type = AccountType::NotAnnounced;
-        super::super::accounts::update_announced(&index, &account, &me);
-        assert!(
-            index.read().is_empty(),
-            "an announcement replacement removes public membership"
-        );
+        update(&account);
+        assert_eq!(count.load(Ordering::Relaxed), 0);
         account.entry_type = AccountType::Announced(vec!["/ip4/1.2.3.4/tcp/1234".parse()?]);
+        update(&account);
+        assert_eq!(count.load(Ordering::Relaxed), 1);
         account.chain_addr = me;
-        super::super::accounts::update_announced(&index, &account, &me);
-        assert!(index.read().is_empty(), "local announcements are excluded");
+        update(&account);
+        assert_eq!(count.load(Ordering::Relaxed), 0, "local announcements are excluded");
         account.chain_addr = Address::from([2; 20]);
-        super::super::accounts::update_announced(&index, &account, &me);
-        index.write().clear();
-        super::super::accounts::update_announced(&index, &account, &me);
-        assert_eq!(
-            index.read().len(),
-            1,
-            "a connection rebuild accepts replayed membership"
-        );
+        update(&account);
+        count.store(backend.count_announced_accounts(&me)?, Ordering::Relaxed);
+        update(&account);
+        assert_eq!(count.load(Ordering::Relaxed), 1, "reconnect replay is idempotent");
+        account.key_id = 3u32.into();
+        update(&account);
+        assert_eq!(count.load(Ordering::Relaxed), 2, "new identities increment the count");
         Ok(())
     }
 }

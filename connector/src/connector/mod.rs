@@ -351,8 +351,9 @@ pub struct HoprBlockchainConnector<C, B, P, R> {
     client: std::sync::Arc<C>,
     graph: std::sync::Arc<parking_lot::RwLock<DiGraphMap<HoprKeyIdent, ChannelId, ahash::RandomState>>>,
     backend: std::sync::Arc<B>,
-    // Public remote accounts observed by this connection; independent of backend scans.
-    announced: std::sync::Arc<parking_lot::RwLock<std::collections::HashSet<HoprKeyIdent>>>,
+    // Public remote accounts in the backend; initialized once per connection.
+    #[cfg(feature = "state-dump")]
+    announced: std::sync::Arc<std::sync::atomic::AtomicU64>,
     connection_handle: Option<AbortHandle>,
     sequencer: TransactionSequencer<C, R>,
     events: EventsChannel,
@@ -411,6 +412,7 @@ where
                 ahash::RandomState::default(),
             ))),
             backend: backend.clone(),
+            #[cfg(feature = "state-dump")]
             announced: Default::default(),
             connection_handle: None,
             sequencer: TransactionSequencer::new(chain_key.clone(), client.clone(), cfg.nonce_gap_tolerance),
@@ -446,6 +448,20 @@ where
     }
 
     async fn do_connect(&self, timeout: Duration) -> Result<AbortHandle, ConnectorError> {
+        #[cfg(feature = "state-dump")]
+        {
+            // Seed from stored accounts before any subscription updates. This also supports
+            // pre-populated backends and reconnects without retaining duplicate identities.
+            let backend = self.backend.clone();
+            let me = self.chain_key.public().to_address();
+            let count = hopr_utils::runtime::prelude::spawn_blocking(move || {
+                backend.count_announced_accounts(&me).map_err(ConnectorError::backend)
+            })
+            .await
+            .map_err(ConnectorError::backend)??;
+            self.announced.store(count, AtomicOrdering::Relaxed);
+        }
+
         let sync_quota = self.cfg.sync_tolerance.clamp(1, 100) as f64 / 100.0;
         let min_accounts = (self
             .client
@@ -481,6 +497,7 @@ where
         let mapper = self.mapper.clone();
         let backend = self.backend.clone();
         let graph = self.graph.clone();
+        #[cfg(feature = "state-dump")]
         let announced = self.announced.clone();
         let event_tx = self.events.0.clone();
         let me = self.chain_key.public().to_address();
@@ -598,6 +615,7 @@ where
                 .and_then(move |account| {
                     let graph = graph_clone.clone();
                     let mapper = mapper.clone();
+                    #[cfg(feature = "state-dump")]
                     let announced = announced.clone();
                     let chain_to_packet = chain_to_packet.clone();
                     let packet_to_chain = packet_to_chain.clone();
@@ -611,7 +629,8 @@ where
                             .backend
                             .insert_account(account.clone())
                             .map_err(ConnectorError::backend)?;
-                        accounts::update_announced(&announced, &account, &me);
+                        #[cfg(feature = "state-dump")]
+                        accounts::update_announced(&announced, &account, old.as_ref(), &me);
                         if let Some(old_account) = &old {
                             if old_account.chain_addr != account.chain_addr {
                                 chain_to_packet.invalidate(&old_account.chain_addr);
@@ -966,7 +985,6 @@ where
             return Err(ConnectorError::InvalidState("connector is already connected"));
         }
 
-        self.announced.write().clear();
         self.health.store(ChainHealthState::Connecting, AtomicOrdering::Relaxed);
 
         let abort_handle = match self
