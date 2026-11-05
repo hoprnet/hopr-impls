@@ -144,10 +144,10 @@ jobs:
       runner_large: depot-ubuntu-24.04-4
     secrets:
       cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
-  # ── Shared tests (unit) ─────────────────────────────────────────────────────
+  # ── Stage 2: shared tests (run after checks pass) ───────────────────────────
   tests:
     name: Test
-    needs: changes
+    needs: [changes, checks]
     permissions:
       contents: read
       id-token: write # Codecov OIDC upload in the coverage job
@@ -162,10 +162,10 @@ jobs:
       test_timeout: 30
     secrets:
       cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
-  # ── Build: workspace ─────────────────────────────────────────────────────────
+  # ── Stage 3: workspace build (runs after checks and tests pass) ─────────────
   build-library:
     name: Library ${{ matrix.architecture }}
-    needs: changes
+    needs: [changes, checks, tests]
     strategy:
       fail-fast: false
       matrix:
