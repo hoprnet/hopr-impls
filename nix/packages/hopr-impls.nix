@@ -15,6 +15,7 @@
   sources,
   rev,
   nixLib,
+  craneLib,
 }:
 
 let
@@ -43,6 +44,21 @@ let
     "lib-hopr-impls-${platform}" = builders.${platform}.callPackage nixLib.mkRustPackage localArgs;
   };
 
+  # Run the doc and doctest checks over all features, like clippy does.
+  allFeaturesArgs = localArgs // {
+    cargoExtraArgs = "--workspace --all-features";
+  };
+
+  # mkRustPackage has no doc or deny mode (only mkRustLibrary does, and it needs a
+  # root package), so run them as a test derivation with a replaced check phase.
+  mkCheck =
+    checkPhase:
+    (builders.local.callPackage nixLib.mkRustPackage (allFeaturesArgs // { runTests = true; }))
+    .overrideAttrs
+      (_: {
+        inherit checkPhase;
+      });
+
   hoprImplsPlatformPackages = builtins.foldl' (a: b: a // b) { } (
     map mkHoprImplsPlatformPackage [
       "x86_64-linux"
@@ -62,5 +78,24 @@ in
       cargoExtraArgs = "--workspace --all-targets --all-features";
     }
   );
+
+  # Rustdoc with warnings denied.
+  doc = mkCheck ''
+    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
+  '';
+
+  # nextest does not run doctests.
+  test-doc = mkCheck ''
+    cargo test --doc --workspace --all-features
+  '';
+
+  # cargo deny compiles nothing, so it needs no dependency build. Advisories are
+  # covered by `nix run .#audit`, which needs network access.
+  deny = craneLib.cargoDeny {
+    pname = "hopr-impls";
+    version = "0.0.0";
+    src = sources.main;
+    cargoDenyChecks = "bans licenses sources";
+  };
 }
 // hoprImplsPlatformPackages
