@@ -179,7 +179,7 @@ jobs:
           - architecture: aarch64-darwin
             runner: depot-macos-15
             required_label: "binary:aarch64-darwin"
-    uses: hoprnet/hopr-workflows/.github/workflows/build-library.yaml@b10acc76183dc89007d30a8c97c00d7f1b75c8d3 # build-library-v3.1.4
+    uses: hoprnet/hopr-workflows/.github/workflows/build-library.yaml@bfdfd56e110ee356595faac1424b74906ed50ac9 # build-library-v3.3.2
     permissions:
       contents: read
       id-token: write
@@ -192,6 +192,8 @@ jobs:
       # workspace (`cargo release publish --workspace`); a name would pass
       # `--package hopr-impls`, which fails since there is no such crate.
       package_name: ""
+      # Cached crane build; cargo release then skips the rebuild (--no-verify).
+      build_command: "nix build -L .#lib-hopr-impls-${{ matrix.architecture }}"
       runner: ${{ matrix.runner }}
       enabled: ${{ needs.changes.outputs.rust == 'true' && (matrix.required_label == '' || github.event_name == 'merge_group' || contains(github.event.pull_request.labels.*.name, matrix.required_label)) }}
     secrets:
