@@ -38,6 +38,11 @@ Each interval, including idle intervals, emits one INFO event with `event=node_s
   scores, health and update times. Unknown measurements stay null. Missing path nodes/edges, ambiguous slots and invalid paths have explicit
   counters. Local and path samples share 3 KiB, so fewer rows may fit; omission counts preserve coverage. Path detail covers sampled SURBs,
   not every route; `graph.value.paths` is null without routing counters and has real zero counts for an available idle producer.
+- Decision-time graph-search evidence in `graph.value.searches`: cumulative search/empty counts, bounded latest forward/return query
+  examples, observed pruning reasons, rejected edge observations and a returned-path example. This can explain why an apparently present
+  path was pruned before reaching the transport selector. Examples share the 3 KiB graph budget and report omissions; these counters are
+  cumulative since graph creation, independently of the interval routing counters. Transport ranking and weighted selection are separate
+  stages and are not inferred from graph traversal output.
 - Connected, publicly announced and distinct open-channel peer counts (excluding the local announcement), including graph-connected,
   graph-disconnected and unknown counts for open-channel peers, alongside transport and probe health.
 - Resolution/search totals and up to eight destination/direction samples with phase-1/phase-2 counts. Failures and empty searches displace
