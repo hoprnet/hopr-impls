@@ -122,7 +122,7 @@ where
         max_intermediate_nodes,
         initial_cost,
         min_cost,
-        cost_fn,
+        move |c, w, i, _, _| cost_fn(c, w, i),
         |_, _, _| {},
     )
 }
@@ -158,7 +158,7 @@ where
     TargetColl: FromIterator<G::NodeId>,
     S: BuildHasher + Default,
     C: Clone + PartialOrd + 'a,
-    F: Fn(C, &<<G as IntoEdgeReferences>::EdgeRef as EdgeRef>::Weight, usize) -> C + 'a,
+    F: Fn(C, &<<G as IntoEdgeReferences>::EdgeRef as EdgeRef>::Weight, usize, G::NodeId, G::NodeId) -> C + 'a,
     O: FnMut(&IndexSet<G::NodeId, S>, &<G as IntoEdgeReferences>::EdgeRef, BranchDecision) + 'a,
 {
     let max_nodes = if let Some(l) = max_intermediate_nodes {
@@ -201,7 +201,13 @@ where
 
                 // initialized by `from` so is always at least len 1
                 let current_nodes = visited.len();
-                let new_cost = cost_fn(costs.last().unwrap().clone(), edge.weight(), current_nodes - 1);
+                let new_cost = cost_fn(
+                    costs.last().unwrap().clone(),
+                    edge.weight(),
+                    current_nodes - 1,
+                    edge.source(),
+                    child,
+                );
 
                 // Prune branch if cost drops below threshold
                 if let Some(ref min) = min_cost

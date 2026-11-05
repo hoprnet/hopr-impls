@@ -22,6 +22,7 @@
 #[cfg(feature = "petgraph")]
 pub mod petgraph;
 
+pub mod correlation;
 pub mod diagnostics;
 pub mod errors;
 #[cfg(feature = "graph-api")]

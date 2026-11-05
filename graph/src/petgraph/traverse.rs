@@ -1,4 +1,10 @@
-use std::{cell::RefCell, collections::HashSet, hash::RandomState, sync::Arc, time::Instant};
+use std::{
+    cell::{Cell, RefCell},
+    collections::HashSet,
+    hash::RandomState,
+    sync::Arc,
+    time::Instant,
+};
 
 use hopr_api::{
     OffchainPublicKey,
@@ -56,7 +62,11 @@ where
 
     let intermediates = length - 1;
 
+    let selection_id = search.selection_id;
+    let search_id = search.search_id;
+    let phase = search.phase;
     let diagnostics = RefCell::new(search);
+    let evaluation = Cell::new(0u64);
     let paths = all_simple_paths_multi_observed::<Vec<_>, _, RandomState, _, _, _>(
         &inner.graph,
         source,
@@ -66,7 +76,14 @@ where
         Some(intermediates),
         initial_value,
         min_value,
-        move |c, w, i| value_fn(c, w, i),
+        |c, w, i, from, to| {
+            evaluation.set(evaluation.get().saturating_add(1));
+            let edge_evaluation_id = evaluation.get();
+            let span = tracing::trace_span!("graph.edge_value", selection_id, search_id, phase, edge_evaluation_id,
+                edge_index=i, source=%inner.graph[from], destination=%inner.graph[to]);
+            let _entered = span.enter();
+            value_fn(c, w, i)
+        },
         |visited, edge, reason| {
             let mut search = diagnostics.borrow_mut();
             match reason {
@@ -101,6 +118,7 @@ where
                         .collect(),
                 );
                 search.rejected_reason = rejection;
+                search.rejected_evaluation_id = (reason == BranchDecision::BelowMinimum).then(|| evaluation.get());
                 search.rejected_prefix_truncated = visited.len() + 1 > prefix.len();
                 search.rejected_edge = Some(super::diagnostics::present(
                     inner,
@@ -117,8 +135,18 @@ where
             // Branch observations are emitted only when TRACE survives static/runtime filters.
             if tracing::enabled!(tracing::Level::TRACE) {
                 let observation = super::diagnostics::present(inner, edge.source(), edge.target(), edge.weight());
+                let mut prefix = [0; 5];
+                for (i, index) in visited.iter().copied().chain(Some(edge.target())).take(5).enumerate() {
+                    prefix[i] = path_id::encode(&inner.graph[index]);
+                }
                 tracing::trace!(
                     event = "graph_branch_decision",
+                    selection_id,
+                    search_id,
+                    phase,
+                    edge_evaluation_id = (reason == BranchDecision::BelowMinimum).then(|| evaluation.get()),
+                    ?prefix,
+                    prefix_truncated = visited.len() + 1 > prefix.len(),
                     ?reason,
                     depth = visited.len(),
                     ?observation,
@@ -155,6 +183,9 @@ where
         }
         tracing::trace!(
             event = "graph_candidate",
+            selection_id,
+            search_id,
+            phase,
             ?path_id,
             ?nodes,
             "graph traversal candidate returned to selector"
@@ -190,7 +221,7 @@ impl hopr_api::graph::NetworkGraphTraverse for ChannelGraph {
             take_count,
             std::any::type_name::<C>(),
         );
-        let span = tracing::trace_span!("graph.simple_paths", source=%search.source, destination=?search.destination, length=search.length, take_count=?take_count);
+        let span = tracing::trace_span!("graph.simple_paths", selection_id=search.selection_id, search_id=search.search_id, phase=search.phase, source=%search.source, destination=?search.destination, length=search.length, take_count=?take_count);
         let _entered = span.enter();
         let paths: Vec<_> = (|| {
             if length == 0 {
@@ -265,7 +296,7 @@ impl hopr_api::graph::NetworkGraphTraverse for ChannelGraph {
             take_count,
             std::any::type_name::<C>(),
         );
-        let span = tracing::trace_span!("graph.simple_paths_from", source=%search.source, destination=?search.destination, length=search.length, take_count=?take_count);
+        let span = tracing::trace_span!("graph.simple_paths_from", selection_id=search.selection_id, search_id=search.search_id, phase=search.phase, source=%search.source, destination=?search.destination, length=search.length, take_count=?take_count);
         let _entered = span.enter();
         let paths: Vec<_> = (|| {
             if length == 0 {
@@ -324,7 +355,7 @@ impl hopr_api::graph::NetworkGraphTraverse for ChannelGraph {
             take_count,
             "loopback_edge_value",
         );
-        let span = tracing::trace_span!("graph.simple_loopback_to_self", source=%search.source, destination=?search.destination, length=search.length, take_count=?take_count);
+        let span = tracing::trace_span!("graph.simple_loopback_to_self", selection_id=search.selection_id, search_id=search.search_id, phase=search.phase, source=%search.source, destination=?search.destination, length=search.length, take_count=?take_count);
         let _entered = span.enter();
         let paths: Vec<_> = (|| {
             if (MIN_LOOPBACK_HOPS..=MAX_LOOPBACK_HOPS).contains(&hops) {
@@ -443,7 +474,13 @@ impl ChannelGraph {
         take_count: Option<usize>,
         value_function: &'static str,
     ) -> SearchRecord {
+        let context = crate::correlation::current_search_context().unwrap_or_else(|| {
+            crate::correlation::SearchContext::new(crate::correlation::next_selection_id(), "unspecified")
+        });
         SearchRecord {
+            selection_id: context.selection_id,
+            search_id: context.search_id,
+            phase: context.phase,
             kind,
             direction: if kind == "loopback" {
                 "loopback"
@@ -473,6 +510,7 @@ impl ChannelGraph {
             rejected_prefix: None,
             rejected_prefix_nodes: None,
             rejected_reason: None,
+            rejected_evaluation_id: None,
             rejected_examples_omitted: 0,
             rejected_prefix_truncated: false,
             rejected_edge: None,

@@ -54,7 +54,10 @@ impl SearchJournal {
                     .is_ok()
             {
                 let suppressed = self.since_debug.swap(0, Ordering::Relaxed);
-                tracing::debug!(event="graph_search_failure", suppressed, search=?record,
+                tracing::debug!(event="graph_search_failure", selection_id=record.selection_id, search_id=record.search_id,
+                    phase=record.phase, direction=record.direction, source=%record.source, destination=?record.destination,
+                    length=record.length, outcome=record.outcome, below_minimum=record.below_minimum,
+                    rejected_reason=?record.rejected_reason, suppressed,
                     "graph search returned no paths; repeated failures are summarized in node_state");
             } else {
                 self.suppressed_debug.fetch_add(1, Ordering::Relaxed);
@@ -424,5 +427,29 @@ mod tests {
         assert!(state.samples.iter().all(|s| s.returned == 0));
         assert!(state.samples.iter().any(|s| s.direction == "forward"));
         assert!(state.samples.iter().any(|s| s.direction == "return"));
+    }
+    #[test]
+    fn caller_context_and_candidate_ids_survive_without_a_subscriber() {
+        use crate::correlation::{SearchContext, candidate_id, next_selection_id, with_search_context};
+        let graph = ChannelGraph::new(key(1));
+        route(&graph, key(1), key(2), 100);
+        let context = SearchContext::new(next_selection_id(), "phase1");
+        let paths = with_search_context(context, || {
+            graph.simple_paths(
+                &key(1),
+                &key(2),
+                1,
+                None,
+                EdgeValueFn::forward(1.try_into().unwrap(), 0.5, 0.1, None),
+            )
+        });
+        let state = graph.graph_state(None);
+        let search = &state.searches.samples[0];
+        assert_eq!(search.selection_id, context.selection_id);
+        assert_eq!(search.search_id, context.search_id);
+        assert_eq!(search.phase, "phase1");
+        assert_eq!(candidate_id(&key(1), &[key(2)]), Some(paths[0].1));
+        assert!(candidate_id(&key(1), &[]).is_none());
+        assert!(candidate_id(&key(1), &[key(2); 5]).is_none());
     }
 }

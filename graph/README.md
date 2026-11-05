@@ -66,3 +66,21 @@ At most two query examples are retained; repeated queries coalesce into their la
 for the diagnostic lock; contention preserves totals and increments an explicit lost-sample count. Forward/return coverage is preferred when
 replacing samples. Examples share the existing 3 KiB graph budget with current edge samples; older/successful query examples and edge detail
 may be omitted to fit. The cumulative search counters are not reset by snapshot reads and are not interval counters.
+
+## Cross-stage identifiers
+
+`correlation::SearchContext` gives each candidate-set computation a `selection_id` and each phase/query a `search_id`. A selector propagates
+it with `with_search_context` around the synchronous graph call. The context is restored on return or unwind and never spans an async
+suspension. Without a supplied context, the graph allocates IDs itself. IDs are allocated independently of log filters, are process-local,
+and must be interpreted with the node identity and process lifetime.
+
+Snapshots retain the IDs and phase. Query, candidate and branch TRACE records carry them explicitly. `graph.edge_value` spans add an
+`edge_evaluation_id`, source/destination and edge index around the actual value-function call. A retained value-pruning example also records
+that evaluation ID, allowing policy events emitted inside the value function to be matched to the exact attempted edge/prefix.
+`correlation::candidate_id` uses the same canonical path slots as the graph, so transport validation, weighting, caching and draws can refer
+to the same route without another graph lookup. It does not establish graph membership or guarantee collision-free identity.
+
+The companion `hopr-api` patch emits specific TRACE gate reasons and the values checked by its built-in value functions; the graph itself
+continues to report the factual `value_below_minimum` result for arbitrary opaque caller functions. No reason is inferred from a later graph
+read. The companion transport patch carries selection IDs with cached candidate sets and records stage/reason fields for filtering,
+validation, retention, weighting, cache refresh and the final weighted/exploratory draw. No extra routine DEBUG events are introduced.

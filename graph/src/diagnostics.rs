@@ -159,6 +159,9 @@ pub struct SearchState {
 /// Evidence for a graph traversal, not the transport's final ranking or random draw.
 #[derive(Clone, Debug, Serialize)]
 pub struct SearchRecord {
+    pub selection_id: u64,
+    pub search_id: u64,
+    pub phase: &'static str,
     pub kind: &'static str,
     pub direction: &'static str,
     pub source: String,
@@ -184,6 +187,7 @@ pub struct SearchRecord {
     pub rejected_prefix: Option<[u64; 5]>,
     pub rejected_prefix_nodes: Option<Vec<String>>,
     pub rejected_reason: Option<&'static str>,
+    pub rejected_evaluation_id: Option<u64>,
     pub rejected_examples_omitted: u64,
     pub rejected_prefix_truncated: bool,
     pub rejected_edge: Option<GraphEdge>,
@@ -197,7 +201,8 @@ pub struct SearchRecord {
 }
 impl SearchRecord {
     pub(crate) fn same_query(&self, other: &Self) -> bool {
-        self.kind == other.kind
+        self.phase == other.phase
+            && self.kind == other.kind
             && self.source == other.source
             && self.destination == other.destination
             && self.length == other.length
