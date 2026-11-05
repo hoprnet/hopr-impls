@@ -74,6 +74,9 @@ pub struct FundingCounts {
 #[derive(Debug, Default, Serialize)]
 pub struct ChannelPeers {
     pub total: u64,
+    pub graph_connected: u64,
+    pub graph_disconnected: u64,
+    pub graph_unknown: u64,
     pub transport_connected: u64,
     pub transport_disconnected: u64,
     pub transport_unknown: u64,
@@ -159,6 +162,7 @@ pub struct Snapshot {
     pub safe_balance: Section<Amount>,
     pub safe_allowance: Section<Amount>,
     pub channels: Section<Channels>,
+    pub graph: Section<hopr_network_graph::diagnostics::GraphState>,
     pub connected_peers: u64,
     pub announced_peers: Section<u64>,
     pub routing: Section<super::IntervalSnapshot>,

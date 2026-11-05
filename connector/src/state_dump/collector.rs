@@ -1,7 +1,10 @@
 use std::{
     collections::HashSet,
     future::Future,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -129,8 +132,8 @@ impl Snapshot {
 
 /// Reusable collector using chain read traits and the error-preserving `StateRead` interface.
 pub struct Collector<C, G, N> {
-    chain: C,
-    graph: G,
+    chain: Arc<C>,
+    graph: Arc<G>,
     network: N,
     safe_address: Address,
     config: Config,
@@ -144,16 +147,22 @@ where
         + ChainReadChannelOperations
         + super::StateRead
         + ChainKeyOperations
-        + Sync,
-    G: NetworkGraphView<NodeId = OffchainPublicKey> + Sync,
+        + Send
+        + Sync
+        + 'static,
+    G: NetworkGraphView<NodeId = OffchainPublicKey>
+        + hopr_network_graph::diagnostics::GraphStateRead
+        + Send
+        + Sync
+        + 'static,
     G::Observed: EdgeObservableRead,
     N: NetworkView + Sync,
 {
     /// The views supply node identities; the host supplies the Safe address.
     pub fn new(chain: C, graph: G, network: N, safe_address: Address, config: Config) -> Self {
         Self {
-            chain,
-            graph,
+            chain: Arc::new(chain),
+            graph: Arc::new(graph),
             network,
             safe_address,
             config,
@@ -204,7 +213,14 @@ where
         let started = Instant::now();
         // Classify every local channel against the same face-value observation.
         let face = self.graph.ticket_face_value();
-        let (balance, allowance, channels, announced) = futures::join!(
+        let paths = routing.as_ref().map(|r| {
+            r.surbs()
+                .iter()
+                .flat_map(|d| d.pairs().iter().flat_map(|pair| [pair.forward, pair.reply]))
+                .collect::<Vec<_>>()
+        });
+        let graph = self.graph.clone();
+        let (balance, allowance, channels, announced, graph) = futures::join!(
             section(self.config.timeout, async {
                 self.chain
                     .balance::<WxHOPR, _>(self.safe_address)
@@ -221,6 +237,11 @@ where
             }),
             self.channels(face),
             section(self.config.timeout, async { self.chain.announced_count() }),
+            section(self.config.timeout, async move {
+                hopr_utils::runtime::prelude::spawn_blocking(move || graph.graph_state(paths.as_deref()))
+                    .await
+                    .map_err(|e| e.to_string())
+            }),
         );
         Snapshot {
             schema_version: 1,
@@ -238,6 +259,7 @@ where
             safe_balance: balance,
             safe_allowance: allowance,
             channels,
+            graph,
             connected_peers: self.network.connected_peers().len() as u64,
             announced_peers: announced,
             routing: routing
@@ -306,7 +328,23 @@ where
                 } else {
                     channel.source
                 };
-                let key = match self.chain.chain_key_to_packet_key(&peer) {
+                let chain = self.chain.clone();
+                let lookup = match hopr_utils::runtime::prelude::spawn_blocking(move || {
+                    chain.chain_key_to_packet_key(&peer).map_err(|e| e.to_string())
+                })
+                .await
+                {
+                    Ok(result) => result,
+                    Err(error) => {
+                        summary.reads.record(super::ReadFailure {
+                            entity: peer.to_string(),
+                            kind: "join",
+                            message: error.to_string(),
+                        });
+                        Ok(None)
+                    }
+                };
+                let key = match lookup {
                     Ok(key) => key,
                     Err(error) => {
                         summary.reads.record(super::ReadFailure {
@@ -405,6 +443,11 @@ impl Channels {
         let poor = probe.is_some_and(|r| r < LOW_PROBE_RATE);
         if count_peer {
             self.peers.total += 1;
+            match connected {
+                Some(true) => self.peers.graph_connected += 1,
+                Some(false) => self.peers.graph_disconnected += 1,
+                None => self.peers.graph_unknown += 1,
+            }
             match transport_connected {
                 Some(true) => self.peers.transport_connected += 1,
                 Some(false) => self.peers.transport_disconnected += 1,
@@ -506,6 +549,7 @@ mod tests {
             .build()?;
         let mut unknown = Channels::default();
         unknown.record(&channel, ChannelDirection::Outgoing, None, Some(true), Some(1.0), true);
+        assert_eq!(unknown.peers.graph_unknown, 1);
         assert_eq!(unknown.sample().len(), 1);
         assert_eq!(unknown.sample()[0].below_funding_value, None);
         assert_eq!(unknown.sample()[0].is_connected, None);
@@ -522,6 +566,8 @@ mod tests {
             true,
         );
         assert!(observed.sample().is_empty());
+        assert_eq!(observed.peers.graph_connected, 1);
+        assert_eq!(observed.peers.graph_disconnected, 0);
         Ok(())
     }
 

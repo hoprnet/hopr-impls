@@ -165,6 +165,8 @@ mod tests {
     struct BackendProbe {
         inner: InMemoryBackend,
         reads: Arc<AtomicUsize>,
+        async_thread: Arc<parking_lot::Mutex<Option<std::thread::ThreadId>>>,
+        identity_reads: Arc<AtomicUsize>,
         failed: Arc<parking_lot::Mutex<Option<ChannelId>>>,
     }
     impl Backend for BackendProbe {
@@ -191,6 +193,14 @@ mod tests {
         }
 
         fn get_account_by_address(&self, a: &Address) -> Result<Option<AccountEntry>, Self::Error> {
+            if let Some(async_thread) = *self.async_thread.lock() {
+                assert_ne!(
+                    std::thread::current().id(),
+                    async_thread,
+                    "backend lookup blocked the async executor"
+                );
+                self.identity_reads.fetch_add(1, Ordering::Relaxed);
+            }
             Ok(self.inner.get_account_by_address(a).unwrap())
         }
 
@@ -281,14 +291,19 @@ mod tests {
                 .any(|r| matches!(r, Err(e) if e.entity == missing.to_string() && e.kind == "missing"))
         );
         assert_eq!(backend.reads.load(Ordering::Relaxed), 5);
+        *backend.async_thread.lock() = Some(std::thread::current().id());
         let collector = crate::state_dump::Collector::new(
-            &connector,
+            connector,
             hopr_network_graph::ChannelGraph::new(*OffchainKeypair::from_secret(&[11; 32])?.public()),
             crate::state_dump::tests::Network::default(),
             Address::from([99; 20]),
             Default::default(),
         );
         let snapshot = collector.collect(None).await;
+        assert!(
+            backend.identity_reads.load(Ordering::Relaxed) >= 2,
+            "local enumeration and peer identity lookup both reach the backend"
+        );
         let crate::state_dump::Section::Partial { value } = snapshot.channels else {
             panic!("failed reads must mark the channel inventory partial")
         };

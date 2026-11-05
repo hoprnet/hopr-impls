@@ -73,7 +73,7 @@ pub struct Destination {
     pub direction: Direction,
     pub destination: NodeId,
     pub counts: PathCounts,
-    /// Earlier observations may be in overflow when a healthy row was replaced.
+    /// Observations may be in overflow after replacement or lock contention.
     pub partial_window: bool,
 }
 /// SURB event counts. Returns can cross minting windows; this is not delivery probability.
@@ -325,6 +325,12 @@ impl IntervalCounters {
             succeeded: self.0.busy.resolutions.swap(0, Ordering::Relaxed),
             ..Default::default()
         };
+        if busy.succeeded > 0 {
+            // Busy successes have no identity, so every named destination may be affected.
+            for row in &mut w.data.destinations {
+                row.partial_window = true;
+            }
+        }
         w.data.totals.add(busy);
         w.data.destinations_overflow.add(busy);
         let busy = SurbCounts {
@@ -449,10 +455,12 @@ mod tests {
             1,
             "a failure always reaches its row"
         );
+        assert!(snapshot.destinations()[0].partial_window);
         assert_eq!((snapshot.surb_totals.minted, snapshot.surb_totals.returned), (2, 1));
         assert_eq!(snapshot.surbs_overflow.minted, 2);
 
         let next = counters.take_snapshot();
+        assert!(next.destinations().is_empty());
         assert_eq!(next.totals.succeeded, 0, "busy counts belong to one window only");
         Ok(())
     }

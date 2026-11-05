@@ -49,6 +49,7 @@ hopr-api = { workspace = true, features = [
   "types-random",
   "types-with-bindings",
 ] }
+hopr-network-graph = { workspace = true }
 hopr-utils = { workspace = true, features = ["runtime-tokio"] }
 
 [dev-dependencies]

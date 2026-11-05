@@ -208,7 +208,8 @@ async fn real_sources_are_collected_and_info_reporter_emits_idle_ticks() -> anyh
         }
     })
     .await??;
-    let graph = ChannelGraph::new(me_packet);
+    let chain = Arc::new(chain);
+    let graph = Arc::new(ChannelGraph::new(me_packet));
     graph.add_node(peer_packet);
     graph.set_ticket_face_value(10u32.into());
     graph.record_edge::<Neighbor, NoPath>(MeasurableEdge::Probe(Ok(EdgeTransportTelemetry::Neighbor(Neighbor(
@@ -233,7 +234,7 @@ async fn real_sources_are_collected_and_info_reporter_emits_idle_ticks() -> anyh
         peers: HashSet::from([peer_packet.into()]),
         ..Default::default()
     };
-    let collector = Collector::new(&chain, &graph, network.clone(), safe, Config::default());
+    let collector = Collector::new(chain.clone(), graph.clone(), network.clone(), safe, Config::default());
     let counters = IntervalCounters::default();
     counters.search(
         Direction::Forward,
@@ -271,6 +272,18 @@ async fn real_sources_are_collected_and_info_reporter_emits_idle_ticks() -> anyh
     assert_eq!(records.len(), 2, "INFO must include idle intervals");
     let first = &records[0];
     let second = &records[1];
+    assert_eq!(first["graph"]["status"], "ok");
+    assert_eq!(first["graph"]["value"]["node_count"], 3);
+    assert_eq!(first["graph"]["value"]["local_edges"].as_array().map(Vec::len), Some(4));
+    assert!(
+        first["graph"]["value"]["local_edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["destination"] == poor_peer.to_string())
+    );
+    assert!(first["graph"]["value"]["paths"]["requested_edges"].as_u64().unwrap() > 0);
+    assert_eq!(second["graph"]["value"]["paths"]["sampled_paths"], 0);
     assert_eq!(first["sequence"], 0);
     assert_eq!(second["sequence"], 1);
     assert_eq!(first["safe_balance"]["value"], "100");
@@ -339,7 +352,7 @@ async fn real_sources_are_collected_and_info_reporter_emits_idle_ticks() -> anyh
     let counters = IntervalCounters::default();
     counters.resolution(Direction::Forward, destination(9999), true);
     let before = network.reads.load(Ordering::Relaxed);
-    let disabled = Collector::new(&chain, &graph, network.clone(), safe, Config::new(0)?);
+    let disabled = Collector::new(chain.clone(), graph.clone(), network.clone(), safe, Config::new(0)?);
     disabled.run(Some(counters.clone())).await;
     assert_eq!(network.reads.load(Ordering::Relaxed), before);
     assert_eq!(counters.take_snapshot().totals.succeeded, 1);
@@ -543,6 +556,9 @@ fn saturated_payload_keeps_sibling_details_and_exact_amounts_within_budget() -> 
         safe_balance: Section::Ok { value: amount },
         safe_allowance: Section::Ok { value: amount },
         channels: Section::Ok { value: channels },
+        graph: Section::Ok {
+            value: saturated_graph_state()?,
+        },
         connected_peers: u64::MAX,
         announced_peers: Section::Error {
             message: "\0".repeat(120),
@@ -557,6 +573,13 @@ fn saturated_payload_keeps_sibling_details_and_exact_amounts_within_budget() -> 
             .map(|name| (name, Value::String("x".repeat(MAX_SECTION_BYTES - 2))))
             .collect(),
     };
+    let bytes = serde_json::to_vec(&snapshot)?;
+    assert!(
+        bytes.len() <= MAX_SNAPSHOT_BYTES,
+        "payload bytes: {}, graph bytes: {}",
+        bytes.len(),
+        serde_json::to_vec(&snapshot.graph)?.len()
+    );
     let json = snapshot.to_json()?;
     assert!(json.len() <= MAX_SNAPSHOT_BYTES);
     let value: Value = serde_json::from_str(&json)?;
@@ -603,6 +626,7 @@ async fn failing_or_hung_sources_do_not_hide_other_collected_sections() -> anyho
     let snapshot = collector.collect(None).await;
     assert!(matches!(snapshot.safe_balance, Section::Timeout));
     assert!(matches!(snapshot.channels, Section::Error { .. }));
+    assert_eq!(snapshot.graph.value().map(|g| g.local_node_present), Some(true));
     assert_eq!(snapshot.safe_allowance.value().map(|a| a.value()), Some(7u32.into()));
     assert!(matches!(snapshot.announced_peers, Section::Ok { value: 0 }));
     faults.set(ChainOp::Balance, Fault::Fail);
@@ -610,6 +634,7 @@ async fn failing_or_hung_sources_do_not_hide_other_collected_sections() -> anyho
     let snapshot = collector.collect(None).await;
     assert!(matches!(snapshot.safe_balance, Section::Error { .. }));
     assert!(matches!(&snapshot.channels, Section::Partial { value } if value.reads.timed_out));
+    assert_eq!(snapshot.graph.value().map(|g| g.local_node_present), Some(true));
     assert_eq!(snapshot.safe_allowance.value().map(|a| a.value()), Some(7u32.into()));
     Ok(())
 }
@@ -760,4 +785,142 @@ fn concurrent_probe_producers_and_resets_preserve_counts() {
     }
     timeouts += counters.take_snapshot().probes.expect("registered").neighbor.timed_out;
     assert_eq!(timeouts, 4000);
+}
+
+fn saturated_graph_state() -> anyhow::Result<hopr_network_graph::diagnostics::GraphState> {
+    use hopr_api::graph::{
+        NetworkGraphView,
+        traits::{EdgeObservableWrite, EdgeWeightType},
+    };
+    use hopr_network_graph::diagnostics::{GraphStateRead, MAX_LOCAL_GRAPH_EDGES, MAX_PATH_GRAPH_EDGES};
+    let me = packet(1)?;
+    let graph = ChannelGraph::new(me);
+    graph.set_ticket_face_value(hopr_api::graph::traits::Balance::MAX);
+    let populate = |o: &mut hopr_network_graph::Observations| {
+        o.record(EdgeWeightType::Balance(Some(hopr_api::graph::traits::Balance::MAX)));
+        o.record(EdgeWeightType::Connected(false));
+        o.record(EdgeWeightType::Immediate(Ok(Duration::from_millis(123456789012345))));
+        o.record(EdgeWeightType::Immediate(Err(())));
+        o.record(EdgeWeightType::Intermediate(Ok(Duration::from_millis(123456789012345))));
+        o.record(EdgeWeightType::Intermediate(Err(())));
+        o.record(EdgeWeightType::ImmediateProtocolConformance {
+            num_packets: 100,
+            num_acks: 13,
+        });
+    };
+    for i in 0..MAX_LOCAL_GRAPH_EDGES {
+        graph.upsert_edge(&me, &packet(i as u8 + 2)?, populate);
+    }
+    let mut paths = Vec::new();
+    for i in 0..MAX_PATH_GRAPH_EDGES {
+        let source = packet(i as u8 + 50)?;
+        let destination = packet(i as u8 + 60)?;
+        graph.upsert_edge(&source, &destination, populate);
+        paths.push([
+            graph.path_slot(&source).unwrap(),
+            graph.path_slot(&destination).unwrap(),
+            0,
+            0,
+            0,
+        ]);
+    }
+    let state = graph.graph_state(Some(&paths));
+    assert!(!state.local_edges().is_empty());
+    assert_eq!(
+        state.local_edges().len() + state.local_edges_omitted,
+        MAX_LOCAL_GRAPH_EDGES
+    );
+    let paths = state.paths.as_ref().unwrap();
+    assert!(!paths.edges().is_empty());
+    assert_eq!(paths.edges().len() + paths.edges_omitted, MAX_PATH_GRAPH_EDGES);
+    assert!(serde_json::to_vec(&state)?.len() <= hopr_network_graph::diagnostics::MAX_GRAPH_STATE_BYTES);
+    Ok(state)
+}
+
+/// A diagnostic source that stalls or fails while the ordinary graph read API stays available.
+struct FaultyGraph {
+    graph: ChannelGraph,
+    panic: bool,
+    executor_thread: std::thread::ThreadId,
+}
+impl hopr_api::graph::NetworkGraphView for FaultyGraph {
+    type NodeId = OffchainPublicKey;
+    type Observed = hopr_network_graph::Observations;
+
+    fn ticket_face_value(&self) -> Option<hopr_api::graph::traits::Balance> {
+        self.graph.ticket_face_value()
+    }
+
+    fn node_count(&self) -> usize {
+        self.graph.node_count()
+    }
+
+    fn contains_node(&self, key: &OffchainPublicKey) -> bool {
+        self.graph.contains_node(key)
+    }
+
+    fn nodes(&self) -> futures::stream::BoxStream<'static, OffchainPublicKey> {
+        self.graph.nodes()
+    }
+
+    fn edge(&self, src: &OffchainPublicKey, dst: &OffchainPublicKey) -> Option<Self::Observed> {
+        self.graph.edge(src, dst)
+    }
+
+    fn identity(&self) -> &OffchainPublicKey {
+        self.graph.identity()
+    }
+
+    fn path_slot(&self, key: &OffchainPublicKey) -> Option<u64> {
+        self.graph.path_slot(key)
+    }
+}
+impl hopr_network_graph::diagnostics::GraphStateRead for FaultyGraph {
+    fn graph_state(&self, paths: Option<&[[u64; 5]]>) -> hopr_network_graph::diagnostics::GraphState {
+        assert_ne!(
+            std::thread::current().id(),
+            self.executor_thread,
+            "graph diagnostics must not block the async executor"
+        );
+        assert!(!self.panic, "injected graph failure");
+        std::thread::sleep(Duration::from_millis(50));
+        self.graph.graph_state(paths)
+    }
+}
+#[tokio::test]
+async fn graph_timeout_or_join_failure_does_not_hide_chain_state() -> anyhow::Result<()> {
+    use crate::testing::create_test_blokli_connector;
+    let me = ChainKeypair::from_secret(&[1; 32])?;
+    let safe = Address::from([88; 20]);
+    let chain = Arc::new(
+        create_test_blokli_connector(
+            &me,
+            BlokliTestStateBuilder::default()
+                .with_balances::<WxHOPR>([(safe, 100u32.into())])
+                .build_static_client(),
+            Address::from([99; 20]),
+        )
+        .await?,
+    );
+    for panic in [false, true] {
+        let collector = Collector::new(
+            chain.clone(),
+            FaultyGraph {
+                graph: ChannelGraph::new(packet(11)?),
+                panic,
+                executor_thread: std::thread::current().id(),
+            },
+            Network::default(),
+            safe,
+            Config::default().with_source_timeout(Duration::from_millis(10))?,
+        );
+        let snapshot = collector.collect(None).await;
+        assert_eq!(snapshot.safe_balance.value().map(|a| a.value()), Some(100u32.into()));
+        if panic {
+            assert!(matches!(snapshot.graph, Section::Error { .. }));
+        } else {
+            assert!(matches!(snapshot.graph, Section::Timeout));
+        }
+    }
+    Ok(())
 }
