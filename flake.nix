@@ -31,7 +31,8 @@
     nixpkgs-unstable.url = "github:NixOS/nixpkgs/nixos-unstable";
 
     # HOPR Nix Library (provides flake-utils and reusable build functions)
-    nix-lib.url = "github:hoprnet/nix-lib/v1.2.0";
+    nix-lib.url = "github:hoprnet/nix-lib/v2.1.1";
+    treefmt-nix.url = "github:numtide/treefmt-nix";
 
     # Rust build system
     crane.url = "github:ipetkov/crane";
@@ -47,6 +48,14 @@
     nix-lib.inputs.nixpkgs.follows = "nixpkgs";
     nix-lib.inputs.crane.follows = "crane";
     nix-lib.inputs.rust-overlay.follows = "rust-overlay";
+    # One unstable/treefmt/flake-parts revision for the whole flake. Left
+    # unfollowed, `nix flake update nix-lib` moves nix-lib's private nixpkgs-unstable,
+    # which supplies cargo-llvm-cov to the dev shell, to a revision missing from the
+    # binary cache.
+    nix-lib.inputs.nixpkgs-unstable.follows = "nixpkgs-unstable";
+    nix-lib.inputs.treefmt-nix.follows = "treefmt-nix";
+    nix-lib.inputs.flake-parts.follows = "flake-parts";
+    treefmt-nix.inputs.nixpkgs.follows = "nixpkgs";
     rust-overlay.inputs.nixpkgs.follows = "nixpkgs";
   };
 
