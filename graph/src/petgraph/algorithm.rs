@@ -113,6 +113,54 @@ where
     C: Clone + PartialOrd + 'a,
     F: Fn(C, &<<G as IntoEdgeReferences>::EdgeRef as EdgeRef>::Weight, usize) -> C + 'a,
 {
+    all_simple_paths_multi_observed(
+        graph,
+        from,
+        to,
+        excluded_nodes,
+        min_intermediate_nodes,
+        max_intermediate_nodes,
+        initial_cost,
+        min_cost,
+        cost_fn,
+        |_, _, _| {},
+    )
+}
+
+/// Decisions made by the DFS, not inferred later from graph state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BranchDecision {
+    Cycle,
+    Excluded,
+    BelowMinimum,
+    TargetTooEarly,
+    DepthLimit,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn all_simple_paths_multi_observed<'a, TargetColl, G, S, F, C, O>(
+    graph: G,
+    from: G::NodeId,
+    to: &'a HashSet<G::NodeId, S>,
+    excluded_nodes: Option<&'a HashSet<G::NodeId, S>>,
+    min_intermediate_nodes: usize,
+    max_intermediate_nodes: Option<usize>,
+    initial_cost: C,
+    min_cost: Option<C>,
+    cost_fn: F,
+    mut observe: O,
+) -> impl Iterator<Item = (TargetColl, C)> + 'a
+where
+    G: NodeCount + IntoEdgesDirected + 'a,
+    <G as IntoEdgesDirected>::EdgesDirected: 'a,
+    G::NodeId: Eq + Hash,
+    TargetColl: FromIterator<G::NodeId>,
+    S: BuildHasher + Default,
+    C: Clone + PartialOrd + 'a,
+    F: Fn(C, &<<G as IntoEdgeReferences>::EdgeRef as EdgeRef>::Weight, usize) -> C + 'a,
+    O: FnMut(&IndexSet<G::NodeId, S>, &<G as IntoEdgeReferences>::EdgeRef, BranchDecision) + 'a,
+{
     let max_nodes = if let Some(l) = max_intermediate_nodes {
         l + 2
     } else {
@@ -142,7 +190,12 @@ where
                 // Excluded nodes checked separately — not inserted into `visited` — so they
                 // never appear in the yielded path. Excluding `from` is a no-op since it's
                 // already in `visited` at position 0.
-                if visited.contains(&child) || excluded_nodes.is_some_and(|excl| excl.contains(&child)) {
+                if visited.contains(&child) {
+                    observe(&visited, &edge, BranchDecision::Cycle);
+                    continue;
+                }
+                if excluded_nodes.is_some_and(|excl| excl.contains(&child)) {
+                    observe(&visited, &edge, BranchDecision::Excluded);
                     continue;
                 }
 
@@ -154,6 +207,7 @@ where
                 if let Some(ref min) = min_cost
                     && new_cost < *min
                 {
+                    observe(&visited, &edge, BranchDecision::BelowMinimum);
                     continue;
                 }
 
@@ -165,6 +219,13 @@ where
                         visited.iter().cloned().chain(Some(child)).collect::<TargetColl>(),
                         new_cost.clone(),
                     ));
+                }
+
+                if to.contains(&child) && (current_nodes + 1) < min_nodes {
+                    observe(&visited, &edge, BranchDecision::TargetTooEarly);
+                }
+                if current_nodes >= (max_nodes - 1) && !to.contains(&child) {
+                    observe(&visited, &edge, BranchDecision::DepthLimit);
                 }
 
                 // Expand the search only if within max length and unexplored target nodes remain

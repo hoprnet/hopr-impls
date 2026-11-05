@@ -234,6 +234,19 @@ async fn real_sources_are_collected_and_info_reporter_emits_idle_ticks() -> anyh
         peers: HashSet::from([peer_packet.into()]),
         ..Default::default()
     };
+    use hopr_api::graph::{NetworkGraphTraverse, function::EdgeValueFn};
+    let unavailable_destination = packet(99)?;
+    assert!(
+        graph
+            .simple_paths(
+                &me_packet,
+                &unavailable_destination,
+                1,
+                None,
+                EdgeValueFn::forward(1.try_into()?, 0.5, 0.1, Some(10u64.into()))
+            )
+            .is_empty()
+    );
     let collector = Collector::new(chain.clone(), graph.clone(), network.clone(), safe, Config::default());
     let counters = IntervalCounters::default();
     counters.search(
@@ -274,13 +287,20 @@ async fn real_sources_are_collected_and_info_reporter_emits_idle_ticks() -> anyh
     let second = &records[1];
     assert_eq!(first["graph"]["status"], "ok");
     assert_eq!(first["graph"]["value"]["node_count"], 3);
-    assert_eq!(first["graph"]["value"]["local_edges"].as_array().map(Vec::len), Some(4));
-    assert!(
-        first["graph"]["value"]["local_edges"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|e| e["destination"] == poor_peer.to_string())
+    let graph_state = &first["graph"]["value"];
+    let named_edges = graph_state["local_edges"].as_array().unwrap().len();
+    assert_eq!(
+        named_edges as u64 + graph_state["local_edges_omitted"].as_u64().unwrap(),
+        4
+    );
+    assert_eq!(graph_state["searches"]["total"], 1);
+    let evidence = &graph_state["searches"]["samples"][0];
+    assert_eq!(evidence["direction"], "forward");
+    assert_eq!(evidence["outcome"], "destination_missing");
+    assert_eq!(evidence["destination"], unavailable_destination.to_string());
+    assert_eq!(
+        second["graph"]["value"]["searches"]["total"], 1,
+        "snapshot reads do not drain search evidence"
     );
     assert!(first["graph"]["value"]["paths"]["requested_edges"].as_u64().unwrap() > 0);
     assert_eq!(second["graph"]["value"]["paths"]["sampled_paths"], 0);

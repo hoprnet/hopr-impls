@@ -79,6 +79,7 @@ pub struct ChannelGraph {
     /// changes. Held once for the whole graph so a change costs one write, not an edge sweep.
     pub(crate) ticket_face_value: Arc<RwLock<Option<hopr_api::graph::traits::Balance>>>,
     pub(crate) inner: Arc<RwLock<InnerGraph>>,
+    pub(crate) searches: Arc<super::search_diagnostics::SearchJournal>,
 }
 
 /// Multiplier applied to an edge with no probe observations, keeping it discoverable (RFC-0010
@@ -141,6 +142,7 @@ impl ChannelGraph {
             max_plausible_loopback_rtt,
             ticket_face_value: Arc::new(RwLock::new(None)),
             inner: Arc::new(RwLock::new(InnerGraph { graph, indices, slots })),
+            searches: Arc::new(Default::default()),
         }
     }
 
