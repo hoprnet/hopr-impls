@@ -15,6 +15,7 @@ version                = "0.31.1"
 
 [features]
 runtime-tokio = ["hopr-utils/runtime-tokio"]
+state-dump    = ["dep:hopr-network-graph"]
 testing       = ["hopr-utils/testing-blokli"]
 
 [dependencies]
@@ -49,7 +50,7 @@ hopr-api = { workspace = true, features = [
   "types-random",
   "types-with-bindings",
 ] }
-hopr-network-graph = { workspace = true }
+hopr-network-graph = { workspace = true, optional = true }
 hopr-utils = { workspace = true, features = ["runtime-tokio"] }
 
 [dev-dependencies]

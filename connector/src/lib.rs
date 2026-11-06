@@ -3,6 +3,7 @@ mod connector;
 pub mod errors;
 mod reader;
 /// Periodic compact state dumps and bounded routing/SURB counter inputs.
+#[cfg(feature = "state-dump")]
 pub mod state_dump;
 #[cfg(any(test, feature = "testing"))]
 pub use hopr_utils::testing::blokli as testing;
