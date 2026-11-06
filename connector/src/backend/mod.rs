@@ -15,6 +15,9 @@ pub use hopr_api::{
 /// Represents a cache backend for the connector.
 pub trait Backend {
     type Error: std::error::Error + Send + Sync + 'static;
+    /// Counts announced accounts with routing information, excluding the local account.
+    /// Used once at connection startup; implementations may scan stored accounts.
+    fn count_announced_accounts(&self, me: &Address) -> Result<u64, Self::Error>;
     /// Inserts an [`AccountEntry`] into the backend.
     ///
     /// Returns the old value if one was present in the backend before.
@@ -69,6 +72,14 @@ impl Default for InMemoryBackend {
 #[cfg(any(test, feature = "testing"))]
 impl Backend for InMemoryBackend {
     type Error = std::convert::Infallible;
+
+    fn count_announced_accounts(&self, me: &Address) -> Result<u64, Self::Error> {
+        Ok(self
+            .accounts
+            .iter()
+            .filter(|a| a.chain_addr != *me && a.has_announced_with_routing_info())
+            .count() as u64)
+    }
 
     fn insert_account(&self, entry: AccountEntry) -> Result<Option<AccountEntry>, Self::Error> {
         Ok(self.accounts.insert(entry.key_id, entry))

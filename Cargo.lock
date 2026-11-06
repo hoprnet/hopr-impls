@@ -3919,7 +3919,7 @@ dependencies = [
 
 [[package]]
 name = "hopr-chain-connector"
-version = "0.31.0"
+version = "0.31.1"
 dependencies = [
  "ahash",
  "anyhow",
@@ -3934,6 +3934,7 @@ dependencies = [
  "futures-time",
  "hex-literal",
  "hopr-api",
+ "hopr-network-graph",
  "hopr-utilities",
  "insta",
  "lazy_static",
@@ -3942,6 +3943,7 @@ dependencies = [
  "petgraph",
  "postcard",
  "redb",
+ "serde",
  "serde_json",
  "smart-default",
  "tempfile",
@@ -3992,7 +3994,7 @@ dependencies = [
 
 [[package]]
 name = "hopr-network-graph"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "anyhow",
  "assertables",

@@ -17,7 +17,7 @@ name = "hopr-network-graph"
 readme = "README.md"
 repository.workspace = true
 rust-version.workspace = true
-version = "0.10.0"
+version = "0.10.1"
 
 [lib]
 crate-type = ["rlib"]
@@ -38,6 +38,8 @@ lazy_static = { workspace = true }
 parking_lot = { workspace = true }
 petgraph    = { workspace = true, optional = true, features = ["rayon"] }
 rand        = { workspace = true, optional = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
 smallvec    = { workspace = true }
 thiserror   = { workspace = true }
 tracing     = { workspace = true }
@@ -55,8 +57,6 @@ assertables = { workspace = true }
 criterion   = { workspace = true }
 hex-literal = { workspace = true }
 insta       = { workspace = true, features = ["yaml"] }
-serde       = { workspace = true }
-serde_json  = { workspace = true }
 tokio       = { workspace = true }
 
 [[bench]]

@@ -1,4 +1,10 @@
-use std::{collections::HashSet, hash::RandomState, sync::Arc};
+use std::{
+    cell::{Cell, RefCell},
+    collections::HashSet,
+    hash::RandomState,
+    sync::Arc,
+    time::Instant,
+};
 
 use hopr_api::{
     OffchainPublicKey,
@@ -8,9 +14,15 @@ use hopr_api::{
     },
     types::internal::routing::PathId,
 };
-use petgraph::graph::NodeIndex;
+use petgraph::{graph::NodeIndex, visit::EdgeRef};
 
-use crate::{ChannelGraph, algorithm::all_simple_paths_multi, graph::InnerGraph, petgraph::path_id};
+use crate::{
+    ChannelGraph,
+    algorithm::{BranchDecision, all_simple_paths_multi_observed},
+    diagnostics::SearchRecord,
+    graph::InnerGraph,
+    petgraph::path_id,
+};
 
 /// Lowest number of intermediate relay hops used for loopback probing.
 ///
@@ -39,6 +51,7 @@ pub(crate) fn find_paths<C>(
     initial_value: C,
     min_value: Option<C>,
     value_fn: SharedValueFn<C>,
+    search: &mut SearchRecord,
 ) -> Vec<(Vec<OffchainPublicKey>, PathId, C)>
 where
     C: Clone + PartialOrd,
@@ -49,7 +62,12 @@ where
 
     let intermediates = length - 1;
 
-    let paths = all_simple_paths_multi::<Vec<_>, _, RandomState, _, _>(
+    let selection_id = search.selection_id;
+    let search_id = search.search_id;
+    let phase = search.phase;
+    let diagnostics = RefCell::new(search);
+    let evaluation = Cell::new(0u64);
+    let paths = all_simple_paths_multi_observed::<Vec<_>, _, RandomState, _, _, _>(
         &inner.graph,
         source,
         destinations,
@@ -58,7 +76,84 @@ where
         Some(intermediates),
         initial_value,
         min_value,
-        move |c, w, i| value_fn(c, w, i),
+        |c, w, i, from, to| {
+            evaluation.set(evaluation.get().saturating_add(1));
+            let edge_evaluation_id = evaluation.get();
+            let span = tracing::trace_span!("graph.edge_value", selection_id, search_id, phase, edge_evaluation_id,
+                edge_index=i, source=%inner.graph[from], destination=%inner.graph[to]);
+            let _entered = span.enter();
+            value_fn(c, w, i)
+        },
+        |visited, edge, reason| {
+            let mut search = diagnostics.borrow_mut();
+            match reason {
+                BranchDecision::Cycle => search.cycles_skipped += 1,
+                BranchDecision::Excluded => search.excluded_skipped += 1,
+                BranchDecision::BelowMinimum => search.below_minimum += 1,
+                BranchDecision::TargetTooEarly => search.target_too_early += 1,
+                BranchDecision::DepthLimit => search.depth_limited += 1,
+            }
+            let rejection = match reason {
+                BranchDecision::BelowMinimum => Some("value_below_minimum"),
+                BranchDecision::TargetTooEarly => Some("target_reached_before_requested_length"),
+                BranchDecision::DepthLimit => Some("requested_length_exhausted_before_target"),
+                _ => None,
+            };
+            if rejection.is_some()
+                && (search.rejected_edge.is_none()
+                    || (reason == BranchDecision::BelowMinimum && search.rejected_reason != rejection))
+            {
+                let mut prefix = [0; 5];
+                for (i, index) in visited.iter().copied().chain(Some(edge.target())).take(5).enumerate() {
+                    prefix[i] = path_id::encode(&inner.graph[index]);
+                }
+                search.rejected_prefix = Some(prefix);
+                search.rejected_prefix_nodes = Some(
+                    visited
+                        .iter()
+                        .copied()
+                        .chain(Some(edge.target()))
+                        .take(5)
+                        .map(|index| inner.graph[index].to_string())
+                        .collect(),
+                );
+                search.rejected_reason = rejection;
+                search.rejected_evaluation_id = (reason == BranchDecision::BelowMinimum).then(|| evaluation.get());
+                search.rejected_prefix_truncated = visited.len() + 1 > prefix.len();
+                search.rejected_edge = Some(super::diagnostics::present(
+                    inner,
+                    edge.source(),
+                    edge.target(),
+                    edge.weight(),
+                ));
+            }
+            search.rejected_examples_omitted = search
+                .below_minimum
+                .saturating_add(search.target_too_early)
+                .saturating_add(search.depth_limited)
+                .saturating_sub(u64::from(search.rejected_edge.is_some()));
+            // Branch observations are emitted only when TRACE survives static/runtime filters.
+            if tracing::enabled!(tracing::Level::TRACE) {
+                let observation = super::diagnostics::present(inner, edge.source(), edge.target(), edge.weight());
+                let mut prefix = [0; 5];
+                for (i, index) in visited.iter().copied().chain(Some(edge.target())).take(5).enumerate() {
+                    prefix[i] = path_id::encode(&inner.graph[index]);
+                }
+                tracing::trace!(
+                    event = "graph_branch_decision",
+                    selection_id,
+                    search_id,
+                    phase,
+                    edge_evaluation_id = (reason == BranchDecision::BelowMinimum).then(|| evaluation.get()),
+                    ?prefix,
+                    prefix_truncated = visited.len() + 1 > prefix.len(),
+                    ?reason,
+                    depth = visited.len(),
+                    ?observation,
+                    "graph branch was not eligible at this stage"
+                );
+            }
+        },
     )
     .filter_map(|(node_indices, final_cost)| {
         // Build the PathId along the path. Slots are key-derived via `path_id::encode`, so no
@@ -83,7 +178,19 @@ where
             .collect::<Vec<_>>();
         // After stripping source: intermediates + destination = length nodes.
         // `simple_paths` additionally pops the destination; the others return as-is.
-        (nodes.len() == length).then_some((nodes, path_id, final_cost))
+        if nodes.len() != length {
+            return None;
+        }
+        tracing::trace!(
+            event = "graph_candidate",
+            selection_id,
+            search_id,
+            phase,
+            ?path_id,
+            ?nodes,
+            "graph traversal candidate returned to selector"
+        );
+        Some((nodes, path_id, final_cost))
     });
 
     if let Some(take_count) = take_count {
@@ -105,37 +212,72 @@ impl hopr_api::graph::NetworkGraphTraverse for ChannelGraph {
         take_count: Option<usize>,
         value_fn: C,
     ) -> Vec<(Vec<Self::NodeId>, PathId, C::Value)> {
-        if length == 0 {
-            return Default::default();
-        }
-
-        let inner = self.inner.read();
-        let Some(start) = inner.indices.get_by_left(source) else {
-            return Default::default();
-        };
-        let Some(end) = inner.indices.get_by_left(destination) else {
-            return Default::default();
-        };
-        let end = HashSet::from_iter([*end]);
-
-        // find_paths returns [intermediates…, destination]; pop destination since caller
-        // supplies it as an explicit input argument and it must not repeat in the path body.
-        find_paths(
-            &inner,
-            *start,
-            &end,
+        let started = Instant::now();
+        let mut search = self.begin_search(
+            "point_to_point",
+            source,
+            Some(destination),
             length,
             take_count,
-            value_fn.initial_value(),
-            value_fn.min_value(),
-            value_fn.into_value_fn(),
-        )
-        .into_iter()
-        .map(|(mut nodes, path_id, cost)| {
-            nodes.pop(); // strip destination — caller already knows it
-            (nodes, path_id, cost)
-        })
-        .collect()
+            std::any::type_name::<C>(),
+        );
+        let span = tracing::trace_span!("graph.simple_paths", selection_id=search.selection_id, search_id=search.search_id, phase=search.phase, source=%search.source, destination=?search.destination, length=search.length, take_count=?take_count);
+        let _entered = span.enter();
+        let paths: Vec<_> = (|| {
+            if length == 0 {
+                search.outcome = "invalid_length";
+                return Default::default();
+            }
+
+            let inner = self.inner.read();
+            let Some(start) = inner.indices.get_by_left(source) else {
+                search.outcome = "source_missing";
+                return Default::default();
+            };
+            let Some(end) = inner.indices.get_by_left(destination) else {
+                search.outcome = "destination_missing";
+                return Default::default();
+            };
+            let end = HashSet::from_iter([*end]);
+
+            // find_paths returns [intermediates…, destination]; pop destination since caller
+            // supplies it as an explicit input argument and it must not repeat in the path body.
+            find_paths(
+                &inner,
+                *start,
+                &end,
+                length,
+                take_count,
+                value_fn.initial_value(),
+                value_fn.min_value(),
+                value_fn.into_value_fn(),
+                &mut search,
+            )
+            .into_iter()
+            .map(|(mut nodes, path_id, cost)| {
+                nodes.pop(); // strip destination — caller already knows it
+                (nodes, path_id, cost)
+            })
+            .collect()
+        })();
+        search.returned_path = paths.first().map(|p| p.1);
+        search.returned_path_nodes = paths.first().map(|p| {
+            std::iter::once(search.source.clone())
+                .chain(p.0.iter().map(ToString::to_string))
+                .take(5)
+                .collect()
+        });
+        if let Some(nodes) = &mut search.returned_path_nodes
+            && nodes.len() < 5
+        {
+            nodes.push(destination.to_string());
+        }
+        search.returned_paths_omitted = paths.len().saturating_sub(1);
+        if take_count == Some(0) && search.outcome == "no_eligible_paths" {
+            search.outcome = "zero_limit";
+        }
+        self.searches.record(search, paths.len(), started.elapsed());
+        paths
     }
 
     fn simple_paths_from<C: ValueFn<Weight = Self::Observed>>(
@@ -145,27 +287,56 @@ impl hopr_api::graph::NetworkGraphTraverse for ChannelGraph {
         take_count: Option<usize>,
         value_fn: C,
     ) -> Vec<(Vec<Self::NodeId>, PathId, C::Value)> {
-        if length == 0 {
-            return Default::default();
-        }
-
-        let inner = self.inner.read();
-        let Some(start) = inner.indices.get_by_left(source) else {
-            return Default::default();
-        };
-
-        let destinations: HashSet<NodeIndex> = inner.graph.node_indices().filter(|idx| idx != start).collect();
-
-        find_paths(
-            &inner,
-            *start,
-            &destinations,
+        let started = Instant::now();
+        let mut search = self.begin_search(
+            "any_destination",
+            source,
+            None,
             length,
             take_count,
-            value_fn.initial_value(),
-            value_fn.min_value(),
-            value_fn.into_value_fn(),
-        )
+            std::any::type_name::<C>(),
+        );
+        let span = tracing::trace_span!("graph.simple_paths_from", selection_id=search.selection_id, search_id=search.search_id, phase=search.phase, source=%search.source, destination=?search.destination, length=search.length, take_count=?take_count);
+        let _entered = span.enter();
+        let paths: Vec<_> = (|| {
+            if length == 0 {
+                search.outcome = "invalid_length";
+                return Default::default();
+            }
+
+            let inner = self.inner.read();
+            let Some(start) = inner.indices.get_by_left(source) else {
+                search.outcome = "source_missing";
+                return Default::default();
+            };
+
+            let destinations: HashSet<NodeIndex> = inner.graph.node_indices().filter(|idx| idx != start).collect();
+
+            find_paths(
+                &inner,
+                *start,
+                &destinations,
+                length,
+                take_count,
+                value_fn.initial_value(),
+                value_fn.min_value(),
+                value_fn.into_value_fn(),
+                &mut search,
+            )
+        })();
+        search.returned_path = paths.first().map(|p| p.1);
+        search.returned_path_nodes = paths.first().map(|p| {
+            std::iter::once(search.source.clone())
+                .chain(p.0.iter().map(ToString::to_string))
+                .take(5)
+                .collect()
+        });
+        search.returned_paths_omitted = paths.len().saturating_sub(1);
+        if take_count == Some(0) && search.outcome == "no_eligible_paths" {
+            search.outcome = "zero_limit";
+        }
+        self.searches.record(search, paths.len(), started.elapsed());
+        paths
     }
 
     /// Generates loopback paths of exactly `hops` intermediate relay nodes.
@@ -175,89 +346,181 @@ impl hopr_api::graph::NetworkGraphTraverse for ChannelGraph {
     ///
     /// Requests outside [`MIN_LOOPBACK_HOPS`]`..=`[`MAX_LOOPBACK_HOPS`] yield no paths.
     fn simple_loopback_to_self(&self, hops: usize, take_count: Option<usize>) -> Vec<(Vec<Self::NodeId>, PathId)> {
-        if (MIN_LOOPBACK_HOPS..=MAX_LOOPBACK_HOPS).contains(&hops) {
-            let inner = self.inner.read();
+        let started = Instant::now();
+        let mut search = self.begin_search(
+            "loopback",
+            &self.me,
+            Some(&self.me),
+            hops.saturating_add(1),
+            take_count,
+            "loopback_edge_value",
+        );
+        let span = tracing::trace_span!("graph.simple_loopback_to_self", selection_id=search.selection_id, search_id=search.search_id, phase=search.phase, source=%search.source, destination=?search.destination, length=search.length, take_count=?take_count);
+        let _entered = span.enter();
+        let paths: Vec<_> = (|| {
+            if (MIN_LOOPBACK_HOPS..=MAX_LOOPBACK_HOPS).contains(&hops) {
+                let inner = self.inner.read();
 
-            if let Some(me_idx) = inner.indices.get_by_left(&self.me) {
-                // The candidate set holds the *last* node before the appended closing `me`, so the
-                // edge that matters is `neighbor → me`, not `me → neighbor`. Since
-                // `MIN_LOOPBACK_HOPS` is 2, the destination is never the first hop, and the
-                // outgoing edge plays no part in the emitted loop. `resolve_loopback_edges` rejects
-                // a probe whose closing edge is absent, so requiring the incoming edge here is what
-                // keeps the probe attributable. A successful neighbor probe upserts both
-                // directions, so this excludes nothing that has actually been reached.
-                let connected_neighbors = inner
-                    .graph
-                    .neighbors_directed(*me_idx, petgraph::Direction::Incoming)
-                    .filter(|neighbor| {
-                        inner
-                            .graph
-                            .edges_connecting(*neighbor, *me_idx)
-                            .next()
-                            // The closing edge must exist; its connectivity must merely not be known
-                            // to be down. Excluding an unchecked neighbour would stop it being
-                            // probed, which is what would keep it unchecked.
-                            .is_some_and(|e| {
-                                e.weight().immediate_qos().and_then(|imm| imm.is_connected()) != Some(false)
-                            })
-                    })
-                    .collect::<HashSet<_>>();
+                if let Some(me_idx) = inner.indices.get_by_left(&self.me) {
+                    // The candidate set holds the *last* node before the appended closing `me`, so the
+                    // edge that matters is `neighbor → me`, not `me → neighbor`. Since
+                    // `MIN_LOOPBACK_HOPS` is 2, the destination is never the first hop, and the
+                    // outgoing edge plays no part in the emitted loop. `resolve_loopback_edges` rejects
+                    // a probe whose closing edge is absent, so requiring the incoming edge here is what
+                    // keeps the probe attributable. A successful neighbor probe upserts both
+                    // directions, so this excludes nothing that has actually been reached.
+                    let connected_neighbors = inner
+                        .graph
+                        .neighbors_directed(*me_idx, petgraph::Direction::Incoming)
+                        .filter(|neighbor| {
+                            inner
+                                .graph
+                                .edges_connecting(*neighbor, *me_idx)
+                                .next()
+                                // The closing edge must exist; its connectivity must merely not be known
+                                // to be down. Excluding an unchecked neighbour would stop it being
+                                // probed, which is what would keep it unchecked.
+                                .is_some_and(|e| {
+                                    e.weight().immediate_qos().and_then(|imm| imm.is_connected()) != Some(false)
+                                })
+                        })
+                        .collect::<HashSet<_>>();
 
-                // Deliberately more permissive than data path selection. RFC-0010 §4.2.1.4 wants
-                // low-scoring edges probed *more* urgently; applying the production `min_ack_rate`
-                // here would instead prune them, so they would stop being probed, never be
-                // resampled, and stay excluded permanently.
-                let value_fn = EdgeValueFn::forward_without_self_loopback(
-                    // The closing edge back to `me` is appended after path-finding.
-                    std::num::NonZeroUsize::new(hops + 1).expect("hop range is non-zero"),
-                    self.edge_penalty,
-                    0.0,
-                    // Whatever the producer last pushed; `None` until the first price is seen.
-                    hopr_api::graph::NetworkGraphView::ticket_face_value(self),
-                );
-
-                return find_paths(
-                    &inner,
-                    *me_idx,
-                    &connected_neighbors,
-                    hops,
-                    take_count,
-                    value_fn.initial_value(),
-                    value_fn.min_value(),
-                    value_fn.into_value_fn(),
-                )
-                .into_iter()
-                .filter_map(|(mut a, mut b, _c)| {
-                    // find_paths already strips the leading `me` (source), so `a` is
-                    // [intermediates…, connected_neighbor]. Append `me` to close the loopback;
-                    // this is the only sanctioned position where `me` appears as a "destination".
-                    //
-                    // b is filled by find_paths BEFORE skip(1), so b[0] = me_idx and
-                    // b[1..=path_node_count] = path nodes. Closing me goes at b[path_node_count + 1].
-                    //
-                    // The hop range above guarantees the slot exists. Without the closing marker
-                    // the PathId cannot be resolved back to a loop, so drop rather than emit it.
-                    let path_node_count = a.len();
-                    debug_assert!(
-                        path_node_count + 1 < b.len(),
-                        "loopback of {path_node_count} hops has no PathId slot for the closing node"
+                    // Deliberately more permissive than data path selection. RFC-0010 §4.2.1.4 wants
+                    // low-scoring edges probed *more* urgently; applying the production `min_ack_rate`
+                    // here would instead prune them, so they would stop being probed, never be
+                    // resampled, and stay excluded permanently.
+                    let value_fn = EdgeValueFn::forward_without_self_loopback(
+                        // The closing edge back to `me` is appended after path-finding.
+                        std::num::NonZeroUsize::new(hops + 1).expect("hop range is non-zero"),
+                        self.edge_penalty,
+                        0.0,
+                        // Whatever the producer last pushed; `None` until the first price is seen.
+                        hopr_api::graph::NetworkGraphView::ticket_face_value(self),
                     );
-                    if path_node_count + 1 >= b.len() {
-                        tracing::warn!(
-                            hops = path_node_count,
-                            "loopback path has no PathId slot for the closing node, dropping"
-                        );
-                        return None;
-                    }
-                    b[path_node_count + 1] = path_id::encode(&self.me);
-                    a.push(self.me);
-                    Some((a, b))
-                })
-                .collect();
-            };
-        }
 
-        vec![]
+                    return find_paths(
+                        &inner,
+                        *me_idx,
+                        &connected_neighbors,
+                        hops,
+                        take_count,
+                        value_fn.initial_value(),
+                        value_fn.min_value(),
+                        value_fn.into_value_fn(),
+                        &mut search,
+                    )
+                    .into_iter()
+                    .filter_map(|(mut a, mut b, _c)| {
+                        // find_paths already strips the leading `me` (source), so `a` is
+                        // [intermediates…, connected_neighbor]. Append `me` to close the loopback;
+                        // this is the only sanctioned position where `me` appears as a "destination".
+                        //
+                        // b is filled by find_paths BEFORE skip(1), so b[0] = me_idx and
+                        // b[1..=path_node_count] = path nodes. Closing me goes at b[path_node_count + 1].
+                        //
+                        // The hop range above guarantees the slot exists. Without the closing marker
+                        // the PathId cannot be resolved back to a loop, so drop rather than emit it.
+                        let path_node_count = a.len();
+                        debug_assert!(
+                            path_node_count + 1 < b.len(),
+                            "loopback of {path_node_count} hops has no PathId slot for the closing node"
+                        );
+                        if path_node_count + 1 >= b.len() {
+                            tracing::warn!(
+                                hops = path_node_count,
+                                "loopback path has no PathId slot for the closing node, dropping"
+                            );
+                            return None;
+                        }
+                        b[path_node_count + 1] = path_id::encode(&self.me);
+                        a.push(self.me);
+                        Some((a, b))
+                    })
+                    .collect();
+                };
+            }
+
+            search.outcome = if !(MIN_LOOPBACK_HOPS..=MAX_LOOPBACK_HOPS).contains(&hops) {
+                "invalid_hops"
+            } else {
+                "source_missing"
+            };
+            vec![]
+        })();
+        search.returned_path = paths.first().map(|p| p.1);
+        search.returned_path_nodes = paths.first().map(|p| {
+            std::iter::once(search.source.clone())
+                .chain(p.0.iter().map(ToString::to_string))
+                .take(5)
+                .collect()
+        });
+        search.returned_paths_omitted = paths.len().saturating_sub(1);
+        if take_count == Some(0) && search.outcome == "no_eligible_paths" {
+            search.outcome = "zero_limit";
+        }
+        self.searches.record(search, paths.len(), started.elapsed());
+        paths
+    }
+}
+
+impl ChannelGraph {
+    fn begin_search(
+        &self,
+        kind: &'static str,
+        source: &OffchainPublicKey,
+        destination: Option<&OffchainPublicKey>,
+        length: usize,
+        take_count: Option<usize>,
+        value_function: &'static str,
+    ) -> SearchRecord {
+        let context = crate::correlation::current_search_context().unwrap_or_else(|| {
+            crate::correlation::SearchContext::new(crate::correlation::next_selection_id(), "unspecified")
+        });
+        SearchRecord {
+            selection_id: context.selection_id,
+            search_id: context.search_id,
+            phase: context.phase,
+            kind,
+            direction: if kind == "loopback" {
+                "loopback"
+            } else if *source == self.me {
+                "forward"
+            } else if destination == Some(&self.me) {
+                "return"
+            } else {
+                "other"
+            },
+            source: source.to_string(),
+            destination: destination.map(ToString::to_string),
+            length,
+            take_count,
+            value_function,
+            graph_ticket_face_value: hopr_api::graph::NetworkGraphView::ticket_face_value(self).map(|v| v.to_string()),
+            graph_min_ack_rate: self.min_ack_rate,
+            graph_edge_penalty: self.edge_penalty,
+            outcome: "no_eligible_paths",
+            returned: 0,
+            limit_reached: false,
+            cycles_skipped: 0,
+            excluded_skipped: 0,
+            below_minimum: 0,
+            target_too_early: 0,
+            depth_limited: 0,
+            rejected_prefix: None,
+            rejected_prefix_nodes: None,
+            rejected_reason: None,
+            rejected_evaluation_id: None,
+            rejected_examples_omitted: 0,
+            rejected_prefix_truncated: false,
+            rejected_edge: None,
+            returned_path: None,
+            returned_path_nodes: None,
+            returned_paths_omitted: 0,
+            elapsed_us: 0,
+            recorded_at_ms: 0,
+            occurrences: 1,
+        }
     }
 }
 

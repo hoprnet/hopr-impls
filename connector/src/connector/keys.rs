@@ -171,6 +171,10 @@ mod tests {
     impl Backend for MockErrorBackend {
         type Error = ConnectorError;
 
+        fn count_announced_accounts(&self, _me: &Address) -> Result<u64, Self::Error> {
+            Ok(0)
+        }
+
         fn insert_account(&self, _entry: AccountEntry) -> Result<Option<AccountEntry>, Self::Error> {
             Err(ConnectorError::InvalidState("mock error"))
         }

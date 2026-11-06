@@ -79,6 +79,7 @@ pub struct ChannelGraph {
     /// changes. Held once for the whole graph so a change costs one write, not an edge sweep.
     pub(crate) ticket_face_value: Arc<RwLock<Option<hopr_api::graph::traits::Balance>>>,
     pub(crate) inner: Arc<RwLock<InnerGraph>>,
+    pub(crate) searches: Arc<super::search_diagnostics::SearchJournal>,
 }
 
 /// Multiplier applied to an edge with no probe observations, keeping it discoverable (RFC-0010
@@ -141,6 +142,7 @@ impl ChannelGraph {
             max_plausible_loopback_rtt,
             ticket_face_value: Arc::new(RwLock::new(None)),
             inner: Arc::new(RwLock::new(InnerGraph { graph, indices, slots })),
+            searches: Arc::new(Default::default()),
         }
     }
 
@@ -308,7 +310,7 @@ impl hopr_api::graph::NetworkGraphWrite for ChannelGraph {
     /// If the edge does not exist, it gets created first.
     ///
     /// If the nodes do not exist, they are added as well.
-    #[tracing::instrument(level = "debug", skip(self, f))]
+    #[tracing::instrument(level = "trace", skip(self, f))]
     fn upsert_edge<F>(&self, src: &OffchainPublicKey, dest: &OffchainPublicKey, f: F)
     where
         F: FnOnce(&mut Observations),
@@ -342,7 +344,7 @@ impl hopr_api::graph::NetworkGraphWrite for ChannelGraph {
 
         if let Some(weight) = inner.graph.edge_weight_mut(edge_idx) {
             f(weight);
-            tracing::debug!(%src, %dest, ?weight, "updated edge weight with an observation");
+            tracing::trace!(%src, %dest, ?weight, "updated edge weight with an observation");
         }
     }
 }

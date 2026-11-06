@@ -1,5 +1,7 @@
 pub mod algorithm;
+mod diagnostics;
 pub mod graph;
+mod search_diagnostics;
 pub mod traverse;
 pub mod update;
 
