@@ -908,7 +908,23 @@ impl hopr_network_graph::diagnostics::GraphStateRead for FaultyGraph {
     }
 }
 #[tokio::test]
-async fn graph_timeout_or_join_failure_does_not_hide_chain_state() -> anyhow::Result<()> {
+async fn graph_timeout_does_not_hide_chain_state() -> anyhow::Result<()> {
+    let snapshot = collect_with_faulty_graph(false, Duration::from_millis(10)).await?;
+    assert_eq!(snapshot.safe_balance.value().map(|a| a.value()), Some(100u32.into()));
+    assert!(matches!(snapshot.graph, Section::Timeout));
+    Ok(())
+}
+
+#[tokio::test]
+async fn graph_join_failure_does_not_hide_chain_state() -> anyhow::Result<()> {
+    // Panic reporting and blocking-task scheduling must not race the timeout under test above.
+    let snapshot = collect_with_faulty_graph(true, Duration::from_secs(5)).await?;
+    assert_eq!(snapshot.safe_balance.value().map(|a| a.value()), Some(100u32.into()));
+    assert!(matches!(snapshot.graph, Section::Error { .. }));
+    Ok(())
+}
+
+async fn collect_with_faulty_graph(panic: bool, timeout: Duration) -> anyhow::Result<Snapshot> {
     use crate::testing::create_test_blokli_connector;
     let me = ChainKeypair::from_secret(&[1; 32])?;
     let safe = Address::from([88; 20]);
@@ -922,25 +938,16 @@ async fn graph_timeout_or_join_failure_does_not_hide_chain_state() -> anyhow::Re
         )
         .await?,
     );
-    for panic in [false, true] {
-        let collector = Collector::new(
-            chain.clone(),
-            FaultyGraph {
-                graph: ChannelGraph::new(packet(11)?),
-                panic,
-                executor_thread: std::thread::current().id(),
-            },
-            Network::default(),
-            safe,
-            Config::default().with_source_timeout(Duration::from_millis(10))?,
-        );
-        let snapshot = collector.collect(None).await;
-        assert_eq!(snapshot.safe_balance.value().map(|a| a.value()), Some(100u32.into()));
-        if panic {
-            assert!(matches!(snapshot.graph, Section::Error { .. }));
-        } else {
-            assert!(matches!(snapshot.graph, Section::Timeout));
-        }
-    }
-    Ok(())
+    let collector = Collector::new(
+        chain,
+        FaultyGraph {
+            graph: ChannelGraph::new(packet(11)?),
+            panic,
+            executor_thread: std::thread::current().id(),
+        },
+        Network::default(),
+        safe,
+        Config::default().with_source_timeout(timeout)?,
+    );
+    Ok(collector.collect(None).await)
 }
