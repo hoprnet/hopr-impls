@@ -14,8 +14,8 @@ report it at TRACE. Enable TRACE in a build that retains it for individual repor
 ## Bounded graph state
 
 `diagnostics::GraphStateRead::graph_state` reads the current graph independently of any chain-channel inventory. `ChannelGraph` implements
-it; references and `Arc` handles delegate to the same reader. The connector's periodic `state_dump` collector includes the result as its
-`graph` section, even when chain reads fail.
+it; references and `Arc` handles delegate to the same reader. With the connector's `state-dump` feature enabled, its periodic `state_dump`
+collector includes the result as its `graph` section, even when chain reads fail.
 
 The snapshot includes graph-wide node/edge counts, whether the local node exists, ticket face value, edge penalty and minimum ack rate. It
 counts both incoming and outgoing local edges and samples up to eight incident edges, including healthy and transport-only edges. Each named
