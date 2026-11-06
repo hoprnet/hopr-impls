@@ -241,5 +241,6 @@ jobs:
           # every inner job of the reusable workflow skips, the caller job
           # reports skipped as well. Allow that skip only for a non-Rust
           # change; a Rust change still has to run both. A failed job reds the
-          # gate either way.
+          # gate, except `label`: it is best-effort (read-only token on fork
+          # PRs, continue-on-error) and its failure is ignored.
           allowed-skips: ${{ needs.changes.outputs.rust == 'true' && (github.event_name == 'pull_request' && 'validate-pr-title, label' || 'validate-pr-title, label, semver-checks') || 'validate-pr-title, label, semver-checks, tests, build-library' }}
