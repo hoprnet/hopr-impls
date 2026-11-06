@@ -31,7 +31,8 @@
     nixpkgs-unstable.url = "github:NixOS/nixpkgs/nixos-unstable";
 
     # HOPR Nix Library (provides flake-utils and reusable build functions)
-    nix-lib.url = "github:hoprnet/nix-lib/v1.2.0";
+    nix-lib.url = "github:hoprnet/nix-lib/v2.1.1";
+    treefmt-nix.url = "github:numtide/treefmt-nix";
 
     # Rust build system
     crane.url = "github:ipetkov/crane";
@@ -47,6 +48,14 @@
     nix-lib.inputs.nixpkgs.follows = "nixpkgs";
     nix-lib.inputs.crane.follows = "crane";
     nix-lib.inputs.rust-overlay.follows = "rust-overlay";
+    # One unstable/treefmt/flake-parts revision for the whole flake. Left
+    # unfollowed, `nix flake update nix-lib` moves nix-lib's private nixpkgs-unstable,
+    # which supplies cargo-llvm-cov to the dev shell, to a revision missing from the
+    # binary cache.
+    nix-lib.inputs.nixpkgs-unstable.follows = "nixpkgs-unstable";
+    nix-lib.inputs.treefmt-nix.follows = "treefmt-nix";
+    nix-lib.inputs.flake-parts.follows = "flake-parts";
+    treefmt-nix.inputs.nixpkgs.follows = "nixpkgs";
     rust-overlay.inputs.nixpkgs.follows = "nixpkgs";
   };
 
@@ -122,12 +131,15 @@
             rustToolchainFile = ./rust-toolchain.toml;
           };
 
+          craneLib = (crane.mkLib pkgs).overrideToolchain stableToolchain;
+
           hoprImplsPackages = import ./nix/packages/hopr-impls.nix {
             inherit
               builders
               sources
               rev
               nixLib
+              craneLib
               ;
           };
 
@@ -146,6 +158,7 @@
           utilityApps = {
             update-github-labels = nixLib.mkUpdateGithubLabelsApp;
             audit = nixLib.mkAuditApp { };
+            semver-checks = nixLib.mkSemverChecksApp { rustToolchain = stableToolchain; };
             check = nixLib.mkCheckApp { inherit system; };
             test = {
               type = "app";
@@ -306,11 +319,11 @@
 
           # Export applications using nix-lib
           apps = utilityApps // {
-            coverage-unit = {
+            coverage = {
               type = "app";
               program = toString (
-                pkgs.writeShellScript "coverage-unit" ''
-                  nix develop .#coverage -c cargo llvm-cov --workspace --all-features --lib --lcov --output-path coverage.lcov
+                pkgs.writeShellScript "coverage" ''
+                  nix develop .#coverage -c cargo llvm-cov --workspace --all-features --lcov --output-path coverage.lcov
                 ''
               );
             };
@@ -321,7 +334,13 @@
           # require bootstrapping a full cross toolchain, which is not feasible
           # locally. On CI each target is built natively on its own runner.
           packages = {
-            inherit (packages) lib-hopr-impls clippy pre-commit-check;
+            inherit (packages)
+              lib-hopr-impls
+              clippy
+              doc
+              test-doc
+              pre-commit-check
+              ;
             # Set default package
             default = packages.lib-hopr-impls;
           }
