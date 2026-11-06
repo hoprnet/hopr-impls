@@ -15,7 +15,7 @@ version                = "0.31.1"
 
 [features]
 runtime-tokio = ["hopr-utils/runtime-tokio"]
-state-dump    = ["dep:hopr-network-graph"]
+state-dump    = ["dep:hopr-network-graph", "dep:serde"]
 testing       = ["hopr-utils/testing-blokli"]
 
 [dependencies]
@@ -35,7 +35,7 @@ parking_lot         = { workspace = true }
 petgraph            = { workspace = true, features = ["graphmap", "rayon"] }
 postcard            = { workspace = true }
 redb                = { workspace = true }
-serde               = { workspace = true }
+serde               = { workspace = true, optional = true }
 serde_json          = { workspace = true }
 smart-default       = { workspace = true }
 tempfile            = { workspace = true }
