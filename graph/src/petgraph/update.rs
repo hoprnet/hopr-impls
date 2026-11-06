@@ -197,7 +197,7 @@ impl hopr_api::graph::NetworkGraphUpdate for ChannelGraph {
         }
     }
 
-    #[tracing::instrument(level = "debug", skip(self, update))]
+    #[tracing::instrument(level = "trace", skip(self, update))]
     fn record_edge<N, P>(&self, update: MeasurableEdge<N, P>)
     where
         N: hopr_api::graph::MeasurablePeer + Send + Clone,
@@ -456,7 +456,7 @@ impl hopr_api::graph::NetworkGraphUpdate for ChannelGraph {
         }
     }
 
-    #[tracing::instrument(level = "debug", skip(self, update))]
+    #[tracing::instrument(level = "trace", skip(self, update))]
     fn record_node<N>(&self, update: N)
     where
         N: MeasurableNode + Clone + Send + Sync + 'static,
