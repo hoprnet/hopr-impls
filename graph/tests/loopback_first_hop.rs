@@ -321,3 +321,36 @@ fn dead_relay_that_is_not_my_neighbour_should_be_starved_for_two_and_three_hops(
     }
     Ok(())
 }
+
+// ── Return paths ─────────────────────────────────────────────────────────
+
+#[test]
+fn return_path_through_a_dead_relay_should_be_starved() -> anyhow::Result<()> {
+    // `a1 → X → me` lies on the loopback cycle `me → a1 → X → me`, so loops that never return
+    // judge `X` on a return path as they do on a forward one.
+    let net = Net::from_json(LAYERED)?;
+
+    let before = net.returning("a1", 1);
+    assert!(
+        before.value_of(&["bb"]).is_some() && before.value_of(&["bg"]).is_some(),
+        "both relays must be routable back before any loop is seen"
+    );
+
+    probe_with_dead(&net, &["bb"]);
+
+    let after = net.returning("a1", 1);
+    let honest = after
+        .value_of(&["bg"])
+        .ok_or_else(|| anyhow::anyhow!("the honest relay must stay routable back"))?;
+    let dead = after
+        .value_of(&["bb"])
+        .ok_or_else(|| anyhow::anyhow!("a starved relay must stay a candidate"))?;
+
+    assert!(dead > 0.0, "a non-positive value prunes the edge");
+    let share = dead / (dead + honest);
+    assert!(
+        share < 1e-6,
+        "a return path through a dead relay must draw a negligible share, got {share}"
+    );
+    Ok(())
+}

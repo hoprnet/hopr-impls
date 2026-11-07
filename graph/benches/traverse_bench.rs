@@ -145,6 +145,7 @@ fn bench_simple_paths(c: &mut Criterion) {
                         std::num::NonZeroUsize::new(2).expect("is greater than 1"),
                         BENCH_EDGE_PENALTY,
                         BENCH_MIN_ACK_RATE,
+                        0.0,
                         None,
                     ),
                 ))
@@ -162,6 +163,7 @@ fn bench_simple_paths(c: &mut Criterion) {
                         std::num::NonZeroUsize::new(3).expect("is greater than 1"),
                         BENCH_EDGE_PENALTY,
                         BENCH_MIN_ACK_RATE,
+                        0.0,
                         None,
                     ),
                 ))
@@ -179,6 +181,7 @@ fn bench_simple_paths(c: &mut Criterion) {
                         std::num::NonZeroUsize::new(4).expect("is greater than 1"),
                         BENCH_EDGE_PENALTY,
                         BENCH_MIN_ACK_RATE,
+                        0.0,
                         None,
                     ),
                 ))

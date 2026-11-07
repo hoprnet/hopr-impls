@@ -223,6 +223,8 @@ pub struct TransportIntermediates {
     /// One `Option` rather than a value plus a timestamp, because the timestamp means nothing
     /// without a peak to date it. Decays rather than latching: see [`Self::peak_at`].
     surb_peak: Option<SurbPeak>,
+    /// Loopbacks over this edge that returned, against all of them, over the last 10 s.
+    loopback: LoopbackWindow,
 }
 
 /// A delivery-ratio peak and the instant it was set, which the decay is measured from.
@@ -230,6 +232,83 @@ pub struct TransportIntermediates {
 struct SurbPeak {
     value: f64,
     at: std::time::Instant,
+}
+
+/// Width of one loopback bucket.
+const LOOPBACK_BUCKET_WIDTH: std::time::Duration = std::time::Duration::from_secs(1);
+/// Buckets in the loopback window: 10 s of evidence.
+const LOOPBACK_BUCKETS: usize = 10;
+/// Loopbacks over an edge that the window needs before it says anything.
+///
+/// Below this a rate of zero would be one lost loop on a fresh edge, not a relay that delivers
+/// nothing.
+const MIN_LOOPBACK_SAMPLES: u32 = 3;
+
+/// One second of loopback outcomes over an edge, tagged with which second it is.
+#[derive(Debug, Copy, Clone, Default, PartialEq)]
+struct LoopbackBucket {
+    second: u64,
+    sent: u32,
+    returned: u32,
+}
+
+/// Loopbacks over an edge that returned, against all of them, over the last 10 s.
+///
+/// Every loop that crosses the edge counts once, as returned or as failed, so the ratio is
+/// returned over returned plus failed. A window rather than a moving average: a relay none of whose
+/// loops returned reads as exactly zero, and anything above zero is a relay that carries traffic.
+#[derive(Debug, Copy, Clone, PartialEq)]
+struct LoopbackWindow {
+    epoch: std::time::Instant,
+    buckets: [LoopbackBucket; LOOPBACK_BUCKETS],
+}
+
+impl LoopbackWindow {
+    fn new(epoch: std::time::Instant) -> Self {
+        Self {
+            epoch,
+            buckets: [LoopbackBucket::default(); LOOPBACK_BUCKETS],
+        }
+    }
+
+    fn second_of(&self, now: std::time::Instant) -> u64 {
+        now.saturating_duration_since(self.epoch).as_secs() / LOOPBACK_BUCKET_WIDTH.as_secs()
+    }
+
+    fn record_at(&mut self, returned: bool, now: std::time::Instant) {
+        let second = self.second_of(now);
+        let bucket = &mut self.buckets[(second % LOOPBACK_BUCKETS as u64) as usize];
+        // The slot belongs to an earlier lap of the ring: its outcomes are out of the window.
+        if bucket.second != second {
+            *bucket = LoopbackBucket {
+                second,
+                ..LoopbackBucket::default()
+            };
+        }
+        bucket.sent = bucket.sent.saturating_add(1);
+        if returned {
+            bucket.returned = bucket.returned.saturating_add(1);
+        }
+    }
+
+    /// `None` until the window holds at least [`MIN_LOOPBACK_SAMPLES`] loopbacks.
+    fn rate_at(&self, now: std::time::Instant) -> Option<f64> {
+        let current = self.second_of(now);
+        let (sent, returned) = self
+            .buckets
+            .iter()
+            .filter(|bucket| {
+                bucket.sent > 0 && bucket.second <= current && bucket.second + LOOPBACK_BUCKETS as u64 > current
+            })
+            .fold((0u32, 0u32), |(sent, returned), bucket| {
+                (
+                    sent.saturating_add(bucket.sent),
+                    returned.saturating_add(bucket.returned),
+                )
+            });
+
+        (sent >= MIN_LOOPBACK_SAMPLES).then(|| f64::from(returned) / f64::from(sent))
+    }
 }
 
 impl Default for TransportIntermediates {
@@ -241,6 +320,7 @@ impl Default for TransportIntermediates {
             balance: None,
             surb: WindowedRatio::new(SURB_BUCKET_WIDTH, now),
             surb_peak: None,
+            loopback: LoopbackWindow::new(now),
         }
     }
 }
@@ -332,10 +412,15 @@ impl EdgeProtocolObservable for TransportIntermediates {
     fn balance(&self) -> Option<hopr_api::graph::traits::Balance> {
         self.balance
     }
+
+    fn loopback_rate(&self) -> Option<f64> {
+        self.loopback.rate_at(std::time::Instant::now())
+    }
 }
 
 impl EdgeLinkObservable for TransportIntermediates {
     fn record(&mut self, measurement: EdgeTransportMeasurement) {
+        self.loopback.record_at(measurement.is_ok(), std::time::Instant::now());
         self.link.record(measurement);
     }
 
@@ -785,6 +870,7 @@ mod tests {
             balance: None,
             surb: WindowedRatio::new(TEST_SLICE, epoch),
             surb_peak: None,
+            loopback: LoopbackWindow::new(epoch),
         }
     }
 
@@ -1065,5 +1151,121 @@ mod tests {
         let imm_score = observation.immediate_qos().unwrap().score();
         assert!(observation.intermediate_qos().is_none());
         assert_eq!(observation.score(), imm_score);
+    }
+}
+
+#[cfg(test)]
+mod loopback_window_tests {
+    use std::time::{Duration, Instant};
+
+    use hopr_api::graph::traits::{EdgeObservableRead, EdgeObservableWrite, EdgeProtocolObservable, EdgeWeightType};
+
+    use super::*;
+
+    fn record(window: &mut LoopbackWindow, at: Instant, returned: usize, failed: usize) {
+        for _ in 0..returned {
+            window.record_at(true, at);
+        }
+        for _ in 0..failed {
+            window.record_at(false, at);
+        }
+    }
+
+    #[test]
+    fn a_window_without_loopbacks_should_say_nothing() {
+        let epoch = Instant::now();
+        assert_eq!(LoopbackWindow::new(epoch).rate_at(epoch), None);
+    }
+
+    #[test]
+    fn fewer_loopbacks_than_the_minimum_should_say_nothing() {
+        // One lost loop on a fresh edge is not a relay that delivers nothing.
+        let epoch = Instant::now();
+        let mut window = LoopbackWindow::new(epoch);
+        record(&mut window, epoch, 0, MIN_LOOPBACK_SAMPLES as usize - 1);
+        assert_eq!(window.rate_at(epoch), None);
+    }
+
+    #[test]
+    fn a_relay_none_of_whose_loopbacks_returned_should_read_as_exactly_zero() {
+        let epoch = Instant::now();
+        let mut window = LoopbackWindow::new(epoch);
+        record(&mut window, epoch, 0, MIN_LOOPBACK_SAMPLES as usize);
+        assert_eq!(window.rate_at(epoch), Some(0.0));
+    }
+
+    #[test]
+    fn returned_and_failed_loopbacks_should_be_summed_into_the_ratio() {
+        let epoch = Instant::now();
+        let mut window = LoopbackWindow::new(epoch);
+        record(&mut window, epoch, 5, 5);
+        assert_eq!(window.rate_at(epoch), Some(0.5));
+    }
+
+    #[test]
+    fn one_returning_loop_among_many_failures_should_read_above_zero() {
+        // Anything above zero is a relay that carries traffic.
+        let epoch = Instant::now();
+        let mut window = LoopbackWindow::new(epoch);
+        record(&mut window, epoch, 1, 9);
+        assert_eq!(window.rate_at(epoch), Some(0.1));
+    }
+
+    #[test]
+    fn outcomes_older_than_the_window_should_be_forgotten() {
+        let epoch = Instant::now();
+        let mut window = LoopbackWindow::new(epoch);
+        record(&mut window, epoch, 0, 5);
+
+        let later = epoch + LOOPBACK_BUCKET_WIDTH * LOOPBACK_BUCKETS as u32;
+        assert_eq!(
+            window.rate_at(later),
+            None,
+            "10 s on, the failures are out of the window"
+        );
+    }
+
+    #[test]
+    fn a_relay_should_recover_once_its_loopbacks_return() {
+        let epoch = Instant::now();
+        let mut window = LoopbackWindow::new(epoch);
+        record(&mut window, epoch, 0, 3);
+        assert_eq!(window.rate_at(epoch), Some(0.0));
+
+        let later = epoch + Duration::from_secs(5);
+        record(&mut window, later, 3, 0);
+        assert_eq!(window.rate_at(later), Some(0.5), "both are still inside the window");
+    }
+
+    #[test]
+    fn a_reused_bucket_should_not_carry_the_outcomes_of_an_earlier_lap() {
+        let epoch = Instant::now();
+        let mut window = LoopbackWindow::new(epoch);
+        record(&mut window, epoch, 0, 4);
+
+        // Same bucket slot one full lap later: the old second must have been cleared.
+        let lap = epoch + LOOPBACK_BUCKET_WIDTH * LOOPBACK_BUCKETS as u32;
+        record(&mut window, lap, 3, 0);
+        assert_eq!(window.rate_at(lap), Some(1.0));
+    }
+
+    #[test]
+    fn only_intermediate_outcomes_should_feed_the_loopback_rate() {
+        let mut observations = Observations::default();
+        for _ in 0..5 {
+            observations.record(EdgeWeightType::Immediate(Err(())));
+        }
+        assert!(
+            observations.intermediate_qos().is_none(),
+            "neighbour pings are not loopbacks"
+        );
+
+        for _ in 0..MIN_LOOPBACK_SAMPLES {
+            observations.record(EdgeWeightType::Intermediate(Err(())));
+        }
+        assert_eq!(
+            observations.intermediate_qos().and_then(|q| q.loopback_rate()),
+            Some(0.0)
+        );
     }
 }

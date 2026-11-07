@@ -260,9 +260,9 @@ impl Net {
             Self::length(hops),
             self.edge_penalty,
             self.min_ack_rate,
+            DEFAULT_MIN_LOOPBACK_RATE,
             self.ticket_face_value,
-        )
-        .with_min_loopback_rate(DEFAULT_MIN_LOOPBACK_RATE);
+        );
         self.to_routes(
             self.graph
                 .simple_paths(&self.key(&self.me), &self.key(dest), hops + 1, None, value_fn),
@@ -275,6 +275,7 @@ impl Net {
             Self::length(hops),
             self.edge_penalty,
             self.min_ack_rate,
+            DEFAULT_MIN_LOOPBACK_RATE,
             self.ticket_face_value,
         );
         self.to_routes(
