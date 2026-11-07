@@ -33,7 +33,8 @@ use hopr_api::{
     types::crypto::prelude::{Keypair, OffchainKeypair},
 };
 use hopr_network_graph::{
-    ChannelGraph, DEFAULT_EDGE_PENALTY, DEFAULT_MAX_PLAUSIBLE_LOOPBACK_RTT, DEFAULT_MIN_ACK_RATE, Observations,
+    ChannelGraph, DEFAULT_EDGE_PENALTY, DEFAULT_MAX_PLAUSIBLE_LOOPBACK_RTT, DEFAULT_MIN_ACK_RATE,
+    DEFAULT_MIN_LOOPBACK_RATE, Observations,
 };
 
 /// A whole network, as one JSON object.
@@ -260,7 +261,8 @@ impl Net {
             self.edge_penalty,
             self.min_ack_rate,
             self.ticket_face_value,
-        );
+        )
+        .with_min_loopback_rate(DEFAULT_MIN_LOOPBACK_RATE);
         self.to_routes(
             self.graph
                 .simple_paths(&self.key(&self.me), &self.key(dest), hops + 1, None, value_fn),

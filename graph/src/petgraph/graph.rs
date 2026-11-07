@@ -88,6 +88,12 @@ pub const DEFAULT_EDGE_PENALTY: f64 = 0.5;
 /// Acknowledgement floor below which data-path selection rejects an immediate peer.
 pub const DEFAULT_MIN_ACK_RATE: f64 = 0.1;
 
+/// Loopback delivery floor below which data-path selection starves a first relay.
+///
+/// A router passes it to `EdgeValueFn::with_min_loopback_rate`. Probe generation does not, so a
+/// starved relay keeps being probed.
+pub const DEFAULT_MIN_LOOPBACK_RATE: f64 = 0.1;
+
 /// Round-trip beyond which a loopback report is treated as clock skew rather than a measurement.
 pub const DEFAULT_MAX_PLAUSIBLE_LOOPBACK_RTT: std::time::Duration = std::time::Duration::from_secs(30);
 

@@ -170,7 +170,10 @@ fn relay_whose_loopbacks_never_return_should_stay_probe_able() -> anyhow::Result
         .flat_map(|hops| net.loopback(hops))
         .filter(|names| names.iter().any(|name| name == "bad"))
         .count();
-    assert!(loops_through_bad > 0, "loops through the bad relay must still be generated");
+    assert!(
+        loops_through_bad > 0,
+        "loops through the bad relay must still be generated"
+    );
     Ok(())
 }
 
@@ -255,9 +258,15 @@ fn relay_that_is_dead_beyond_the_first_hop_should_be_starved_for_two_and_three_h
 
         let (through, around) = split_by(&net, hops, dead);
         let best_around = around.iter().copied().fold(0.0, f64::max);
-        assert!(best_around > 0.0, "{dead}, {hops} hop(s): honest routes must stay routable");
+        assert!(
+            best_around > 0.0,
+            "{dead}, {hops} hop(s): honest routes must stay routable"
+        );
         for value in through {
-            assert!(value > 0.0, "{dead}, {hops} hop(s): a starved route must stay a candidate");
+            assert!(
+                value > 0.0,
+                "{dead}, {hops} hop(s): a starved route must stay a candidate"
+            );
             let share = value / (value + best_around);
             assert!(
                 share < 1e-6,
@@ -275,7 +284,11 @@ fn layered_with_far_dead_relay() -> String {
         .lines()
         .filter(|line| !line.contains(r#""from": "bb",  "to": "me""#))
         .collect();
-    assert_eq!(without_return.len() + 1, LAYERED.lines().count(), "exactly one line removed");
+    assert_eq!(
+        without_return.len() + 1,
+        LAYERED.lines().count(),
+        "exactly one line removed"
+    );
     without_return.join("\n")
 }
 

@@ -367,7 +367,9 @@ impl hopr_api::graph::NetworkGraphUpdate for ChannelGraph {
                 // The loop returned over every edge on it, which is the evidence against a timeout on
                 // each. Only the target's latency is isolated above, so the others are credited with
                 // what they already carry, leaving their averages untouched. The edge back into `me`
-                // is left out: it is not a hop anyone chooses.
+                // is left out: it is not a hop anyone chooses. The target edge is skipped because it
+                // is recorded below; on a 2-hop loop it is also the first hop, and crediting it here
+                // would count the loop twice.
                 let fair_share = total_rtt / edges.len() as u32;
                 for (i, &edge) in edges[..edges.len() - 1].iter().enumerate() {
                     if i != target_idx {
@@ -472,7 +474,8 @@ impl hopr_api::graph::NetworkGraphUpdate for ChannelGraph {
                 // while a good relay also sits on loops that do return and credit it back, see the
                 // success branch. A relay that is not my neighbour can never be the last relay of a
                 // loop, so this is the only way an outcome reaches the edge into it. The edge back
-                // into `me` is left out.
+                // into `me` is left out, and so is the target edge, which recorded its failure above
+                // and would otherwise count this loop twice (on a 2-hop loop it is the first hop).
                 for (i, &edge) in edges[..edges.len() - 1].iter().enumerate() {
                     if i != target_idx
                         && let Some(weight) = inner.graph.edge_weight_mut(edge)
@@ -1857,9 +1860,7 @@ mod tests {
         send_loopback(&graph, &[me, a, b, me], 200);
 
         let obs = graph.edge(&me, &a).context("edge me→a should exist")?;
-        let qos = obs
-            .intermediate_qos()
-            .context("a returning loop must reach me→a")?;
+        let qos = obs.intermediate_qos().context("a returning loop must reach me→a")?;
         assert_eq!(qos.average_probe_rate(), Some(1.0), "the loop through a returned");
         assert_in_delta!(
             qos.average_latency().context("latency should be set")?.as_millis(),
