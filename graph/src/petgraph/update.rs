@@ -29,11 +29,12 @@ fn observe_neighbor_quality(graph: &ChannelGraph, peer: &hopr_api::OffchainPubli
     }
 }
 
-/// Credits a returning loopback to the first-hop edge, with the latency that edge already carries.
+/// Credits a returning loopback to an edge on the loop, with the latency that edge already carries.
 ///
-/// The intermediate latency is preferred, else the neighbor-probe latency, which is what the first
-/// hop's speed is. With neither there is no honest figure to record, so nothing is credited.
-fn credit_first_hop(inner: &mut InnerGraph, edge: EdgeIndex) {
+/// The intermediate latency is preferred, else the neighbor-probe latency. An edge that carries
+/// neither is credited `fallback`, the edge's share of the loop's round trip: a success must be
+/// recorded or the failures alone would make the edge look dead.
+fn credit_edge(inner: &mut InnerGraph, edge: EdgeIndex, fallback: std::time::Duration) {
     use hopr_api::graph::{
         EdgeLinkObservable,
         traits::{EdgeObservableRead, EdgeWeightType},
@@ -47,10 +48,7 @@ fn credit_first_hop(inner: &mut InnerGraph, edge: EdgeIndex) {
         .and_then(|q| q.average_latency())
         .or_else(|| weight.immediate_qos().and_then(|q| q.average_latency()));
 
-    match carried {
-        Some(latency) => weight.record(EdgeWeightType::Intermediate(Ok(latency))),
-        None => tracing::debug!("first hop carries no latency, loopback success not credited"),
-    }
+    weight.record(EdgeWeightType::Intermediate(Ok(carried.unwrap_or(fallback))));
 }
 
 /// Resolves a loopback path from serialized node-index bytes into a validated chain of edge indices.
@@ -366,11 +364,15 @@ impl hopr_api::graph::NetworkGraphUpdate for ChannelGraph {
                     }
                 }
 
-                // The loop returned through the first relay, which is the evidence against a timeout
-                // there. It says nothing new about that edge's speed, so the latency it already
-                // carries is credited, leaving the average untouched.
-                if target_idx != 0 {
-                    credit_first_hop(&mut inner, edges[0]);
+                // The loop returned over every edge on it, which is the evidence against a timeout on
+                // each. Only the target's latency is isolated above, so the others are credited with
+                // what they already carry, leaving their averages untouched. The edge back into `me`
+                // is left out: it is not a hop anyone chooses.
+                let fair_share = total_rtt / edges.len() as u32;
+                for (i, &edge) in edges[..edges.len() - 1].iter().enumerate() {
+                    if i != target_idx {
+                        credit_edge(&mut inner, edge, fair_share);
+                    }
                 }
 
                 // A saturating subtraction would turn "the known latencies already account for the
@@ -465,13 +467,18 @@ impl hopr_api::graph::NetworkGraphUpdate for ChannelGraph {
                     weight.record(EdgeWeightType::Intermediate(Err(())));
                 }
 
-                // Which relay on the loop dropped it is unknowable, but the first hop is the one
-                // routing decides on, and a relay that sits on loops that never return should lose
-                // that decision. Loops that do return credit it back, see the success branch.
-                if target_idx != 0
-                    && let Some(weight) = inner.graph.edge_weight_mut(edges[0])
-                {
-                    weight.record(EdgeWeightType::Intermediate(Err(())));
+                // Which relay on the loop dropped it is unknowable, so every edge on it takes the
+                // failure. A relay that sits on loops that never return loses ground on all of them,
+                // while a good relay also sits on loops that do return and credit it back, see the
+                // success branch. A relay that is not my neighbour can never be the last relay of a
+                // loop, so this is the only way an outcome reaches the edge into it. The edge back
+                // into `me` is left out.
+                for (i, &edge) in edges[..edges.len() - 1].iter().enumerate() {
+                    if i != target_idx
+                        && let Some(weight) = inner.graph.edge_weight_mut(edge)
+                    {
+                        weight.record(EdgeWeightType::Intermediate(Err(())));
+                    }
                 }
             }
             MeasurableEdge::Balance(update) => {
@@ -1149,9 +1156,9 @@ mod tests {
             25
         );
 
-        // me→a should NOT have intermediate QoS from this probe
+        // me→a is credited too: the loop returned over it
         let obs_me_a = graph.edge(&me, &a).context("edge me→a should exist")?;
-        assert!(obs_me_a.intermediate_qos().is_none());
+        assert!(obs_me_a.intermediate_qos().is_some());
 
         Ok(())
     }
@@ -1189,11 +1196,11 @@ mod tests {
             25
         ); // no preceding intermediate latencies, so full RTT is attributed
 
-        // Earlier edges should NOT have intermediate QoS from this probe
+        // Earlier edges are credited too: the loop returned over them
         let obs_me_a = graph.edge(&me, &a).context("edge me→a should exist")?;
-        assert!(obs_me_a.intermediate_qos().is_none());
+        assert!(obs_me_a.intermediate_qos().is_some());
         let obs_a_b = graph.edge(&a, &b).context("edge a→b should exist")?;
-        assert!(obs_a_b.intermediate_qos().is_none());
+        assert!(obs_a_b.intermediate_qos().is_some());
 
         Ok(())
     }
@@ -1929,11 +1936,16 @@ mod tests {
         assert!(qos.average_latency().is_none());
         assert!(qos.average_probe_rate().expect("probed") < 1.0);
 
-        // The first hop is marked failing too; middle edges still get nothing
+        // Every edge on the loop takes the failure, except the one back into me
         let obs_me_a = graph.edge(&me, &a).context("edge me→a should exist")?;
         assert!(obs_me_a.intermediate_qos().is_some());
         let obs_a_b = graph.edge(&a, &b).context("edge a→b should exist")?;
-        assert!(obs_a_b.intermediate_qos().is_none());
+        assert!(obs_a_b.intermediate_qos().is_some());
+        let obs_c_me = graph.edge(&c, &me).context("edge c→me should exist")?;
+        assert!(
+            obs_c_me.intermediate_qos().is_none(),
+            "the edge back into me is not a hop anyone chooses"
+        );
 
         Ok(())
     }
