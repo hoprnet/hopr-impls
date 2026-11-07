@@ -1752,6 +1752,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn loopback_timeout_should_also_mark_the_first_hop_edge_as_failing() -> anyhow::Result<()> {
+        // A loop that never returns is evidence against the relay we chose as first hop, which the
+        // `edges[len - 2]` attribution never reaches: the first-hop decision reads me→a.
+        let me = pubkey_from(&SECRET_0);
+        let a = pubkey_from(&SECRET_1);
+        let b = pubkey_from(&SECRET_2);
+
+        let graph = ChannelGraph::new(me);
+        graph.add_node(a);
+        graph.add_node(b);
+        graph.add_edge(&me, &a)?;
+        graph.add_edge(&a, &b)?;
+        graph.add_edge(&b, &me)?;
+
+        for _ in 0..3 {
+            send_loopback_timeout(&graph, &[me, a, b, me]);
+        }
+
+        let obs = graph.edge(&me, &a).context("edge me→a should exist")?;
+        let qos = obs
+            .intermediate_qos()
+            .context("a loop through a that never returned must reach me→a")?;
+        assert_eq!(
+            qos.average_probe_rate(),
+            Some(0.0),
+            "every loop through a failed, so me→a is measured dead"
+        );
+        assert_eq!(qos.score(), Some(0.0), "a measured-dead edge scores zero, not absent");
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn loopback_timeout_should_record_failed_intermediate_on_target_edge() -> anyhow::Result<()> {
         // Loopback: me(0) → a(1) → b(2) → me(0)
         // PathId nodes: [me=0, a=1, b=2, me=0, 0]
