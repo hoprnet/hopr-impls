@@ -90,13 +90,19 @@ fn the_loop(slots: [u64; 5], timestamp_ms: u128) -> Loop {
 /// Every loop through `bad` times out and every loop through `good` returns, over both loop shapes
 /// probing generates.
 fn probe_everything(net: &Net) {
+    probe_with_dead(net, &["bad"]);
+}
+
+/// Every loop through any `dead` relay times out and every other loop returns, over both loop
+/// shapes probing generates.
+fn probe_with_dead(net: &Net, dead: &[&str]) {
     for loop_hops in [2, 3] {
         let names = net.loopback(loop_hops);
         let slots = net.loopback_slots(loop_hops);
         assert!(!names.is_empty(), "the topology must offer {loop_hops}-hop loops");
 
         for (names, slots) in names.iter().zip(slots) {
-            let through_bad = names.iter().any(|name| name == "bad");
+            let through_bad = names.iter().any(|name| dead.contains(&name.as_str()));
             for _ in 0..LOOPS_PER_SHAPE {
                 let telemetry = if through_bad {
                     Err(NetworkGraphError::ProbeLoopbackTimeout(the_loop(slots, 0)))
@@ -180,5 +186,125 @@ fn direct_route_should_ignore_loopback_evidence() -> anyhow::Result<()> {
         vec![Vec::<String>::new()],
         "a direct route must survive loopback evidence against other relays"
     );
+    Ok(())
+}
+
+// ── A failing relay deeper in the path ───────────────────────────────────
+
+/// Two candidates at each of three positions. Every `b` and `c` is a relay that pings and acks
+/// identically, so which one is dead is visible only through the loops that pass it.
+///
+/// `me → a1|a2 → bg|bb → cg|cb → exit`, with every relay able to close a loop at `me`.
+const LAYERED: &str = r#"{
+  "me": "me",
+  "ticket_face_value": 100,
+  "edges": [
+    { "from": "me",  "to": "a1",   "connected": true, "latency_ms": 20, "balance": 100000, "packets": 10, "acks": 10 },
+    { "from": "me",  "to": "a2",   "connected": true, "latency_ms": 20, "balance": 100000, "packets": 10, "acks": 10 },
+    { "from": "me",  "to": "exit", "connected": true, "latency_ms": 20, "balance": 100000, "packets": 10, "acks": 10 },
+    { "from": "a1",  "to": "bg",   "connected": true, "latency_ms": 20, "balance": 100000 },
+    { "from": "a1",  "to": "bb",   "connected": true, "latency_ms": 20, "balance": 100000 },
+    { "from": "a2",  "to": "bg",   "connected": true, "latency_ms": 20, "balance": 100000 },
+    { "from": "a2",  "to": "bb",   "connected": true, "latency_ms": 20, "balance": 100000 },
+    { "from": "bg",  "to": "cg",   "connected": true, "latency_ms": 20, "balance": 100000 },
+    { "from": "bg",  "to": "cb",   "connected": true, "latency_ms": 20, "balance": 100000 },
+    { "from": "bb",  "to": "cg",   "connected": true, "latency_ms": 20, "balance": 100000 },
+    { "from": "bb",  "to": "cb",   "connected": true, "latency_ms": 20, "balance": 100000 },
+    { "from": "a1",  "to": "exit", "connected": true, "latency_ms": 20, "balance": 100000 },
+    { "from": "a2",  "to": "exit", "connected": true, "latency_ms": 20, "balance": 100000 },
+    { "from": "bg",  "to": "exit", "connected": true, "latency_ms": 20, "balance": 100000 },
+    { "from": "bb",  "to": "exit", "connected": true, "latency_ms": 20, "balance": 100000 },
+    { "from": "cg",  "to": "exit", "connected": true, "latency_ms": 20, "balance": 100000 },
+    { "from": "cb",  "to": "exit", "connected": true, "latency_ms": 20, "balance": 100000 },
+    { "from": "a1",  "to": "me",   "connected": true, "latency_ms": 20 },
+    { "from": "a2",  "to": "me",   "connected": true, "latency_ms": 20 },
+    { "from": "bg",  "to": "me",   "connected": true, "latency_ms": 20 },
+    { "from": "bb",  "to": "me",   "connected": true, "latency_ms": 20 },
+    { "from": "cg",  "to": "me",   "connected": true, "latency_ms": 20 },
+    { "from": "cb",  "to": "me",   "connected": true, "latency_ms": 20 }
+  ]
+}"#;
+
+/// The value of every route over `hops` relays, split by whether it passes the `dead` relay.
+fn split_by(net: &Net, hops: usize, dead: &str) -> (Vec<f64>, Vec<f64>) {
+    let routes = net.forward("exit", hops);
+    let (through, around): (Vec<_>, Vec<_>) = routes
+        .0
+        .iter()
+        .partition(|(relays, _)| relays.iter().any(|name| name == dead));
+    (
+        through.into_iter().map(|(_, value)| *value).collect(),
+        around.into_iter().map(|(_, value)| *value).collect(),
+    )
+}
+
+#[test]
+fn relay_that_is_dead_beyond_the_first_hop_should_be_starved_for_two_and_three_hops() -> anyhow::Result<()> {
+    // Position 2 is `bb` (second hop of a 2- or 3-hop route), position 3 is `cb` (third hop of a
+    // 3-hop route). Both look healthy to every ping and ack.
+    for (dead, hops) in [("bb", 2), ("bb", 3), ("cb", 3)] {
+        let net = Net::from_json(LAYERED)?;
+
+        let (through, around) = split_by(&net, hops, dead);
+        assert!(
+            !through.is_empty() && !around.is_empty(),
+            "{dead}, {hops} hop(s): routes through and around the relay must both exist before any loop is seen"
+        );
+
+        probe_with_dead(&net, &[dead]);
+
+        let (through, around) = split_by(&net, hops, dead);
+        let best_around = around.iter().copied().fold(0.0, f64::max);
+        assert!(best_around > 0.0, "{dead}, {hops} hop(s): honest routes must stay routable");
+        for value in through {
+            assert!(value > 0.0, "{dead}, {hops} hop(s): a starved route must stay a candidate");
+            let share = value / (value + best_around);
+            assert!(
+                share < 1e-6,
+                "{dead}, {hops} hop(s): a route through a dead relay must draw a negligible share, got {share}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `LAYERED` with `bb` not a neighbour of `me`: it has no edge back, so it can never be the last
+/// relay of a loop. Most relays two or three hops away are in this position.
+fn layered_with_far_dead_relay() -> String {
+    let without_return: Vec<&str> = LAYERED
+        .lines()
+        .filter(|line| !line.contains(r#""from": "bb",  "to": "me""#))
+        .collect();
+    assert_eq!(without_return.len() + 1, LAYERED.lines().count(), "exactly one line removed");
+    without_return.join("\n")
+}
+
+#[test]
+fn dead_relay_that_is_not_my_neighbour_should_be_starved_for_two_and_three_hops() -> anyhow::Result<()> {
+    // `bb` is only ever a middle relay of a loop, so no outcome is attributed to the edge into it
+    // unless every edge of the loop is credited.
+    for hops in [2, 3] {
+        let net = Net::from_json(&layered_with_far_dead_relay())?;
+
+        let (through, around) = split_by(&net, hops, "bb");
+        assert!(
+            !through.is_empty() && !around.is_empty(),
+            "{hops} hop(s): routes through and around bb must both exist before any loop is seen"
+        );
+
+        probe_with_dead(&net, &["bb"]);
+
+        let (through, around) = split_by(&net, hops, "bb");
+        let best_around = around.iter().copied().fold(0.0, f64::max);
+        assert!(best_around > 0.0, "{hops} hop(s): honest routes must stay routable");
+        for value in through {
+            assert!(value > 0.0, "{hops} hop(s): a starved route must stay a candidate");
+            let share = value / (value + best_around);
+            assert!(
+                share < 1e-6,
+                "{hops} hop(s): a route through a dead non-neighbour relay must draw a negligible share, got {share}"
+            );
+        }
+    }
     Ok(())
 }
