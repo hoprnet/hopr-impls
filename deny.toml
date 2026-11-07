@@ -29,3 +29,6 @@ allow = [
 [sources]
 unknown-git      = "deny"
 unknown-registry = "deny"
+# TEMPORARY (GNO-1183): hopr-api 5.1.0 is not published yet and is patched in from a git branch in Cargo.toml.
+# Drop this together with that patch.
+allow-git = ["https://github.com/hoprnet/hopr-api"]

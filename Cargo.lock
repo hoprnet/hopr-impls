@@ -3880,9 +3880,8 @@ dependencies = [
 
 [[package]]
 name = "hopr-api"
-version = "5.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fa64c5a401c0c7db4ad9a0688d11e59bc4566f92c0661e8ef97e4008816509ad"
+version = "5.1.0"
+source = "git+https://github.com/hoprnet/hopr-api?branch=kauki%2Ffix%2Fgraph%2Ffirst-hop-loopback-gate#c90432df87d4f678ee2b179e068ffd71935aa889"
 dependencies = [
  "async-trait",
  "atomic_enum",
@@ -3992,7 +3991,7 @@ dependencies = [
 
 [[package]]
 name = "hopr-network-graph"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "anyhow",
  "assertables",
@@ -6439,7 +6438,7 @@ dependencies = [
  "quinn-udp 0.5.16",
  "rustc-hash",
  "rustls",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -6479,7 +6478,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.61.2",
 ]
@@ -6492,7 +6491,7 @@ checksum = "47091c86514c2e11452cb228dee77037334b99d92a23e4c69aa5982261f39247"
 dependencies = [
  "cfg_aliases",
  "libc",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "windows-sys 0.61.2",
 ]
 
