@@ -223,7 +223,7 @@ pub struct TransportIntermediates {
     /// One `Option` rather than a value plus a timestamp, because the timestamp means nothing
     /// without a peak to date it. Decays rather than latching: see [`Self::peak_at`].
     surb_peak: Option<SurbPeak>,
-    /// Loopbacks over this edge that returned, against all of them, over the last 10 s.
+    /// Loopbacks over this edge that returned, against all of them, over the last 60 s.
     loopback: LoopbackWindow,
 }
 
@@ -235,28 +235,30 @@ struct SurbPeak {
 }
 
 /// Width of one loopback bucket.
-const LOOPBACK_BUCKET_WIDTH: std::time::Duration = std::time::Duration::from_secs(1);
-/// Buckets in the loopback window: 10 s of evidence.
-const LOOPBACK_BUCKETS: usize = 10;
-/// Loopbacks over an edge that the window needs before it says anything.
+const LOOPBACK_BUCKET_WIDTH: std::time::Duration = std::time::Duration::from_secs(5);
+/// Buckets in the loopback window: 60 s of evidence.
 ///
-/// Below this a rate of zero would be one lost loop on a fresh edge, not a relay that delivers
-/// nothing.
-const MIN_LOOPBACK_SAMPLES: u32 = 3;
+/// Loops are sent once per probing round, 30 s by default, and a lost one is recorded after the 3 s
+/// probe timeout. The window has to span more than one round, or the evidence is gone for most of
+/// the time between rounds. Two rounds is the shortest span that bridges the gap with room for a
+/// late round; a longer one only delays noticing that a relay stopped returning, because the last
+/// good loop stays counted until it expires.
+const LOOPBACK_BUCKETS: usize = 12;
 
-/// One second of loopback outcomes over an edge, tagged with which second it is.
+/// One bucket of loopback outcomes over an edge, tagged with which bucket of time it is.
 #[derive(Debug, Copy, Clone, Default, PartialEq)]
 struct LoopbackBucket {
-    second: u64,
+    slot: u64,
     sent: u32,
     returned: u32,
 }
 
-/// Loopbacks over an edge that returned, against all of them, over the last 10 s.
+/// Loopbacks over an edge that returned, against all of them, over the last 60 s.
 ///
 /// Every loop that crosses the edge counts once, as returned or as failed, so the ratio is
 /// returned over returned plus failed. A window rather than a moving average: a relay none of whose
 /// loops returned reads as exactly zero, and anything above zero is a relay that carries traffic.
+/// A single loop is evidence, since an edge may see only one per probing round.
 #[derive(Debug, Copy, Clone, PartialEq)]
 struct LoopbackWindow {
     epoch: std::time::Instant,
@@ -271,17 +273,17 @@ impl LoopbackWindow {
         }
     }
 
-    fn second_of(&self, now: std::time::Instant) -> u64 {
+    fn slot_of(&self, now: std::time::Instant) -> u64 {
         now.saturating_duration_since(self.epoch).as_secs() / LOOPBACK_BUCKET_WIDTH.as_secs()
     }
 
     fn record_at(&mut self, returned: bool, now: std::time::Instant) {
-        let second = self.second_of(now);
-        let bucket = &mut self.buckets[(second % LOOPBACK_BUCKETS as u64) as usize];
-        // The slot belongs to an earlier lap of the ring: its outcomes are out of the window.
-        if bucket.second != second {
+        let slot = self.slot_of(now);
+        let bucket = &mut self.buckets[(slot % LOOPBACK_BUCKETS as u64) as usize];
+        // The bucket belongs to an earlier lap of the ring: its outcomes are out of the window.
+        if bucket.slot != slot {
             *bucket = LoopbackBucket {
-                second,
+                slot,
                 ..LoopbackBucket::default()
             };
         }
@@ -291,14 +293,14 @@ impl LoopbackWindow {
         }
     }
 
-    /// `None` until the window holds at least [`MIN_LOOPBACK_SAMPLES`] loopbacks.
+    /// `None` when no loopback crossed the edge in the window.
     fn rate_at(&self, now: std::time::Instant) -> Option<f64> {
-        let current = self.second_of(now);
+        let current = self.slot_of(now);
         let (sent, returned) = self
             .buckets
             .iter()
             .filter(|bucket| {
-                bucket.sent > 0 && bucket.second <= current && bucket.second + LOOPBACK_BUCKETS as u64 > current
+                bucket.sent > 0 && bucket.slot <= current && bucket.slot + LOOPBACK_BUCKETS as u64 > current
             })
             .fold((0u32, 0u32), |(sent, returned), bucket| {
                 (
@@ -307,7 +309,7 @@ impl LoopbackWindow {
                 )
             });
 
-        (sent >= MIN_LOOPBACK_SAMPLES).then(|| f64::from(returned) / f64::from(sent))
+        (sent > 0).then(|| f64::from(returned) / f64::from(sent))
     }
 }
 
@@ -1178,19 +1180,20 @@ mod loopback_window_tests {
     }
 
     #[test]
-    fn fewer_loopbacks_than_the_minimum_should_say_nothing() {
-        // One lost loop on a fresh edge is not a relay that delivers nothing.
+    fn one_failed_loopback_should_read_as_zero() {
+        // Loops are sent once per probing round, so an edge may see one a round. Waiting for more
+        // would mean never judging it.
         let epoch = Instant::now();
         let mut window = LoopbackWindow::new(epoch);
-        record(&mut window, epoch, 0, MIN_LOOPBACK_SAMPLES as usize - 1);
-        assert_eq!(window.rate_at(epoch), None);
+        record(&mut window, epoch, 0, 1);
+        assert_eq!(window.rate_at(epoch), Some(0.0));
     }
 
     #[test]
     fn a_relay_none_of_whose_loopbacks_returned_should_read_as_exactly_zero() {
         let epoch = Instant::now();
         let mut window = LoopbackWindow::new(epoch);
-        record(&mut window, epoch, 0, MIN_LOOPBACK_SAMPLES as usize);
+        record(&mut window, epoch, 0, 3);
         assert_eq!(window.rate_at(epoch), Some(0.0));
     }
 
@@ -1221,7 +1224,7 @@ mod loopback_window_tests {
         assert_eq!(
             window.rate_at(later),
             None,
-            "10 s on, the failures are out of the window"
+            "a full window on, the failures are out of it"
         );
     }
 
@@ -1249,6 +1252,83 @@ mod loopback_window_tests {
         assert_eq!(window.rate_at(lap), Some(1.0));
     }
 
+    // ── Cadence ─────────────────────────────────────────────────────────
+
+    // Loops are sent once per probing round (30 s by default) and a lost one is recorded after the
+    // 3 s probe timeout. The window has to bridge the gap between rounds, or the evidence is gone
+    // for most of the time.
+
+    const ROUND: Duration = Duration::from_secs(30);
+    const TIMEOUT: Duration = Duration::from_secs(3);
+
+    /// Plays a timeline second by second: the round-`n` loop over the edge has its outcome known
+    /// `TIMEOUT` after the round starts, and `rate` is read after every second.
+    ///
+    /// Time has to move forward: a ring window is only meaningful for a clock that does.
+    fn play(outcomes: &[bool], until: Duration) -> Vec<(u64, Option<f64>)> {
+        let epoch = Instant::now();
+        let mut window = LoopbackWindow::new(epoch);
+        (0..=until.as_secs())
+            .map(|second| {
+                let now = epoch + Duration::from_secs(second);
+                if let Some(since) = second.checked_sub(TIMEOUT.as_secs())
+                    && since % ROUND.as_secs() == 0
+                    && let Some(returned) = outcomes.get((since / ROUND.as_secs()) as usize)
+                {
+                    window.record_at(*returned, now);
+                }
+                (second, window.rate_at(now))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_dead_relay_should_stay_starved_between_probing_rounds() {
+        let timeline = play(&[false; 6], ROUND * 5 + TIMEOUT);
+
+        // From the first outcome on, every second must read zero, not only the seconds just after a round.
+        for (second, rate) in timeline.into_iter().filter(|(second, _)| *second >= TIMEOUT.as_secs()) {
+            assert_eq!(rate, Some(0.0), "t = {second} s: evidence gone between rounds");
+        }
+    }
+
+    #[test]
+    fn a_relay_that_dies_should_be_starved_within_two_rounds() {
+        let timeline = play(&[true, false, false, false], ROUND * 3 + TIMEOUT);
+        let at = |second: u64| timeline[second as usize].1;
+
+        // The last good loop is still in the window one round later.
+        assert!(at(ROUND.as_secs() + TIMEOUT.as_secs()).is_some_and(|rate| rate > 0.0));
+        // Two rounds later it has expired, and only failures are left.
+        assert_eq!(
+            at((ROUND * 2).as_secs() + TIMEOUT.as_secs()),
+            Some(0.0),
+            "a relay that stopped returning must read zero within two rounds"
+        );
+    }
+
+    #[test]
+    fn a_relay_should_be_usable_as_soon_as_a_loop_returns() {
+        let timeline = play(&[false, false, false, true], ROUND * 3 + TIMEOUT);
+        let recovered = timeline[(ROUND * 3 + TIMEOUT).as_secs() as usize].1;
+        assert!(
+            recovered.is_some_and(|rate| rate > 0.0),
+            "one returning loop is enough, however many failures are still in the window"
+        );
+    }
+
+    #[test]
+    fn one_lost_loop_should_starve_a_single_loop_edge_for_at_most_one_round() {
+        let timeline = play(&[false, true], ROUND + TIMEOUT);
+        let at = |second: u64| timeline[second as usize].1;
+
+        assert_eq!(at(TIMEOUT.as_secs() + 20), Some(0.0), "starved until the next round");
+        assert!(
+            at(ROUND.as_secs() + TIMEOUT.as_secs()).is_some_and(|rate| rate > 0.0),
+            "the next round's loop clears it"
+        );
+    }
+
     #[test]
     fn only_intermediate_outcomes_should_feed_the_loopback_rate() {
         let mut observations = Observations::default();
@@ -1260,9 +1340,7 @@ mod loopback_window_tests {
             "neighbour pings are not loopbacks"
         );
 
-        for _ in 0..MIN_LOOPBACK_SAMPLES {
-            observations.record(EdgeWeightType::Intermediate(Err(())));
-        }
+        observations.record(EdgeWeightType::Intermediate(Err(())));
         assert_eq!(
             observations.intermediate_qos().and_then(|q| q.loopback_rate()),
             Some(0.0)
