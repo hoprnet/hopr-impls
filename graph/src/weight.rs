@@ -245,6 +245,14 @@ const LOOPBACK_BUCKET_WIDTH: std::time::Duration = std::time::Duration::from_sec
 /// good loop stays counted until it expires.
 const LOOPBACK_BUCKETS: usize = 12;
 
+/// How far back loopback outcomes over an edge are still counted.
+///
+/// The probing interval must stay well inside it: a loop is sent once per round, so with a longer
+/// interval the evidence expires between rounds and a failing relay reads as unprobed instead of
+/// dead. The loopback generator's own configuration is checked against it.
+pub const LOOPBACK_WINDOW: std::time::Duration =
+    std::time::Duration::from_secs(LOOPBACK_BUCKET_WIDTH.as_secs() * LOOPBACK_BUCKETS as u64);
+
 /// One bucket of loopback outcomes over an edge, tagged with which bucket of time it is.
 #[derive(Debug, Copy, Clone, Default, PartialEq)]
 struct LoopbackBucket {

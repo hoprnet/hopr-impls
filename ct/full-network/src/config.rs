@@ -6,7 +6,11 @@ use validator::{Validate, ValidationError, ValidationErrors};
 #[derive(Debug, Clone, Copy, PartialEq, smart_default::SmartDefault)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(deny_unknown_fields))]
 pub struct ProberConfig {
-    /// The delay between individual probing rounds for neighbor discovery
+    /// The delay between individual probing rounds for neighbor discovery.
+    ///
+    /// A loopback is sent once per round, and the graph counts its outcome for
+    /// `hopr_network_graph::LOOPBACK_WINDOW`. Keep this at no more than half of that, or a failing
+    /// relay's evidence expires between rounds and it reads as unprobed, not dead.
     #[cfg_attr(
         feature = "serde",
         serde(default = "default_probing_interval", with = "humantime_serde")
@@ -146,6 +150,19 @@ const fn just_true() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_default_probing_interval_should_fit_twice_in_the_loopback_window() {
+        // Evidence from one round must still be counted when the next one is sent, with room for the
+        // probe timeout and a late round.
+        let cfg = ProberConfig::default();
+        assert!(
+            cfg.interval * 2 <= hopr_network_graph::LOOPBACK_WINDOW,
+            "interval {:?} against window {:?}",
+            cfg.interval,
+            hopr_network_graph::LOOPBACK_WINDOW
+        );
+    }
 
     #[test]
     fn interval_less_than_probe_timeout_is_invalid() {
