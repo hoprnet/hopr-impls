@@ -1067,6 +1067,64 @@ mod tests {
         );
     }
 
+    // ── The gate on later hops ──────────────────────────────────────────
+
+    /// A relay in the middle of a path that was good and whose loops have all failed since.
+    ///
+    /// Its moving average is still positive, so its score only falls gradually, while the loopback
+    /// window already reads zero. The value function has to starve it on that.
+    fn a_middle_relay_that_stopped_returning_loops() -> Observations {
+        let epoch = std::time::Instant::now();
+        let mut m = fast_slices(epoch);
+        m.balance = Some(hopr_api::graph::traits::Balance::from(1_000u64));
+        for _ in 0..5 {
+            m.link.record(Ok(std::time::Duration::from_millis(30)));
+        }
+        for _ in 0..2 {
+            m.link.record(Err(()));
+            m.loopback.record_at(false, epoch);
+        }
+
+        Observations {
+            intermediate_probe: Some(m),
+            ..Observations::default()
+        }
+    }
+
+    #[test]
+    fn a_later_relay_whose_loopbacks_never_returned_should_be_starved_though_its_average_is_still_positive() {
+        use hopr_api::graph::{ValueFn, function::EdgeValueFn, traits::EdgeObservableRead};
+
+        let observed = a_middle_relay_that_stopped_returning_loops();
+        let intermediate = observed.intermediate_qos().expect("recorded");
+
+        // Vacuity guards: the case only means something while the two disagree.
+        assert!(
+            intermediate.score().is_some_and(|score| score > 0.1),
+            "the moving average must still be positive"
+        );
+        assert_eq!(intermediate.loopback_rate(), Some(0.0), "while the window reads zero");
+
+        let path_length = std::num::NonZeroUsize::new(3).expect("non-zero");
+        // Edge 1 of 3 leads into the second relay: neither the first edge nor the one into the destination.
+        let valued = |min_loopback_rate: f64| {
+            EdgeValueFn::<f64, Observations>::forward(path_length, 0.5, 0.1, min_loopback_rate, None).into_value_fn()(
+                1.0, &observed, 1,
+            )
+        };
+
+        let routed = valued(f64::EPSILON);
+        let probing = valued(0.0);
+        assert!(
+            probing > 0.1,
+            "probe generation sees the edge at full weight, got {probing}"
+        );
+        assert!(
+            routed > 0.0 && routed / probing < 1e-8,
+            "a relay in the middle whose loops never return must be starved too, got {routed} against {probing}"
+        );
+    }
+
     /// The discount must be soft and self-clearing, not a latch.
     #[test]
     fn an_edge_should_recover_its_rate_once_the_recent_slices_climb_back() {
