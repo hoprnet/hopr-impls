@@ -7,11 +7,11 @@
 mod common;
 
 use common::Net;
-use hopr_api::graph::traits::{EdgeObservableWrite, EdgeWeightType};
 use hopr_api::{
     OffchainPublicKey,
     graph::{
         EdgeTransportTelemetry, MeasurableEdge, MeasurablePath, MeasurablePeer, NetworkGraphError, NetworkGraphUpdate,
+        traits::{EdgeObservableWrite, EdgeWeightType},
     },
 };
 
