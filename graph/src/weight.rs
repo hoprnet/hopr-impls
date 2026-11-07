@@ -328,6 +328,16 @@ impl Default for TransportIntermediates {
 }
 
 impl TransportIntermediates {
+    /// [`EdgeProtocolObservable::loopback_rate`] against a caller-supplied clock.
+    pub(crate) fn loopback_rate_at(&self, now: std::time::Instant) -> Option<f64> {
+        self.loopback.rate_at(now)
+    }
+
+    /// [`EdgeProtocolObservable::traffic_rate`] against a caller-supplied clock.
+    pub(crate) fn traffic_rate_at(&self, now: std::time::Instant) -> Option<f64> {
+        self.surb_delivery_rate_at(now)
+    }
+
     /// Folds one reporting interval of SURB round-trips into the window.
     pub(crate) fn record_surb_round_trips(&mut self, expected: u64, observed: u64) {
         self.record_surb_round_trips_at(expected, observed, std::time::Instant::now())
@@ -416,7 +426,11 @@ impl EdgeProtocolObservable for TransportIntermediates {
     }
 
     fn loopback_rate(&self) -> Option<f64> {
-        self.loopback.rate_at(std::time::Instant::now())
+        self.loopback_rate_at(std::time::Instant::now())
+    }
+
+    fn traffic_rate(&self) -> Option<f64> {
+        self.traffic_rate_at(std::time::Instant::now())
     }
 }
 
@@ -954,6 +968,102 @@ mod tests {
             collapsed_rate < undiscounted,
             "the trend must discount below the peak-relative value, otherwise it is inert: rate={collapsed_rate} \
              undiscounted={undiscounted}"
+        );
+    }
+
+    // ── Traffic as a second witness ─────────────────────────────────────
+
+    // Probes are sparse and fail on any hop of their loop; SURBs come back at data rate and a
+    // collapse shows within seconds. They are two witnesses that the edge works, kept apart so the
+    // value function can let either one keep a relay (hopr-api `EdgeValueFn`).
+
+    #[test]
+    fn traffic_that_stopped_returning_should_read_zero_within_the_trend_window() {
+        let epoch = std::time::Instant::now();
+        let mut m = fast_slices(epoch);
+        let now = deliver_healthily(&mut m, epoch);
+        let now = record_slices(&mut m, now + TEST_SLICE, 2, 100, 0);
+
+        assert_eq!(
+            m.traffic_rate_at(now),
+            Some(0.0),
+            "SURBs minted and none returned: traffic is dead long before the next loopback round"
+        );
+        assert_eq!(m.loopback_rate_at(now), None, "and no loopback was involved");
+    }
+
+    #[test]
+    fn traffic_that_keeps_returning_should_read_above_zero() {
+        let epoch = std::time::Instant::now();
+        let mut m = fast_slices(epoch);
+        let now = deliver_healthily(&mut m, epoch);
+
+        assert!(m.traffic_rate_at(now).is_some_and(|rate| rate > 0.0));
+    }
+
+    #[test]
+    fn the_loopback_rate_should_not_include_traffic() {
+        // Kept apart: a healthy SURB window says nothing about loops, and the other way round.
+        let epoch = std::time::Instant::now();
+        let mut m = fast_slices(epoch);
+        let now = deliver_healthily(&mut m, epoch);
+        assert_eq!(m.loopback_rate_at(now), None);
+
+        for _ in 0..3 {
+            m.loopback.record_at(false, now);
+        }
+        assert_eq!(m.loopback_rate_at(now), Some(0.0));
+        assert!(
+            m.traffic_rate_at(now).is_some_and(|rate| rate > 0.0),
+            "failed probes must not change what traffic says"
+        );
+    }
+
+    #[test]
+    fn traffic_that_never_returned_should_say_nothing() {
+        // The edge has never delivered one, so there is no baseline to have collapsed from: it may
+        // be a session that has only just started.
+        let epoch = std::time::Instant::now();
+        let mut m = fast_slices(epoch);
+        let now = record_slices(&mut m, epoch, 4, 100, 0);
+
+        assert_eq!(m.traffic_rate_at(now), None);
+    }
+
+    #[test]
+    fn an_idle_edge_should_not_read_zero_traffic() {
+        // No SURBs minted lately is not SURBs that failed to return.
+        let epoch = std::time::Instant::now();
+        let mut m = fast_slices(epoch);
+        let now = deliver_healthily(&mut m, epoch);
+
+        let idle = now + TEST_SLICE * 4;
+        assert!(
+            m.traffic_rate_at(idle).is_none_or(|rate| rate > 0.0),
+            "an idle edge must not be starved"
+        );
+    }
+
+    #[test]
+    fn the_trait_should_expose_both_witnesses_of_an_intermediate_stream() {
+        use hopr_api::graph::traits::{
+            EdgeObservableRead, EdgeObservableWrite, EdgeProtocolObservable, EdgeWeightType,
+        };
+
+        let mut observations = Observations::default();
+        observations.record(EdgeWeightType::SurbRoundTrips {
+            expected: 100,
+            observed: 100,
+        });
+        for _ in 0..2 {
+            observations.record(EdgeWeightType::Intermediate(Err(())));
+        }
+
+        let intermediate = observations.intermediate_qos().expect("recorded");
+        assert_eq!(intermediate.loopback_rate(), Some(0.0), "the probes failed");
+        assert!(
+            intermediate.traffic_rate().is_some_and(|rate| rate > 0.0),
+            "while the traffic came back"
         );
     }
 

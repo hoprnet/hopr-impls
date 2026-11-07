@@ -7,6 +7,7 @@
 mod common;
 
 use common::Net;
+use hopr_api::graph::traits::{EdgeObservableWrite, EdgeWeightType};
 use hopr_api::{
     OffchainPublicKey,
     graph::{
@@ -351,6 +352,35 @@ fn return_path_through_a_dead_relay_should_be_starved() -> anyhow::Result<()> {
     assert!(
         share < 1e-6,
         "a return path through a dead relay must draw a negligible share, got {share}"
+    );
+    Ok(())
+}
+
+// ── Probes and traffic as two witnesses ──────────────────────────────────
+
+#[test]
+fn probes_that_failed_should_not_starve_a_relay_whose_traffic_went_through() -> anyhow::Result<()> {
+    // Probes are sparse and fail on any hop of their loop. SURBs that came back over the same edge
+    // prove the relay works, so the failed probes do not outweigh them.
+    let net = Net::from_json(TOPOLOGY)?;
+    probe_everything(&net);
+    net.observe("me", "bad", |obs| {
+        obs.record(EdgeWeightType::SurbRoundTrips {
+            expected: 100,
+            observed: 100,
+        });
+    });
+
+    let routes = net.forward("exit", 1);
+    let bad = routes
+        .value_of(&["bad"])
+        .ok_or_else(|| anyhow::anyhow!("bad must stay routable"))?;
+    let good = routes
+        .value_of(&["good"])
+        .ok_or_else(|| anyhow::anyhow!("good must stay routable"))?;
+    assert!(
+        bad / (bad + good) > 0.2,
+        "traffic that came back must keep the relay at a real share, got {bad} against {good}"
     );
     Ok(())
 }
