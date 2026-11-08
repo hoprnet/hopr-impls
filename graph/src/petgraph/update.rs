@@ -1,9 +1,6 @@
 #[cfg(all(feature = "telemetry", not(test)))]
 use hopr_api::graph::NetworkGraphView;
-use hopr_api::graph::{
-    EdgeLinkObservable, MeasurableEdge, MeasurableNode, NetworkGraphWrite,
-    traits::{EdgeObservableRead, EdgeObservableWrite, EdgeWeightType},
-};
+use hopr_api::graph::{MeasurableEdge, MeasurableNode, NetworkGraphWrite, traits::EdgeObservableWrite};
 use petgraph::graph::EdgeIndex;
 
 use crate::{ChannelGraph, Observations, graph::InnerGraph};
@@ -30,24 +27,6 @@ fn observe_neighbor_quality(graph: &ChannelGraph, peer: &hopr_api::OffchainPubli
     {
         METRIC_PEERS_BY_QUALITY.observe(score);
     }
-}
-
-/// Credits a returning loopback to an edge on the loop, with the latency that edge already carries.
-///
-/// The intermediate latency is preferred, else the neighbor-probe latency. An edge that carries
-/// neither is credited `fallback`, the edge's share of the loop's round trip: a success must be
-/// recorded or the failures alone would make the edge look dead.
-fn credit_edge(inner: &mut InnerGraph, edge: EdgeIndex, fallback: std::time::Duration) {
-    let Some(weight) = inner.graph.edge_weight_mut(edge) else {
-        tracing::warn!(?edge, "loopback edge vanished between resolution and crediting");
-        return;
-    };
-    let carried = weight
-        .intermediate_qos()
-        .and_then(|q| q.average_latency())
-        .or_else(|| weight.immediate_qos().and_then(|q| q.average_latency()));
-
-    weight.record(EdgeWeightType::Intermediate(Ok(carried.unwrap_or(fallback))));
 }
 
 /// Resolves a loopback path from serialized node-index bytes into a validated chain of edge indices.
@@ -374,7 +353,21 @@ impl hopr_api::graph::NetworkGraphUpdate for ChannelGraph {
                     .iter()
                     .enumerate()
                     .filter(|&(i, _)| i != target_idx)
-                    .for_each(|(_, &edge)| credit_edge(&mut inner, edge, fair_share));
+                    .for_each(|(_, &edge)| {
+                        // The intermediate latency is preferred, else the neighbor-probe latency. An edge
+                        // that carries neither is credited its share of the round trip: a success must be
+                        // recorded or the failures alone would make the edge look dead.
+                        let Some(weight) = inner.graph.edge_weight_mut(edge) else {
+                            tracing::warn!(?edge, "loopback edge vanished between resolution and crediting");
+                            return;
+                        };
+                        let carried = weight
+                            .intermediate_qos()
+                            .and_then(|q| q.average_latency())
+                            .or_else(|| weight.immediate_qos().and_then(|q| q.average_latency()));
+
+                        weight.record(EdgeWeightType::Intermediate(Ok(carried.unwrap_or(fair_share))));
+                    });
 
                 // A saturating subtraction would turn "the known latencies already account for the
                 // whole round trip" into a measured zero — and a zero latency scores in the *fastest*
