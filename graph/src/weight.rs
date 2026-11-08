@@ -113,6 +113,15 @@ impl EdgeObservableWrite for Observations {
                 imm.messages_sent = imm.messages_sent * ACK_DECAY + num_packets as f64;
                 imm.acks_received = imm.acks_received * ACK_DECAY + num_acks as f64;
             }
+            EdgeWeightType::RelayedProtocolConformance {
+                num_relayed,
+                num_genuine_acks,
+            } => {
+                // Decayed per report, not per second: an idle relay keeps its verdict until traffic tests it again.
+                let imm = self.immediate_probe.get_or_insert_default();
+                imm.relayed_sent = imm.relayed_sent * ACK_DECAY + num_relayed as f64;
+                imm.genuine_acks_received = imm.genuine_acks_received * ACK_DECAY + num_genuine_acks as f64;
+            }
         }
     }
 }
@@ -141,6 +150,10 @@ pub struct TransportImmediates {
     messages_sent: f64,
     /// Exponentially decayed count of acknowledgements received from this peer.
     acks_received: f64,
+    /// Exponentially decayed count of packets sent to this peer for it to relay.
+    relayed_sent: f64,
+    /// Exponentially decayed count of those acked with the solution to their challenge.
+    genuine_acks_received: f64,
 }
 
 impl EdgeNetworkObservableRead for TransportImmediates {
@@ -152,6 +165,11 @@ impl EdgeNetworkObservableRead for TransportImmediates {
 impl EdgeImmediateProtocolObservable for TransportImmediates {
     fn ack_rate(&self) -> Option<f64> {
         (self.messages_sent >= MIN_ACK_SAMPLE_VOLUME).then(|| (self.acks_received / self.messages_sent).clamp(0.0, 1.0))
+    }
+
+    fn genuine_ack_rate(&self) -> Option<f64> {
+        (self.relayed_sent >= MIN_ACK_SAMPLE_VOLUME)
+            .then(|| (self.genuine_acks_received / self.relayed_sent).clamp(0.0, 1.0))
     }
 }
 
@@ -622,6 +640,58 @@ mod tests {
 
         let imm = observation.immediate_qos().context("should have immediate QoS")?;
         assert_eq!(imm.ack_rate(), Some(1.0));
+        Ok(())
+    }
+
+    #[test]
+    fn a_relay_answering_with_random_acks_should_keep_its_ack_rate_but_lose_its_genuine_ack_rate() -> anyhow::Result<()>
+    {
+        let mut observation = Observations::default();
+        observation.record(EdgeWeightType::ImmediateProtocolConformance {
+            num_packets: 10,
+            num_acks: 10,
+        });
+        observation.record(EdgeWeightType::RelayedProtocolConformance {
+            num_relayed: 10,
+            num_genuine_acks: 0,
+        });
+
+        let imm = observation.immediate_qos().context("should have immediate QoS")?;
+        assert_eq!(imm.ack_rate(), Some(1.0));
+        assert_eq!(imm.genuine_ack_rate(), Some(0.0));
+        Ok(())
+    }
+
+    #[test]
+    fn genuine_ack_rate_should_be_none_without_relayed_packets() -> anyhow::Result<()> {
+        let mut observation = Observations::default();
+        observation.record(EdgeWeightType::ImmediateProtocolConformance {
+            num_packets: 10,
+            num_acks: 10,
+        });
+
+        let imm = observation.immediate_qos().context("should have immediate QoS")?;
+        assert_eq!(imm.genuine_ack_rate(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn genuine_ack_rate_should_recover_once_relayed_packets_are_acked_again() -> anyhow::Result<()> {
+        let mut observation = Observations::default();
+        observation.record(EdgeWeightType::RelayedProtocolConformance {
+            num_relayed: 10,
+            num_genuine_acks: 0,
+        });
+        for _ in 0..20 {
+            observation.record(EdgeWeightType::RelayedProtocolConformance {
+                num_relayed: 10,
+                num_genuine_acks: 10,
+            });
+        }
+
+        let imm = observation.immediate_qos().context("should have immediate QoS")?;
+        let rate = imm.genuine_ack_rate().context("should have genuine ack rate")?;
+        assert!(rate > 0.9, "a relay that acks genuinely again must recover, got {rate}");
         Ok(())
     }
 
