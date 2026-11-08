@@ -336,6 +336,14 @@ impl Default for TransportIntermediates {
 }
 
 impl TransportIntermediates {
+    /// [`EdgeLinkObservable::average_probe_rate`] against a caller-supplied clock.
+    pub(crate) fn average_probe_rate_at(&self, now: std::time::Instant) -> Option<f64> {
+        match (self.surb_delivery_rate_at(now), self.link.average_probe_rate()) {
+            (Some(surb), Some(probe)) => Some((surb + probe) / 2.0),
+            (surb, probe) => surb.or(probe),
+        }
+    }
+
     /// [`EdgeProtocolObservable::loopback_rate`] against a caller-supplied clock.
     pub(crate) fn loopback_rate_at(&self, now: std::time::Instant) -> Option<f64> {
         self.loopback.rate_at(now)
@@ -452,27 +460,25 @@ impl EdgeLinkObservable for TransportIntermediates {
         self.link.average_latency()
     }
 
-    /// The more pessimistic of the two delivery signals, over whichever of them carry evidence.
+    /// The average of the two delivery signals, over whichever of them carry evidence.
     ///
     /// SURB round-trips react sooner -- probing runs on an interval, while SURBs accrue at data
     /// rates -- but sooner is not the same as instead of. The two measure different things: the
     /// probe rate reports reachability of this hop, the SURB rate peak-relative delivery of the
-    /// whole loop, and a failing probe is real evidence even while SURBs keep arriving. Taking the
-    /// worse of the two lets either signal condemn an edge and neither mask the other.
+    /// whole loop, and each is real evidence while the other disagrees. They are two witnesses that
+    /// the edge works, so neither alone may condemn it: the average is zero only when both read
+    /// zero, and a failing probe still lowers the rate of an edge whose SURBs keep arriving.
     ///
     /// Evidence, not merely a number: an unprobed edge's probe rate reads 0.0 exactly as a wholly
     /// failing one does (an unprobed stream reports `None` rather than a rate), so combining them unconditionally would
     /// score every SURB-only edge as dead.
     fn average_probe_rate(&self) -> Option<f64> {
-        match (self.surb_delivery_rate(), self.link.average_probe_rate()) {
-            (Some(surb), Some(probe)) => Some(surb.min(probe)),
-            (surb, probe) => surb.or(probe),
-        }
+        self.average_probe_rate_at(std::time::Instant::now())
     }
 
     fn score(&self) -> Option<f64> {
-        // `average_probe_rate` already takes the worse of the probe and SURB signals over whichever
-        // carry evidence, and reports `None` when neither does.
+        // `average_probe_rate` already averages the probe and SURB signals over whichever carry
+        // evidence, and reports `None` when neither does.
         //
         // Latency modulates that rate only where it was measured. A round-trip proves the loop was
         // traversed but carries no per-edge latency, so an edge known solely from SURB delivery has
@@ -1223,6 +1229,86 @@ mod tests {
             "a hop whose probes all fail must not score as well as one whose probes were never run: \
              failing={failing_rate} unprobed={surbs_only_rate}"
         );
+    }
+
+    // ── Two witnesses in the score ──────────────────────────────────────
+
+    // Probes and SURBs are two witnesses that the edge works. One of them reading dead must not
+    // zero the score while the other shows traffic going through, or the value function floors the
+    // edge before the loopback gate ever sees the healthy witness.
+
+    /// An edge with healthy SURBs, and the clock at the last of them.
+    fn with_healthy_surbs(epoch: std::time::Instant) -> (TransportIntermediates, std::time::Instant) {
+        let mut m = fast_slices(epoch);
+        let now = deliver_healthily(&mut m, epoch);
+        (m, now)
+    }
+
+    #[test]
+    fn failed_probes_should_not_zero_the_rate_of_an_edge_whose_surbs_came_back() {
+        let (mut m, now) = with_healthy_surbs(std::time::Instant::now());
+        for _ in 0..5 {
+            m.record(Err(()));
+        }
+
+        assert_eq!(m.link.average_probe_rate(), Some(0.0), "every probe failed");
+        assert!(
+            m.surb_delivery_rate_at(now).is_some_and(|rate| rate > 0.9),
+            "while SURBs came back"
+        );
+        let combined = m.average_probe_rate_at(now).expect("both witnesses have evidence");
+        assert!(
+            combined > 0.0,
+            "traffic that came back keeps the edge above zero, got {combined}"
+        );
+    }
+
+    #[test]
+    fn collapsed_surbs_should_not_zero_the_rate_of_an_edge_whose_probes_came_back() {
+        let (mut m, now) = with_healthy_surbs(std::time::Instant::now());
+        let now = record_slices(&mut m, now + TEST_SLICE, 2, 100, 0);
+        for _ in 0..5 {
+            m.record(Ok(std::time::Duration::from_millis(30)));
+        }
+
+        assert_eq!(m.surb_delivery_rate_at(now), Some(0.0), "traffic stopped coming back");
+        assert!(
+            m.link.average_probe_rate().is_some_and(|rate| rate > 0.9),
+            "while probes come back"
+        );
+        let combined = m.average_probe_rate_at(now).expect("both witnesses have evidence");
+        assert!(
+            combined > 0.0,
+            "probes that came back keep the edge above zero, got {combined}"
+        );
+    }
+
+    #[test]
+    fn an_edge_should_read_zero_only_when_both_witnesses_read_zero() {
+        let (mut m, now) = with_healthy_surbs(std::time::Instant::now());
+        let now = record_slices(&mut m, now + TEST_SLICE, 2, 100, 0);
+        for _ in 0..5 {
+            m.record(Err(()));
+        }
+
+        assert_eq!(m.surb_delivery_rate_at(now), Some(0.0), "traffic dead");
+        assert_eq!(m.link.average_probe_rate(), Some(0.0), "probes dead");
+        assert_eq!(m.average_probe_rate_at(now), Some(0.0), "both dead");
+    }
+
+    #[test]
+    fn two_witnesses_should_still_rank_a_better_edge_above_a_worse_one() {
+        // Graded, not a switch: an edge both witnesses like beats one only a single witness likes.
+        let (mut both, now) = with_healthy_surbs(std::time::Instant::now());
+        let (mut one, _) = with_healthy_surbs(std::time::Instant::now());
+        for _ in 0..5 {
+            both.record(Ok(std::time::Duration::from_millis(30)));
+            one.record(Err(()));
+        }
+
+        let both = both.average_probe_rate_at(now).expect("evidence");
+        let one = one.average_probe_rate_at(now).expect("evidence");
+        assert!(one > 0.0 && one < both, "one witness {one} must rank below two {both}");
     }
 
     /// A relay that stops returning SURBs must score below one that keeps delivering.

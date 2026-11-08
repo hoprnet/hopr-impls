@@ -384,3 +384,56 @@ fn probes_that_failed_should_not_starve_a_relay_whose_traffic_went_through() -> 
     );
     Ok(())
 }
+
+#[test]
+fn a_middle_relay_whose_probes_failed_but_whose_traffic_came_back_should_not_be_starved() -> anyhow::Result<()> {
+    // `a1 → bb` is a middle edge of a 2-hop route, and every loop through `bb` timed out. SURBs
+    // came back over it, so the edge works and neither the score nor the gate may floor it.
+    let net = Net::from_json(LAYERED)?;
+    probe_with_dead(&net, &["bb"]);
+    net.observe("a1", "bb", |obs| {
+        obs.record(EdgeWeightType::SurbRoundTrips {
+            expected: 100,
+            observed: 100,
+        });
+    });
+
+    let routes = net.forward("exit", 2);
+    let kept = routes
+        .value_of(&["a1", "bb"])
+        .ok_or_else(|| anyhow::anyhow!("a1 → bb must stay routable"))?;
+    let honest = routes
+        .value_of(&["a1", "bg"])
+        .ok_or_else(|| anyhow::anyhow!("a1 → bg must stay routable"))?;
+    assert!(
+        kept / (kept + honest) > 0.2,
+        "traffic that came back must keep the middle relay at a real share, got {kept} against {honest}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_return_path_through_a_relay_whose_probes_failed_but_whose_traffic_came_back_should_not_be_starved()
+-> anyhow::Result<()> {
+    let net = Net::from_json(LAYERED)?;
+    probe_with_dead(&net, &["bb"]);
+    net.observe("a1", "bb", |obs| {
+        obs.record(EdgeWeightType::SurbRoundTrips {
+            expected: 100,
+            observed: 100,
+        });
+    });
+
+    let routes = net.returning("a1", 1);
+    let kept = routes
+        .value_of(&["bb"])
+        .ok_or_else(|| anyhow::anyhow!("a1 → bb → me must stay routable"))?;
+    let honest = routes
+        .value_of(&["bg"])
+        .ok_or_else(|| anyhow::anyhow!("a1 → bg → me must stay routable"))?;
+    assert!(
+        kept / (kept + honest) > 0.2,
+        "traffic that came back must keep the return relay at a real share, got {kept} against {honest}"
+    );
+    Ok(())
+}
