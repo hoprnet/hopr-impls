@@ -33,8 +33,7 @@ use hopr_api::{
     types::crypto::prelude::{Keypair, OffchainKeypair},
 };
 use hopr_network_graph::{
-    ChannelGraph, DEFAULT_EDGE_PENALTY, DEFAULT_MAX_PLAUSIBLE_LOOPBACK_RTT, DEFAULT_MIN_ACK_RATE,
-    DEFAULT_MIN_LOOPBACK_RATE, Observations,
+    ChannelGraph, DEFAULT_EDGE_PENALTY, DEFAULT_MAX_PLAUSIBLE_LOOPBACK_RTT, DEFAULT_MIN_ACK_RATE, Observations,
 };
 
 /// A whole network, as one JSON object.
@@ -256,11 +255,10 @@ impl Net {
     /// `hops == 0` is the direct case: RFC-0004 needs no channel on a final hop, so a 0-hop path is
     /// one channel-less edge.
     pub fn forward(&self, dest: &str, hops: usize) -> Routes {
-        let value_fn = EdgeValueFn::forward_gated(
+        let value_fn = EdgeValueFn::forward(
             Self::length(hops),
             self.edge_penalty,
             self.min_ack_rate,
-            DEFAULT_MIN_LOOPBACK_RATE,
             self.ticket_face_value,
         );
         self.to_routes(
@@ -271,11 +269,10 @@ impl Net {
 
     /// Return paths from `source` back to `me`, as the planner builds them for SURBs.
     pub fn returning(&self, source: &str, hops: usize) -> Routes {
-        let value_fn = EdgeValueFn::returning_gated(
+        let value_fn = EdgeValueFn::returning(
             Self::length(hops),
             self.edge_penalty,
             self.min_ack_rate,
-            DEFAULT_MIN_LOOPBACK_RATE,
             self.ticket_face_value,
         );
         self.to_routes(

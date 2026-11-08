@@ -388,7 +388,7 @@ fn probes_that_failed_should_not_starve_a_relay_whose_traffic_went_through() -> 
 #[test]
 fn a_middle_relay_whose_probes_failed_but_whose_traffic_came_back_should_not_be_starved() -> anyhow::Result<()> {
     // `a1 → bb` is a middle edge of a 2-hop route, and every loop through `bb` timed out. SURBs
-    // came back over it, so the edge works and neither the score nor the gate may floor it.
+    // came back over it, so the edge works and its score must not be floored.
     let net = Net::from_json(LAYERED)?;
     probe_with_dead(&net, &["bb"]);
     net.observe("a1", "bb", |obs| {
@@ -435,5 +435,139 @@ fn a_return_path_through_a_relay_whose_probes_failed_but_whose_traffic_came_back
         kept / (kept + honest) > 0.2,
         "traffic that came back must keep the return relay at a real share, got {kept} against {honest}"
     );
+    Ok(())
+}
+
+// ── Every position, both directions ──────────────────────────────────────
+
+/// Three layers of two relays, each layer connected to the next and to the one before it, every relay
+/// connected to `me` and `exit` both ways, plus the direct route. Each edge pings and is funded. Loops
+/// (`me → a → b [→ c] → me`) exist for both loop shapes, and a path of 1 to 3 relays exists in both
+/// directions with the relay of any layer in any position.
+///
+/// Every edge but those into `dead` has carried a loop before, so the dead relay reads dead only on the
+/// edges into it, as a relay whose other edges still show healthy evidence does. A relay failing on every
+/// edge would be starved by the node health the graph derives, with no help from the edge itself.
+fn layered_both_ways(dead: &str) -> String {
+    let edge = |from: &str, to: &str| {
+        let counted = if from == "me" || to == "me" {
+            r#", "packets": 10, "acks": 10"#
+        } else {
+            ""
+        };
+        let carried = if to == dead { "" } else { r#", "relayed_ms": 30"# };
+        format!(
+            r#"{{ "from": "{from}", "to": "{to}", "connected": true, "latency_ms": 20, "balance": 100000{counted}{carried} }}"#
+        )
+    };
+    let relay = |layer: usize, dead: bool| format!("{}{layer}", if dead { "d" } else { "g" });
+    let mut edges = vec![edge("me", "exit"), edge("exit", "me")];
+    for layer in 1..=3 {
+        for dead in [false, true] {
+            let name = relay(layer, dead);
+            edges.extend([
+                edge("me", &name),
+                edge(&name, "me"),
+                edge(&name, "exit"),
+                edge("exit", &name),
+            ]);
+            if layer < 3 {
+                for next in [false, true] {
+                    edges.push(edge(&name, &relay(layer + 1, next)));
+                    edges.push(edge(&relay(layer + 1, next), &name));
+                }
+            }
+        }
+    }
+    format!(
+        r#"{{ "me": "me", "ticket_face_value": 100, "edges": [{}] }}"#,
+        edges.join(",\n")
+    )
+}
+
+/// The share of the best route through `dead` against the best route around it, or `None` without a
+/// route through it.
+fn share_of(routes: &common::Routes, dead: &str) -> Option<f64> {
+    let best = |through: bool| {
+        routes
+            .0
+            .iter()
+            .filter(|(names, _)| names.iter().any(|name| name == dead) == through)
+            .map(|(_, value)| *value)
+            .fold(None, |best: Option<f64>, value| {
+                Some(best.map_or(value, |b| b.max(value)))
+            })
+    };
+    let (through, around) = (best(true)?, best(false)?);
+    Some(through / (through + around))
+}
+
+#[test]
+fn a_dead_relay_should_be_starved_at_every_position_for_zero_to_three_hops_in_both_directions() -> anyhow::Result<()> {
+    let mut failures = Vec::new();
+    let mut judged = 0;
+
+    for layer in 1..=3 {
+        let dead = format!("d{layer}");
+        let net = Net::from_json(&layered_both_ways(&dead))?;
+        let direct = (
+            net.forward("exit", 0).value_of(&[]),
+            net.returning("exit", 0).value_of(&[]),
+        );
+        assert!(
+            direct.0.is_some() && direct.1.is_some(),
+            "the direct route must exist in both directions"
+        );
+        for hops in 1..=3 {
+            for (direction, routes) in [
+                ("forward", net.forward("exit", hops)),
+                ("return", net.returning("exit", hops)),
+            ] {
+                assert!(
+                    share_of(&routes, &dead).is_some_and(|share| share > 0.1),
+                    "{direction}, {hops} hop(s): before any loop is seen the relay must draw a real share"
+                );
+            }
+        }
+
+        probe_with_dead(&net, &[dead.as_str()]);
+
+        for hops in 1..=3 {
+            for (direction, routes) in [
+                ("forward", net.forward("exit", hops)),
+                ("return", net.returning("exit", hops)),
+            ] {
+                let Some(share) = share_of(&routes, &dead) else {
+                    failures.push(format!(
+                        "{direction}, {hops} hop(s), layer {layer}: the dead relay vanished from the routes"
+                    ));
+                    continue;
+                };
+                judged += 1;
+                if share >= 1e-6 {
+                    failures.push(format!(
+                        "{direction}, {hops} hop(s), dead relay in layer {layer}: share {share}"
+                    ));
+                }
+            }
+        }
+        // 0 hops has no relay to judge: a dead relay elsewhere may blame the direct edge for loops it
+        // crossed, which dilutes it a little, but never starves it.
+        let after = (
+            net.forward("exit", 0).value_of(&[]),
+            net.returning("exit", 0).value_of(&[]),
+        );
+        if after.0.is_none_or(|value| value < 0.1) || after.1.is_none_or(|value| value < 0.1) {
+            failures.push(format!(
+                "0 hops, dead relay in layer {layer}: direct routes starved, {direct:?} became {after:?}"
+            ));
+        }
+    }
+
+    assert!(
+        judged == 18,
+        "every direction, hop count and layer must be judged, got {judged}"
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
     Ok(())
 }
