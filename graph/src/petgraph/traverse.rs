@@ -212,9 +212,6 @@ impl hopr_api::graph::NetworkGraphTraverse for ChannelGraph {
                     std::num::NonZeroUsize::new(hops + 1).expect("hop range is non-zero"),
                     self.edge_penalty,
                     0.0,
-                    // No loopback threshold either: a relay whose loopbacks stopped returning must keep
-                    // getting loops, or its rate stays at zero and it can never recover.
-                    0.0,
                     // Whatever the producer last pushed; `None` until the first price is seen.
                     hopr_api::graph::NetworkGraphView::ticket_face_value(self),
                 );
@@ -336,7 +333,6 @@ mod tests {
                 std::num::NonZeroUsize::new(1).context("should be non-zero")?,
                 TEST_EDGE_PENALTY,
                 TEST_MIN_ACK_RATE,
-                0.0,
                 None,
             ),
         );
@@ -361,7 +357,6 @@ mod tests {
                 std::num::NonZeroUsize::new(1).context("should be non-zero")?,
                 TEST_EDGE_PENALTY,
                 TEST_MIN_ACK_RATE,
-                0.0,
                 None,
             ),
         );
@@ -402,7 +397,6 @@ mod tests {
                 std::num::NonZeroUsize::new(2).context("should be non-zero")?,
                 TEST_EDGE_PENALTY,
                 TEST_MIN_ACK_RATE,
-                0.0,
                 None,
             ),
         );
@@ -433,7 +427,6 @@ mod tests {
             std::num::NonZeroUsize::new(2).context("should be non-zero")?,
             TEST_EDGE_PENALTY,
             TEST_MIN_ACK_RATE,
-            0.0,
             None,
         ))
     }
@@ -508,7 +501,6 @@ mod tests {
                 std::num::NonZeroUsize::new(2).context("should be non-zero")?,
                 TEST_EDGE_PENALTY,
                 TEST_MIN_ACK_RATE,
-                0.0,
                 None,
             ),
         );
@@ -532,7 +524,6 @@ mod tests {
                 std::num::NonZeroUsize::new(1).context("should be non-zero")?,
                 TEST_EDGE_PENALTY,
                 TEST_MIN_ACK_RATE,
-                0.0,
                 None,
             ),
         );
@@ -620,7 +611,6 @@ mod tests {
                 std::num::NonZeroUsize::new(3).context("should be non-zero")?,
                 TEST_EDGE_PENALTY,
                 TEST_MIN_ACK_RATE,
-                0.0,
                 None,
             ),
         );
@@ -649,7 +639,6 @@ mod tests {
                 std::num::NonZeroUsize::new(1).context("should be non-zero")?,
                 TEST_EDGE_PENALTY,
                 TEST_MIN_ACK_RATE,
-                0.0,
                 None,
             ),
         );
@@ -689,7 +678,6 @@ mod tests {
                 std::num::NonZeroUsize::new(3).context("should be non-zero")?,
                 TEST_EDGE_PENALTY,
                 TEST_MIN_ACK_RATE,
-                0.0,
                 None,
             ),
         );
@@ -721,7 +709,6 @@ mod tests {
                 std::num::NonZeroUsize::new(1).context("should be non-zero")?,
                 TEST_EDGE_PENALTY,
                 TEST_MIN_ACK_RATE,
-                0.0,
                 None,
             ),
         );
@@ -766,7 +753,6 @@ mod tests {
                 std::num::NonZeroUsize::new(3).context("should be non-zero")?,
                 TEST_EDGE_PENALTY,
                 TEST_MIN_ACK_RATE,
-                0.0,
                 None,
             ),
         );
@@ -821,7 +807,6 @@ mod tests {
                 std::num::NonZeroUsize::new(2).context("should be non-zero")?,
                 TEST_EDGE_PENALTY,
                 TEST_MIN_ACK_RATE,
-                0.0,
                 None,
             ),
         );
@@ -868,7 +853,6 @@ mod tests {
                 std::num::NonZeroUsize::new(1).context("should be non-zero")?,
                 TEST_EDGE_PENALTY,
                 TEST_MIN_ACK_RATE,
-                0.0,
                 None,
             ),
         );
@@ -903,7 +887,6 @@ mod tests {
                 std::num::NonZeroUsize::new(2).context("should be non-zero")?,
                 TEST_EDGE_PENALTY,
                 TEST_MIN_ACK_RATE,
-                0.0,
                 None,
             ),
         );
@@ -947,7 +930,6 @@ mod tests {
                 std::num::NonZeroUsize::new(2).context("should be non-zero")?,
                 TEST_EDGE_PENALTY,
                 TEST_MIN_ACK_RATE,
-                0.0,
                 None,
             ),
         );

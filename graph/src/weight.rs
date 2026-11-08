@@ -1116,9 +1116,8 @@ mod tests {
         let path_length = std::num::NonZeroUsize::new(3).expect("non-zero");
         // Edge 1 of 3 leads into the second relay: neither the first edge nor the one into the destination.
         let valued = |min_loopback_rate: f64| {
-            EdgeValueFn::<f64, Observations>::forward(path_length, 0.5, 0.1, min_loopback_rate, None).into_value_fn()(
-                1.0, &observed, 1,
-            )
+            EdgeValueFn::<f64, Observations>::forward_gated(path_length, 0.5, 0.1, min_loopback_rate, None)
+                .into_value_fn()(1.0, &observed, 1)
         };
 
         let routed = valued(f64::EPSILON);

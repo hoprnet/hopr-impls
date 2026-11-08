@@ -256,7 +256,7 @@ impl Net {
     /// `hops == 0` is the direct case: RFC-0004 needs no channel on a final hop, so a 0-hop path is
     /// one channel-less edge.
     pub fn forward(&self, dest: &str, hops: usize) -> Routes {
-        let value_fn = EdgeValueFn::forward(
+        let value_fn = EdgeValueFn::forward_gated(
             Self::length(hops),
             self.edge_penalty,
             self.min_ack_rate,
@@ -271,7 +271,7 @@ impl Net {
 
     /// Return paths from `source` back to `me`, as the planner builds them for SURBs.
     pub fn returning(&self, source: &str, hops: usize) -> Routes {
-        let value_fn = EdgeValueFn::returning(
+        let value_fn = EdgeValueFn::returning_gated(
             Self::length(hops),
             self.edge_penalty,
             self.min_ack_rate,
