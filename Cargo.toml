@@ -104,6 +104,6 @@ tracing = { version = "0.1.44", features = ["release_max_level_debug"] }
 validator = { version = "0.21.0", features = ["derive"] }
 
 # TEMPORARY (GNO-1183): hopr-api 5.1.0 is not published yet. Drop this block, and repin hopr-api, once
-# hoprnet/hopr-api#158 is released.
+# hoprnet/hopr-api#158 is released. Points at the genuine-ack witness branch stacked on #158.
 [patch.crates-io]
-hopr-api = { git = "https://github.com/hoprnet/hopr-api", branch = "kauki/fix/graph/first-hop-loopback-gate" }
+hopr-api = { git = "https://github.com/hoprnet/hopr-api", branch = "ronnyesterluss/gno-1183-genuine-ack-witness" }
