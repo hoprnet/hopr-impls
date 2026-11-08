@@ -108,7 +108,7 @@ impl Validate for ProberConfig {
 
         // The loopback evidence of one round must still be counted when the next one is sent, with room for
         // the probe timeout and a late round, or a failing relay reads as unprobed instead of starved.
-        if self.interval * 2 > hopr_network_graph::LOOPBACK_WINDOW {
+        if self.interval > hopr_network_graph::LOOPBACK_WINDOW / 2 {
             errors.add(
                 "interval",
                 ValidationError::new("interval must fit twice in the 60 s loopback evidence window"),
@@ -179,6 +179,16 @@ mod tests {
             ..ProberConfig::default()
         };
         let err = over.validate().unwrap_err();
+        assert!(err.field_errors().contains_key("interval"), "{err}");
+    }
+
+    #[test]
+    fn an_interval_too_large_to_double_should_be_invalid_instead_of_panicking() {
+        let huge = ProberConfig {
+            interval: std::time::Duration::MAX,
+            ..ProberConfig::default()
+        };
+        let err = huge.validate().unwrap_err();
         assert!(err.field_errors().contains_key("interval"), "{err}");
     }
 

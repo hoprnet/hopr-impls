@@ -39,6 +39,7 @@ fn observe_neighbor_quality(graph: &ChannelGraph, peer: &hopr_api::OffchainPubli
 /// recorded or the failures alone would make the edge look dead.
 fn credit_edge(inner: &mut InnerGraph, edge: EdgeIndex, fallback: std::time::Duration) {
     let Some(weight) = inner.graph.edge_weight_mut(edge) else {
+        tracing::warn!(?edge, "loopback edge vanished between resolution and crediting");
         return;
     };
     let carried = weight
