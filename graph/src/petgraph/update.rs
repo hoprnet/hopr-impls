@@ -1,6 +1,9 @@
-use hopr_api::graph::{MeasurableEdge, MeasurableNode, NetworkGraphWrite, traits::EdgeObservableWrite};
 #[cfg(all(feature = "telemetry", not(test)))]
-use hopr_api::graph::{NetworkGraphView, traits::EdgeObservableRead};
+use hopr_api::graph::NetworkGraphView;
+use hopr_api::graph::{
+    EdgeLinkObservable, MeasurableEdge, MeasurableNode, NetworkGraphWrite,
+    traits::{EdgeObservableRead, EdgeObservableWrite, EdgeWeightType},
+};
 use petgraph::graph::EdgeIndex;
 
 use crate::{ChannelGraph, Observations, graph::InnerGraph};
@@ -35,11 +38,6 @@ fn observe_neighbor_quality(graph: &ChannelGraph, peer: &hopr_api::OffchainPubli
 /// neither is credited `fallback`, the edge's share of the loop's round trip: a success must be
 /// recorded or the failures alone would make the edge look dead.
 fn credit_edge(inner: &mut InnerGraph, edge: EdgeIndex, fallback: std::time::Duration) {
-    use hopr_api::graph::{
-        EdgeLinkObservable,
-        traits::{EdgeObservableRead, EdgeWeightType},
-    };
-
     let Some(weight) = inner.graph.edge_weight_mut(edge) else {
         return;
     };
@@ -371,11 +369,11 @@ impl hopr_api::graph::NetworkGraphUpdate for ChannelGraph {
                 // is recorded below; on a 2-hop loop it is also the first hop, and crediting it here
                 // would count the loop twice.
                 let fair_share = total_rtt / edges.len() as u32;
-                for (i, &edge) in edges[..edges.len() - 1].iter().enumerate() {
-                    if i != target_idx {
-                        credit_edge(&mut inner, edge, fair_share);
-                    }
-                }
+                edges[..edges.len() - 1]
+                    .iter()
+                    .enumerate()
+                    .filter(|&(i, _)| i != target_idx)
+                    .for_each(|(_, &edge)| credit_edge(&mut inner, edge, fair_share));
 
                 // A saturating subtraction would turn "the known latencies already account for the
                 // whole round trip" into a measured zero — and a zero latency scores in the *fastest*
@@ -476,13 +474,15 @@ impl hopr_api::graph::NetworkGraphUpdate for ChannelGraph {
                 // loop, so this is the only way an outcome reaches the edge into it. The edge back
                 // into `me` is left out, and so is the target edge, which recorded its failure above
                 // and would otherwise count this loop twice (on a 2-hop loop it is the first hop).
-                for (i, &edge) in edges[..edges.len() - 1].iter().enumerate() {
-                    if i != target_idx
-                        && let Some(weight) = inner.graph.edge_weight_mut(edge)
-                    {
-                        weight.record(EdgeWeightType::Intermediate(Err(())));
-                    }
-                }
+                edges[..edges.len() - 1]
+                    .iter()
+                    .enumerate()
+                    .filter(|&(i, _)| i != target_idx)
+                    .for_each(|(_, &edge)| {
+                        if let Some(weight) = inner.graph.edge_weight_mut(edge) {
+                            weight.record(EdgeWeightType::Intermediate(Err(())));
+                        }
+                    });
             }
             MeasurableEdge::Balance(update) => {
                 self.upsert_edge(&update.src, &update.dest, |obs: &mut Observations| {

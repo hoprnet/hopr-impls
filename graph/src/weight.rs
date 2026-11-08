@@ -116,9 +116,11 @@ impl EdgeObservableWrite for Observations {
         }
 
         let now = std::time::Instant::now();
-        let starved = self.intermediate_probe.is_some_and(|i| i.relay_starved_at(now));
         if let Some(immediate) = self.immediate_probe.as_mut() {
-            immediate.relay_starved_at = starved.then_some(now);
+            immediate.relay_starved_at = self
+                .intermediate_probe
+                .is_some_and(|i| i.relay_starved_at(now))
+                .then_some(now);
         }
     }
 }
@@ -381,6 +383,29 @@ impl TransportIntermediates {
             .or_else(|| self.link.average_probe_rate())
     }
 
+    /// The score of an edge whose relay is not starved, against a caller-supplied clock.
+    ///
+    /// Split from [`EdgeLinkObservable::score`] so a caller that has just read the verdict does not
+    /// read it again for every metric: it is the costliest part of a score, and scores are read per
+    /// edge during path search.
+    pub(crate) fn live_score_at(&self, now: std::time::Instant) -> Option<f64> {
+        // `average_probe_rate` already averages the probe and SURB signals over whichever carry
+        // evidence, and reports `None` when neither does.
+        //
+        // Latency modulates that rate only where it was measured. A round-trip proves the loop was
+        // traversed but carries no per-edge latency, so an edge known solely from SURB delivery has
+        // a rate and no latency. Scoring the missing latency as [`latency_score`] does — 0.05, the
+        // no-data floor — would multiply real delivery evidence by a twentieth and rank the edge
+        // below one nothing at all is known about, inverting the very ordering the score exists to
+        // express.
+        let rate = self.average_probe_rate_at(now)?;
+        Some(
+            self.link
+                .average_latency()
+                .map_or(rate, |latency| rate * latency_score(latency)),
+        )
+    }
+
     /// The share of loopbacks over this edge that returned in the last [`LOOPBACK_WINDOW`], or `None`
     /// without any. `Some(0.0)` means loops crossed it and none returned.
     pub fn loopback_rate(&self) -> Option<f64> {
@@ -517,24 +542,11 @@ impl EdgeLinkObservable for TransportIntermediates {
     }
 
     fn score(&self) -> Option<f64> {
-        if self.relay_starved_at(std::time::Instant::now()) {
+        let now = std::time::Instant::now();
+        if self.relay_starved_at(now) {
             return Some(0.0);
         }
-
-        // `average_probe_rate` already averages the probe and SURB signals over whichever carry
-        // evidence, and reports `None` when neither does.
-        //
-        // Latency modulates that rate only where it was measured. A round-trip proves the loop was
-        // traversed but carries no per-edge latency, so an edge known solely from SURB delivery has
-        // a rate and no latency. Scoring the missing latency as [`latency_score`] does — 0.05, the
-        // no-data floor — would multiply real delivery evidence by a twentieth and rank the edge
-        // below one nothing at all is known about, inverting the very ordering the score exists to
-        // express.
-        let rate = self.average_probe_rate()?;
-        Some(
-            self.average_latency()
-                .map_or(rate, |latency| rate * latency_score(latency)),
-        )
+        self.live_score_at(now)
     }
 }
 
@@ -571,15 +583,14 @@ impl EdgeObservableRead for Observations {
     /// An edge whose relay is starved scores `0.0` outright: the neighbour's healthy ping must not
     /// average it up to half.
     fn score(&self) -> Option<f64> {
-        if self
-            .intermediate_probe
-            .is_some_and(|i| i.relay_starved_at(std::time::Instant::now()))
-        {
+        let now = std::time::Instant::now();
+        if self.intermediate_probe.is_some_and(|i| i.relay_starved_at(now)) {
             return Some(0.0);
         }
 
+        // Not starved, as just read, so the stream scores itself without reading the verdict again.
         let immediate = self.immediate_probe.and_then(|m| m.score());
-        let intermediate = self.intermediate_probe.and_then(|m| m.score());
+        let intermediate = self.intermediate_probe.and_then(|m| m.live_score_at(now));
 
         match (immediate, intermediate) {
             (Some(immediate), Some(intermediate)) => Some((immediate + intermediate) / 2.0),

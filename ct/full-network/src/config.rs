@@ -9,8 +9,8 @@ pub struct ProberConfig {
     /// The delay between individual probing rounds for neighbor discovery.
     ///
     /// A loopback is sent once per round, and the graph counts its outcome for
-    /// `hopr_network_graph::LOOPBACK_WINDOW`. Keep this at no more than half of that, or a failing
-    /// relay's evidence expires between rounds and it reads as unprobed, not dead.
+    /// `hopr_network_graph::LOOPBACK_WINDOW`. Validation rejects an interval above half of that, because a
+    /// failing relay's evidence would expire between rounds and it would read as unprobed, not dead.
     #[cfg_attr(
         feature = "serde",
         serde(default = "default_probing_interval", with = "humantime_serde")
@@ -106,6 +106,15 @@ impl Validate for ProberConfig {
             );
         }
 
+        // The loopback evidence of one round must still be counted when the next one is sent, with room for
+        // the probe timeout and a late round, or a failing relay reads as unprobed instead of starved.
+        if self.interval * 2 > hopr_network_graph::LOOPBACK_WINDOW {
+            errors.add(
+                "interval",
+                ValidationError::new("interval must fit twice in the 60 s loopback evidence window"),
+            );
+        }
+
         if self.staleness_weight + self.quality_weight + self.base_priority <= 0.0 {
             errors.add(
                 "weights",
@@ -152,16 +161,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_default_probing_interval_should_fit_twice_in_the_loopback_window() {
-        // Evidence from one round must still be counted when the next one is sent, with room for the
-        // probe timeout and a late round.
-        let cfg = ProberConfig::default();
-        assert!(
-            cfg.interval * 2 <= hopr_network_graph::LOOPBACK_WINDOW,
-            "interval {:?} against window {:?}",
-            cfg.interval,
-            hopr_network_graph::LOOPBACK_WINDOW
-        );
+    fn the_default_probing_interval_should_pass_validation() {
+        assert!(ProberConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn an_interval_that_does_not_fit_twice_in_the_loopback_window_should_be_invalid() {
+        let half = hopr_network_graph::LOOPBACK_WINDOW / 2;
+        let at_limit = ProberConfig {
+            interval: half,
+            ..ProberConfig::default()
+        };
+        assert!(at_limit.validate().is_ok(), "exactly twice fits");
+
+        let over = ProberConfig {
+            interval: half + std::time::Duration::from_secs(1),
+            ..ProberConfig::default()
+        };
+        let err = over.validate().unwrap_err();
+        assert!(err.field_errors().contains_key("interval"), "{err}");
     }
 
     #[test]
