@@ -28,7 +28,7 @@ rust-version = "1.97"
 
 [workspace.dependencies]
 # In-repo crates (path + version so they are publishable)
-hopr-chain-connector = { path = "connector", version = "0.31.1" }
+hopr-chain-connector = { path = "connector", version = "0.32.0" }
 hopr-network-graph   = { path = "graph", version = "0.10.1", default-features = false }
 
 # HOPR crates published to crates.io
