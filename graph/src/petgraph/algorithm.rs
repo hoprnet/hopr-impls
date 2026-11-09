@@ -113,6 +113,47 @@ where
     C: Clone + PartialOrd + 'a,
     F: Fn(C, &<<G as IntoEdgeReferences>::EdgeRef as EdgeRef>::Weight, usize) -> C + 'a,
 {
+    all_simple_paths_multi_where(
+        graph,
+        from,
+        to,
+        excluded_nodes,
+        min_intermediate_nodes,
+        max_intermediate_nodes,
+        initial_cost,
+        min_cost,
+        cost_fn,
+        |_| true,
+    )
+}
+
+/// As [`all_simple_paths_multi`], but an edge for which `edge_allowed` is `false` is never walked.
+///
+/// A filter rather than a rejecting cost: the cost type is generic, so there is no value to return
+/// that is certain to fall below `min_cost`.
+#[allow(clippy::too_many_arguments)]
+pub fn all_simple_paths_multi_where<'a, TargetColl, G, S, F, C, P>(
+    graph: G,
+    from: G::NodeId,
+    to: &'a HashSet<G::NodeId, S>,
+    excluded_nodes: Option<&'a HashSet<G::NodeId, S>>,
+    min_intermediate_nodes: usize,
+    max_intermediate_nodes: Option<usize>,
+    initial_cost: C,
+    min_cost: Option<C>,
+    cost_fn: F,
+    edge_allowed: P,
+) -> impl Iterator<Item = (TargetColl, C)> + 'a
+where
+    G: NodeCount + IntoEdgesDirected + 'a,
+    <G as IntoEdgesDirected>::EdgesDirected: 'a,
+    G::NodeId: Eq + Hash,
+    TargetColl: FromIterator<G::NodeId>,
+    S: BuildHasher + Default,
+    C: Clone + PartialOrd + 'a,
+    F: Fn(C, &<<G as IntoEdgeReferences>::EdgeRef as EdgeRef>::Weight, usize) -> C + 'a,
+    P: Fn(&<<G as IntoEdgeReferences>::EdgeRef as EdgeRef>::Weight) -> bool + 'a,
+{
     let max_nodes = if let Some(l) = max_intermediate_nodes {
         l + 2
     } else {
@@ -137,6 +178,9 @@ where
     from_fn(move || {
         while let Some(edges) = stack.last_mut() {
             if let Some(edge) = edges.next() {
+                if !edge_allowed(edge.weight()) {
+                    continue;
+                }
                 let child = edge.target();
 
                 // Excluded nodes checked separately — not inserted into `visited` — so they

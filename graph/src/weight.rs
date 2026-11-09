@@ -104,6 +104,14 @@ impl Observations {
         self.restamp_starved();
     }
 
+    /// Whether the graph has judged this edge dead: nothing has come back over it, by traffic or by
+    /// loopback. Production routing leaves such an edge out; probing still walks it, because a returning
+    /// loop is the only way it can be seen to recover.
+    pub(crate) fn is_starved(&self) -> bool {
+        self.intermediate_probe
+            .is_some_and(|i| i.relay_starved_at(std::time::Instant::now()))
+    }
+
     /// The neighbour ping reads the verdict of the edge's loopback stream; see `relay_starved_at`.
     fn restamp_starved(&mut self) {
         let now = std::time::Instant::now();

@@ -160,29 +160,28 @@ fn a_zero_face_value_waives_the_amount_but_not_the_channel() -> anyhow::Result<(
 // ── Presence versus measurement ──────────────────────────────────────────
 
 #[test]
-fn a_measured_dead_relay_is_starved_but_not_pruned() -> anyhow::Result<()> {
-    // RFC-0010 §4.2.3 requires unreliable edges to be "progressively starved rather than suddenly
-    // eliminated", with their score "continuously updated by the ongoing probe stream". A pruned
-    // edge receives no probes, so starvation must never reach zero candidates.
-    // Dead on every stream, which is what "measured dead" means. A relay that answers pings but
-    // relays nothing is the separate masking case below.
+fn a_measured_dead_relay_is_excluded_from_routing() -> anyhow::Result<()> {
+    // The active tier of RFC-0010 §4.2.3: a relay the graph has judged dead on every stream is left
+    // out of routing. The passive tier (a negligible share) is what an edge without such a verdict
+    // gets. Probing still walks the relay, so its score keeps being updated by the probe stream and it
+    // is routable again once a loop returns (see `loopback_first_hop.rs`).
+    // Dead on every stream, what "measured dead" means. The relay answers pings but relays nothing;
+    // a separate case below covers the masking.
     let net = Net::from_json(&two_relays(
         r#"{ "from": "me", "to": "ra", "connected": true, "latency_ms": 20, "balance": 100000, "relayed_ms": 30, "packets": 10, "acks": 10 }"#,
         r#"{ "from": "me", "to": "rb", "connected": true, "failed_probes": 20, "balance": 100000, "failed_relays": 20, "packets": 10, "acks": 10 }"#,
     ))?;
 
     let routes = net.forward("exit", 1);
-    let healthy = routes.value_of(&["ra"]).expect("ra should be a candidate");
-    let dead = routes.value_of(&["rb"]).expect("rb must remain a candidate");
-
     assert!(
-        dead > 0.0,
-        "a non-positive value prunes the edge from selection, so it could never recover"
+        routes.value_of(&["ra"]).is_some_and(|value| value > 0.0),
+        "the healthy relay must stay routable"
     );
-    let share = dead / (dead + healthy);
-    assert!(
-        share < 0.05,
-        "a measured-dead relay must draw a negligible share of the sampling weight, got {share}"
+    assert_eq!(
+        routes.value_of(&["rb"]),
+        None,
+        "a measured-dead relay must not be a candidate, got {:?}",
+        routes.names()
     );
     Ok(())
 }

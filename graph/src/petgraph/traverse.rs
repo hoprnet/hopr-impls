@@ -10,7 +10,7 @@ use hopr_api::{
 };
 use petgraph::graph::NodeIndex;
 
-use crate::{ChannelGraph, algorithm::all_simple_paths_multi, graph::InnerGraph, petgraph::path_id};
+use crate::{ChannelGraph, algorithm::all_simple_paths_multi_where, graph::InnerGraph, petgraph::path_id};
 
 /// Lowest number of intermediate relay hops used for loopback probing.
 ///
@@ -39,6 +39,7 @@ pub(crate) fn find_paths<C>(
     initial_value: C,
     min_value: Option<C>,
     value_fn: SharedValueFn<C>,
+    exclude_starved: bool,
 ) -> Vec<(Vec<OffchainPublicKey>, PathId, C)>
 where
     C: Clone + PartialOrd,
@@ -49,7 +50,7 @@ where
 
     let intermediates = length - 1;
 
-    let paths = all_simple_paths_multi::<Vec<_>, _, RandomState, _, _>(
+    let paths = all_simple_paths_multi_where::<Vec<_>, _, RandomState, _, _, _>(
         &inner.graph,
         source,
         destinations,
@@ -59,6 +60,8 @@ where
         initial_value,
         min_value,
         move |c, w, i| value_fn(c, w, i),
+        // A starved edge is what probing must still reach, so only routing leaves it out.
+        move |w| !(exclude_starved && w.is_starved()),
     )
     .filter_map(|(node_indices, final_cost)| {
         // Build the PathId along the path. Slots are key-derived via `path_id::encode`, so no
@@ -129,6 +132,7 @@ impl hopr_api::graph::NetworkGraphTraverse for ChannelGraph {
             value_fn.initial_value(),
             value_fn.min_value(),
             value_fn.into_value_fn(),
+            true,
         )
         .into_iter()
         .map(|(mut nodes, path_id, cost)| {
@@ -165,6 +169,7 @@ impl hopr_api::graph::NetworkGraphTraverse for ChannelGraph {
             value_fn.initial_value(),
             value_fn.min_value(),
             value_fn.into_value_fn(),
+            true,
         )
     }
 
@@ -203,7 +208,9 @@ impl hopr_api::graph::NetworkGraphTraverse for ChannelGraph {
                     })
                     .collect::<HashSet<_>>();
 
-                // Deliberately more permissive than data path selection. RFC-0010 §4.2.1.4 wants
+                // Deliberately more permissive than data path selection, and the one traversal that still
+                // walks a starved edge: a relay judged dead is excluded from routing (RFC-0010 §4.2.3, the
+                // active tier), and loops that keep crossing it are how it is seen to recover. RFC-0010 §4.2.1.4 wants
                 // low-scoring edges probed *more* urgently; applying the production `min_ack_rate`
                 // here would instead prune them, so they would stop being probed, never be
                 // resampled, and stay excluded permanently.
@@ -225,6 +232,8 @@ impl hopr_api::graph::NetworkGraphTraverse for ChannelGraph {
                     value_fn.initial_value(),
                     value_fn.min_value(),
                     value_fn.into_value_fn(),
+                    // Deliberately kept: see the comment above.
+                    false,
                 )
                 .into_iter()
                 .filter_map(|(mut a, mut b, _c)| {
