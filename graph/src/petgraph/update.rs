@@ -1,6 +1,6 @@
-#[cfg(all(feature = "telemetry", not(test)))]
-use hopr_api::graph::NetworkGraphView;
 use hopr_api::graph::{MeasurableEdge, MeasurableNode, NetworkGraphWrite, traits::EdgeObservableWrite};
+#[cfg(all(feature = "telemetry", not(test)))]
+use hopr_api::graph::{NetworkGraphView, traits::EdgeObservableRead};
 use petgraph::graph::EdgeIndex;
 
 use crate::{ChannelGraph, Observations, graph::InnerGraph};
@@ -343,30 +343,22 @@ impl hopr_api::graph::NetworkGraphUpdate for ChannelGraph {
                 }
 
                 // The loop returned over every edge on it, which is the evidence against a timeout on
-                // each. Only the target's latency is isolated above, so the others are credited with
-                // what they already carry, leaving their averages untouched. The edge back into `me`
-                // is left out: it is not a hop anyone chooses. The target edge is skipped because it
-                // is recorded below; on a 2-hop loop it is also the first hop, and crediting it here
-                // would count the loop twice.
-                let fair_share = total_rtt / edges.len() as u32;
+                // each. Only the target's latency is isolated above, so the others get a success with no
+                // latency: writing back the value an edge already carries would pin it. The edge back
+                // into `me` is left out: it is not a hop anyone chooses. The target edge is skipped
+                // because it is recorded below; on a 2-hop loop it is also the first hop, and crediting
+                // it here would count the loop twice.
                 edges[..edges.len() - 1]
                     .iter()
                     .enumerate()
                     .filter(|&(i, _)| i != target_idx)
                     .for_each(|(_, &edge)| {
-                        // The intermediate latency is preferred, else the neighbor-probe latency. An edge
-                        // that carries neither is credited its share of the round trip: a success must be
-                        // recorded or the failures alone would make the edge look dead.
                         let Some(weight) = inner.graph.edge_weight_mut(edge) else {
                             tracing::warn!(?edge, "loopback edge vanished between resolution and crediting");
                             return;
                         };
-                        let carried = weight
-                            .intermediate_qos()
-                            .and_then(|q| q.average_latency())
-                            .or_else(|| weight.immediate_qos().and_then(|q| q.average_latency()));
-
-                        weight.record(EdgeWeightType::Intermediate(Ok(carried.unwrap_or(fair_share))));
+                        // A success must be recorded or the failures alone would make the edge look dead.
+                        weight.credit_loopback();
                     });
 
                 // A saturating subtraction would turn "the known latencies already account for the
@@ -1856,10 +1848,17 @@ mod tests {
         let obs = graph.edge(&me, &a).context("edge me→a should exist")?;
         let qos = obs.intermediate_qos().context("a returning loop must reach me→a")?;
         assert_eq!(qos.average_probe_rate(), Some(1.0), "the loop through a returned");
-        assert_in_delta!(
-            qos.average_latency().context("latency should be set")?.as_millis(),
-            60,
-            5
+        assert_eq!(
+            qos.average_latency(),
+            None,
+            "a credit carries no timing: the ping's value must not be copied into the loop stream"
+        );
+        assert_eq!(
+            obs.immediate_qos()
+                .and_then(|q| q.average_latency())
+                .map(|l| l.as_millis()),
+            Some(60),
+            "and the ping keeps what it measured"
         );
 
         Ok(())
