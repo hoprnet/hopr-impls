@@ -579,7 +579,10 @@ fn with_surbs_into_exit(good: [u64; 2], bad: [u64; 2]) -> String {
             match surbs {
                 Some((_, [expected, observed])) => {
                     marked += 1;
-                    line.replace(" }", &format!(r#", "surbs": [{expected}, {observed}] }}"#))
+                    // Loops rarely cross the edge into the exit, so it carries no loop evidence: only the SURBs
+                    // speak for it (hopr-impls#81). A returned loop would otherwise outweigh them.
+                    line.replace(r#", "relayed_ms": 30"#, "")
+                        .replace(" }", &format!(r#", "surbs": [{expected}, {observed}] }}"#))
                 }
                 None => line.to_string(),
             }
@@ -628,7 +631,8 @@ fn a_relay_whose_surbs_into_the_exit_never_return_should_be_excluded_for_one_to_
                 } else {
                     10
                 };
-                line.replace(" }", &format!(r#", "surbs": [10, {observed}] }}"#))
+                line.replace(r#", "relayed_ms": 30"#, "")
+                    .replace(" }", &format!(r#", "surbs": [10, {observed}] }}"#))
             })
             .collect::<Vec<_>>()
             .join("\n");

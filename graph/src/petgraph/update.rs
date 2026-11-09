@@ -345,10 +345,12 @@ impl hopr_api::graph::NetworkGraphUpdate for ChannelGraph {
                 // The loop returned over every edge on it, which is the evidence against a timeout on
                 // each. Only the target's latency is isolated above, so the others get a success with no
                 // latency: writing back the value an edge already carries would pin it. The edge back
-                // into `me` is left out: it is not a hop anyone chooses. The target edge is skipped
+                // into `me` is credited too, though it is not a hop anyone chooses on the way out: it is
+                // the last edge of a return path, and a returned loop is the only unambiguous evidence it
+                // delivers. (A failed loop does not blame it, see below.) The target edge is skipped
                 // because it is recorded below; on a 2-hop loop it is also the first hop, and crediting
                 // it here would count the loop twice.
-                edges[..edges.len() - 1]
+                edges
                     .iter()
                     .enumerate()
                     .filter(|&(i, _)| i != target_idx)

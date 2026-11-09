@@ -393,13 +393,17 @@ impl Default for TransportIntermediates {
 impl TransportIntermediates {
     /// Whether the relay at the end of this edge delivers, or `None` without evidence.
     ///
-    /// Traffic decides where any crossed the edge: it says more than probing does, and probing is
-    /// only needed where none did. Without traffic the loopbacks decide. Starved means the evidence
-    /// reads exactly zero, so a single returned packet or loop keeps the relay.
+    /// A returned packet or loop is unambiguous: it crossed every edge it is credited to. A failure
+    /// is not: a SURB round trip or a loop that did not come back blames every edge on it, the
+    /// healthy ones included (a dead forward relay fails every round trip whichever relay the reply
+    /// takes home). So any positive witness keeps the edge, and only evidence that reads exactly
+    /// zero everywhere starves it.
     pub(crate) fn delivers_at(&self, now: std::time::Instant) -> Option<bool> {
-        self.traffic_rate_at(now)
-            .or_else(|| self.loopback_rate_at(now))
+        [self.traffic_rate_at(now), self.loopback_rate_at(now)]
+            .into_iter()
+            .flatten()
             .map(|rate| rate > 0.0)
+            .reduce(|any, positive| any || positive)
     }
 
     /// Whether the evidence says that the relay at the end of this edge delivers nothing.
