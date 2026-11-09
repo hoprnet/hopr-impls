@@ -237,6 +237,12 @@ impl hopr_api::graph::NetworkGraphUpdate for ChannelGraph {
                 let Some(edges) = resolve_round_trip_edges(&inner, &self.me, &telemetry.paths) else {
                     return;
                 };
+                // A neighbour ping's pong: it needs no ticket, so a relay dropping what it should forward still
+                // answers.
+                if edges.len() == 2 {
+                    tracing::trace!("zero-hop surb round-trip says nothing about relaying, dropping it");
+                    return;
+                }
 
                 // Every edge on the loop, unlike the loopback handler above which attributes to a
                 // single edge. That one is doing incremental latency tomography: it knows the rest
@@ -647,6 +653,33 @@ mod tests {
             // was. The absolute ratio is not a delivery rate -- it also measures how far the
             // balancer over-mints -- so only movement away from the peak is meaningful.
             assert_in_delta!(rate, 1.0, 1e-9);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_zero_hop_round_trip_should_credit_nothing() -> anyhow::Result<()> {
+        let me = pubkey_from(&SECRET_0);
+        let neighbour = pubkey_from(&SECRET_1);
+        let graph = ChannelGraph::new(me);
+        graph.add_node(neighbour);
+        graph.add_edge(&me, &neighbour)?;
+        graph.add_edge(&neighbour, &me)?;
+        let (me_i, neighbour_i) = (slot_of(&graph, &me), slot_of(&graph, &neighbour));
+
+        let paths = hopr_api::graph::ForwardAndReturnPath {
+            forward: [me_i, neighbour_i, 0, 0, 0],
+            reply: [neighbour_i, me_i, 0, 0, 0],
+        };
+        graph.record_edge::<TestNeighbor, TestPath>(hopr_api::graph::MeasurableEdge::Surb(surb(paths, 1, 1)));
+
+        for (src, dst) in [(me, neighbour), (neighbour, me)] {
+            let traffic = graph
+                .edge(&src, &dst)
+                .context("edge should exist")?
+                .intermediate_qos()
+                .and_then(|q| q.traffic_rate());
+            assert_eq!(traffic, None, "a pong must not read as relayed traffic");
         }
         Ok(())
     }
