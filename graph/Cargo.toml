@@ -62,3 +62,7 @@ tokio       = { workspace = true }
 [[bench]]
 harness = false
 name    = "traverse_bench"
+
+[[bench]]
+harness = false
+name    = "dump_contention"
