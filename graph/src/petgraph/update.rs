@@ -685,6 +685,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_graph_should_hand_its_starvation_params_to_the_edges_it_creates() -> anyhow::Result<()> {
+        use hopr_api::graph::traits::{EdgeObservableWrite, EdgeWeightType};
+
+        let me = pubkey_from(&SECRET_0);
+        let other = pubkey_from(&SECRET_1);
+        // One loop in four returned: a quarter, under the half this graph asks of a relay.
+        let graph = ChannelGraph::new(me).with_starvation(crate::StarvationParams {
+            min_loopbacks_for_rate: 3,
+            min_return_rate: 0.5,
+        });
+        graph.add_node(other);
+        graph.add_edge(&me, &other)?;
+        graph.upsert_edge(&me, &other, |obs| {
+            obs.record(EdgeWeightType::Intermediate(Ok(std::time::Duration::from_millis(40))));
+            for _ in 0..3 {
+                obs.record(EdgeWeightType::Intermediate(Err(())));
+            }
+        });
+
+        let edge = graph.edge(&me, &other).context("edge should exist")?;
+        assert!(
+            edge.is_starved(),
+            "the graph's own params must reach the edges it creates"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn a_round_trip_report_from_outside_the_window_should_be_dropped() -> anyhow::Result<()> {
         // The window buckets a report at `Instant::now()` regardless of when it was produced, so a
         // batch delayed past the window would be counted as current traffic and could move the
