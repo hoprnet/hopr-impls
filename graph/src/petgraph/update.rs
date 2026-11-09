@@ -686,6 +686,26 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn a_graph_should_reject_starvation_params_that_would_starve_every_relay_or_none() {
+        let me = pubkey_from(&SECRET_0);
+        for min_return_rate in [f64::NAN, f64::INFINITY, 0.0, -0.1, 1.5] {
+            let params = crate::StarvationParams {
+                min_loopbacks_for_rate: 3,
+                min_return_rate,
+            };
+            assert!(
+                ChannelGraph::new(me).with_starvation(params).is_err(),
+                "a return rate of {min_return_rate} must be rejected"
+            );
+        }
+        let params = crate::StarvationParams {
+            min_loopbacks_for_rate: 0,
+            min_return_rate: 0.5,
+        };
+        assert!(ChannelGraph::new(me).with_starvation(params).is_err());
+    }
+
     #[tokio::test]
     async fn a_graph_should_hand_its_starvation_params_to_the_edges_it_creates() -> anyhow::Result<()> {
         use hopr_api::graph::traits::{EdgeObservableWrite, EdgeWeightType};
@@ -697,6 +717,7 @@ mod tests {
             min_loopbacks_for_rate: 3,
             min_return_rate: 0.5,
         });
+        let graph = graph.map_err(|e| anyhow::anyhow!(e))?;
         graph.add_node(other);
         graph.add_edge(&me, &other)?;
         graph.upsert_edge(&me, &other, |obs| {

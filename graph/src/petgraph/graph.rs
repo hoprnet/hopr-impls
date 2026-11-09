@@ -150,10 +150,15 @@ impl ChannelGraph {
     /// This graph with `starvation` deciding when the loops over an edge starve its relay. The defaults
     /// stand otherwise. Call before the graph is shared; production code takes the values from the path
     /// planner's configuration, as it does the edge parameters.
-    #[must_use]
-    pub fn with_starvation(mut self, starvation: StarvationParams) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Fails when `starvation` does not pass [`StarvationParams::validate`]: a NaN or out-of-range rate would
+    /// starve every relay, or none.
+    pub fn with_starvation(mut self, starvation: StarvationParams) -> Result<Self, String> {
+        starvation.validate()?;
         self.starvation = starvation;
-        self
+        Ok(self)
     }
 
     /// Returns the self-identity key of this graph.
