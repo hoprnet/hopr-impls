@@ -20,6 +20,14 @@ pub struct TransportLinkMeasurement {
     samples: u64,
 }
 
+impl TransportLinkMeasurement {
+    /// A success that carries no timing: counts toward the rate and leaves the latency average alone.
+    fn credit(&mut self) {
+        self.samples = self.samples.saturating_add(1);
+        self.probe_success_rate.update(1.0);
+    }
+}
+
 impl EdgeLinkObservable for TransportLinkMeasurement {
     fn record(&mut self, measurement: EdgeTransportMeasurement) {
         self.samples = self.samples.saturating_add(1);
@@ -86,6 +94,26 @@ impl Observations {
     pub(crate) fn set_health(&mut self, health: Option<f64>) {
         self.health = health;
     }
+
+    /// Credits a returned loopback to this edge without a latency; see [`TransportIntermediates::credit_loopback`].
+    pub(crate) fn credit_loopback(&mut self) {
+        self.last_update = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        self.intermediate_probe.get_or_insert_default().credit_loopback();
+        self.restamp_starved();
+    }
+
+    /// The neighbour ping reads the verdict of the edge's loopback stream; see `relay_starved_at`.
+    fn restamp_starved(&mut self) {
+        let now = std::time::Instant::now();
+        if let Some(immediate) = self.immediate_probe.as_mut() {
+            immediate.relay_starved_at = self
+                .intermediate_probe
+                .is_some_and(|i| i.relay_starved_at(now))
+                .then_some(now);
+        }
+    }
 }
 
 impl EdgeObservableWrite for Observations {
@@ -115,13 +143,7 @@ impl EdgeObservableWrite for Observations {
             }
         }
 
-        let now = std::time::Instant::now();
-        if let Some(immediate) = self.immediate_probe.as_mut() {
-            immediate.relay_starved_at = self
-                .intermediate_probe
-                .is_some_and(|i| i.relay_starved_at(now))
-                .then_some(now);
-        }
+        self.restamp_starved();
     }
 }
 
@@ -513,6 +535,16 @@ impl TransportIntermediates {
 impl EdgeProtocolObservable for TransportIntermediates {
     fn balance(&self) -> Option<hopr_api::graph::traits::Balance> {
         self.balance
+    }
+}
+
+impl TransportIntermediates {
+    /// A loop that returned over this edge. The edge was not timed on its own, so only the rates move:
+    /// writing the latency it already carries back would pin a stale value, and a loop's round trip
+    /// cannot be split between its edges.
+    fn credit_loopback(&mut self) {
+        self.loopback.record_at(true, std::time::Instant::now());
+        self.link.credit();
     }
 }
 
@@ -1096,6 +1128,23 @@ mod tests {
             m.traffic_rate_at(now).is_some_and(|rate| rate > 0.0),
             "failed probes must not change what traffic says"
         );
+    }
+
+    #[test]
+    fn a_credited_loopback_should_not_write_a_latency_into_the_edge() {
+        // The edge is known by its neighbour ping only. A loop that returns over it says nothing about
+        // its own latency, so crediting must not copy the ping's value into the loop stream, where it
+        // would be read back and written again on every loop.
+        let mut observations = Observations::default();
+        observations.record(EdgeWeightType::Immediate(Ok(std::time::Duration::from_millis(20))));
+        for _ in 0..5 {
+            observations.credit_loopback();
+        }
+
+        let intermediate = observations.intermediate_qos().expect("credited");
+        assert_eq!(intermediate.average_latency(), None, "a credit carries no timing");
+        assert_eq!(intermediate.loopback_rate(), Some(1.0), "but it is a success");
+        assert_eq!(intermediate.average_probe_rate(), Some(1.0));
     }
 
     #[test]
