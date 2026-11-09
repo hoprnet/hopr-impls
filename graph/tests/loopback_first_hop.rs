@@ -662,3 +662,77 @@ fn a_relay_whose_surbs_into_the_exit_never_return_should_be_starved_for_one_to_t
     }
     Ok(())
 }
+
+// ── A starved relay is not routable (the active exclusion tier, RFC-0010 4.2.3) ──────────────
+
+fn as_strs(route: &[String]) -> Vec<&str> {
+    route.iter().map(String::as_str).collect()
+}
+
+#[test]
+fn a_starved_relay_should_get_no_forward_route_for_one_to_three_hops() -> anyhow::Result<()> {
+    let one_hop = (1, route(&["good"]), route(&["bad"]));
+    let two_hops = (2, route(&["good", "m1"]), route(&["bad", "m1"]));
+    let three_hops = (3, route(&["good", "m1", "m2"]), route(&["bad", "m1", "m2"]));
+
+    for (hops, good, bad) in [one_hop, two_hops, three_hops] {
+        let net = Net::from_json(TOPOLOGY)?;
+        probe_everything(&net);
+
+        let routes = net.forward("exit", hops);
+        assert!(
+            routes.value_of(&as_strs(&good)).is_some_and(|value| value > 0.0),
+            "{hops} hop(s): the relay whose loops return must stay routable, got {:?}",
+            routes.names()
+        );
+        assert_eq!(
+            routes.value_of(&as_strs(&bad)),
+            None,
+            "{hops} hop(s): a relay known to carry nothing must not be a candidate, got {:?}",
+            routes.names()
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn a_starved_relay_should_get_no_return_route() -> anyhow::Result<()> {
+    let net = Net::from_json(LAYERED)?;
+    probe_with_dead(&net, &["bb"]);
+
+    let after = net.returning("a1", 1);
+    assert!(
+        after.value_of(&["bg"]).is_some_and(|value| value > 0.0),
+        "the honest relay must stay routable back, got {:?}",
+        after.names()
+    );
+    assert_eq!(
+        after.value_of(&["bb"]),
+        None,
+        "a relay known to carry nothing must not carry the return path, got {:?}",
+        after.names()
+    );
+    Ok(())
+}
+
+#[test]
+fn a_starved_relay_should_be_routable_again_once_a_loop_returns() -> anyhow::Result<()> {
+    let net = Net::from_json(TOPOLOGY)?;
+    probe_everything(&net);
+    assert_eq!(
+        net.forward("exit", 1).value_of(&["bad"]),
+        None,
+        "the relay must be excluded first, or recovery proves nothing"
+    );
+
+    // The loops through it return from now on.
+    probe_with_dead(&net, &[]);
+
+    assert!(
+        net.forward("exit", 1)
+            .value_of(&["bad"])
+            .is_some_and(|value| value > 0.0),
+        "a relay whose loops return again must be a candidate again"
+    );
+    Ok(())
+}
