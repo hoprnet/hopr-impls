@@ -178,15 +178,17 @@ where
     from_fn(move || {
         while let Some(edges) = stack.last_mut() {
             if let Some(edge) = edges.next() {
-                if !edge_allowed(edge.weight()) {
-                    continue;
-                }
                 let child = edge.target();
 
                 // Excluded nodes checked separately — not inserted into `visited` — so they
                 // never appear in the yielded path. Excluding `from` is a no-op since it's
                 // already in `visited` at position 0.
                 if visited.contains(&child) || excluded_nodes.is_some_and(|excl| excl.contains(&child)) {
+                    continue;
+                }
+
+                // Last, since the predicate can be costly (the starved verdict reads the evidence windows).
+                if !edge_allowed(edge.weight()) {
                     continue;
                 }
 

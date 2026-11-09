@@ -27,7 +27,19 @@ pub const MAX_LOOPBACK_HOPS: usize = hopr_api::types::internal::routing::Routing
 /// A shared cost function that computes a cumulative cost from edge observations.
 pub(crate) type SharedValueFn<C> = Arc<dyn Fn(C, &crate::Observations, usize) -> C + Send + Sync>;
 
-/// Core path-finding routine that runs `all_simple_paths_multi` on the
+/// Whether a traversal walks an edge the graph has judged dead (see `Observations::is_starved`).
+///
+/// Routing leaves such an edge out (RFC-0010 §4.2.3, the active tier). Probing walks it: a returning loop
+/// is the only way it can be seen to recover. This is a second place that acts on the verdict next to the
+/// value functions in `hopr-api`, which floor a dead edge at `MEASURED_DEAD_FLOOR` instead of excluding it.
+/// Both read the same verdict; if either definition of "dead" changes, the other has to follow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StarvedEdges {
+    Exclude,
+    Walk,
+}
+
+/// Core path-finding routine that runs `all_simple_paths_multi_where` on the
 /// inner petgraph.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn find_paths<C>(
@@ -39,7 +51,7 @@ pub(crate) fn find_paths<C>(
     initial_value: C,
     min_value: Option<C>,
     value_fn: SharedValueFn<C>,
-    exclude_starved: bool,
+    starved: StarvedEdges,
 ) -> Vec<(Vec<OffchainPublicKey>, PathId, C)>
 where
     C: Clone + PartialOrd,
@@ -61,7 +73,7 @@ where
         min_value,
         move |c, w, i| value_fn(c, w, i),
         // A starved edge is what probing must still reach, so only routing leaves it out.
-        move |w| !(exclude_starved && w.is_starved()),
+        move |w| starved == StarvedEdges::Walk || !w.is_starved(),
     )
     .filter_map(|(node_indices, final_cost)| {
         // Build the PathId along the path. Slots are key-derived via `path_id::encode`, so no
@@ -132,7 +144,7 @@ impl hopr_api::graph::NetworkGraphTraverse for ChannelGraph {
             value_fn.initial_value(),
             value_fn.min_value(),
             value_fn.into_value_fn(),
-            true,
+            StarvedEdges::Exclude,
         )
         .into_iter()
         .map(|(mut nodes, path_id, cost)| {
@@ -169,7 +181,7 @@ impl hopr_api::graph::NetworkGraphTraverse for ChannelGraph {
             value_fn.initial_value(),
             value_fn.min_value(),
             value_fn.into_value_fn(),
-            true,
+            StarvedEdges::Exclude,
         )
     }
 
@@ -232,8 +244,7 @@ impl hopr_api::graph::NetworkGraphTraverse for ChannelGraph {
                     value_fn.initial_value(),
                     value_fn.min_value(),
                     value_fn.into_value_fn(),
-                    // Deliberately kept: see the comment above.
-                    false,
+                    StarvedEdges::Walk,
                 )
                 .into_iter()
                 .filter_map(|(mut a, mut b, _c)| {

@@ -200,3 +200,29 @@ fn a_session_over_every_relay_pair_should_leave_only_the_healthy_relay_routable(
     }
     Ok(())
 }
+
+#[test]
+fn after_probing_alone_only_the_healthy_relay_should_be_routable_in_both_directions() -> anyhow::Result<()> {
+    // The state the entry is in when the session opens: a learning period with loops and no data.
+    let net = Net::from_json(&topology())?;
+    probe(&net);
+
+    for direction in ["forward", "return"] {
+        assert!(
+            routable(&net, direction, "good"),
+            "{direction}: the healthy relay must be routable, got {:?}",
+            if direction == "forward" {
+                net.forward("exit", 1).names()
+            } else {
+                net.returning("exit", 1).names()
+            }
+        );
+        for dead in ["bad1", "bad2"] {
+            assert!(
+                !routable(&net, direction, dead),
+                "{direction}: {dead} must not be routable"
+            );
+        }
+    }
+    Ok(())
+}
