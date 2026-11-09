@@ -325,13 +325,6 @@ const LOOPBACK_BUCKETS: usize = 12;
 pub const LOOPBACK_WINDOW: std::time::Duration =
     std::time::Duration::from_secs(LOOPBACK_BUCKET_WIDTH.as_secs() * LOOPBACK_BUCKETS as u64);
 
-/// Loops in the window from which the return rate, not a single returned loop, judges the relay.
-const MIN_LOOPBACKS_FOR_RATE: u32 = 10;
-
-/// Return rate below which a relay is starved; piz-palu-prod droppers peaked at 0.09, working first hops stayed above
-/// 0.25.
-const STARVED_LOOPBACK_RATE: f64 = 0.1;
-
 /// Loops over an edge from which the return rate, not a single returned loop, judges its relay. Three, not
 /// more: a sparse network sees few loops per edge, and a dropping relay should not stay usable for want of
 /// a sample.
@@ -387,10 +380,11 @@ struct LoopbackBucket {
 
 /// Loopbacks over an edge that returned, against all of them, over the last 60 s.
 ///
-/// Every loop that crosses the edge counts once, as returned or as failed, so the ratio is
-/// returned over returned plus failed. A window rather than a moving average: a relay none of whose
-/// loops returned reads as exactly zero, and anything above zero is a relay that carries traffic.
-/// A single loop is evidence, since an edge may see only one per probing round.
+/// Every loop that crosses the edge counts once, returned or failed, so the rate is returned over returned
+/// plus failed. A window rather than a moving average: a relay none of whose loops returned reads exactly
+/// zero. Below [`StarvationParams::min_loopbacks_for_rate`] loops one returned loop is evidence enough, since
+/// an edge may see only one per probing round; from there on the rate has to reach
+/// [`StarvationParams::min_return_rate`], because a dropping relay still returns the odd loop.
 #[derive(Debug, Copy, Clone, PartialEq)]
 struct LoopbackWindow {
     epoch: std::time::Instant,
@@ -448,15 +442,15 @@ impl LoopbackWindow {
     }
 
     /// Whether the loops over the edge say its relay delivers, or `None` without any.
-    fn delivers_at(&self, now: std::time::Instant, _params: StarvationParams) -> Option<bool> {
+    fn delivers_at(&self, now: std::time::Instant, params: StarvationParams) -> Option<bool> {
         let (sent, returned) = self.counts_at(now);
         if sent == 0 {
             return None;
         }
-        // A dropping relay still returns the odd loop; below the minimum one returned loop is all we can ask.
-        let has_rate = sent >= MIN_LOOPBACKS_FOR_RATE;
-        if has_rate {
-            return Some(f64::from(returned) / f64::from(sent) >= STARVED_LOOPBACK_RATE);
+        // A dropping relay still returns the odd loop. Once the window holds enough loops the return rate
+        // judges the relay; below that, one returned loop is all that can be asked.
+        if sent >= params.min_loopbacks_for_rate {
+            return Some(f64::from(returned) / f64::from(sent) >= params.min_return_rate);
         }
         Some(returned > 0)
     }
@@ -492,7 +486,9 @@ impl TransportIntermediates {
     /// is not: a SURB round trip or a loop that did not come back blames every edge on it, the
     /// healthy ones included (a dead forward relay fails every round trip whichever relay the reply
     /// takes home). So any positive witness keeps the edge, and only evidence that reads exactly
-    /// zero everywhere starves it. Over a full loop window, the odd returned loop is not positive.
+    /// zero everywhere starves it. Once the window holds [`StarvationParams::min_loopbacks_for_rate`] loops, the odd
+    /// returned loop no longer counts as a positive witness: the return rate has to reach
+    /// [`StarvationParams::min_return_rate`].
     pub(crate) fn delivers_at(&self, now: std::time::Instant) -> Option<bool> {
         [
             self.traffic_rate_at(now).map(|rate| rate > 0.0),

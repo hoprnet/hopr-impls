@@ -237,10 +237,12 @@ impl hopr_api::graph::NetworkGraphUpdate for ChannelGraph {
                 let Some(edges) = resolve_round_trip_edges(&inner, &self.me, &telemetry.paths) else {
                     return;
                 };
-                // A neighbour ping's pong: it needs no ticket, so a relay dropping what it should forward still
-                // answers.
+                // Two edges (me -> X -> me) is one hop each way, which is what a neighbour ping's pong is. It
+                // needs no ticket, so a relay dropping what it should forward still answers, and its 1/1 would
+                // keep that relay's edge alive. A direct session reports the same two edges and is dropped
+                // with it: the telemetry cannot tell them apart.
                 if edges.len() == 2 {
-                    tracing::trace!("zero-hop surb round-trip says nothing about relaying, dropping it");
+                    tracing::trace!("two-edge (one-hop) surb round-trip says nothing about relaying, dropping it");
                     return;
                 }
 
@@ -658,7 +660,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_zero_hop_round_trip_should_credit_nothing() -> anyhow::Result<()> {
+    async fn a_two_edge_round_trip_should_credit_nothing() -> anyhow::Result<()> {
         let me = pubkey_from(&SECRET_0);
         let neighbour = pubkey_from(&SECRET_1);
         let graph = ChannelGraph::new(me);
