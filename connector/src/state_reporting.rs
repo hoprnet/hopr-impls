@@ -1,12 +1,10 @@
-//! Component-owned state and explicit analysis signals, independent of node composition.
+//! Private bounded diagnostic reporting; no public snapshot types or reporting traits.
+//! Kept local so each component remains independently publishable without a diagnostic dependency.
 use std::{
     future::Future,
     io::{self, Write},
     panic::AssertUnwindSafe,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -17,47 +15,12 @@ use serde::Serialize;
 /// Maximum serialized record, excluding the logger envelope.
 pub const MAX_SNAPSHOT_BYTES: usize = 32 * 1024;
 
-/// Health of the observed scope, assessed by the component itself.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Signal {
-    Healthy,
-    NeedsAnalysis,
-    Unknown,
-}
-impl Signal {
-    pub fn analysis_required(self) -> bool {
-        self != Self::Healthy
-    }
-}
-
-/// Component-specific state and its interpretation. `reason` is a short stable code, not an error log.
-#[derive(Debug)]
+/// Private diagnostic result. Analysis is independent of operational state.
+#[derive(Debug, Serialize)]
 pub struct Dump<T> {
     pub state: T,
-    pub signal: Signal,
+    pub analysis_required: bool,
     pub reason: &'static str,
-}
-
-/// Optional functionality implemented by a component or an adapter, separate from its operational interface.
-/// Payloads have no prescribed shape. Implementations must bound work and avoid blocking the async executor.
-pub trait StateDump: Send + Sync {
-    type State: Serialize + Send;
-    fn state_dump(&self) -> impl Future<Output = Result<Dump<Self::State>, String>> + Send;
-}
-impl<T: StateDump + ?Sized> StateDump for Arc<T> {
-    type State = T::State;
-
-    async fn state_dump(&self) -> Result<Dump<Self::State>, String> {
-        (**self).state_dump().await
-    }
-}
-impl<T: StateDump + ?Sized> StateDump for &T {
-    type State = T::State;
-
-    async fn state_dump(&self) -> Result<Dump<Self::State>, String> {
-        (**self).state_dump().await
-    }
 }
 
 /// Observation coverage. Missing or incomplete data is never represented as an observed zero.
@@ -68,7 +31,6 @@ pub enum Section<T> {
     Partial { value: T },
     Error { message: String },
     Timeout,
-    Unavailable,
 }
 impl<T> Section<T> {
     pub fn value(&self) -> Option<&T> {
@@ -134,16 +96,13 @@ impl Config {
         }
     }
 
+    #[cfg(test)]
     pub fn with_source_timeout(mut self, timeout: Duration) -> Result<Self, ConfigError> {
         if timeout.is_zero() || timeout > Duration::from_secs(5) {
             return Err(ConfigError("source timeout must be positive and at most 5 seconds"));
         }
         self.timeout = timeout;
         Ok(self)
-    }
-
-    pub fn interval(&self) -> Option<Duration> {
-        self.interval
     }
 
     pub fn source_timeout(&self) -> Duration {
@@ -160,7 +119,6 @@ pub struct Record<T> {
     pub sequence: u64,
     pub collected_at_ms: u64,
     pub collection_ms: u64,
-    pub signal: Signal,
     pub reason: String,
     pub analysis_required: bool,
     pub state: Section<T>,
@@ -201,65 +159,63 @@ impl<T: Serialize> Record<T> {
             return Err(EncodeError::TooLarge);
         }
         result?;
-        Ok(String::from_utf8(writer.bytes).expect("JSON is UTF-8"))
+        Ok(String::from_utf8(writer.bytes).expect("serde_json writes valid UTF-8"))
     }
 
     /// Analysis fields remain structured even if the payload cannot be encoded.
     pub fn emit(&self) {
         match self.to_json() {
             Ok(state) => tracing::info!(event="component_state", component=self.component, instance=%self.instance,
-                sequence=self.sequence, signal=?self.signal, reason=%self.reason,
+                sequence=self.sequence, reason=%self.reason,
                 analysis_required=self.analysis_required, state=%state, "component operational state"),
             Err(error) => tracing::info!(event="component_state", component=self.component, instance=%self.instance,
-                sequence=self.sequence, signal=?Signal::NeedsAnalysis, reason="encoding_error",
+                sequence=self.sequence, reason="encoding_error",
                 analysis_required=true, %error, "component operational state"),
         }
     }
 }
 
 /// One independent reporter per component. The host supplies identity, runtime, and cancellation.
-pub struct Reporter<T> {
+pub struct Reporter {
     component: &'static str,
     instance: String,
-    source: T,
     config: Config,
     sequence: AtomicU64,
 }
-impl<T: StateDump> Reporter<T> {
-    pub fn new(component: &'static str, instance: impl Into<String>, source: T, config: Config) -> Self {
+impl Reporter {
+    pub fn new(component: &'static str, instance: impl Into<String>, config: Config) -> Self {
         Self {
             component,
             instance: instance.into().chars().take(120).collect(),
-            source,
             config,
             sequence: AtomicU64::new(0),
         }
     }
 
     /// Always collect on demand, even when periodic reporting is disabled.
-    pub async fn collect(&self) -> Record<T::State> {
+    pub async fn collect<T: Serialize>(&self, source: impl Future<Output = Result<Dump<T>, String>>) -> Record<T> {
         let started = Instant::now();
-        let read = AssertUnwindSafe(async { self.source.state_dump().await }).catch_unwind();
-        let (state, signal, reason) = match read
+        let read = AssertUnwindSafe(source).catch_unwind();
+        let (state, analysis_required, reason) = match read
             .timeout(futures_time::time::Duration::from(self.config.timeout))
             .await
         {
-            Ok(Ok(Ok(dump))) => (Section::Ok { value: dump.state }, dump.signal, dump.reason),
+            Ok(Ok(Ok(dump))) => (Section::Ok { value: dump.state }, dump.analysis_required, dump.reason),
             Ok(Ok(Err(message))) => (
                 Section::Error {
                     message: message.chars().take(120).collect(),
                 },
-                Signal::Unknown,
+                true,
                 "collection_error",
             ),
             Ok(Err(_)) => (
                 Section::Error {
                     message: "component state collection panicked".into(),
                 },
-                Signal::Unknown,
+                true,
                 "collection_panicked",
             ),
-            Err(_) => (Section::Timeout, Signal::Unknown, "collection_timeout"),
+            Err(_) => (Section::Timeout, true, "collection_timeout"),
         };
         Record {
             schema_version: 1,
@@ -272,29 +228,110 @@ impl<T: StateDump> Reporter<T> {
                 .as_millis()
                 .min(u64::MAX as u128) as u64,
             collection_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
-            signal,
             reason: reason.chars().take(120).collect(),
-            analysis_required: signal.analysis_required(),
+            analysis_required,
             state,
         }
     }
 
-    pub async fn run(&self) {
+    pub async fn run<T: Serialize, Fut: Future<Output = Result<Dump<T>, String>>>(&self, source: impl Fn() -> Fut) {
         if let Some(interval) = self.config.interval {
             let ticks = futures_time::stream::interval(futures_time::time::Duration::from(interval)).map(|_| ());
-            self.run_on(ticks).await;
+            self.run_on(ticks, source).await;
         }
     }
 
-    async fn run_on<S: Stream<Item = ()> + Unpin>(&self, mut ticks: S) {
+    async fn run_on<T: Serialize, Fut: Future<Output = Result<Dump<T>, String>>, S: Stream<Item = ()> + Unpin>(
+        &self,
+        mut ticks: S,
+        source: impl Fn() -> Fut,
+    ) {
         if self.config.interval.is_none() {
             return;
         }
         while ticks.next().await.is_some() {
-            self.collect().await.emit();
+            self.collect(source()).await.emit();
         }
     }
 }
 
 #[cfg(test)]
-mod tests;
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn collection_failures_preserve_coverage_and_request_analysis() -> anyhow::Result<()> {
+        let reporter = Reporter::new(
+            "test",
+            "node",
+            Config::default().with_source_timeout(Duration::from_millis(5))?,
+        );
+        let timeout = reporter
+            .collect(std::future::pending::<Result<Dump<()>, String>>())
+            .await;
+        assert!(matches!(timeout.state, Section::Timeout));
+        assert!(timeout.analysis_required);
+        let error = reporter.collect(async { Err::<Dump<()>, _>("x".repeat(500)) }).await;
+        let Section::Error { message } = error.state else {
+            anyhow::bail!("expected collection error")
+        };
+        assert!(message.len() <= 120);
+        let panic = reporter
+            .collect(async {
+                panic!("injected failure");
+                #[allow(unreachable_code)]
+                Ok::<_, String>(Dump {
+                    state: (),
+                    analysis_required: false,
+                    reason: "unreachable",
+                })
+            })
+            .await;
+        assert_eq!(panic.reason, "collection_panicked");
+        let recovered = reporter
+            .collect(async {
+                Ok(Dump {
+                    state: 7,
+                    analysis_required: false,
+                    reason: "ok",
+                })
+            })
+            .await;
+        assert!(!recovered.analysis_required);
+        assert_eq!(recovered.sequence, 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn disabled_periodic_reporting_does_not_poll_or_drain_sources() -> anyhow::Result<()> {
+        let reads = AtomicU64::new(0);
+        Reporter::new("test", "node", Config::new(0)?)
+            .run_on(futures::stream::iter([(), ()]), || async {
+                reads.fetch_add(1, Ordering::Relaxed);
+                Ok(Dump {
+                    state: (),
+                    analysis_required: false,
+                    reason: "ok",
+                })
+            })
+            .await;
+        assert_eq!(reads.load(Ordering::Relaxed), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn records_enforce_the_byte_budget_and_preserve_analysis_fields() {
+        let reporter = Reporter::new("test", "node", Config::default());
+        let record = reporter
+            .collect(async {
+                Ok(Dump {
+                    state: "x".repeat(MAX_SNAPSHOT_BYTES),
+                    analysis_required: true,
+                    reason: "test",
+                })
+            })
+            .await;
+        assert!(matches!(record.to_json(), Err(EncodeError::TooLarge)));
+        assert!(record.analysis_required);
+    }
+}

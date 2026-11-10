@@ -3880,9 +3880,8 @@ dependencies = [
 
 [[package]]
 name = "hopr-api"
-version = "5.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fa64c5a401c0c7db4ad9a0688d11e59bc4566f92c0661e8ef97e4008816509ad"
+version = "5.1.0"
+source = "git+https://github.com/hoprnet/hopr-api?branch=feature%2Fcore-1168-periodic-compact-state-dump-reduce-debug-cardinality-for#bc838995f864a2afb0d434106d9993303e170d1c"
 dependencies = [
  "async-trait",
  "atomic_enum",
@@ -3892,6 +3891,7 @@ dependencies = [
  "futures-concurrency",
  "hopr-types",
  "libp2p-identity",
+ "num_enum",
  "serde",
  "serde_bytes",
  "strum",
@@ -3934,7 +3934,6 @@ dependencies = [
  "futures-time",
  "hex-literal",
  "hopr-api",
- "hopr-state-dump",
  "hopr-utilities",
  "insta",
  "lazy_static",
@@ -4001,9 +4000,9 @@ dependencies = [
  "bimap",
  "criterion",
  "futures",
+ "futures-time",
  "hex-literal",
  "hopr-api",
- "hopr-state-dump",
  "hopr-utilities",
  "indexmap 2.14.2",
  "insta",
@@ -4039,19 +4038,6 @@ dependencies = [
  "tokio-retry",
  "tracing",
  "validator",
-]
-
-[[package]]
-name = "hopr-state-dump"
-version = "0.1.0"
-dependencies = [
- "futures",
- "futures-time",
- "serde",
- "serde_json",
- "thiserror 2.0.21",
- "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -4094,9 +4080,9 @@ dependencies = [
  "bytes",
  "dashmap",
  "futures",
+ "futures-time",
  "futures-timer",
  "hopr-api",
- "hopr-state-dump",
  "hopr-utilities",
  "lazy_static",
  "libp2p",
@@ -4105,6 +4091,7 @@ dependencies = [
  "pin-project",
  "quinn-udp 0.6.3",
  "serde",
+ "serde_json",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -6457,7 +6444,7 @@ dependencies = [
  "quinn-udp 0.5.16",
  "rustc-hash",
  "rustls",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -6497,7 +6484,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.61.2",
 ]
@@ -6510,7 +6497,7 @@ checksum = "47091c86514c2e11452cb228dee77037334b99d92a23e4c69aa5982261f39247"
 dependencies = [
  "cfg_aliases",
  "libc",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "windows-sys 0.61.2",
 ]
 

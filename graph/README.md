@@ -11,26 +11,22 @@ edges can disappear while telemetry is in flight; those unattributable reports d
 path structure still produces WARN diagnostics, and so does a missing local node in the SURB round-trip handler; the loopback handlers
 report it at TRACE. Enable TRACE in a build that retains it for individual reports; the workspace compiles TRACE out of release builds.
 
-## Bounded graph state
+## Bounded graph diagnostics
 
-`diagnostics::GraphStateRead::graph_state` reads the current graph independently of any chain-channel inventory. `ChannelGraph` implements
-it; references and `Arc` handles delegate to the same reader. Enable this crate's opt-in `state-dump` feature to use
-`state_dump::GraphDump`, an independent adapter implementing `hopr_state_dump::StateDump` with `GraphState` as its own payload. It requires
-no chain or transport view. A replacement graph can implement `StateDump` with its own schema instead of implementing `GraphStateRead`.
+Enable `serde` to implement `hopr_api::StateDump` on `ChannelGraph`. The asynchronous `state_dump().await` collects off the executor and
+returns an opaque Serde-compatible object. For sampled paths, `graph.state_view(bounded_paths)` returns an opaque configured view
+implementing the same trait. Concrete snapshot types and the graph read seam are private; the diagnostic schema may change. The legacy
+`state-dump` feature enables `serde` too. There is no standalone diagnostic crate.
 
-```rust,ignore
-use hopr_network_graph::state_dump::GraphDump;
-use hopr_state_dump::{Config, Reporter};
-let source = GraphDump::new(graph.clone());
-let reporter = Reporter::new("graph", node_id.to_string(), source, Config::from_env()?);
-// Spawn reporter.run() independently of chain and transport reporters.
-```
+`graph.state(paths)` remains a synchronous inherent convenience method.
 
-The adapter runs reads in blocking tasks. Its signal requests analysis for a missing local node, new empty searches, missing sampled path
-components or degraded sampled edges (connectivity, funding, acknowledgement rate, probes, score or health). Unavailable samples or wholly
-unobserved quality signal `Unknown`, which also requests analysis. Otherwise the sampled scope signals `Healthy`; it does not establish
-network-wide health. New empty-search detection has its own baseline, so historical cumulative failures do not latch the signal forever.
-Keep one adapter per reporting stream. Decision evidence remains cumulative and is never drained by the reporter.
+The on-demand method is synchronous and briefly locks the graph. For periodic reporting, run
+`graph.run_state_reporting(instance, bounded_paths)` in the host runtime. The path provider runs with collection in a blocking task, must
+bound its allocation, and must supply a non-draining view. The host owns cancellation and its tracing subscriber. Each reporting stream
+keeps its own empty-search baseline; cumulative search diagnostics are never drained.
+
+Missing local nodes, new empty searches, missing sampled path elements, degraded sampled observations and incomplete observations request
+analysis. This diagnostic assessment does not assign operational `ComponentState::Failed`.
 
 The snapshot includes graph-wide node/edge counts, whether the local node exists, ticket face value, edge penalty and minimum ack rate. It
 counts both incoming and outgoing local edges and samples up to eight incident edges, including healthy and transport-only edges. Each named
@@ -41,8 +37,8 @@ balance or zero probe success rate remains distinct. Unknown streams are not tre
 When supplied with paths, the reader inspects at most 32 forward/reply slot arrays and samples up to four unique directed edges from them,
 including remote edges. `paths` is null when the path source is unavailable and reports zero counts for an available idle source. Missing
 edges, missing nodes, ambiguous slots and invalid padding are explicit. These observations cover the supplied path sample, not all routes. A
-host may supply paths using `GraphDump::with_paths(|| bounded_paths())`. Path sampling runs in the same blocking task; the provider must
-bound allocation and supply a non-draining view. This avoids coupling the graph to a particular routing/SURB counter implementation.
+host supplies paths using the `run_state_reporting` callback. Path sampling runs in the same blocking task; the provider must bound
+allocation and supply a non-draining view. This avoids coupling the graph to a particular routing/SURB counter implementation.
 
 Samples prioritize missing path components, underfunding, disconnection/low acknowledgement rates, and poor probes/health, with
 deterministic endpoint ordering for ties. Both samples share a 3 KiB JSON budget, so fewer rows may fit than the count caps.
@@ -51,8 +47,9 @@ Self-loops count once in the sample and once in each direction.
 
 The implementation reads local adjacency and indexed path slots under one graph read lock. It does not enumerate remote topology or compute
 routes, and temporary memory is bounded independently of network size. Serialization for the byte budget happens after releasing the lock.
-The shared `Reporter` applies an independent deadline and emits a separate `event=component_state` record with `component=graph`, signal,
-reason and `analysis_required`. Graph observations are not an atomic snapshot with any other component. The host owns timers and wiring.
+The private reporter applies a 5-second deadline and a 32 KiB record budget, emitting `event=component_state` with `component=graph`, reason
+and `analysis_required`. Graph observations are not atomic with any other component. `HOPR_STATE_DUMP_INTERVAL` defaults to 60 seconds,
+accepts 5 through 86400, and disables reads at zero.
 
 ## License
 

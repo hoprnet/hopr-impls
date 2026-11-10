@@ -42,7 +42,7 @@ mod sequencer;
 #[cfg(test)]
 pub(crate) mod service_fixtures;
 mod services;
-#[cfg(feature = "state-dump")]
+#[cfg(feature = "serde")]
 pub(crate) mod state_reads;
 mod tickets;
 mod values;
@@ -228,6 +228,24 @@ enum ChainHealthState {
     Dropped = 7,
     /// A subscription is stalled or rejected and is still being retried.
     SubscriptionDegraded = 8,
+}
+
+// Coarse operational state of the live chain workflow. Keep the richer lifecycle as the
+// single source of truth so subscription retries, terminal failures and their reasons remain intact.
+impl From<ChainHealthState> for hopr_api::ComponentState {
+    fn from(state: ChainHealthState) -> Self {
+        match state {
+            ChainHealthState::Ready => Self::Running,
+            ChainHealthState::WaitingForConnection
+            | ChainHealthState::Connecting
+            | ChainHealthState::SyncTimedOut
+            | ChainHealthState::SubscriptionDegraded => Self::Degraded,
+            ChainHealthState::SubscriptionEnded
+            | ChainHealthState::ServerNotHealthy
+            | ChainHealthState::ConnectionFailed
+            | ChainHealthState::Dropped => Self::Failed,
+        }
+    }
 }
 
 impl From<ChainHealthState> for hopr_api::node::ComponentStatus {
@@ -1062,6 +1080,22 @@ where
     }
 }
 
+impl<C, B, P, R> HoprBlockchainConnector<C, B, P, R> {
+    /// Current operational state of the connector's live chain workflow.
+    ///
+    /// `Running` means the required subscriptions are operational. `Degraded` covers startup,
+    /// incomplete synchronization or subscription retries. `Failed` means a required subscription
+    /// ended or the connection workflow cannot run. Reconnection is required after terminal failure.
+    /// Metadata and cached reads may remain available in that state.
+    ///
+    /// This reads the existing atomic lifecycle; diagnostic collection errors do not change it.
+    /// [`component_status`](hopr_api::node::ComponentStatusReporter::component_status) retains the
+    /// more detailed status and reason for existing callers.
+    pub fn component_state(&self) -> hopr_api::ComponentState {
+        self.health.load(AtomicOrdering::Relaxed).into()
+    }
+}
+
 impl<B, C, P, R> hopr_api::node::ComponentStatusReporter for HoprBlockchainConnector<C, B, P, R> {
     fn component_status(&self) -> hopr_api::node::ComponentStatus {
         self.health.load(AtomicOrdering::Relaxed).into()
@@ -1278,6 +1312,83 @@ pub(crate) mod tests {
         let err = res.await;
         assert!(matches!(err, Err(hopr_api::chain::TicketRedeemError::Rejected(_, _))));
 
+        Ok(())
+    }
+
+    #[test]
+    fn shared_component_states_follow_the_live_chain_lifecycle() {
+        use hopr_api::ComponentState;
+        for (lifecycle, expected) in [
+            (ChainHealthState::Ready, ComponentState::Running),
+            (ChainHealthState::WaitingForConnection, ComponentState::Degraded),
+            (ChainHealthState::Connecting, ComponentState::Degraded),
+            (ChainHealthState::SyncTimedOut, ComponentState::Degraded),
+            (ChainHealthState::SubscriptionDegraded, ComponentState::Degraded),
+            (ChainHealthState::SubscriptionEnded, ComponentState::Failed),
+            (ChainHealthState::ServerNotHealthy, ComponentState::Failed),
+            (ChainHealthState::ConnectionFailed, ComponentState::Failed),
+            (ChainHealthState::Dropped, ComponentState::Failed),
+        ] {
+            assert_eq!(ComponentState::from(lifecycle), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn component_state_observes_existing_lifecycle_transitions_and_recovery() -> anyhow::Result<()> {
+        use hopr_api::ComponentState;
+        let client = BlokliTestStateBuilder::default().build_static_client();
+        let mut connector = create_connector(client)?;
+        assert_eq!(connector.component_state(), ComponentState::Degraded);
+        connector.connect().await?;
+        assert_eq!(connector.component_state(), ComponentState::Running);
+        connector
+            .health
+            .store(ChainHealthState::SubscriptionDegraded, AtomicOrdering::Relaxed);
+        assert_eq!(connector.component_state(), ComponentState::Degraded);
+        set_subscription_health(&connector.health, false, false);
+        assert_eq!(connector.component_state(), ComponentState::Running);
+        set_subscription_health(&connector.health, false, true);
+        assert_eq!(connector.component_state(), ComponentState::Failed);
+        set_subscription_health(&connector.health, false, false);
+        assert_eq!(
+            connector.component_state(),
+            ComponentState::Failed,
+            "an ended subscription needs reconnecting"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "serde")]
+    #[tokio::test]
+    async fn opaque_chain_dumps_include_operational_state_independently_of_read_coverage() -> anyhow::Result<()> {
+        use hopr_api::ComponentState;
+        async fn snapshot<T: hopr_api::StateDump>(source: T) -> anyhow::Result<serde_json::Value> {
+            Ok(serde_json::to_value(source.state_dump().await?)?)
+        }
+        let client = BlokliTestStateBuilder::default().build_static_client();
+        let mut connector = create_connector(client)?;
+        let safe = Address::from([99; 20]);
+        let degraded = snapshot(connector.state_view(safe, None)).await?;
+        assert_eq!(
+            degraded["state"]["component_state"],
+            serde_json::to_value(ComponentState::Degraded)?
+        );
+        assert_eq!(degraded["reason"], "chain_component_degraded");
+        assert_eq!(degraded["analysis_required"], true);
+        connector.connect().await?;
+        let running = snapshot(connector.state_view(safe, None)).await?;
+        assert_eq!(
+            running["state"]["component_state"],
+            serde_json::to_value(ComponentState::Running)?
+        );
+        set_subscription_health(&connector.health, false, true);
+        let failed = snapshot(connector.state_view(safe, None)).await?;
+        assert_eq!(
+            failed["state"]["component_state"],
+            serde_json::to_value(ComponentState::Failed)?
+        );
+        assert_eq!(failed["reason"], "chain_component_failed");
+        assert_eq!(failed["analysis_required"], true);
         Ok(())
     }
 
@@ -1692,6 +1803,7 @@ pub(crate) mod tests {
         let mut connector = create_connector(blokli_client)?;
         let _ = connector.connect().await;
         assert!(connector.component_status().is_unavailable());
+        assert_eq!(connector.component_state(), hopr_api::ComponentState::Failed);
         Ok(())
     }
 

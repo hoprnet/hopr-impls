@@ -34,8 +34,8 @@ pub(crate) mod liveness;
 pub mod peer_store;
 
 /// Optional transport-owned state and analysis signals.
-#[cfg(feature = "state-dump")]
-pub mod state_dump;
+#[cfg(feature = "serde")]
+mod state_dump;
 /// Raw swarm definition for the HOPR network.
 pub mod swarm;
 
@@ -156,3 +156,6 @@ impl NetworkStreamControl for HoprNetwork {
             .map(|inner| LivenessStream::new(inner, flag))
     }
 }
+
+#[cfg(feature = "serde")]
+mod state_reporting;

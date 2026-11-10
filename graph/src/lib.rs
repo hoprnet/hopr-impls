@@ -23,12 +23,13 @@
 pub mod petgraph;
 
 pub mod correlation;
-pub mod diagnostics;
+#[cfg(feature = "petgraph")]
+mod diagnostics;
 pub mod errors;
 #[cfg(feature = "graph-api")]
 pub mod render;
-#[cfg(feature = "state-dump")]
-pub mod state_dump;
+#[cfg(all(feature = "serde", feature = "petgraph"))]
+mod state_dump;
 pub mod weight;
 
 use hopr_api::OffchainPublicKey;
@@ -56,3 +57,6 @@ impl From<GraphNode> for OffchainPublicKey {
         val.0
     }
 }
+
+#[cfg(all(feature = "serde", feature = "petgraph"))]
+mod state_reporting;

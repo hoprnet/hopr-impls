@@ -3,26 +3,33 @@ use hopr_api::OffchainPublicKey;
 use serde::{Serialize, Serializer};
 
 /// Maximum named incident edges, including both directions and transport-only edges.
-pub const MAX_LOCAL_GRAPH_EDGES: usize = 8;
+#[cfg(any(feature = "serde", test))]
+pub(crate) const MAX_LOCAL_GRAPH_EDGES: usize = 8;
 /// Maximum named directed edges referenced by sampled paths.
-pub const MAX_PATH_GRAPH_EDGES: usize = 4;
+#[cfg(any(feature = "serde", test))]
+pub(crate) const MAX_PATH_GRAPH_EDGES: usize = 4;
 /// Maximum supplied paths inspected per read (four destinations, four pairs, two legs).
-pub const MAX_GRAPH_PATHS: usize = 32;
+#[cfg(any(feature = "serde", test))]
+pub(crate) const MAX_GRAPH_PATHS: usize = 32;
 /// Serialized graph detail budget, leaving room for the other operational sections.
-pub const MAX_GRAPH_STATE_BYTES: usize = 3 * 1024;
+#[cfg(any(feature = "serde", test))]
+pub(crate) const MAX_GRAPH_STATE_BYTES: usize = 3 * 1024;
 
 /// Read observations without traversing or allocating the whole graph.
 /// Implementations must respect the sample limits and preserve omission counts.
-pub trait GraphStateRead {
+#[cfg(any(feature = "serde", test))]
+pub(crate) trait GraphStateRead {
     /// `None` means path producers are unavailable; an empty slice means no sampled paths.
     /// Paths use the graph's canonical slots, with trailing zero padding.
     fn graph_state(&self, paths: Option<&[[u64; 5]]>) -> GraphState;
 }
+#[cfg(any(feature = "serde", test))]
 impl<T: GraphStateRead + ?Sized> GraphStateRead for &T {
     fn graph_state(&self, paths: Option<&[[u64; 5]]>) -> GraphState {
         (**self).graph_state(paths)
     }
 }
+#[cfg(any(feature = "serde", test))]
 impl<T: GraphStateRead + ?Sized> GraphStateRead for std::sync::Arc<T> {
     fn graph_state(&self, paths: Option<&[[u64; 5]]>) -> GraphState {
         (**self).graph_state(paths)
@@ -31,7 +38,8 @@ impl<T: GraphStateRead + ?Sized> GraphStateRead for std::sync::Arc<T> {
 
 /// One graph read. Counts cover the graph; detail covers incident and sampled-path edges only.
 #[derive(Debug, Serialize)]
-pub struct GraphState {
+#[cfg(any(feature = "serde", test))]
+pub(crate) struct GraphState {
     pub scope: &'static str,
     pub node_count: usize,
     pub edge_count: usize,
@@ -48,6 +56,7 @@ pub struct GraphState {
     pub paths: Option<PathGraphState>,
     pub searches: SearchState,
 }
+#[cfg(any(feature = "serde", test))]
 impl GraphState {
     /// Drop lowest-priority rows until the graph fits its reserved payload budget.
     /// Keep both scopes represented when possible; counts continue to describe full coverage.
@@ -70,6 +79,7 @@ impl GraphState {
         }
     }
 
+    #[cfg(test)]
     pub fn local_edges(&self) -> &[GraphEdge] {
         &self.local_edges
     }
@@ -77,7 +87,8 @@ impl GraphState {
 
 /// Coverage of unique directed edges from the supplied SURB path sample, not all routed traffic.
 #[derive(Debug, Default, Serialize)]
-pub struct PathGraphState {
+#[cfg(any(feature = "serde", test))]
+pub(crate) struct PathGraphState {
     pub sampled_paths: usize,
     pub paths_omitted: usize,
     pub invalid_paths: usize,
@@ -88,7 +99,9 @@ pub struct PathGraphState {
     pub edges_omitted: usize,
     pub edges: Vec<GraphEdge>,
 }
+#[cfg(any(feature = "serde", test))]
 impl PathGraphState {
+    #[cfg(test)]
     pub fn edges(&self) -> &[GraphEdge] {
         &self.edges
     }
@@ -96,16 +109,19 @@ impl PathGraphState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum GraphEdgeStatus {
+pub(crate) enum GraphEdgeStatus {
     Present,
+    #[cfg(any(feature = "serde", test))]
     MissingEdge,
+    #[cfg(any(feature = "serde", test))]
     MissingNode,
+    #[cfg(any(feature = "serde", test))]
     AmbiguousSlot,
 }
 
 /// Endpoints and current observations of one directed edge. Null metrics mean unobserved.
 #[derive(Clone, Debug, Serialize)]
-pub struct GraphEdge {
+pub(crate) struct GraphEdge {
     pub source_slot: u64,
     pub destination_slot: u64,
     /// Missing or ambiguous slots have no trustworthy identity.
@@ -118,7 +134,7 @@ pub struct GraphEdge {
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub struct GraphObservation {
+pub(crate) struct GraphObservation {
     /// Decimal token base units. Null is unknown; "0" is an observed empty channel.
     pub balance: Option<String>,
     pub is_connected: Option<bool>,
@@ -141,11 +157,12 @@ fn optional_key<S: Serializer>(key: &Option<OffchainPublicKey>, serializer: S) -
 }
 
 /// Retain decision-time examples, prioritizing unsuccessful searches.
-pub const MAX_SEARCH_SAMPLES: usize = 2;
+pub(crate) const MAX_SEARCH_SAMPLES: usize = 2;
 
 /// Cumulative counters and capped latest query examples. Reading does not drain counters.
 #[derive(Debug, Serialize)]
-pub struct SearchState {
+#[cfg(any(feature = "serde", test))]
+pub(crate) struct SearchState {
     pub scope: &'static str,
     pub total: u64,
     pub empty: u64,
@@ -158,7 +175,7 @@ pub struct SearchState {
 
 /// Evidence for a graph traversal, not the transport's final ranking or random draw.
 #[derive(Clone, Debug, Serialize)]
-pub struct SearchRecord {
+pub(crate) struct SearchRecord {
     pub selection_id: u64,
     pub search_id: u64,
     pub phase: &'static str,

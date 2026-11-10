@@ -27,5 +27,7 @@ allow = [
 ]
 
 [sources]
+# Temporary API branch used by the component-state and dump migration.
+allow-git        = ["https://github.com/hoprnet/hopr-api"]
 unknown-git      = "deny"
 unknown-registry = "deny"

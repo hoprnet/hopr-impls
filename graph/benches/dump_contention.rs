@@ -17,7 +17,7 @@ use hopr_api::{
     },
     types::crypto::prelude::Keypair,
 };
-use hopr_network_graph::{ChannelGraph, diagnostics::GraphStateRead};
+use hopr_network_graph::ChannelGraph;
 
 const BENCH_EDGE_PENALTY: f64 = 0.5;
 /// Intentionally 0.0 for benchmarks (no ack filtering).
@@ -176,7 +176,7 @@ fn run(size: usize, density: usize, updates: bool) {
         while during.elapsed() < Duration::from_secs(1) {
             let before = progress.load(Ordering::Relaxed);
             let start = Instant::now();
-            let state = graph.graph_state(Some(&paths));
+            let state = graph.state(Some(&paths)).unwrap();
             let payload = serde_json::to_vec(&state).unwrap();
             payload_bytes = payload.len();
             black_box(payload);

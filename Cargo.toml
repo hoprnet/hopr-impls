@@ -5,7 +5,6 @@ members = [
   "ct/immediate",
   "graph",
   "session-server-forwarder",
-  "state-dump",
   "ticket-manager",
   "transport/p2p",
 ]
@@ -31,9 +30,8 @@ rust-version = "1.97"
 # In-repo crates (path + version so they are publishable)
 hopr-chain-connector = { path = "connector", version = "0.32.0" }
 hopr-network-graph   = { path = "graph", version = "0.10.4", default-features = false }
-hopr-state-dump      = { path = "state-dump", version = "0.1.0" }
 
-# HOPR crates published to crates.io
+# External HOPR crates
 blokli-client = "0.37.0"
 hopr-api      = "5.0.0"
 hopr-utils    = { package = "hopr-utilities", version = "0.19.0", default-features = false }
@@ -104,3 +102,7 @@ tokio = { version = "1.53.1", features = [
 tokio-retry = "0.3.2"
 tracing = { version = "0.1.44", features = ["release_max_level_debug"] }
 validator = { version = "0.21.0", features = ["derive"] }
+
+# Keep transitive users on the same API branch until hopr-api 5.1.0 is published.
+[patch.crates-io]
+hopr-api = { git = "https://github.com/hoprnet/hopr-api", branch = "feature/core-1168-periodic-compact-state-dump-reduce-debug-cardinality-for" }

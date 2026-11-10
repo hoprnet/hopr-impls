@@ -1,12 +1,13 @@
-//! Optional graph-owned dump adapter. Custom graph implementations can implement `StateDump` with their own schema.
+//! Graph-owned diagnostic collection and assessment.
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
 
-use hopr_state_dump::{Dump, Signal, StateDump};
-
-use crate::diagnostics::{GraphState, GraphStateRead};
+use crate::{
+    diagnostics::{GraphState, GraphStateRead},
+    state_reporting::Dump,
+};
 
 type Paths = Arc<dyn Fn() -> Vec<[u64; 5]> + Send + Sync>;
 
@@ -34,10 +35,8 @@ impl<G> GraphDump<G> {
         self
     }
 }
-impl<G: GraphStateRead + Send + Sync + 'static> StateDump for GraphDump<G> {
-    type State = GraphState;
-
-    async fn state_dump(&self) -> Result<Dump<Self::State>, String> {
+impl<G: GraphStateRead + Send + Sync + 'static> GraphDump<G> {
+    async fn collect_dump(&self) -> Result<Dump<GraphState>, String> {
         let graph = self.graph.clone();
         let paths = self.paths.clone();
         let state = hopr_utils::runtime::prelude::spawn_blocking(move || {
@@ -47,21 +46,25 @@ impl<G: GraphStateRead + Send + Sync + 'static> StateDump for GraphDump<G> {
         .await
         .map_err(|e| e.to_string())?;
         let previous = self.previous_empty.fetch_max(state.searches.empty, Ordering::Relaxed);
-        let (signal, reason) = assess(&state, state.searches.empty > previous);
-        Ok(Dump { state, signal, reason })
+        let (analysis_required, reason) = assess(&state, state.searches.empty > previous);
+        Ok(Dump {
+            state,
+            analysis_required,
+            reason,
+        })
     }
 }
-fn assess(state: &GraphState, new_empty_search: bool) -> (Signal, &'static str) {
+fn assess(state: &GraphState, new_empty_search: bool) -> (bool, &'static str) {
     if !state.local_node_present {
-        return (Signal::NeedsAnalysis, "local_node_missing");
+        return (true, "local_node_missing");
     }
     if new_empty_search {
-        return (Signal::NeedsAnalysis, "new_empty_searches");
+        return (true, "new_empty_searches");
     }
     if state.paths.as_ref().is_some_and(|p| {
         p.invalid_paths > 0 || p.missing_edges > 0 || p.missing_node_edges > 0 || p.ambiguous_slot_edges > 0
     }) {
-        return (Signal::NeedsAnalysis, "sampled_path_unavailable");
+        return (true, "sampled_path_unavailable");
     }
     let edges = || {
         state
@@ -86,7 +89,7 @@ fn assess(state: &GraphState, new_empty_search: bool) -> (Signal, &'static str) 
                 .zip(face)
                 .is_some_and(|(balance, face)| balance < face)
     }) {
-        return (Signal::NeedsAnalysis, "sampled_edge_degraded");
+        return (true, "sampled_edge_degraded");
     }
     if state.searches.samples_unavailable
         || edges().any(|e| {
@@ -98,9 +101,70 @@ fn assess(state: &GraphState, new_empty_search: bool) -> (Signal, &'static str) 
             })
         })
     {
-        return (Signal::Unknown, "graph_observations_incomplete");
+        return (true, "graph_observations_incomplete");
     }
-    (Signal::Healthy, "observed_graph_scope_ok")
+    (false, "observed_graph_scope_ok")
+}
+
+#[cfg(feature = "petgraph")]
+impl crate::ChannelGraph {
+    /// Configure path sampling for collection through [`hopr_api::StateDump`].
+    /// The provider runs off the async executor and must bound allocation without draining counters.
+    pub fn state_view(
+        &self,
+        paths: impl Fn() -> Vec<[u64; 5]> + Send + Sync + 'static,
+    ) -> impl hopr_api::StateDump<Error = std::io::Error> {
+        GraphDump::new(self.clone()).with_paths(paths)
+    }
+
+    /// Read bounded graph diagnostics as an opaque Serde object.
+    /// This synchronous read briefly locks the graph. The diagnostic schema may change.
+    pub fn state(
+        &self,
+        paths: Option<&[[u64; 5]]>,
+    ) -> Result<impl serde::Serialize + serde::de::DeserializeOwned + Send, serde_json::Error> {
+        serde_json::to_value(self.graph_state(paths))
+    }
+
+    /// Collect off the async executor and emit periodic diagnostics until cancelled.
+    /// HOPR_STATE_DUMP_INTERVAL controls the interval; zero disables collection.
+    pub async fn run_state_reporting(
+        &self,
+        instance: &str,
+        paths: impl Fn() -> Vec<[u64; 5]> + Send + Sync + 'static,
+    ) -> Result<(), String> {
+        let config = crate::state_reporting::Config::from_env().map_err(|e| e.to_string())?;
+        let source = GraphDump::new(self.clone()).with_paths(paths);
+        crate::state_reporting::Reporter::new("graph", instance, config)
+            .run(|| source.collect_dump())
+            .await;
+        Ok(())
+    }
+}
+
+impl<G: GraphStateRead + Send + Sync + 'static> hopr_api::StateDump for GraphDump<G> {
+    type Error = std::io::Error;
+
+    async fn state_dump(
+        &self,
+    ) -> Result<impl serde::Serialize + serde::de::DeserializeOwned + Send + 'static, Self::Error> {
+        let dump = self.collect_dump().await.map_err(std::io::Error::other)?;
+        serde_json::to_value(dump).map_err(std::io::Error::other)
+    }
+}
+
+impl hopr_api::StateDump for crate::ChannelGraph {
+    type Error = std::io::Error;
+
+    async fn state_dump(
+        &self,
+    ) -> Result<impl serde::Serialize + serde::de::DeserializeOwned + Send + 'static, Self::Error> {
+        let graph = self.clone();
+        let state = hopr_utils::runtime::prelude::spawn_blocking(move || graph.graph_state(None))
+            .await
+            .map_err(std::io::Error::other)?;
+        serde_json::to_value(state).map_err(std::io::Error::other)
+    }
 }
 
 #[cfg(all(test, feature = "petgraph"))]
@@ -115,10 +179,12 @@ mod tests {
         },
         types::crypto::prelude::{Keypair, OffchainKeypair},
     };
-    use hopr_state_dump::{Config, Reporter, Section};
 
     use super::*;
-    use crate::ChannelGraph;
+    use crate::{
+        ChannelGraph,
+        state_reporting::{Config, Reporter, Section},
+    };
     fn key(i: u8) -> hopr_api::OffchainPublicKey {
         *OffchainKeypair::from_secret(&[i; 32]).unwrap().public()
     }
@@ -127,7 +193,7 @@ mod tests {
     async fn graph_owns_health_and_new_search_failures_do_not_latch_forever() {
         let graph = ChannelGraph::new(key(1));
         let adapter = GraphDump::new(graph.clone()).with_paths(Vec::new);
-        assert_eq!(adapter.state_dump().await.unwrap().signal, Signal::Healthy);
+        assert!(!adapter.collect_dump().await.unwrap().analysis_required);
         assert!(
             graph
                 .simple_paths(
@@ -139,28 +205,50 @@ mod tests {
                 )
                 .is_empty()
         );
-        let failed = adapter.state_dump().await.unwrap();
-        assert_eq!(failed.signal, Signal::NeedsAnalysis);
+        let failed = adapter.collect_dump().await.unwrap();
+        assert!(failed.analysis_required);
         assert_eq!(failed.reason, "new_empty_searches");
         assert!(failed.state.paths.is_some());
-        let next = adapter.state_dump().await.unwrap();
-        assert_eq!(
-            next.signal,
-            Signal::Healthy,
+        let next = adapter.collect_dump().await.unwrap();
+        assert!(
+            !next.analysis_required,
             "historical empty searches are not fresh failures"
         );
         assert_eq!(next.state.searches.empty, 1, "diagnostics are not drained");
         graph.upsert_edge(&key(1), &key(2), |o| o.record(EdgeWeightType::Connected(false)));
-        assert_eq!(adapter.state_dump().await.unwrap().reason, "sampled_edge_degraded");
+        assert_eq!(adapter.collect_dump().await.unwrap().reason, "sampled_edge_degraded");
     }
     #[tokio::test]
     async fn optional_paths_and_unobserved_measurements_remain_distinct() {
         let graph = ChannelGraph::new(key(1));
         graph.upsert_edge(&key(1), &key(2), |_| {});
-        let dump = GraphDump::new(graph).state_dump().await.unwrap();
+        let dump = GraphDump::new(graph).collect_dump().await.unwrap();
         assert!(dump.state.paths.is_none());
-        assert_eq!(dump.signal, Signal::Unknown);
+        assert!(dump.analysis_required);
     }
+    #[test]
+    fn callers_can_serialize_graph_state_without_access_to_its_model() -> anyhow::Result<()> {
+        let graph = ChannelGraph::new(key(1));
+        let snapshot = graph.state(None)?;
+        let value = serde_json::to_value(snapshot)?;
+        assert_eq!(value["node_count"], 1);
+        assert!(value["paths"].is_null());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn generic_callers_can_collect_graphs_and_configured_path_views() -> anyhow::Result<()> {
+        async fn collect<T: hopr_api::StateDump>(source: &T) -> anyhow::Result<serde_json::Value> {
+            Ok(serde_json::to_value(source.state_dump().await?)?)
+        }
+        let graph = ChannelGraph::new(key(1));
+        assert_eq!(collect(&graph).await?["node_count"], 1);
+        let view = graph.state_view(Vec::new);
+        let snapshot = collect(&view).await?;
+        assert!(snapshot["state"]["paths"].is_object());
+        Ok(())
+    }
+
     struct Faulty {
         graph: ChannelGraph,
         panic: bool,
@@ -187,15 +275,10 @@ mod tests {
                 panic,
                 executor: std::thread::current().id(),
             });
-            let reporter = Reporter::new(
-                "graph",
-                "node",
-                source,
-                Config::default().with_source_timeout(timeout).unwrap(),
-            );
-            let record = reporter.collect().await;
+            let reporter = Reporter::new("graph", "node", Config::default().with_source_timeout(timeout).unwrap());
+            let record = reporter.collect(source.collect_dump()).await;
             assert!(record.analysis_required);
-            assert_eq!(record.signal, Signal::Unknown);
+            assert!(record.analysis_required);
             if panic {
                 assert!(matches!(record.state, Section::Error { .. }));
             } else {

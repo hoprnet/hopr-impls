@@ -6,7 +6,9 @@ use std::{
 
 use parking_lot::Mutex;
 
-use crate::diagnostics::{MAX_SEARCH_SAMPLES, SearchRecord, SearchState};
+#[cfg(any(feature = "serde", test))]
+use crate::diagnostics::SearchState;
+use crate::diagnostics::{MAX_SEARCH_SAMPLES, SearchRecord};
 
 #[derive(Debug)]
 pub(crate) struct SearchJournal {
@@ -96,6 +98,7 @@ impl SearchJournal {
         }
     }
 
+    #[cfg(any(feature = "serde", test))]
     pub(crate) fn snapshot(&self) -> SearchState {
         let samples = self.samples.try_lock();
         let retained = samples.as_ref().map(|s| s.to_vec()).unwrap_or_default();

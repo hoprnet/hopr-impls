@@ -108,7 +108,6 @@ jobs:
               - "ct/**"
               - "graph/**"
               - "session-server-forwarder/**"
-              - "state-dump/**"
               - "ticket-manager/**"
               - "transport/**"
               - "Cargo.toml"

@@ -2,60 +2,59 @@
 
 Implementation of HOPR Chain APIs using Blokli client. Part of the [HOPR](https://hoprnet.org/) protocol implementation.
 
-## Optional chain state dump
+## Optional diagnostics
 
-Enable `features = ["state-dump"]` to use `state_dump::ChainDump`. This adapter implements the shared `hopr_state_dump::StateDump` trait
-with the connector's own `ChainState`. It needs a chain source and Safe address; it has no dependency on a graph or transport
-implementation. Custom connectors may implement `StateDump` with a completely different serializable payload.
+Enable `serde` for diagnostics through `hopr_api::StateDump`. Configure the Safe address and funding policy with
+`connector.state_view(safe_address, funding_value)`, then poll the returned opaque view through `state_dump().await`. Generic callers use
+the same trait for chain, graph, transport, and producer diagnostics. Concrete view and snapshot types remain private to this crate; their
+schema may change. The legacy `state-dump` feature also enables `serde`.
 
 ```rust,ignore
-use hopr_chain_connector::state_dump::{ChainDump, Config, Reporter};
-let config = Config::from_env()?;
-let source = ChainDump::new(chain.clone(), safe_address, config.clone());
-let reporter = Reporter::new("chain", node_id.to_string(), source, config);
-// Spawn reporter.run() in the host runtime; the host owns cancellation and the tracing subscriber.
+use hopr_api::StateDump;
+let view = connector.state_view(safe_address, funding_value);
+let snapshot = view.state_dump().await?;
+let json = serde_json::to_string(&snapshot)?;
 ```
 
-`ChainDump::collect()` reads Safe balance/allowance, publicly announced remote accounts, and source-visible local channels independently.
-Amounts are decimal base-unit strings. Channels retain direction/status totals, up to four problematic channels, and up to sixteen
-underfunded outgoing channels sorted by balance. Incoming channels are funded by their counterparty. Omission counts preserve coverage.
+`connector.state(safe_address, funding_value).await` remains an inherent convenience method. There is no standalone diagnostic crate.
 
-Use `with_funding_value(face_value)` to compare balances against the face value used by the host's funding policy. The adapter must be
-refreshed when that policy changes. Without it, outgoing funding is explicitly unknown; it is not inferred from another component.
-Connectivity and probe quality belong to the graph and transport dumps, not the chain's channel schema.
+Collection reads Safe balance and allowance, announced accounts, and locally adjacent channels independently. Read errors, timeouts, partial
+coverage, missing funding values and observed zeros remain distinct. Amounts use decimal base units. Channel details retain up to four
+problematic channels and sixteen underfunded outgoing channels, with omission counts. Incoming channels are funded by their counterparties.
+The supplied funding value must reflect the caller's current policy.
 
-`state_dump()` interprets the collected state: incomplete reads signal `Unknown`; underfunding or pending closures signal `NeedsAnalysis`;
-unknown funding signals `Unknown`; otherwise the observed scope signals `Healthy`. Unknown observations request analysis as well. Read
-failures, timeouts, partial coverage and observed zero remain distinct. A timeout preserves channels already read. Individual reads use half
-the configured component deadline, reserving time to return partial observations to the reporter. Error samples retain a capped
-entity/message. Reads are not atomic: `chain_freshness=unverified` and `channels.scope=source_visible` do not claim a verified full-chain
-inventory. Closed channels absent from the source are not reconstructed.
+For periodic INFO telemetry, run `connector.run_state_reporting(instance, safe_address, funding_value)` in the host runtime. The host owns
+cancellation and its tracing subscriber. Each component reports independently with its own deadline and sequence. Records carry
+`event=component_state`, component identity, reason and `analysis_required`; they are capped at 32 KiB. Collection issues request diagnostic
+analysis and do not assign operational `ComponentState::Failed`.
 
-The diagnostic `StateRead` interface preserves errors before the legacy best-effort streams discard them. The built-in reader enumerates
-only locally adjacent channel IDs, loads records in batches of at most 64 in blocking tasks, and maintains an announced-account counter.
-Memory for channel IDs and peer deduplication scales with local channels, not remote topology. Reconnects reseed the announced counter.
-Custom backends provide `count_announced_accounts`.
+`HOPR_STATE_DUMP_INTERVAL` defaults to 60 seconds, accepts 5 through 86400 seconds, and disables collection at zero. Disabled reporting
+performs no reads or counter resets. Chain subreads have a 2.5-second timeout, leaving time to retain partial observations within the
+overall 5-second deadline. Local channel reads run in blocking batches of at most 64; memory scales with local adjacency rather than remote
+topology. Reconnects reseed the announced-account counter.
 
-## Independent producer counters
+## Operational state
 
-`IntervalCounters` also implements `StateDump`, with its own `IntervalSnapshot` payload. Give each resolver, selector, SURB or probe module
-its own handle and `Reporter`, using the producer's component name. A clone shares a window; a new handle creates an independent window. No
-graph or chain source is required. Hosts may replace these counters with their own `StateDump` implementation.
+`connector.component_state()` returns the shared `hopr_api::ComponentState`, even without enabling diagnostics. It reads the existing atomic
+chain lifecycle: required live subscriptions operating normally are `Running`; startup, incomplete synchronization and subscription retries
+are `Degraded`; a terminal subscription or connection failure is `Failed`. The existing `component_status()` retains the detailed status and
+reason. No second atomic state is maintained.
 
-Record `resolution(direction, destination, succeeded)`, `search(direction, destination, actual_phase_outcomes)`, and
-`surb(destination, forward_reply_paths, counts)` at the corresponding producer. Register probes using `enable_probes()`; record matched
-replies or actual expiries with `neighbor_probe` and `loopback_probe`. Late or unknown pongs must not count twice. Missing probe producers
-remain `None`; registered idle producers report zero. Successful resolution/SURB recording never waits for a busy lock; overflow preserves
-totals and marks affected windows partial. Failure samples displace healthy destination/peer samples.
+Chain snapshots include the same `component_state`. Operational degradation and failure request analysis independently of snapshot
+completeness, funding and channel observations. A diagnostic timeout does not change the runtime state; an operationally `Running` connector
+may still return a partial diagnostic snapshot. Cached reads and metadata may remain available after live processing fails.
 
-Dumping drains only that handle's interval. Resolution failures, empty searches and probe timeouts signal `NeedsAnalysis`; idle windows
-signal `Healthy`. SURB returns may cross minting windows, so `minted - returned` is not treated as a loss probability or failure signal.
-Destination samples, sibling paths, peer samples and overflow counts remain bounded.
+## Ownership
 
-All reporters emit separate INFO `event=component_state` records with component identity, signal, reason and `analysis_required` fields. See
-`hopr-state-dump` for interval configuration, deadlines, the 32 KiB record budget, and log extraction. Disabled reporters perform no reads
-or counter resets. The former `Collector::new(chain, graph, network, ...)`, fixed node `Snapshot`, and `with_section` API are replaced by
-independent reporters. Add custom strategy or node functionality by implementing `StateDump`, rather than inserting a fixed node section.
+The connector owns chain snapshots only. Its private `diagnostics` module keeps collection and serialization models together; the backend
+reader preserves individual channel read failures.
+
+Routing, SURB, search-phase and probe counters live beside their event producers in `hopr_transport::TransportDiagnostics` (the `hoprnet`
+repository). That handle consumes transport events, supplies a bounded non-draining path view to graph diagnostics, and implements the same
+`hopr_api::StateDump` interface. The connector has no dependency on those counters.
+
+For a changing funding policy, use `run_state_reporting_with_funding_policy(instance, safe_address, policy)`. The bounded, non-blocking
+policy callback is read once per collection, so a cached ticket face-value update appears in the next chain snapshot.
 
 ## License
 

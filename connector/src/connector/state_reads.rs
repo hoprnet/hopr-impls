@@ -5,7 +5,7 @@ use serde::Serialize;
 
 /// A failed diagnostic read. Messages and named samples are bounded by the collector.
 #[derive(Debug, Serialize)]
-pub struct ReadFailure {
+pub(crate) struct ReadFailure {
     pub entity: String,
     pub kind: &'static str,
     pub message: String,
@@ -13,12 +13,17 @@ pub struct ReadFailure {
 
 /// Read interface for the reporter, separate from the existing best-effort chain streams.
 /// Implementations must enumerate each local channel once and preserve individual failures.
-pub trait StateRead: Sync {
+pub(crate) trait StateRead: Sync {
+    fn component_state(&self) -> hopr_api::ComponentState;
     fn local_channels(&self) -> Result<BoxStream<'_, Result<ChannelEntry, ReadFailure>>, String>;
     /// Public remote accounts stored by the connector, excluding the local account.
     fn announced_count(&self) -> Result<u64, String>;
 }
 impl<T: StateRead + ?Sized> StateRead for &T {
+    fn component_state(&self) -> hopr_api::ComponentState {
+        (**self).component_state()
+    }
+
     fn local_channels(&self) -> Result<BoxStream<'_, Result<ChannelEntry, ReadFailure>>, String> {
         (**self).local_channels()
     }
@@ -28,6 +33,10 @@ impl<T: StateRead + ?Sized> StateRead for &T {
     }
 }
 impl<T: StateRead + Send + ?Sized> StateRead for std::sync::Arc<T> {
+    fn component_state(&self) -> hopr_api::ComponentState {
+        (**self).component_state()
+    }
+
     fn local_channels(&self) -> Result<BoxStream<'_, Result<ChannelEntry, ReadFailure>>, String> {
         (**self).local_channels()
     }
@@ -46,6 +55,10 @@ where
     P: Send + Sync,
     R: Send + Sync,
 {
+    fn component_state(&self) -> hopr_api::ComponentState {
+        crate::HoprBlockchainConnector::component_state(self)
+    }
+
     fn announced_count(&self) -> Result<u64, String> {
         self.check_connection_state().map_err(|e| e.to_string())?;
         Ok(self.announced.load(std::sync::atomic::Ordering::Relaxed))
@@ -292,21 +305,28 @@ mod tests {
         );
         assert_eq!(backend.reads.load(Ordering::Relaxed), 5);
         *backend.async_thread.lock() = Some(std::thread::current().id());
-        let collector = crate::state_dump::ChainDump::new(connector, Address::from([99; 20]), Default::default());
-        let snapshot = collector.collect().await;
-        assert!(
-            backend.identity_reads.load(Ordering::Relaxed) >= 1,
-            "local channel enumeration reaches the backend"
-        );
-        let crate::state_dump::Section::Partial { value } = snapshot.channels else {
-            panic!("failed reads must mark the channel inventory partial")
+        let value = {
+            let view = connector.state_view(Address::from([99; 20]), None);
+            let opaque = hopr_api::StateDump::state_dump(&view).await?;
+            serde_json::to_value(opaque)?
         };
-        assert_eq!(value.total, 1);
-        assert_eq!(value.reads.read_ok, 1);
-        assert_eq!(value.reads.missing, 1);
-        assert_eq!(value.reads.backend_errors, 1);
-        assert!(!value.reads.complete);
-        assert_eq!(value.reads.error_samples().len(), 2);
+        assert_eq!(value["state"]["channels"]["status"], "partial");
+        assert_eq!(
+            value["state"]["component_state"],
+            serde_json::to_value(connector.component_state())?
+        );
+        let channels = &value["state"]["channels"];
+        assert_eq!(channels["status"], "partial");
+        assert_eq!(channels["value"]["total"], 1);
+        assert_eq!(channels["value"]["reads"]["read_ok"], 1);
+        assert_eq!(channels["value"]["reads"]["missing"], 1);
+        assert_eq!(channels["value"]["reads"]["backend_errors"], 1);
+        assert_eq!(channels["value"]["reads"]["complete"], false);
+        assert_eq!(
+            channels["value"]["reads"]["error_samples"].as_array().map(Vec::len),
+            Some(2)
+        );
+        assert!(backend.identity_reads.load(Ordering::Relaxed) >= 1);
         Ok(())
     }
     #[test]

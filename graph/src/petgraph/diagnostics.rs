@@ -1,20 +1,27 @@
+#[cfg(any(feature = "serde", test))]
 use std::collections::BTreeSet;
 
 use hopr_api::graph::traits::{
     EdgeImmediateProtocolObservable, EdgeLinkObservable, EdgeNetworkObservableRead, EdgeObservableRead,
     EdgeProtocolObservable,
 };
-use petgraph::{Direction, graph::NodeIndex, visit::EdgeRef};
+use petgraph::graph::NodeIndex;
+#[cfg(any(feature = "serde", test))]
+use petgraph::{Direction, visit::EdgeRef};
 
-use super::{ChannelGraph, graph::InnerGraph, path_id};
+#[cfg(any(feature = "serde", test))]
+use super::ChannelGraph;
+use super::{graph::InnerGraph, path_id};
+#[cfg(any(feature = "serde", test))]
+use crate::diagnostics::{
+    GraphState, GraphStateRead, MAX_GRAPH_PATHS, MAX_LOCAL_GRAPH_EDGES, MAX_PATH_GRAPH_EDGES, PathGraphState,
+};
 use crate::{
     Observations,
-    diagnostics::{
-        GraphEdge, GraphEdgeStatus, GraphObservation, GraphState, GraphStateRead, MAX_GRAPH_PATHS,
-        MAX_LOCAL_GRAPH_EDGES, MAX_PATH_GRAPH_EDGES, PathGraphState,
-    },
+    diagnostics::{GraphEdge, GraphEdgeStatus, GraphObservation},
 };
 
+#[cfg(any(feature = "serde", test))]
 impl GraphStateRead for ChannelGraph {
     fn graph_state(&self, paths: Option<&[[u64; 5]]>) -> GraphState {
         let face = *self.ticket_face_value.read();
@@ -101,6 +108,7 @@ impl GraphStateRead for ChannelGraph {
     }
 }
 
+#[cfg(any(feature = "serde", test))]
 fn path_edge(inner: &InnerGraph, source: u64, destination: u64) -> GraphEdge {
     // Do not guess or emit one warning per stale/ambiguous path slot during a periodic read.
     let resolve = |slot| match inner.slots.get(&slot).map(Vec::as_slice) {
@@ -158,6 +166,7 @@ pub(crate) fn present(inner: &InnerGraph, source: NodeIndex, destination: NodeIn
     }
 }
 
+#[cfg(any(feature = "serde", test))]
 fn retain(
     rows: &mut Vec<GraphEdge>,
     row: GraphEdge,
@@ -187,6 +196,7 @@ fn retain(
     rows.truncate(limit);
 }
 
+#[cfg(any(feature = "serde", test))]
 fn priority(row: &GraphEdge, min_ack: f64, face: Option<hopr_api::graph::traits::Balance>) -> u8 {
     let Some(obs) = &row.observation else { return 16 };
     let below = obs.balance.as_ref().zip(face).is_some_and(|(balance, face)| {

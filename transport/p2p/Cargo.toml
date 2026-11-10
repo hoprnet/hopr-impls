@@ -19,7 +19,8 @@ crate-type = ["rlib"]
 [features]
 default        = []
 runtime-tokio  = ["libp2p/tokio"]
-state-dump     = ["dep:hopr-state-dump", "dep:serde"]
+serde          = ["dep:futures-time", "dep:serde", "dep:serde_json", "hopr-api/serde"]
+state-dump     = ["serde"]
 telemetry      = ["dep:lazy_static", "hopr-api/types-telemetry"]
 testing        = []
 transport-quic = ["dep:quinn-udp", "libp2p/quic"]
@@ -29,8 +30,8 @@ async-broadcast = { workspace = true }
 async-trait = { workspace = true }
 backon = { workspace = true }
 futures = { workspace = true }
+futures-time = { workspace = true, optional = true }
 futures-timer = { workspace = true }
-hopr-state-dump = { workspace = true, optional = true }
 lazy_static = { workspace = true, optional = true }
 libp2p = { workspace = true, features = [
   "autonat",
@@ -44,13 +45,14 @@ libp2p = { workspace = true, features = [
 libp2p-stream = { workspace = true }
 quinn-udp = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
 dashmap     = { workspace = true }
 pin-project = { workspace = true }
 
-hopr-api   = { workspace = true, features = ["ct", "network"] }
+hopr-api   = { workspace = true, features = ["component", "ct", "network"] }
 hopr-utils = { workspace = true, features = ["network-types"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]

@@ -1,10 +1,10 @@
 mod backend;
 mod connector;
+/// Optional chain-owned diagnostic collection.
+#[cfg(feature = "serde")]
+mod diagnostics;
 pub mod errors;
 mod reader;
-/// Optional chain state dumps and bounded producer counters.
-#[cfg(feature = "state-dump")]
-pub mod state_dump;
 #[cfg(any(test, feature = "testing"))]
 pub use hopr_utils::testing::blokli as testing;
 
@@ -322,3 +322,6 @@ mod blokli_client_tests {
         assert_eq!(cfg.dns_override, Some(dns_override));
     }
 }
+
+#[cfg(feature = "serde")]
+mod state_reporting;
