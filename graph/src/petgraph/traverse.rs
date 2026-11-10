@@ -297,7 +297,9 @@ pub trait FocusedLoopback {
     /// Generates loopback paths of exactly `hops` relays around `exits`, each ranked by [`FocusRelevance`].
     ///
     /// The search runs on the subgraph around the exits' forward and return paths, so loops elsewhere
-    /// in the network do not appear. `take_count` bounds the result after ranking, forward loops first. Closing
+    /// in the network do not appear. `take_count` bounds the result after ranking, forward loops first. The search
+    /// lists at most ten times `take_count` loops before ranking, so in a neighborhood with more loops than that a
+    /// focused loop may be left out even when fewer than `take_count` are returned. Closing
     /// edges follow `simple_loopback_to_self`: they must exist and not be known to be down.
     ///
     /// Requests outside [`MIN_LOOPBACK_HOPS`]`..=`[`MAX_LOOPBACK_HOPS`], unknown exits and an empty
