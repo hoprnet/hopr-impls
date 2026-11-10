@@ -39,7 +39,19 @@ pub const MAX_LOOPBACK_HOPS: usize = hopr_api::types::internal::routing::Routing
 /// A shared cost function that computes a cumulative cost from edge observations.
 pub(crate) type SharedValueFn<C> = Arc<dyn Fn(C, &crate::Observations, usize) -> C + Send + Sync>;
 
-/// Core path-finding routine that runs `all_simple_paths_multi` on the
+/// Whether a traversal walks an edge the graph has judged dead (see `Observations::is_starved`).
+///
+/// Routing leaves such an edge out (RFC-0010 §4.2.3, the active tier). Probing walks it: a returning loop
+/// is the only way it can be seen to recover. This is a second place that acts on the verdict next to the
+/// value functions in `hopr-api`, which floor a dead edge at `MEASURED_DEAD_FLOOR` instead of excluding it.
+/// Both read the same verdict; if either definition of "dead" changes, the other has to follow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StarvedEdges {
+    Exclude,
+    Walk,
+}
+
+/// Core path-finding routine that runs `all_simple_paths_multi_where` on the
 /// inner petgraph.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn find_paths<C>(
@@ -51,6 +63,7 @@ pub(crate) fn find_paths<C>(
     initial_value: C,
     min_value: Option<C>,
     value_fn: SharedValueFn<C>,
+    starved: StarvedEdges,
     search: &mut SearchRecord,
 ) -> Vec<(Vec<OffchainPublicKey>, PathId, C)>
 where
@@ -67,7 +80,7 @@ where
     let phase = search.phase;
     let diagnostics = RefCell::new(search);
     let evaluation = Cell::new(0u64);
-    let paths = all_simple_paths_multi_observed::<Vec<_>, _, RandomState, _, _, _>(
+    let paths = all_simple_paths_multi_observed::<Vec<_>, _, RandomState, _, _, _, _>(
         &inner.graph,
         source,
         destinations,
@@ -84,6 +97,8 @@ where
             let _entered = span.enter();
             value_fn(c, w, i)
         },
+        // A starved edge is what probing must still reach, so only routing leaves it out.
+        move |w| starved == StarvedEdges::Walk || !w.is_starved(),
         |visited, edge, reason| {
             let mut search = diagnostics.borrow_mut();
             match reason {
@@ -251,6 +266,7 @@ impl hopr_api::graph::NetworkGraphTraverse for ChannelGraph {
                 value_fn.initial_value(),
                 value_fn.min_value(),
                 value_fn.into_value_fn(),
+                StarvedEdges::Exclude,
                 &mut search,
             )
             .into_iter()
@@ -321,6 +337,7 @@ impl hopr_api::graph::NetworkGraphTraverse for ChannelGraph {
                 value_fn.initial_value(),
                 value_fn.min_value(),
                 value_fn.into_value_fn(),
+                StarvedEdges::Exclude,
                 &mut search,
             )
         })();
@@ -386,7 +403,8 @@ impl hopr_api::graph::NetworkGraphTraverse for ChannelGraph {
                         })
                         .collect::<HashSet<_>>();
 
-                    // Deliberately more permissive than data path selection. RFC-0010 §4.2.1.4 wants
+                    // Deliberately more permissive than data path selection: probes still walk starved edges
+                    // so they can be seen to recover. RFC-0010 §4.2.1.4 wants
                     // low-scoring edges probed *more* urgently; applying the production `min_ack_rate`
                     // here would instead prune them, so they would stop being probed, never be
                     // resampled, and stay excluded permanently.
@@ -408,6 +426,7 @@ impl hopr_api::graph::NetworkGraphTraverse for ChannelGraph {
                         value_fn.initial_value(),
                         value_fn.min_value(),
                         value_fn.into_value_fn(),
+                        StarvedEdges::Walk,
                         &mut search,
                     )
                     .into_iter()

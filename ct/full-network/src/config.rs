@@ -6,7 +6,11 @@ use validator::{Validate, ValidationError, ValidationErrors};
 #[derive(Debug, Clone, Copy, PartialEq, smart_default::SmartDefault)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(deny_unknown_fields))]
 pub struct ProberConfig {
-    /// The delay between individual probing rounds for neighbor discovery
+    /// The delay between individual probing rounds for neighbor discovery.
+    ///
+    /// A loopback is sent once per round, and the graph counts its outcome for
+    /// `hopr_network_graph::LOOPBACK_WINDOW`. Validation rejects an interval above half of that, because a
+    /// failing relay's evidence would expire between rounds and it would read as unprobed, not dead.
     #[cfg_attr(
         feature = "serde",
         serde(default = "default_probing_interval", with = "humantime_serde")
@@ -102,6 +106,15 @@ impl Validate for ProberConfig {
             );
         }
 
+        // The loopback evidence of one round must still be counted when the next one is sent, with room for
+        // the probe timeout and a late round, or a failing relay reads as unprobed instead of starved.
+        if self.interval > hopr_network_graph::LOOPBACK_WINDOW / 2 {
+            errors.add(
+                "interval",
+                ValidationError::new("interval must fit twice in the 60 s loopback evidence window"),
+            );
+        }
+
         if self.staleness_weight + self.quality_weight + self.base_priority <= 0.0 {
             errors.add(
                 "weights",
@@ -146,6 +159,38 @@ const fn just_true() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_default_probing_interval_should_pass_validation() {
+        assert!(ProberConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn an_interval_that_does_not_fit_twice_in_the_loopback_window_should_be_invalid() {
+        let half = hopr_network_graph::LOOPBACK_WINDOW / 2;
+        let at_limit = ProberConfig {
+            interval: half,
+            ..ProberConfig::default()
+        };
+        assert!(at_limit.validate().is_ok(), "exactly twice fits");
+
+        let over = ProberConfig {
+            interval: half + std::time::Duration::from_secs(1),
+            ..ProberConfig::default()
+        };
+        let err = over.validate().unwrap_err();
+        assert!(err.field_errors().contains_key("interval"), "{err}");
+    }
+
+    #[test]
+    fn an_interval_too_large_to_double_should_be_invalid_instead_of_panicking() {
+        let huge = ProberConfig {
+            interval: std::time::Duration::MAX,
+            ..ProberConfig::default()
+        };
+        let err = huge.validate().unwrap_err();
+        assert!(err.field_errors().contains_key("interval"), "{err}");
+    }
 
     #[test]
     fn interval_less_than_probe_timeout_is_invalid() {

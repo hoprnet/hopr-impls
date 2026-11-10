@@ -20,6 +20,14 @@ pub struct TransportLinkMeasurement {
     samples: u64,
 }
 
+impl TransportLinkMeasurement {
+    /// A success that carries no timing: counts toward the rate and leaves the latency average alone.
+    fn credit(&mut self) {
+        self.samples = self.samples.saturating_add(1);
+        self.probe_success_rate.update(1.0);
+    }
+}
+
 impl EdgeLinkObservable for TransportLinkMeasurement {
     fn record(&mut self, measurement: EdgeTransportMeasurement) {
         self.samples = self.samples.saturating_add(1);
@@ -80,11 +88,56 @@ pub struct Observations {
     intermediate_probe: Option<TransportIntermediates>,
     /// Health of the edge's destination as a relayer; `None` is not judged.
     health: Option<f64>,
+    /// How the loops over this edge judge its relay, handed to its intermediate stream.
+    starvation: StarvationParams,
 }
 
 impl Observations {
+    /// An edge whose loops are judged by `starvation` instead of the defaults.
+    pub(crate) fn with_starvation(starvation: StarvationParams) -> Self {
+        Self {
+            starvation,
+            ..Self::default()
+        }
+    }
+
+    /// The intermediate stream, created on first use with this edge's starvation parameters.
+    fn intermediate_mut(&mut self) -> &mut TransportIntermediates {
+        let starvation = self.starvation;
+        self.intermediate_probe
+            .get_or_insert_with(|| TransportIntermediates::with_starvation(starvation))
+    }
+
     pub(crate) fn set_health(&mut self, health: Option<f64>) {
         self.health = health;
+    }
+
+    /// Credits a returned loopback to this edge without a latency; see [`TransportIntermediates::credit_loopback`].
+    pub(crate) fn credit_loopback(&mut self) {
+        self.last_update = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        self.intermediate_mut().credit_loopback();
+        self.restamp_starved();
+    }
+
+    /// Whether the graph has judged this edge dead: nothing has come back over it, by traffic or by
+    /// loopback. Production routing leaves such an edge out; probing still walks it, because a returning
+    /// loop is the only way it can be seen to recover.
+    pub(crate) fn is_starved(&self) -> bool {
+        self.intermediate_probe
+            .is_some_and(|i| i.relay_starved_at(std::time::Instant::now()))
+    }
+
+    /// The neighbour ping reads the verdict of the edge's loopback stream; see `relay_starved_at`.
+    fn restamp_starved(&mut self) {
+        let now = std::time::Instant::now();
+        if let Some(immediate) = self.immediate_probe.as_mut() {
+            immediate.relay_starved_at = self
+                .intermediate_probe
+                .is_some_and(|i| i.relay_starved_at(now))
+                .then_some(now);
+        }
     }
 }
 
@@ -97,15 +150,13 @@ impl EdgeObservableWrite for Observations {
 
         match measurement {
             EdgeWeightType::Immediate(result) => self.immediate_probe.get_or_insert_default().record(result),
-            EdgeWeightType::Intermediate(result) => self.intermediate_probe.get_or_insert_default().record(result),
-            EdgeWeightType::Balance(balance) => self.intermediate_probe.get_or_insert_default().balance = balance,
+            EdgeWeightType::Intermediate(result) => self.intermediate_mut().record(result),
+            EdgeWeightType::Balance(balance) => self.intermediate_mut().balance = balance,
             EdgeWeightType::Connected(is_connected) => {
                 self.immediate_probe.get_or_insert_default().is_connected = Some(is_connected)
             }
             EdgeWeightType::SurbRoundTrips { expected, observed } => {
-                self.intermediate_probe
-                    .get_or_insert_default()
-                    .record_surb_round_trips(expected, observed);
+                self.intermediate_mut().record_surb_round_trips(expected, observed);
             }
             EdgeWeightType::ImmediateProtocolConformance { num_packets, num_acks } => {
                 let imm = self.immediate_probe.get_or_insert_default();
@@ -114,6 +165,8 @@ impl EdgeObservableWrite for Observations {
                 imm.acks_received = imm.acks_received * ACK_DECAY + num_acks as f64;
             }
         }
+
+        self.restamp_starved();
     }
 }
 
@@ -141,6 +194,18 @@ pub struct TransportImmediates {
     messages_sent: f64,
     /// Exponentially decayed count of acknowledgements received from this peer.
     acks_received: f64,
+    /// When the edge's intermediate stream last showed that the relay at its end delivers nothing.
+    ///
+    /// The neighbour answers pings whatever it does with relayed packets, so this stream's latency says
+    /// nothing about a relay that is starved. The stream cannot see the other one, so the edge stamps
+    /// the verdict here on every record, and it lapses with the window it was read from.
+    relay_starved_at: Option<std::time::Instant>,
+}
+
+impl TransportImmediates {
+    fn relay_starved(&self) -> bool {
+        self.relay_starved_at.is_some_and(|at| at.elapsed() < LOOPBACK_WINDOW)
+    }
 }
 
 impl EdgeNetworkObservableRead for TransportImmediates {
@@ -160,7 +225,12 @@ impl EdgeLinkObservable for TransportImmediates {
         self.link.record(measurement)
     }
 
+    /// Withheld while the relay at the end of the edge is starved: a ping answered by a relay that drops
+    /// everything it should forward is not its latency.
     fn average_latency(&self) -> Option<std::time::Duration> {
+        if self.relay_starved() {
+            return None;
+        }
         self.link.average_latency()
     }
 
@@ -223,6 +293,10 @@ pub struct TransportIntermediates {
     /// One `Option` rather than a value plus a timestamp, because the timestamp means nothing
     /// without a peak to date it. Decays rather than latching: see [`Self::peak_at`].
     surb_peak: Option<SurbPeak>,
+    /// Loopbacks over this edge that returned, against all of them, over the last 60 s.
+    loopback: LoopbackWindow,
+    /// How the loops over this edge judge its relay.
+    starvation: StarvationParams,
 }
 
 /// A delivery-ratio peak and the instant it was set, which the decay is measured from.
@@ -230,6 +304,156 @@ pub struct TransportIntermediates {
 struct SurbPeak {
     value: f64,
     at: std::time::Instant,
+}
+
+/// Width of one loopback bucket.
+const LOOPBACK_BUCKET_WIDTH: std::time::Duration = std::time::Duration::from_secs(5);
+/// Buckets in the loopback window: 60 s of evidence.
+///
+/// Loops are sent once per probing round, 30 s by default, and a lost one is recorded after the 3 s
+/// probe timeout. The window has to span more than one round, or the evidence is gone for most of
+/// the time between rounds. Two rounds is the shortest span that bridges the gap with room for a
+/// late round; a longer one only delays noticing that a relay stopped returning, because the last
+/// good loop stays counted until it expires.
+const LOOPBACK_BUCKETS: usize = 12;
+
+/// How far back loopback outcomes over an edge are still counted.
+///
+/// The probing interval must stay well inside it: a loop is sent once per round, so with a longer
+/// interval the evidence expires between rounds and a failing relay reads as unprobed instead of
+/// dead. The loopback generator's own configuration is checked against it.
+pub const LOOPBACK_WINDOW: std::time::Duration =
+    std::time::Duration::from_secs(LOOPBACK_BUCKET_WIDTH.as_secs() * LOOPBACK_BUCKETS as u64);
+
+/// Loops over an edge from which the return rate, not a single returned loop, judges its relay. Three, not
+/// more: a sparse network sees few loops per edge, and a dropping relay should not stay usable for want of
+/// a sample.
+pub const DEFAULT_MIN_LOOPBACKS_FOR_RATE: u32 = 3;
+
+/// Return rate below which a relay with enough loops is starved. Never zero: a dropping relay still returns
+/// the odd loop (on piz-palu-prod they peaked at 0.09, working first hops stayed above 0.25).
+pub const DEFAULT_MIN_LOOPBACK_RETURN_RATE: f64 = 0.1;
+
+/// How the loops over an edge judge its relay. Built from the path planner's configuration by whoever
+/// constructs the graph, see [`ChannelGraph::with_starvation`](crate::ChannelGraph::with_starvation).
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub struct StarvationParams {
+    /// Loops in the window from which the return rate judges the relay. Below it, a single returned loop
+    /// keeps the relay and none starves it.
+    pub min_loopbacks_for_rate: u32,
+    /// Return rate below which a relay with at least `min_loopbacks_for_rate` loops is starved. In `(0, 1]`.
+    pub min_return_rate: f64,
+}
+
+impl Default for StarvationParams {
+    fn default() -> Self {
+        Self {
+            min_loopbacks_for_rate: DEFAULT_MIN_LOOPBACKS_FOR_RATE,
+            min_return_rate: DEFAULT_MIN_LOOPBACK_RETURN_RATE,
+        }
+    }
+}
+
+impl StarvationParams {
+    /// Rejects values that would silently disable or invert the verdict.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.min_loopbacks_for_rate == 0 {
+            return Err("min_loopbacks_for_rate must be at least 1".into());
+        }
+        if !(self.min_return_rate > 0.0 && self.min_return_rate <= 1.0) {
+            return Err(format!(
+                "min_return_rate must be in (0, 1], got {}: zero never starves a relay that returns the odd loop",
+                self.min_return_rate
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// One bucket of loopback outcomes over an edge, tagged with which bucket of time it is.
+#[derive(Debug, Copy, Clone, Default, PartialEq)]
+struct LoopbackBucket {
+    slot: u64,
+    sent: u32,
+    returned: u32,
+}
+
+/// Loopbacks over an edge that returned, against all of them, over the last 60 s.
+///
+/// Every loop that crosses the edge counts once, returned or failed, so the rate is returned over returned
+/// plus failed. A window rather than a moving average: a relay none of whose loops returned reads exactly
+/// zero. Below [`StarvationParams::min_loopbacks_for_rate`] loops one returned loop is evidence enough, since
+/// an edge may see only one per probing round; from there on the rate has to reach
+/// [`StarvationParams::min_return_rate`], because a dropping relay still returns the odd loop.
+#[derive(Debug, Copy, Clone, PartialEq)]
+struct LoopbackWindow {
+    epoch: std::time::Instant,
+    buckets: [LoopbackBucket; LOOPBACK_BUCKETS],
+}
+
+impl LoopbackWindow {
+    fn new(epoch: std::time::Instant) -> Self {
+        Self {
+            epoch,
+            buckets: [LoopbackBucket::default(); LOOPBACK_BUCKETS],
+        }
+    }
+
+    fn slot_of(&self, now: std::time::Instant) -> u64 {
+        now.saturating_duration_since(self.epoch).as_secs() / LOOPBACK_BUCKET_WIDTH.as_secs()
+    }
+
+    fn record_at(&mut self, returned: bool, now: std::time::Instant) {
+        let slot = self.slot_of(now);
+        let bucket = &mut self.buckets[(slot % LOOPBACK_BUCKETS as u64) as usize];
+        // The bucket belongs to an earlier lap of the ring: its outcomes are out of the window.
+        if bucket.slot != slot {
+            *bucket = LoopbackBucket {
+                slot,
+                ..LoopbackBucket::default()
+            };
+        }
+        bucket.sent = bucket.sent.saturating_add(1);
+        if returned {
+            bucket.returned = bucket.returned.saturating_add(1);
+        }
+    }
+
+    /// Loops that crossed the edge in the window, and how many of them returned.
+    fn counts_at(&self, now: std::time::Instant) -> (u32, u32) {
+        let current = self.slot_of(now);
+        self.buckets
+            .iter()
+            .filter(|bucket| {
+                bucket.sent > 0 && bucket.slot <= current && bucket.slot + LOOPBACK_BUCKETS as u64 > current
+            })
+            .fold((0u32, 0u32), |(sent, returned), bucket| {
+                (
+                    sent.saturating_add(bucket.sent),
+                    returned.saturating_add(bucket.returned),
+                )
+            })
+    }
+
+    /// `None` when no loopback crossed the edge in the window.
+    fn rate_at(&self, now: std::time::Instant) -> Option<f64> {
+        let (sent, returned) = self.counts_at(now);
+        (sent > 0).then(|| f64::from(returned) / f64::from(sent))
+    }
+
+    /// Whether the loops over the edge say its relay delivers, or `None` without any.
+    fn delivers_at(&self, now: std::time::Instant, params: StarvationParams) -> Option<bool> {
+        let (sent, returned) = self.counts_at(now);
+        if sent == 0 {
+            return None;
+        }
+        // A dropping relay still returns the odd loop. Once the window holds enough loops the return rate
+        // judges the relay; below that, one returned loop is all that can be asked.
+        if sent >= params.min_loopbacks_for_rate {
+            return Some(f64::from(returned) / f64::from(sent) >= params.min_return_rate);
+        }
+        Some(returned > 0)
+    }
 }
 
 impl Default for TransportIntermediates {
@@ -241,11 +465,96 @@ impl Default for TransportIntermediates {
             balance: None,
             surb: WindowedRatio::new(SURB_BUCKET_WIDTH, now),
             surb_peak: None,
+            loopback: LoopbackWindow::new(now),
+            starvation: StarvationParams::default(),
         }
     }
 }
 
 impl TransportIntermediates {
+    /// An edge stream that judges its relay by `starvation`.
+    pub(crate) fn with_starvation(starvation: StarvationParams) -> Self {
+        Self {
+            starvation,
+            ..Self::default()
+        }
+    }
+
+    /// Whether the relay at the end of this edge delivers, or `None` without evidence.
+    ///
+    /// A returned packet or loop is unambiguous: it crossed every edge it is credited to. A failure
+    /// is not: a SURB round trip or a loop that did not come back blames every edge on it, the
+    /// healthy ones included (a dead forward relay fails every round trip whichever relay the reply
+    /// takes home). So any positive witness keeps the edge, and only evidence that reads exactly
+    /// zero everywhere starves it. Once the window holds [`StarvationParams::min_loopbacks_for_rate`] loops, the odd
+    /// returned loop no longer counts as a positive witness: the return rate has to reach
+    /// [`StarvationParams::min_return_rate`].
+    pub(crate) fn delivers_at(&self, now: std::time::Instant) -> Option<bool> {
+        [
+            self.traffic_rate_at(now).map(|rate| rate > 0.0),
+            self.loopback.delivers_at(now, self.starvation),
+        ]
+        .into_iter()
+        .flatten()
+        .reduce(|any, positive| any || positive)
+    }
+
+    /// Whether the evidence says that the relay at the end of this edge delivers nothing.
+    pub(crate) fn relay_starved_at(&self, now: std::time::Instant) -> bool {
+        self.delivers_at(now) == Some(false)
+    }
+
+    /// [`EdgeLinkObservable::average_probe_rate`] against a caller-supplied clock.
+    pub(crate) fn average_probe_rate_at(&self, now: std::time::Instant) -> Option<f64> {
+        self.surb_delivery_rate_at(now)
+            .or_else(|| self.link.average_probe_rate())
+    }
+
+    /// The score of an edge whose relay is not starved, against a caller-supplied clock.
+    ///
+    /// Split from [`EdgeLinkObservable::score`] so a caller that has just read the verdict does not
+    /// read it again for every metric: it is the costliest part of a score, and scores are read per
+    /// edge during path search.
+    pub(crate) fn live_score_at(&self, now: std::time::Instant) -> Option<f64> {
+        // `average_probe_rate` already averages the probe and SURB signals over whichever carry
+        // evidence, and reports `None` when neither does.
+        //
+        // Latency modulates that rate only where it was measured. A round-trip proves the loop was
+        // traversed but carries no per-edge latency, so an edge known solely from SURB delivery has
+        // a rate and no latency. Scoring the missing latency as [`latency_score`] does — 0.05, the
+        // no-data floor — would multiply real delivery evidence by a twentieth and rank the edge
+        // below one nothing at all is known about, inverting the very ordering the score exists to
+        // express.
+        let rate = self.average_probe_rate_at(now)?;
+        Some(
+            self.link
+                .average_latency()
+                .map_or(rate, |latency| rate * latency_score(latency)),
+        )
+    }
+
+    /// The share of loopbacks over this edge that returned in the last [`LOOPBACK_WINDOW`], or `None`
+    /// without any. `Some(0.0)` means loops crossed it and none returned.
+    pub fn loopback_rate(&self) -> Option<f64> {
+        self.loopback_rate_at(std::time::Instant::now())
+    }
+
+    /// [`Self::loopback_rate`] against a caller-supplied clock.
+    pub(crate) fn loopback_rate_at(&self, now: std::time::Instant) -> Option<f64> {
+        self.loopback.rate_at(now)
+    }
+
+    /// How real traffic over this edge is coming back, relative to its own best, or `None` without
+    /// traffic. Same as [`Self::surb_delivery_rate`].
+    pub fn traffic_rate(&self) -> Option<f64> {
+        self.traffic_rate_at(std::time::Instant::now())
+    }
+
+    /// [`Self::traffic_rate`] against a caller-supplied clock.
+    pub(crate) fn traffic_rate_at(&self, now: std::time::Instant) -> Option<f64> {
+        self.surb_delivery_rate_at(now)
+    }
+
     /// Folds one reporting interval of SURB round-trips into the window.
     pub(crate) fn record_surb_round_trips(&mut self, expected: u64, observed: u64) {
         self.record_surb_round_trips_at(expected, observed, std::time::Instant::now())
@@ -315,7 +624,13 @@ impl TransportIntermediates {
     pub(crate) fn surb_delivery_rate_at(&self, now: std::time::Instant) -> Option<f64> {
         let value = self.surb.value(now)?;
         let peak = self.peak_at(now)?;
-        let against_peak = (peak > 0.0).then(|| (value / peak).clamp(0.0, 1.0))?;
+        // SURBs minted over the edge and none ever returned: there is no baseline to compare with,
+        // and that absence is the evidence. Reading it as "no evidence" let a relay that drops
+        // everything keep a full score (hopr-impls#81). The first returned SURB lifts the peak.
+        if peak <= 0.0 {
+            return (value <= 0.0).then_some(0.0);
+        }
+        let against_peak = (value / peak).clamp(0.0, 1.0);
 
         // A relay that has just stopped delivering still reads well against its peak for most of
         // the window, because eleven healthy slices outvote the one bad one. Folding the trend in
@@ -334,48 +649,47 @@ impl EdgeProtocolObservable for TransportIntermediates {
     }
 }
 
+impl TransportIntermediates {
+    /// A loop that returned over this edge. The edge was not timed on its own, so only the rates move:
+    /// writing the latency it already carries back would pin a stale value, and a loop's round trip
+    /// cannot be split between its edges.
+    fn credit_loopback(&mut self) {
+        self.loopback.record_at(true, std::time::Instant::now());
+        self.link.credit();
+    }
+}
+
 impl EdgeLinkObservable for TransportIntermediates {
     fn record(&mut self, measurement: EdgeTransportMeasurement) {
+        self.loopback.record_at(measurement.is_ok(), std::time::Instant::now());
         self.link.record(measurement);
     }
 
     fn average_latency(&self) -> Option<std::time::Duration> {
+        if self.relay_starved_at(std::time::Instant::now()) {
+            return None;
+        }
         self.link.average_latency()
     }
 
-    /// The more pessimistic of the two delivery signals, over whichever of them carry evidence.
+    /// The SURB delivery rate where traffic crossed the edge, else the probe rate.
     ///
-    /// SURB round-trips react sooner -- probing runs on an interval, while SURBs accrue at data
-    /// rates -- but sooner is not the same as instead of. The two measure different things: the
-    /// probe rate reports reachability of this hop, the SURB rate peak-relative delivery of the
-    /// whole loop, and a failing probe is real evidence even while SURBs keep arriving. Taking the
-    /// worse of the two lets either signal condemn an edge and neither mask the other.
+    /// Traffic comes first: it reacts at data rates where probing runs on an interval, and it says more
+    /// about the loop than a probe does, so probing is only needed where no traffic went through. Once
+    /// the traffic stops, its window empties and the probes speak again.
     ///
-    /// Evidence, not merely a number: an unprobed edge's probe rate reads 0.0 exactly as a wholly
-    /// failing one does (an unprobed stream reports `None` rather than a rate), so combining them unconditionally would
-    /// score every SURB-only edge as dead.
+    /// Evidence, not merely a number: an unprobed edge's probe rate reads `None`, not `0.0`, so a
+    /// SURB-only edge is not scored as dead.
     fn average_probe_rate(&self) -> Option<f64> {
-        match (self.surb_delivery_rate(), self.link.average_probe_rate()) {
-            (Some(surb), Some(probe)) => Some(surb.min(probe)),
-            (surb, probe) => surb.or(probe),
-        }
+        self.average_probe_rate_at(std::time::Instant::now())
     }
 
     fn score(&self) -> Option<f64> {
-        // `average_probe_rate` already takes the worse of the probe and SURB signals over whichever
-        // carry evidence, and reports `None` when neither does.
-        //
-        // Latency modulates that rate only where it was measured. A round-trip proves the loop was
-        // traversed but carries no per-edge latency, so an edge known solely from SURB delivery has
-        // a rate and no latency. Scoring the missing latency as [`latency_score`] does — 0.05, the
-        // no-data floor — would multiply real delivery evidence by a twentieth and rank the edge
-        // below one nothing at all is known about, inverting the very ordering the score exists to
-        // express.
-        let rate = self.average_probe_rate()?;
-        Some(
-            self.average_latency()
-                .map_or(rate, |latency| rate * latency_score(latency)),
-        )
+        let now = std::time::Instant::now();
+        if self.relay_starved_at(now) {
+            return Some(0.0);
+        }
+        self.live_score_at(now)
     }
 }
 
@@ -408,9 +722,18 @@ impl EdgeObservableRead for Observations {
     /// allocation as presence averaged against a phantom zero, halving every edge only one stream
     /// can observe: every edge incident to `me`, since immediate probes touch only those and
     /// loopback attribution targets `edges[len - 2]`.
+    ///
+    /// An edge whose relay is starved scores `0.0` outright: the neighbour's healthy ping must not
+    /// average it up to half.
     fn score(&self) -> Option<f64> {
+        let now = std::time::Instant::now();
+        if self.intermediate_probe.is_some_and(|i| i.relay_starved_at(now)) {
+            return Some(0.0);
+        }
+
+        // Not starved, as just read, so the stream scores itself without reading the verdict again.
         let immediate = self.immediate_probe.and_then(|m| m.score());
-        let intermediate = self.intermediate_probe.and_then(|m| m.score());
+        let intermediate = self.intermediate_probe.and_then(|m| m.live_score_at(now));
 
         match (immediate, intermediate) {
             (Some(immediate), Some(intermediate)) => Some((immediate + intermediate) / 2.0),
@@ -785,6 +1108,8 @@ mod tests {
             balance: None,
             surb: WindowedRatio::new(TEST_SLICE, epoch),
             surb_peak: None,
+            loopback: LoopbackWindow::new(epoch),
+            starvation: StarvationParams::default(),
         }
     }
 
@@ -869,6 +1194,172 @@ mod tests {
         );
     }
 
+    // ── Traffic as a second witness ─────────────────────────────────────
+
+    // Probes are sparse and fail on any hop of their loop; SURBs come back at data rate and a
+    // collapse shows within seconds. They are two witnesses that the edge works, kept apart so the
+    // value function can let either one keep a relay (hopr-api `EdgeValueFn`).
+
+    #[test]
+    fn traffic_that_stopped_returning_should_read_zero_within_the_trend_window() {
+        let epoch = std::time::Instant::now();
+        let mut m = fast_slices(epoch);
+        let now = deliver_healthily(&mut m, epoch);
+        let now = record_slices(&mut m, now + TEST_SLICE, 2, 100, 0);
+
+        assert_eq!(
+            m.traffic_rate_at(now),
+            Some(0.0),
+            "SURBs minted and none returned: traffic is dead long before the next loopback round"
+        );
+        assert_eq!(m.loopback_rate_at(now), None, "and no loopback was involved");
+    }
+
+    #[test]
+    fn traffic_that_keeps_returning_should_read_above_zero() {
+        let epoch = std::time::Instant::now();
+        let mut m = fast_slices(epoch);
+        let now = deliver_healthily(&mut m, epoch);
+
+        assert!(m.traffic_rate_at(now).is_some_and(|rate| rate > 0.0));
+    }
+
+    #[test]
+    fn the_loopback_rate_should_not_include_traffic() {
+        // Kept apart: a healthy SURB window says nothing about loops, and the other way round.
+        let epoch = std::time::Instant::now();
+        let mut m = fast_slices(epoch);
+        let now = deliver_healthily(&mut m, epoch);
+        assert_eq!(m.loopback_rate_at(now), None);
+
+        for _ in 0..3 {
+            m.loopback.record_at(false, now);
+        }
+        assert_eq!(m.loopback_rate_at(now), Some(0.0));
+        assert!(
+            m.traffic_rate_at(now).is_some_and(|rate| rate > 0.0),
+            "failed probes must not change what traffic says"
+        );
+    }
+
+    #[test]
+    fn a_credited_loopback_should_not_write_a_latency_into_the_edge() {
+        // The edge is known by its neighbour ping only. A loop that returns over it says nothing about
+        // its own latency, so crediting must not copy the ping's value into the loop stream, where it
+        // would be read back and written again on every loop.
+        let mut observations = Observations::default();
+        observations.record(EdgeWeightType::Immediate(Ok(std::time::Duration::from_millis(20))));
+        for _ in 0..5 {
+            observations.credit_loopback();
+        }
+
+        let intermediate = observations.intermediate_qos().expect("credited");
+        assert_eq!(intermediate.average_latency(), None, "a credit carries no timing");
+        assert_eq!(intermediate.loopback_rate(), Some(1.0), "but it is a success");
+        assert_eq!(intermediate.average_probe_rate(), Some(1.0));
+    }
+
+    #[test]
+    fn traffic_that_never_returned_should_read_dead() {
+        // SURBs were minted over the edge and none came back: with no peak to have collapsed from,
+        // the absence is the evidence (hopr-impls#81).
+        let epoch = std::time::Instant::now();
+        let mut m = fast_slices(epoch);
+        let now = record_slices(&mut m, epoch, 4, 100, 0);
+
+        assert_eq!(m.traffic_rate_at(now), Some(0.0));
+    }
+
+    #[test]
+    fn the_first_returned_surb_should_lift_an_edge_that_read_dead() {
+        let epoch = std::time::Instant::now();
+        let mut m = fast_slices(epoch);
+        let now = record_slices(&mut m, epoch, 4, 100, 0);
+        assert_eq!(m.traffic_rate_at(now), Some(0.0));
+
+        let later = record_slices(&mut m, now, 1, 100, 50);
+        assert!(
+            m.traffic_rate_at(later).is_some_and(|rate| rate > 0.0),
+            "a returning edge must recover"
+        );
+    }
+
+    #[test]
+    fn an_idle_edge_should_not_read_zero_traffic() {
+        // No SURBs minted lately is not SURBs that failed to return.
+        let epoch = std::time::Instant::now();
+        let mut m = fast_slices(epoch);
+        let now = deliver_healthily(&mut m, epoch);
+
+        let idle = now + TEST_SLICE * 4;
+        assert!(
+            m.traffic_rate_at(idle).is_none_or(|rate| rate > 0.0),
+            "an idle edge must not be starved"
+        );
+    }
+
+    #[test]
+    fn the_trait_should_expose_both_witnesses_of_an_intermediate_stream() {
+        use hopr_api::graph::traits::{EdgeObservableRead, EdgeObservableWrite, EdgeWeightType};
+
+        let mut observations = Observations::default();
+        observations.record(EdgeWeightType::SurbRoundTrips {
+            expected: 100,
+            observed: 100,
+        });
+        for _ in 0..2 {
+            observations.record(EdgeWeightType::Intermediate(Err(())));
+        }
+
+        let intermediate = observations.intermediate_qos().expect("recorded");
+        assert_eq!(intermediate.loopback_rate(), Some(0.0), "the probes failed");
+        assert!(
+            intermediate.traffic_rate().is_some_and(|rate| rate > 0.0),
+            "while the traffic came back"
+        );
+    }
+
+    // ── Later hops ──────────────────────────────────────────────────────
+
+    /// A relay in the middle of a path that was good and whose loops have all failed since.
+    ///
+    /// Its moving average is still positive, so its score alone would only fall gradually, while the
+    /// loopback window already reads zero. The edge has to read dead on that, for every reader.
+    fn a_middle_relay_that_stopped_returning_loops() -> Observations {
+        let epoch = std::time::Instant::now();
+        let mut m = fast_slices(epoch);
+        m.balance = Some(hopr_api::graph::traits::Balance::from(1_000u64));
+        for _ in 0..5 {
+            m.link.record(Ok(std::time::Duration::from_millis(30)));
+        }
+        for _ in 0..2 {
+            m.link.record(Err(()));
+            m.loopback.record_at(false, epoch);
+        }
+
+        Observations {
+            intermediate_probe: Some(m),
+            ..Observations::default()
+        }
+    }
+
+    #[test]
+    fn a_later_relay_whose_loopbacks_never_returned_should_read_dead_though_its_average_is_still_positive() {
+        let observed = a_middle_relay_that_stopped_returning_loops();
+        let intermediate = observed.intermediate_qos().expect("recorded");
+
+        // Vacuity guards: the case only means something while the average and the window disagree.
+        assert!(
+            intermediate.link.score().is_some_and(|score| score > 0.1),
+            "the moving average must still be positive"
+        );
+        assert_eq!(intermediate.loopback_rate(), Some(0.0), "while the window reads zero");
+
+        assert_eq!(intermediate.score(), Some(0.0));
+        assert_eq!(observed.score(), Some(0.0));
+        assert_eq!(intermediate.average_latency(), None);
+    }
+
     /// The discount must be soft and self-clearing, not a latch.
     #[test]
     fn an_edge_should_recover_its_rate_once_the_recent_slices_climb_back() {
@@ -934,9 +1425,9 @@ mod tests {
         );
     }
 
-    /// Neither delivery signal may hide the other; an unprobed edge must not be read as a dead one.
+    /// An unprobed edge must not be read as a dead one, and probes are not read against traffic.
     #[test]
-    fn a_failing_probe_should_not_be_masked_by_healthy_surb_traffic() {
+    fn a_failing_probe_should_not_lower_the_rate_of_an_edge_with_healthy_surb_traffic() {
         let epoch = std::time::Instant::now();
 
         let mut surbs_only = fast_slices(epoch);
@@ -946,19 +1437,96 @@ mod tests {
             .expect("SURB traffic alone is evidence, so the rate must be present");
         assert_in_delta!(surbs_only_rate, 1.0, 0.001);
 
-        // Same healthy SURB window, but every probe of this hop failed. The probe rate is evidence
-        // too, and taking the SURB rate alone would discard it.
         let mut probes_failing = fast_slices(epoch);
         deliver_healthily(&mut probes_failing, epoch);
         for _ in 0..5 {
             probes_failing.record(Err(()));
         }
 
-        let failing_rate = probes_failing.average_probe_rate().expect("probed and delivering");
+        assert_eq!(
+            probes_failing.average_probe_rate(),
+            Some(surbs_only_rate),
+            "traffic that crossed the edge says more than the probes that failed"
+        );
+    }
+
+    // ── Two witnesses in the score ──────────────────────────────────────
+
+    // Traffic comes first and probing fills in where none crossed the edge, so failed probes cannot zero
+    // an edge whose traffic came back, and returned probes cannot save an edge whose traffic stopped.
+
+    /// An edge with healthy SURBs, and the clock at the last of them.
+    fn with_healthy_surbs(epoch: std::time::Instant) -> (TransportIntermediates, std::time::Instant) {
+        let mut m = fast_slices(epoch);
+        let now = deliver_healthily(&mut m, epoch);
+        (m, now)
+    }
+
+    #[test]
+    fn failed_probes_should_not_zero_the_rate_of_an_edge_whose_surbs_came_back() {
+        let (mut m, now) = with_healthy_surbs(std::time::Instant::now());
+        for _ in 0..5 {
+            m.record(Err(()));
+        }
+
+        assert_eq!(m.link.average_probe_rate(), Some(0.0), "every probe failed");
         assert!(
-            failing_rate < surbs_only_rate,
-            "a hop whose probes all fail must not score as well as one whose probes were never run: \
-             failing={failing_rate} unprobed={surbs_only_rate}"
+            m.surb_delivery_rate_at(now).is_some_and(|rate| rate > 0.9),
+            "while SURBs came back"
+        );
+        let combined = m.average_probe_rate_at(now).expect("both witnesses have evidence");
+        assert!(
+            combined > 0.0,
+            "traffic that came back keeps the edge above zero, got {combined}"
+        );
+    }
+
+    #[test]
+    fn collapsed_surbs_should_zero_the_rate_of_an_edge_whose_probes_came_back() {
+        let (mut m, now) = with_healthy_surbs(std::time::Instant::now());
+        let now = record_slices(&mut m, now + TEST_SLICE, 2, 100, 0);
+        for _ in 0..5 {
+            m.record(Ok(std::time::Duration::from_millis(30)));
+        }
+
+        assert_eq!(m.surb_delivery_rate_at(now), Some(0.0), "traffic stopped coming back");
+        assert!(
+            m.link.average_probe_rate().is_some_and(|rate| rate > 0.9),
+            "while probes come back"
+        );
+        assert_eq!(
+            m.average_probe_rate_at(now),
+            Some(0.0),
+            "probes that came back do not save an edge whose traffic stopped"
+        );
+    }
+
+    #[test]
+    fn an_edge_should_read_zero_only_when_both_witnesses_read_zero() {
+        let (mut m, now) = with_healthy_surbs(std::time::Instant::now());
+        let now = record_slices(&mut m, now + TEST_SLICE, 2, 100, 0);
+        for _ in 0..5 {
+            m.record(Err(()));
+        }
+
+        assert_eq!(m.surb_delivery_rate_at(now), Some(0.0), "traffic dead");
+        assert_eq!(m.link.average_probe_rate(), Some(0.0), "probes dead");
+        assert_eq!(m.average_probe_rate_at(now), Some(0.0), "both dead");
+    }
+
+    #[test]
+    fn probes_should_not_rank_edges_that_carry_traffic() {
+        let (mut both, now) = with_healthy_surbs(std::time::Instant::now());
+        let (mut one, _) = with_healthy_surbs(std::time::Instant::now());
+        for _ in 0..5 {
+            both.record(Ok(std::time::Duration::from_millis(30)));
+            one.record(Err(()));
+        }
+
+        assert_eq!(
+            both.average_probe_rate_at(now),
+            one.average_probe_rate_at(now),
+            "the traffic rates both carry decide, whatever the probes said"
         );
     }
 
@@ -1065,5 +1633,428 @@ mod tests {
         let imm_score = observation.immediate_qos().unwrap().score();
         assert!(observation.intermediate_qos().is_none());
         assert_eq!(observation.score(), imm_score);
+    }
+}
+
+#[cfg(test)]
+mod loopback_window_tests {
+    use std::time::{Duration, Instant};
+
+    use hopr_api::graph::traits::{EdgeObservableRead, EdgeObservableWrite, EdgeWeightType};
+
+    use super::*;
+
+    fn record(window: &mut LoopbackWindow, at: Instant, returned: usize, failed: usize) {
+        for _ in 0..returned {
+            window.record_at(true, at);
+        }
+        for _ in 0..failed {
+            window.record_at(false, at);
+        }
+    }
+
+    #[test]
+    fn a_window_without_loopbacks_should_say_nothing() {
+        let epoch = Instant::now();
+        assert_eq!(LoopbackWindow::new(epoch).rate_at(epoch), None);
+    }
+
+    #[test]
+    fn one_failed_loopback_should_read_as_zero() {
+        // Loops are sent once per probing round, so an edge may see one a round. Waiting for more
+        // would mean never judging it.
+        let epoch = Instant::now();
+        let mut window = LoopbackWindow::new(epoch);
+        record(&mut window, epoch, 0, 1);
+        assert_eq!(window.rate_at(epoch), Some(0.0));
+    }
+
+    #[test]
+    fn a_relay_none_of_whose_loopbacks_returned_should_read_as_exactly_zero() {
+        let epoch = Instant::now();
+        let mut window = LoopbackWindow::new(epoch);
+        record(&mut window, epoch, 0, 3);
+        assert_eq!(window.rate_at(epoch), Some(0.0));
+    }
+
+    #[test]
+    fn returned_and_failed_loopbacks_should_be_summed_into_the_ratio() {
+        let epoch = Instant::now();
+        let mut window = LoopbackWindow::new(epoch);
+        record(&mut window, epoch, 5, 5);
+        assert_eq!(window.rate_at(epoch), Some(0.5));
+    }
+
+    #[test]
+    fn one_returning_loop_among_many_failures_should_read_above_zero() {
+        // Anything above zero is a relay that carries traffic.
+        let epoch = Instant::now();
+        let mut window = LoopbackWindow::new(epoch);
+        record(&mut window, epoch, 1, 9);
+        assert_eq!(window.rate_at(epoch), Some(0.1));
+    }
+
+    #[test]
+    fn outcomes_older_than_the_window_should_be_forgotten() {
+        let epoch = Instant::now();
+        let mut window = LoopbackWindow::new(epoch);
+        record(&mut window, epoch, 0, 5);
+
+        let later = epoch + LOOPBACK_BUCKET_WIDTH * LOOPBACK_BUCKETS as u32;
+        assert_eq!(
+            window.rate_at(later),
+            None,
+            "a full window on, the failures are out of it"
+        );
+    }
+
+    #[test]
+    fn a_relay_should_recover_once_its_loopbacks_return() {
+        let epoch = Instant::now();
+        let mut window = LoopbackWindow::new(epoch);
+        record(&mut window, epoch, 0, 3);
+        assert_eq!(window.rate_at(epoch), Some(0.0));
+
+        let later = epoch + Duration::from_secs(5);
+        record(&mut window, later, 3, 0);
+        assert_eq!(window.rate_at(later), Some(0.5), "both are still inside the window");
+    }
+
+    #[test]
+    fn a_reused_bucket_should_not_carry_the_outcomes_of_an_earlier_lap() {
+        let epoch = Instant::now();
+        let mut window = LoopbackWindow::new(epoch);
+        record(&mut window, epoch, 0, 4);
+
+        // Same bucket slot one full lap later: the old second must have been cleared.
+        let lap = epoch + LOOPBACK_BUCKET_WIDTH * LOOPBACK_BUCKETS as u32;
+        record(&mut window, lap, 3, 0);
+        assert_eq!(window.rate_at(lap), Some(1.0));
+    }
+
+    // ── Cadence ─────────────────────────────────────────────────────────
+
+    // Loops are sent once per probing round (30 s by default) and a lost one is recorded after the
+    // 3 s probe timeout. The window has to bridge the gap between rounds, or the evidence is gone
+    // for most of the time.
+
+    const ROUND: Duration = Duration::from_secs(30);
+    const TIMEOUT: Duration = Duration::from_secs(3);
+
+    /// Plays a timeline second by second: the round-`n` loop over the edge has its outcome known
+    /// `TIMEOUT` after the round starts, and `rate` is read after every second.
+    ///
+    /// Time has to move forward: a ring window is only meaningful for a clock that does.
+    fn play(outcomes: &[bool], until: Duration) -> Vec<(u64, Option<f64>)> {
+        let epoch = Instant::now();
+        let mut window = LoopbackWindow::new(epoch);
+        (0..=until.as_secs())
+            .map(|second| {
+                let now = epoch + Duration::from_secs(second);
+                if let Some(since) = second.checked_sub(TIMEOUT.as_secs())
+                    && since % ROUND.as_secs() == 0
+                    && let Some(returned) = outcomes.get((since / ROUND.as_secs()) as usize)
+                {
+                    window.record_at(*returned, now);
+                }
+                (second, window.rate_at(now))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_dead_relay_should_stay_starved_between_probing_rounds() {
+        let timeline = play(&[false; 6], ROUND * 5 + TIMEOUT);
+
+        // From the first outcome on, every second must read zero, not only the seconds just after a round.
+        for (second, rate) in timeline.into_iter().filter(|(second, _)| *second >= TIMEOUT.as_secs()) {
+            assert_eq!(rate, Some(0.0), "t = {second} s: evidence gone between rounds");
+        }
+    }
+
+    #[test]
+    fn a_relay_that_dies_should_be_starved_within_two_rounds() {
+        let timeline = play(&[true, false, false, false], ROUND * 3 + TIMEOUT);
+        let at = |second: u64| timeline[second as usize].1;
+
+        // The last good loop is still in the window one round later.
+        assert!(at(ROUND.as_secs() + TIMEOUT.as_secs()).is_some_and(|rate| rate > 0.0));
+        // Two rounds later it has expired, and only failures are left.
+        assert_eq!(
+            at((ROUND * 2).as_secs() + TIMEOUT.as_secs()),
+            Some(0.0),
+            "a relay that stopped returning must read zero within two rounds"
+        );
+    }
+
+    #[test]
+    fn a_relay_returning_the_odd_loop_of_many_should_be_starved() {
+        let mut observations = Observations::default();
+        observations.record(EdgeWeightType::Intermediate(Ok(Duration::from_millis(40))));
+        for _ in 0..50 {
+            observations.record(EdgeWeightType::Intermediate(Err(())));
+        }
+
+        assert!(observations.is_starved(), "one loop in 51 returned");
+        assert_eq!(observations.score(), Some(0.0));
+    }
+
+    #[test]
+    fn a_relay_returning_a_fair_share_of_many_loops_should_be_kept() {
+        let mut observations = Observations::default();
+        for i in 0..20 {
+            observations.record(EdgeWeightType::Intermediate(if i % 4 == 0 {
+                Ok(Duration::from_millis(40))
+            } else {
+                Err(())
+            }));
+        }
+
+        assert!(
+            !observations.is_starved(),
+            "one loop in four returned, as a working first hop does"
+        );
+    }
+
+    #[test]
+    fn a_relay_should_be_usable_as_soon_as_a_loop_returns() {
+        let timeline = play(&[false, false, false, true], ROUND * 3 + TIMEOUT);
+        let recovered = timeline[(ROUND * 3 + TIMEOUT).as_secs() as usize].1;
+        assert!(
+            recovered.is_some_and(|rate| rate > 0.0),
+            "one returning loop is enough, however many failures are still in the window"
+        );
+    }
+
+    #[test]
+    fn one_lost_loop_should_starve_a_single_loop_edge_for_at_most_one_round() {
+        let timeline = play(&[false, true], ROUND + TIMEOUT);
+        let at = |second: u64| timeline[second as usize].1;
+
+        assert_eq!(at(TIMEOUT.as_secs() + 20), Some(0.0), "starved until the next round");
+        assert!(
+            at(ROUND.as_secs() + TIMEOUT.as_secs()).is_some_and(|rate| rate > 0.0),
+            "the next round's loop clears it"
+        );
+    }
+
+    #[test]
+    fn only_intermediate_outcomes_should_feed_the_loopback_rate() {
+        let mut observations = Observations::default();
+        for _ in 0..5 {
+            observations.record(EdgeWeightType::Immediate(Err(())));
+        }
+        assert!(
+            observations.intermediate_qos().is_none(),
+            "neighbour pings are not loopbacks"
+        );
+
+        observations.record(EdgeWeightType::Intermediate(Err(())));
+        assert_eq!(
+            observations.intermediate_qos().and_then(|q| q.loopback_rate()),
+            Some(0.0)
+        );
+    }
+
+    fn neighbour(ping_ms: u64) -> Observations {
+        let mut observations = Observations::default();
+        observations.record(EdgeWeightType::Connected(true));
+        for _ in 0..3 {
+            observations.record(EdgeWeightType::Immediate(Ok(std::time::Duration::from_millis(ping_ms))));
+        }
+        observations
+    }
+
+    fn latency_of(observations: &Observations) -> Option<std::time::Duration> {
+        observations.immediate_qos().and_then(|q| q.average_latency())
+    }
+
+    /// A relay that rejects our packets still answers pings fast. The verdict lives in the edge itself, so every
+    /// reader of the graph sees a dead relay, whichever value function it applies.
+    #[test]
+    fn a_neighbour_whose_loopbacks_never_return_should_read_dead_in_every_metric() {
+        let mut observations = neighbour(5);
+        for _ in 0..5 {
+            observations.record(EdgeWeightType::Intermediate(Err(())));
+        }
+
+        assert_eq!(observations.score(), Some(0.0), "not half of a healthy ping");
+        assert_eq!(
+            latency_of(&observations),
+            None,
+            "its fast ping is not a property of a working relay"
+        );
+        assert_eq!(observations.intermediate_qos().and_then(|q| q.score()), Some(0.0));
+        assert_eq!(observations.intermediate_qos().and_then(|q| q.average_latency()), None);
+    }
+
+    #[test]
+    fn a_neighbour_with_returning_loopbacks_should_keep_its_score_and_latency() {
+        let mut observations = neighbour(5);
+        observations.record(EdgeWeightType::Intermediate(Ok(std::time::Duration::from_millis(40))));
+        for _ in 0..4 {
+            observations.record(EdgeWeightType::Intermediate(Err(())));
+        }
+
+        assert!(
+            observations.score().is_some_and(|score| score > 0.0),
+            "one loop in five returned"
+        );
+        assert!(latency_of(&observations).is_some());
+    }
+
+    #[test]
+    fn a_neighbour_without_loopback_evidence_should_be_left_as_it_was() {
+        let observations = neighbour(5);
+
+        assert_eq!(
+            observations.score(),
+            observations.immediate_qos().and_then(|q| q.score())
+        );
+        assert!(latency_of(&observations).is_some());
+    }
+
+    #[test]
+    fn a_neighbour_should_recover_once_a_loopback_returns() {
+        let mut observations = neighbour(5);
+        for _ in 0..5 {
+            observations.record(EdgeWeightType::Intermediate(Err(())));
+        }
+        assert_eq!(observations.score(), Some(0.0));
+
+        observations.record(EdgeWeightType::Intermediate(Ok(std::time::Duration::from_millis(40))));
+        assert!(observations.score().is_some_and(|score| score > 0.0));
+        assert!(latency_of(&observations).is_some(), "its latency comes back with it");
+    }
+
+    /// Where traffic crosses the edge it says more than probing does, so failed probes are not read against it.
+    #[test]
+    fn traffic_should_take_precedence_over_failed_probes() {
+        let mut with_failed_probes = neighbour(5);
+        with_failed_probes.record(EdgeWeightType::SurbRoundTrips {
+            expected: 10,
+            observed: 10,
+        });
+        let mut without = with_failed_probes;
+        for _ in 0..5 {
+            with_failed_probes.record(EdgeWeightType::Intermediate(Err(())));
+        }
+
+        assert_eq!(
+            with_failed_probes.score(),
+            without.score(),
+            "probes are read only without traffic"
+        );
+        assert!(with_failed_probes.score().is_some_and(|score| score > 0.0));
+        assert!(latency_of(&with_failed_probes).is_some());
+        // Keep the comparison honest: the unchanged copy really carries traffic and no probe.
+        without.record(EdgeWeightType::Balance(None));
+    }
+
+    /// Traffic that stopped is a verdict by itself, whatever the probes say.
+    #[test]
+    fn traffic_that_stopped_should_outweigh_probes_that_returned() {
+        let t0 = std::time::Instant::now();
+        let mut intermediates = TransportIntermediates::default();
+        intermediates.record_surb_round_trips_at(10, 10, t0);
+        for _ in 0..5 {
+            intermediates.record(Ok(std::time::Duration::from_millis(40)));
+        }
+        // The healthy history has aged out of the SURB window, and the latest interval returned nothing.
+        let later = t0 + std::time::Duration::from_secs(30);
+        intermediates.record_surb_round_trips_at(10, 0, later);
+
+        assert_eq!(intermediates.traffic_rate_at(later), Some(0.0));
+        assert!(intermediates.loopback_rate_at(t0).is_some_and(|rate| rate > 0.0));
+        assert_eq!(
+            intermediates.average_probe_rate_at(later),
+            Some(0.0),
+            "the probes that returned do not dilute traffic that stopped"
+        );
+    }
+}
+
+#[cfg(test)]
+mod starvation_params_tests {
+    use hopr_api::graph::traits::{EdgeObservableWrite, EdgeWeightType};
+
+    use super::*;
+
+    /// An edge that saw `returned` loops come back and `lost` time out.
+    fn edge_with(params: StarvationParams, returned: u32, lost: u32) -> Observations {
+        let mut observations = Observations::with_starvation(params);
+        for _ in 0..returned {
+            observations.record(EdgeWeightType::Intermediate(Ok(std::time::Duration::from_millis(40))));
+        }
+        for _ in 0..lost {
+            observations.record(EdgeWeightType::Intermediate(Err(())));
+        }
+        observations
+    }
+
+    fn params(min_loopbacks_for_rate: u32, min_return_rate: f64) -> StarvationParams {
+        StarvationParams {
+            min_loopbacks_for_rate,
+            min_return_rate,
+        }
+    }
+
+    #[test]
+    fn the_defaults_should_be_three_loops_and_a_tenth() {
+        let defaults = StarvationParams::default();
+        assert_eq!(defaults.min_loopbacks_for_rate, 3);
+        assert_eq!(defaults.min_return_rate, 0.1);
+        assert!(defaults.validate().is_ok());
+    }
+
+    #[test]
+    fn the_minimum_loop_count_should_come_from_the_params() {
+        // One loop in four returned: a quarter, under the half this relay has to return.
+        let judged_from_three = edge_with(params(3, 0.5), 1, 3);
+        let judged_from_ten = edge_with(params(10, 0.5), 1, 3);
+
+        assert!(
+            judged_from_three.is_starved(),
+            "four loops are enough to judge by the rate when the minimum is three"
+        );
+        assert!(
+            !judged_from_ten.is_starved(),
+            "below a minimum of ten, one returned loop is all that can be asked"
+        );
+    }
+
+    #[test]
+    fn the_return_rate_should_come_from_the_params() {
+        let loose = edge_with(params(3, 0.2), 1, 3);
+        let strict = edge_with(params(3, 0.3), 1, 3);
+
+        assert!(!loose.is_starved(), "a quarter of the loops returned clears a fifth");
+        assert!(
+            strict.is_starved(),
+            "a quarter of the loops returned misses three tenths"
+        );
+    }
+
+    #[test]
+    fn a_relay_that_returned_nothing_should_be_starved_whatever_the_params() {
+        for p in [params(1, 0.01), params(3, 0.1), params(50, 1.0)] {
+            assert!(edge_with(p, 0, 2).is_starved(), "{p:?}");
+        }
+    }
+
+    #[test]
+    fn invalid_params_should_be_rejected() {
+        assert!(
+            params(0, 0.1).validate().is_err(),
+            "no loops would judge by the rate on nothing"
+        );
+        assert!(
+            params(3, 0.0).validate().is_err(),
+            "a rate of zero never starves a relay returning the odd loop"
+        );
+        assert!(params(3, -0.1).validate().is_err());
+        assert!(params(3, 1.5).validate().is_err());
+        assert!(params(3, f64::NAN).validate().is_err());
+        assert!(params(3, 1.0).validate().is_ok());
     }
 }

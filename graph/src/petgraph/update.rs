@@ -237,6 +237,14 @@ impl hopr_api::graph::NetworkGraphUpdate for ChannelGraph {
                 let Some(edges) = resolve_round_trip_edges(&inner, &self.me, &telemetry.paths) else {
                     return;
                 };
+                // Two edges (me -> X -> me) is one hop each way, which is what a neighbour ping's pong is. It
+                // needs no ticket, so a relay dropping what it should forward still answers, and its 1/1 would
+                // keep that relay's edge alive. A direct session reports the same two edges and is dropped
+                // with it: the telemetry cannot tell them apart.
+                if edges.len() == 2 {
+                    tracing::trace!("two-edge (one-hop) surb round-trip says nothing about relaying, dropping it");
+                    return;
+                }
 
                 // Every edge on the loop, unlike the loopback handler above which attributes to a
                 // single edge. That one is doing incremental latency tomography: it knows the rest
@@ -342,6 +350,27 @@ impl hopr_api::graph::NetworkGraphUpdate for ChannelGraph {
                     }
                 }
 
+                // The loop returned over every edge on it, which is the evidence against a timeout on
+                // each. Only the target's latency is isolated above, so the others get a success with no
+                // latency: writing back the value an edge already carries would pin it. The edge back
+                // into `me` is credited too, though it is not a hop anyone chooses on the way out: it is
+                // the last edge of a return path, and a returned loop is the only unambiguous evidence it
+                // delivers. (A failed loop does not blame it, see below.) The target edge is skipped
+                // because it is recorded below; on a 2-hop loop it is also the first hop, and crediting
+                // it here would count the loop twice.
+                edges
+                    .iter()
+                    .enumerate()
+                    .filter(|&(i, _)| i != target_idx)
+                    .for_each(|(_, &edge)| {
+                        let Some(weight) = inner.graph.edge_weight_mut(edge) else {
+                            tracing::warn!(?edge, "loopback edge vanished between resolution and crediting");
+                            return;
+                        };
+                        // A success must be recorded or the failures alone would make the edge look dead.
+                        weight.credit_loopback();
+                    });
+
                 // A saturating subtraction would turn "the known latencies already account for the
                 // whole round trip" into a measured zero — and a zero latency scores in the *fastest*
                 // band, so a clamp would be read as the best possible link. The residual is only a
@@ -433,6 +462,23 @@ impl hopr_api::graph::NetworkGraphUpdate for ChannelGraph {
                 if let Some(weight) = inner.graph.edge_weight_mut(edges[target_idx]) {
                     weight.record(EdgeWeightType::Intermediate(Err(())));
                 }
+
+                // Which relay on the loop dropped it is unknowable, so every edge on it takes the
+                // failure. A relay that sits on loops that never return loses ground on all of them,
+                // while a good relay also sits on loops that do return and credit it back, see the
+                // success branch. A relay that is not my neighbour can never be the last relay of a
+                // loop, so this is the only way an outcome reaches the edge into it. The edge back
+                // into `me` is left out, and so is the target edge, which recorded its failure above
+                // and would otherwise count this loop twice (on a 2-hop loop it is the first hop).
+                edges[..edges.len() - 1]
+                    .iter()
+                    .enumerate()
+                    .filter(|&(i, _)| i != target_idx)
+                    .for_each(|(_, &edge)| {
+                        if let Some(weight) = inner.graph.edge_weight_mut(edge) {
+                            weight.record(EdgeWeightType::Intermediate(Err(())));
+                        }
+                    });
             }
             MeasurableEdge::Balance(update) => {
                 self.upsert_edge(&update.src, &update.dest, |obs: &mut Observations| {
@@ -610,6 +656,82 @@ mod tests {
             // balancer over-mints -- so only movement away from the peak is meaningful.
             assert_in_delta!(rate, 1.0, 1e-9);
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_two_edge_round_trip_should_credit_nothing() -> anyhow::Result<()> {
+        let me = pubkey_from(&SECRET_0);
+        let neighbour = pubkey_from(&SECRET_1);
+        let graph = ChannelGraph::new(me);
+        graph.add_node(neighbour);
+        graph.add_edge(&me, &neighbour)?;
+        graph.add_edge(&neighbour, &me)?;
+        let (me_i, neighbour_i) = (slot_of(&graph, &me), slot_of(&graph, &neighbour));
+
+        let paths = hopr_api::graph::ForwardAndReturnPath {
+            forward: [me_i, neighbour_i, 0, 0, 0],
+            reply: [neighbour_i, me_i, 0, 0, 0],
+        };
+        graph.record_edge::<TestNeighbor, TestPath>(hopr_api::graph::MeasurableEdge::Surb(surb(paths, 1, 1)));
+
+        for (src, dst) in [(me, neighbour), (neighbour, me)] {
+            let traffic = graph
+                .edge(&src, &dst)
+                .context("edge should exist")?
+                .intermediate_qos()
+                .and_then(|q| q.traffic_rate());
+            assert_eq!(traffic, None, "a pong must not read as relayed traffic");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_graph_should_reject_starvation_params_that_would_starve_every_relay_or_none() {
+        let me = pubkey_from(&SECRET_0);
+        for min_return_rate in [f64::NAN, f64::INFINITY, 0.0, -0.1, 1.5] {
+            let params = crate::StarvationParams {
+                min_loopbacks_for_rate: 3,
+                min_return_rate,
+            };
+            assert!(
+                ChannelGraph::new(me).with_starvation(params).is_err(),
+                "a return rate of {min_return_rate} must be rejected"
+            );
+        }
+        let params = crate::StarvationParams {
+            min_loopbacks_for_rate: 0,
+            min_return_rate: 0.5,
+        };
+        assert!(ChannelGraph::new(me).with_starvation(params).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_graph_should_hand_its_starvation_params_to_the_edges_it_creates() -> anyhow::Result<()> {
+        use hopr_api::graph::traits::{EdgeObservableWrite, EdgeWeightType};
+
+        let me = pubkey_from(&SECRET_0);
+        let other = pubkey_from(&SECRET_1);
+        // One loop in four returned: a quarter, under the half this graph asks of a relay.
+        let graph = ChannelGraph::new(me).with_starvation(crate::StarvationParams {
+            min_loopbacks_for_rate: 3,
+            min_return_rate: 0.5,
+        });
+        let graph = graph.map_err(|e| anyhow::anyhow!(e))?;
+        graph.add_node(other);
+        graph.add_edge(&me, &other)?;
+        graph.upsert_edge(&me, &other, |obs| {
+            obs.record(EdgeWeightType::Intermediate(Ok(std::time::Duration::from_millis(40))));
+            for _ in 0..3 {
+                obs.record(EdgeWeightType::Intermediate(Err(())));
+            }
+        });
+
+        let edge = graph.edge(&me, &other).context("edge should exist")?;
+        assert!(
+            edge.is_starved(),
+            "the graph's own params must reach the edges it creates"
+        );
         Ok(())
     }
 
@@ -1109,9 +1231,9 @@ mod tests {
             25
         );
 
-        // me→a should NOT have intermediate QoS from this probe
+        // me→a is credited too: the loop returned over it
         let obs_me_a = graph.edge(&me, &a).context("edge me→a should exist")?;
-        assert!(obs_me_a.intermediate_qos().is_none());
+        assert!(obs_me_a.intermediate_qos().is_some());
 
         Ok(())
     }
@@ -1149,11 +1271,11 @@ mod tests {
             25
         ); // no preceding intermediate latencies, so full RTT is attributed
 
-        // Earlier edges should NOT have intermediate QoS from this probe
+        // Earlier edges are credited too: the loop returned over them
         let obs_me_a = graph.edge(&me, &a).context("edge me→a should exist")?;
-        assert!(obs_me_a.intermediate_qos().is_none());
+        assert!(obs_me_a.intermediate_qos().is_some());
         let obs_a_b = graph.edge(&a, &b).context("edge a→b should exist")?;
-        assert!(obs_a_b.intermediate_qos().is_none());
+        assert!(obs_a_b.intermediate_qos().is_some());
 
         Ok(())
     }
@@ -1752,6 +1874,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn loopback_timeout_should_also_mark_the_first_hop_edge_as_failing() -> anyhow::Result<()> {
+        // A loop that never returns is evidence against the relay we chose as first hop, which the
+        // `edges[len - 2]` attribution never reaches: the first-hop decision reads me→a.
+        let me = pubkey_from(&SECRET_0);
+        let a = pubkey_from(&SECRET_1);
+        let b = pubkey_from(&SECRET_2);
+
+        let graph = ChannelGraph::new(me);
+        graph.add_node(a);
+        graph.add_node(b);
+        graph.add_edge(&me, &a)?;
+        graph.add_edge(&a, &b)?;
+        graph.add_edge(&b, &me)?;
+
+        for _ in 0..3 {
+            send_loopback_timeout(&graph, &[me, a, b, me]);
+        }
+
+        let obs = graph.edge(&me, &a).context("edge me→a should exist")?;
+        let qos = obs
+            .intermediate_qos()
+            .context("a loop through a that never returned must reach me→a")?;
+        assert_eq!(
+            qos.average_probe_rate(),
+            Some(0.0),
+            "every loop through a failed, so me→a is measured dead"
+        );
+        assert_eq!(qos.score(), Some(0.0), "a measured-dead edge scores zero, not absent");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn loopback_success_should_credit_the_first_hop_edge_without_moving_its_latency() -> anyhow::Result<()> {
+        // Failures alone would make a relay on lossy loops look dead. A returning loop is the
+        // counter-evidence, and it carries no latency for the first hop, so the edge's own
+        // latency (here its neighbor-probe RTT) is credited rather than the loop's total.
+        let me = pubkey_from(&SECRET_0);
+        let a = pubkey_from(&SECRET_1);
+        let b = pubkey_from(&SECRET_2);
+
+        let graph = ChannelGraph::new(me);
+        graph.add_node(a);
+        graph.add_node(b);
+        graph.add_edge(&me, &a)?;
+        graph.add_edge(&a, &b)?;
+        graph.add_edge(&b, &me)?;
+
+        graph.upsert_edge(&me, &a, |obs| {
+            use hopr_api::graph::traits::EdgeObservableWrite;
+            obs.record(hopr_api::graph::traits::EdgeWeightType::Immediate(Ok(
+                std::time::Duration::from_millis(60),
+            )));
+        });
+
+        send_loopback(&graph, &[me, a, b, me], 200);
+
+        let obs = graph.edge(&me, &a).context("edge me→a should exist")?;
+        let qos = obs.intermediate_qos().context("a returning loop must reach me→a")?;
+        assert_eq!(qos.average_probe_rate(), Some(1.0), "the loop through a returned");
+        assert_eq!(
+            qos.average_latency(),
+            None,
+            "a credit carries no timing: the ping's value must not be copied into the loop stream"
+        );
+        assert_eq!(
+            obs.immediate_qos()
+                .and_then(|q| q.average_latency())
+                .map(|l| l.as_millis()),
+            Some(60),
+            "and the ping keeps what it measured"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn loopback_timeout_should_record_failed_intermediate_on_target_edge() -> anyhow::Result<()> {
         // Loopback: me(0) → a(1) → b(2) → me(0)
         // PathId nodes: [me=0, a=1, b=2, me=0, 0]
@@ -1779,9 +1978,12 @@ mod tests {
             "failed probe should lower success rate"
         );
 
-        // me→a should NOT have intermediate QoS
+        // me→a, the first hop, is marked failing too
         let obs_me_a = graph.edge(&me, &a).context("edge me→a should exist")?;
-        assert!(obs_me_a.intermediate_qos().is_none());
+        let qos_me_a = obs_me_a
+            .intermediate_qos()
+            .context("first hop should record the failed loop")?;
+        assert!(qos_me_a.average_probe_rate().expect("probed") < 1.0);
 
         Ok(())
     }
@@ -1814,11 +2016,16 @@ mod tests {
         assert!(qos.average_latency().is_none());
         assert!(qos.average_probe_rate().expect("probed") < 1.0);
 
-        // Earlier edges should NOT have intermediate QoS
+        // Every edge on the loop takes the failure, except the one back into me
         let obs_me_a = graph.edge(&me, &a).context("edge me→a should exist")?;
-        assert!(obs_me_a.intermediate_qos().is_none());
+        assert!(obs_me_a.intermediate_qos().is_some());
         let obs_a_b = graph.edge(&a, &b).context("edge a→b should exist")?;
-        assert!(obs_a_b.intermediate_qos().is_none());
+        assert!(obs_a_b.intermediate_qos().is_some());
+        let obs_c_me = graph.edge(&c, &me).context("edge c→me should exist")?;
+        assert!(
+            obs_c_me.intermediate_qos().is_none(),
+            "the edge back into me is not a hop anyone chooses"
+        );
 
         Ok(())
     }
