@@ -308,6 +308,13 @@ const LOOPBACK_BUCKETS: usize = 12;
 pub const LOOPBACK_WINDOW: std::time::Duration =
     std::time::Duration::from_secs(LOOPBACK_BUCKET_WIDTH.as_secs() * LOOPBACK_BUCKETS as u64);
 
+/// Loops in the window from which the return rate, not a single returned loop, judges the relay.
+const MIN_LOOPBACKS_FOR_RATE: u32 = 10;
+
+/// Return rate below which a relay is starved; piz-palu-prod droppers peaked at 0.09, working first hops stayed above
+/// 0.25.
+const STARVED_LOOPBACK_RATE: f64 = 0.1;
+
 /// One bucket of loopback outcomes over an edge, tagged with which bucket of time it is.
 #[derive(Debug, Copy, Clone, Default, PartialEq)]
 struct LoopbackBucket {
@@ -356,11 +363,10 @@ impl LoopbackWindow {
         }
     }
 
-    /// `None` when no loopback crossed the edge in the window.
-    fn rate_at(&self, now: std::time::Instant) -> Option<f64> {
+    /// Loops that crossed the edge in the window, and how many of them returned.
+    fn counts_at(&self, now: std::time::Instant) -> (u32, u32) {
         let current = self.slot_of(now);
-        let (sent, returned) = self
-            .buckets
+        self.buckets
             .iter()
             .filter(|bucket| {
                 bucket.sent > 0 && bucket.slot <= current && bucket.slot + LOOPBACK_BUCKETS as u64 > current
@@ -370,9 +376,27 @@ impl LoopbackWindow {
                     sent.saturating_add(bucket.sent),
                     returned.saturating_add(bucket.returned),
                 )
-            });
+            })
+    }
 
+    /// `None` when no loopback crossed the edge in the window.
+    fn rate_at(&self, now: std::time::Instant) -> Option<f64> {
+        let (sent, returned) = self.counts_at(now);
         (sent > 0).then(|| f64::from(returned) / f64::from(sent))
+    }
+
+    /// Whether the loops over the edge say its relay delivers, or `None` without any.
+    fn delivers_at(&self, now: std::time::Instant) -> Option<bool> {
+        let (sent, returned) = self.counts_at(now);
+        if sent == 0 {
+            return None;
+        }
+        // A dropping relay still returns the odd loop; below the minimum one returned loop is all we can ask.
+        let has_rate = sent >= MIN_LOOPBACKS_FOR_RATE;
+        if has_rate {
+            return Some(f64::from(returned) / f64::from(sent) >= STARVED_LOOPBACK_RATE);
+        }
+        Some(returned > 0)
     }
 }
 
@@ -397,13 +421,15 @@ impl TransportIntermediates {
     /// is not: a SURB round trip or a loop that did not come back blames every edge on it, the
     /// healthy ones included (a dead forward relay fails every round trip whichever relay the reply
     /// takes home). So any positive witness keeps the edge, and only evidence that reads exactly
-    /// zero everywhere starves it.
+    /// zero everywhere starves it. Over a full loop window, the odd returned loop is not positive.
     pub(crate) fn delivers_at(&self, now: std::time::Instant) -> Option<bool> {
-        [self.traffic_rate_at(now), self.loopback_rate_at(now)]
-            .into_iter()
-            .flatten()
-            .map(|rate| rate > 0.0)
-            .reduce(|any, positive| any || positive)
+        [
+            self.traffic_rate_at(now).map(|rate| rate > 0.0),
+            self.loopback.delivers_at(now),
+        ]
+        .into_iter()
+        .flatten()
+        .reduce(|any, positive| any || positive)
     }
 
     /// Whether the evidence says that the relay at the end of this edge delivers nothing.
@@ -1690,6 +1716,35 @@ mod loopback_window_tests {
             at((ROUND * 2).as_secs() + TIMEOUT.as_secs()),
             Some(0.0),
             "a relay that stopped returning must read zero within two rounds"
+        );
+    }
+
+    #[test]
+    fn a_relay_returning_the_odd_loop_of_many_should_be_starved() {
+        let mut observations = Observations::default();
+        observations.record(EdgeWeightType::Intermediate(Ok(Duration::from_millis(40))));
+        for _ in 0..50 {
+            observations.record(EdgeWeightType::Intermediate(Err(())));
+        }
+
+        assert!(observations.is_starved(), "one loop in 51 returned");
+        assert_eq!(observations.score(), Some(0.0));
+    }
+
+    #[test]
+    fn a_relay_returning_a_fair_share_of_many_loops_should_be_kept() {
+        let mut observations = Observations::default();
+        for i in 0..20 {
+            observations.record(EdgeWeightType::Intermediate(if i % 4 == 0 {
+                Ok(Duration::from_millis(40))
+            } else {
+                Err(())
+            }));
+        }
+
+        assert!(
+            !observations.is_starved(),
+            "one loop in four returned, as a working first hop does"
         );
     }
 
