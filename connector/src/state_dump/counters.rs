@@ -418,6 +418,32 @@ fn record_surb(
     }
 }
 
+/// Use a separate handle/reporter for each producer module. Reading drains only this handle's window.
+impl hopr_state_dump::StateDump for IntervalCounters {
+    type State = IntervalSnapshot;
+    async fn state_dump(&self) -> Result<hopr_state_dump::Dump<Self::State>, String> {
+        let state = self.take_snapshot();
+        let problematic = state.totals.problematic()
+            || state
+                .probes
+                .as_ref()
+                .is_some_and(|p| p.neighbor.timed_out > 0 || p.loopback.timed_out > 0);
+        Ok(hopr_state_dump::Dump {
+            state,
+            signal: if problematic {
+                hopr_state_dump::Signal::NeedsAnalysis
+            } else {
+                hopr_state_dump::Signal::Healthy
+            },
+            reason: if problematic {
+                "routing_or_probe_failures"
+            } else {
+                "producer_window_ok"
+            },
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use hopr_api::types::{

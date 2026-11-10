@@ -292,17 +292,11 @@ mod tests {
         );
         assert_eq!(backend.reads.load(Ordering::Relaxed), 5);
         *backend.async_thread.lock() = Some(std::thread::current().id());
-        let collector = crate::state_dump::Collector::new(
-            connector,
-            hopr_network_graph::ChannelGraph::new(*OffchainKeypair::from_secret(&[11; 32])?.public()),
-            crate::state_dump::tests::Network::default(),
-            Address::from([99; 20]),
-            Default::default(),
-        );
-        let snapshot = collector.collect(None).await;
+        let collector = crate::state_dump::ChainDump::new(connector, Address::from([99; 20]), Default::default());
+        let snapshot = collector.collect().await;
         assert!(
-            backend.identity_reads.load(Ordering::Relaxed) >= 2,
-            "local enumeration and peer identity lookup both reach the backend"
+            backend.identity_reads.load(Ordering::Relaxed) >= 1,
+            "local channel enumeration reaches the backend"
         );
         let crate::state_dump::Section::Partial { value } = snapshot.channels else {
             panic!("failed reads must mark the channel inventory partial")

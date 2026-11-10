@@ -1,7 +1,5 @@
 //! Stable serializable snapshot schema. Monetary values use decimal base units.
-use std::collections::BTreeMap;
-
-use hopr_api::{OffchainPublicKey, types::primitive::prelude::Address};
+use hopr_api::types::primitive::prelude::Address;
 use serde::{Serialize, Serializer};
 
 /// An exact amount in token base units, serialized as a decimal string.
@@ -21,30 +19,6 @@ impl From<hopr_api::graph::traits::Balance> for Amount {
 impl Serialize for Amount {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.collect_str(&self.0)
-    }
-}
-/// A source read succeeds, fails, times out, or was not supplied by the embedding node.
-#[derive(Debug, Serialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum Section<T> {
-    /// Source value, including a genuine zero if observed.
-    Ok { value: T },
-    /// Usable observations with incomplete coverage; inspect read statistics.
-    Partial { value: T },
-    /// Source failure; the collector caps the message at 120 characters.
-    Error { message: String },
-    /// Collection exceeded its deadline.
-    Timeout,
-    /// A producer or prerequisite is unavailable; this is not a zero observation.
-    Unavailable,
-}
-impl<T> Section<T> {
-    /// The observed value, if available.
-    pub fn value(&self) -> Option<&T> {
-        match self {
-            Self::Ok { value } | Self::Partial { value } => Some(value),
-            _ => None,
-        }
     }
 }
 /// Channel direction relative to the reporting node.
@@ -70,20 +44,12 @@ pub struct FundingCounts {
     pub above: u64,
     pub unknown: u64,
 }
-/// Distinct peers with local open channels. Probe/connection unknowns are explicit.
+/// Distinct peers with local open channels; connectivity belongs to the network/graph dumps.
 #[derive(Debug, Default, Serialize)]
 pub struct ChannelPeers {
     pub total: u64,
-    pub graph_connected: u64,
-    pub graph_disconnected: u64,
-    pub graph_unknown: u64,
-    pub transport_connected: u64,
-    pub transport_disconnected: u64,
-    pub transport_unknown: u64,
-    pub poor_probe: u64,
-    pub probe_unknown: u64,
 }
-/// One retained problematic local channel. Reachability is local-to-peer for either direction.
+/// One retained underfunded, pending-close or funding-unknown local channel.
 #[derive(Debug, Serialize)]
 pub struct ChannelSample {
     pub counterparty: Address,
@@ -93,11 +59,6 @@ pub struct ChannelSample {
     /// Whether an outgoing channel holds less than one winning ticket. Always `None` for incoming
     /// channels, which this node does not fund.
     pub below_funding_value: Option<bool>,
-    /// Last graph connectivity observation, as present in edge-observation logs.
-    pub is_connected: Option<bool>,
-    /// Current transport connection; this does not establish probe success.
-    pub transport_connected: Option<bool>,
-    pub probe_success_rate: Option<f64>,
 }
 /// Diagnostic read progress. Counts describe observed failures, not unseen records after timeout.
 #[derive(Debug, Default, Serialize)]
@@ -128,7 +89,6 @@ pub struct Channels {
     pub funding: FundingCounts,
     pub funding_value: Option<Amount>,
     pub peers: ChannelPeers,
-    pub low_probe_threshold: f64,
     pub problematic: u64,
     pub omitted: u64,
     pub(crate) sample: Vec<ChannelSample>,
@@ -148,26 +108,14 @@ impl Channels {
         &self.underfunded
     }
 }
-/// One compact node snapshot. Source reads are not an atomic chain snapshot.
+/// The chain component's schema; graph, transport and routing state are reported independently.
 #[derive(Debug, Serialize)]
-pub struct Snapshot {
-    pub schema_version: u8,
-    pub node: OffchainPublicKey,
+pub struct ChainState {
     pub node_address: Address,
     pub safe_address: Address,
-    pub sequence: u64,
-    pub collected_at_ms: u64,
-    pub collection_ms: u64,
     pub chain_freshness: &'static str,
-    pub safe_balance: Section<Amount>,
-    pub safe_allowance: Section<Amount>,
-    pub channels: Section<Channels>,
-    pub graph: Section<hopr_network_graph::diagnostics::GraphState>,
-    pub connected_peers: u64,
-    pub announced_peers: Section<u64>,
-    pub routing: Section<super::IntervalSnapshot>,
-    /// Extra named sections supplied by the embedding node, such as strategy states. Each one is
-    /// capped at [`MAX_SECTION_BYTES`](super::MAX_SECTION_BYTES); a larger one is replaced by a marker.
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub sections: BTreeMap<&'static str, serde_json::Value>,
+    pub safe_balance: super::Section<Amount>,
+    pub safe_allowance: super::Section<Amount>,
+    pub channels: super::Section<Channels>,
+    pub announced_peers: super::Section<u64>,
 }

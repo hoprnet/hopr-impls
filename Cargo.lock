@@ -3934,7 +3934,7 @@ dependencies = [
  "futures-time",
  "hex-literal",
  "hopr-api",
- "hopr-network-graph",
+ "hopr-state-dump",
  "hopr-utilities",
  "insta",
  "lazy_static",
