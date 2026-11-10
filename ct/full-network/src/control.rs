@@ -15,6 +15,8 @@ pub enum ProbingLevel {
     /// The configured pace.
     #[default]
     High,
+    /// Twice the configured pace. Overcharge for a short burst, such as a new session that needs path evidence fast.
+    Ultra,
 }
 
 impl ProbingLevel {
@@ -24,6 +26,7 @@ impl ProbingLevel {
             Self::Low => 0.1,
             Self::Medium => 0.5,
             Self::High => 1.0,
+            Self::Ultra => 2.0,
         }
     }
 
@@ -143,6 +146,7 @@ mod handle {
             (ProbingLevel::Low, Duration::from_secs(300)),
             (ProbingLevel::Medium, Duration::from_secs(60)),
             (ProbingLevel::High, interval),
+            (ProbingLevel::Ultra, Duration::from_secs(15)),
         ] {
             assert_eq!(level.period(interval), expected, "{level:?}");
         }
