@@ -88,9 +88,26 @@ pub struct Observations {
     intermediate_probe: Option<TransportIntermediates>,
     /// Health of the edge's destination as a relayer; `None` is not judged.
     health: Option<f64>,
+    /// How the loops over this edge judge its relay, handed to its intermediate stream.
+    starvation: StarvationParams,
 }
 
 impl Observations {
+    /// An edge whose loops are judged by `starvation` instead of the defaults.
+    pub(crate) fn with_starvation(starvation: StarvationParams) -> Self {
+        Self {
+            starvation,
+            ..Self::default()
+        }
+    }
+
+    /// The intermediate stream, created on first use with this edge's starvation parameters.
+    fn intermediate_mut(&mut self) -> &mut TransportIntermediates {
+        let starvation = self.starvation;
+        self.intermediate_probe
+            .get_or_insert_with(|| TransportIntermediates::with_starvation(starvation))
+    }
+
     pub(crate) fn set_health(&mut self, health: Option<f64>) {
         self.health = health;
     }
@@ -100,7 +117,7 @@ impl Observations {
         self.last_update = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();
-        self.intermediate_probe.get_or_insert_default().credit_loopback();
+        self.intermediate_mut().credit_loopback();
         self.restamp_starved();
     }
 
@@ -133,15 +150,13 @@ impl EdgeObservableWrite for Observations {
 
         match measurement {
             EdgeWeightType::Immediate(result) => self.immediate_probe.get_or_insert_default().record(result),
-            EdgeWeightType::Intermediate(result) => self.intermediate_probe.get_or_insert_default().record(result),
-            EdgeWeightType::Balance(balance) => self.intermediate_probe.get_or_insert_default().balance = balance,
+            EdgeWeightType::Intermediate(result) => self.intermediate_mut().record(result),
+            EdgeWeightType::Balance(balance) => self.intermediate_mut().balance = balance,
             EdgeWeightType::Connected(is_connected) => {
                 self.immediate_probe.get_or_insert_default().is_connected = Some(is_connected)
             }
             EdgeWeightType::SurbRoundTrips { expected, observed } => {
-                self.intermediate_probe
-                    .get_or_insert_default()
-                    .record_surb_round_trips(expected, observed);
+                self.intermediate_mut().record_surb_round_trips(expected, observed);
             }
             EdgeWeightType::ImmediateProtocolConformance { num_packets, num_acks } => {
                 let imm = self.immediate_probe.get_or_insert_default();
@@ -280,6 +295,8 @@ pub struct TransportIntermediates {
     surb_peak: Option<SurbPeak>,
     /// Loopbacks over this edge that returned, against all of them, over the last 60 s.
     loopback: LoopbackWindow,
+    /// How the loops over this edge judge its relay.
+    starvation: StarvationParams,
 }
 
 /// A delivery-ratio peak and the instant it was set, which the decay is measured from.
@@ -308,12 +325,50 @@ const LOOPBACK_BUCKETS: usize = 12;
 pub const LOOPBACK_WINDOW: std::time::Duration =
     std::time::Duration::from_secs(LOOPBACK_BUCKET_WIDTH.as_secs() * LOOPBACK_BUCKETS as u64);
 
-/// Loops in the window from which the return rate, not a single returned loop, judges the relay.
-const MIN_LOOPBACKS_FOR_RATE: u32 = 10;
+/// Loops over an edge from which the return rate, not a single returned loop, judges its relay. Three, not
+/// more: a sparse network sees few loops per edge, and a dropping relay should not stay usable for want of
+/// a sample.
+pub const DEFAULT_MIN_LOOPBACKS_FOR_RATE: u32 = 3;
 
-/// Return rate below which a relay is starved; piz-palu-prod droppers peaked at 0.09, working first hops stayed above
-/// 0.25.
-const STARVED_LOOPBACK_RATE: f64 = 0.1;
+/// Return rate below which a relay with enough loops is starved. Never zero: a dropping relay still returns
+/// the odd loop (on piz-palu-prod they peaked at 0.09, working first hops stayed above 0.25).
+pub const DEFAULT_MIN_LOOPBACK_RETURN_RATE: f64 = 0.1;
+
+/// How the loops over an edge judge its relay. Built from the path planner's configuration by whoever
+/// constructs the graph, see [`ChannelGraph::with_starvation`](crate::ChannelGraph::with_starvation).
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub struct StarvationParams {
+    /// Loops in the window from which the return rate judges the relay. Below it, a single returned loop
+    /// keeps the relay and none starves it.
+    pub min_loopbacks_for_rate: u32,
+    /// Return rate below which a relay with at least `min_loopbacks_for_rate` loops is starved. In `(0, 1]`.
+    pub min_return_rate: f64,
+}
+
+impl Default for StarvationParams {
+    fn default() -> Self {
+        Self {
+            min_loopbacks_for_rate: DEFAULT_MIN_LOOPBACKS_FOR_RATE,
+            min_return_rate: DEFAULT_MIN_LOOPBACK_RETURN_RATE,
+        }
+    }
+}
+
+impl StarvationParams {
+    /// Rejects values that would silently disable or invert the verdict.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.min_loopbacks_for_rate == 0 {
+            return Err("min_loopbacks_for_rate must be at least 1".into());
+        }
+        if !(self.min_return_rate > 0.0 && self.min_return_rate <= 1.0) {
+            return Err(format!(
+                "min_return_rate must be in (0, 1], got {}: zero never starves a relay that returns the odd loop",
+                self.min_return_rate
+            ));
+        }
+        Ok(())
+    }
+}
 
 /// One bucket of loopback outcomes over an edge, tagged with which bucket of time it is.
 #[derive(Debug, Copy, Clone, Default, PartialEq)]
@@ -325,10 +380,11 @@ struct LoopbackBucket {
 
 /// Loopbacks over an edge that returned, against all of them, over the last 60 s.
 ///
-/// Every loop that crosses the edge counts once, as returned or as failed, so the ratio is
-/// returned over returned plus failed. A window rather than a moving average: a relay none of whose
-/// loops returned reads as exactly zero, and anything above zero is a relay that carries traffic.
-/// A single loop is evidence, since an edge may see only one per probing round.
+/// Every loop that crosses the edge counts once, returned or failed, so the rate is returned over returned
+/// plus failed. A window rather than a moving average: a relay none of whose loops returned reads exactly
+/// zero. Below [`StarvationParams::min_loopbacks_for_rate`] loops one returned loop is evidence enough, since
+/// an edge may see only one per probing round; from there on the rate has to reach
+/// [`StarvationParams::min_return_rate`], because a dropping relay still returns the odd loop.
 #[derive(Debug, Copy, Clone, PartialEq)]
 struct LoopbackWindow {
     epoch: std::time::Instant,
@@ -386,15 +442,15 @@ impl LoopbackWindow {
     }
 
     /// Whether the loops over the edge say its relay delivers, or `None` without any.
-    fn delivers_at(&self, now: std::time::Instant) -> Option<bool> {
+    fn delivers_at(&self, now: std::time::Instant, params: StarvationParams) -> Option<bool> {
         let (sent, returned) = self.counts_at(now);
         if sent == 0 {
             return None;
         }
-        // A dropping relay still returns the odd loop; below the minimum one returned loop is all we can ask.
-        let has_rate = sent >= MIN_LOOPBACKS_FOR_RATE;
-        if has_rate {
-            return Some(f64::from(returned) / f64::from(sent) >= STARVED_LOOPBACK_RATE);
+        // A dropping relay still returns the odd loop. Once the window holds enough loops the return rate
+        // judges the relay; below that, one returned loop is all that can be asked.
+        if sent >= params.min_loopbacks_for_rate {
+            return Some(f64::from(returned) / f64::from(sent) >= params.min_return_rate);
         }
         Some(returned > 0)
     }
@@ -410,22 +466,33 @@ impl Default for TransportIntermediates {
             surb: WindowedRatio::new(SURB_BUCKET_WIDTH, now),
             surb_peak: None,
             loopback: LoopbackWindow::new(now),
+            starvation: StarvationParams::default(),
         }
     }
 }
 
 impl TransportIntermediates {
+    /// An edge stream that judges its relay by `starvation`.
+    pub(crate) fn with_starvation(starvation: StarvationParams) -> Self {
+        Self {
+            starvation,
+            ..Self::default()
+        }
+    }
+
     /// Whether the relay at the end of this edge delivers, or `None` without evidence.
     ///
     /// A returned packet or loop is unambiguous: it crossed every edge it is credited to. A failure
     /// is not: a SURB round trip or a loop that did not come back blames every edge on it, the
     /// healthy ones included (a dead forward relay fails every round trip whichever relay the reply
     /// takes home). So any positive witness keeps the edge, and only evidence that reads exactly
-    /// zero everywhere starves it. Over a full loop window, the odd returned loop is not positive.
+    /// zero everywhere starves it. Once the window holds [`StarvationParams::min_loopbacks_for_rate`] loops, the odd
+    /// returned loop no longer counts as a positive witness: the return rate has to reach
+    /// [`StarvationParams::min_return_rate`].
     pub(crate) fn delivers_at(&self, now: std::time::Instant) -> Option<bool> {
         [
             self.traffic_rate_at(now).map(|rate| rate > 0.0),
-            self.loopback.delivers_at(now),
+            self.loopback.delivers_at(now, self.starvation),
         ]
         .into_iter()
         .flatten()
@@ -1042,6 +1109,7 @@ mod tests {
             surb: WindowedRatio::new(TEST_SLICE, epoch),
             surb_peak: None,
             loopback: LoopbackWindow::new(epoch),
+            starvation: StarvationParams::default(),
         }
     }
 
@@ -1903,5 +1971,90 @@ mod loopback_window_tests {
             Some(0.0),
             "the probes that returned do not dilute traffic that stopped"
         );
+    }
+}
+
+#[cfg(test)]
+mod starvation_params_tests {
+    use hopr_api::graph::traits::{EdgeObservableWrite, EdgeWeightType};
+
+    use super::*;
+
+    /// An edge that saw `returned` loops come back and `lost` time out.
+    fn edge_with(params: StarvationParams, returned: u32, lost: u32) -> Observations {
+        let mut observations = Observations::with_starvation(params);
+        for _ in 0..returned {
+            observations.record(EdgeWeightType::Intermediate(Ok(std::time::Duration::from_millis(40))));
+        }
+        for _ in 0..lost {
+            observations.record(EdgeWeightType::Intermediate(Err(())));
+        }
+        observations
+    }
+
+    fn params(min_loopbacks_for_rate: u32, min_return_rate: f64) -> StarvationParams {
+        StarvationParams {
+            min_loopbacks_for_rate,
+            min_return_rate,
+        }
+    }
+
+    #[test]
+    fn the_defaults_should_be_three_loops_and_a_tenth() {
+        let defaults = StarvationParams::default();
+        assert_eq!(defaults.min_loopbacks_for_rate, 3);
+        assert_eq!(defaults.min_return_rate, 0.1);
+        assert!(defaults.validate().is_ok());
+    }
+
+    #[test]
+    fn the_minimum_loop_count_should_come_from_the_params() {
+        // One loop in four returned: a quarter, under the half this relay has to return.
+        let judged_from_three = edge_with(params(3, 0.5), 1, 3);
+        let judged_from_ten = edge_with(params(10, 0.5), 1, 3);
+
+        assert!(
+            judged_from_three.is_starved(),
+            "four loops are enough to judge by the rate when the minimum is three"
+        );
+        assert!(
+            !judged_from_ten.is_starved(),
+            "below a minimum of ten, one returned loop is all that can be asked"
+        );
+    }
+
+    #[test]
+    fn the_return_rate_should_come_from_the_params() {
+        let loose = edge_with(params(3, 0.2), 1, 3);
+        let strict = edge_with(params(3, 0.3), 1, 3);
+
+        assert!(!loose.is_starved(), "a quarter of the loops returned clears a fifth");
+        assert!(
+            strict.is_starved(),
+            "a quarter of the loops returned misses three tenths"
+        );
+    }
+
+    #[test]
+    fn a_relay_that_returned_nothing_should_be_starved_whatever_the_params() {
+        for p in [params(1, 0.01), params(3, 0.1), params(50, 1.0)] {
+            assert!(edge_with(p, 0, 2).is_starved(), "{p:?}");
+        }
+    }
+
+    #[test]
+    fn invalid_params_should_be_rejected() {
+        assert!(
+            params(0, 0.1).validate().is_err(),
+            "no loops would judge by the rate on nothing"
+        );
+        assert!(
+            params(3, 0.0).validate().is_err(),
+            "a rate of zero never starves a relay returning the odd loop"
+        );
+        assert!(params(3, -0.1).validate().is_err());
+        assert!(params(3, 1.5).validate().is_err());
+        assert!(params(3, f64::NAN).validate().is_err());
+        assert!(params(3, 1.0).validate().is_ok());
     }
 }

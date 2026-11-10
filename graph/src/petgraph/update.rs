@@ -237,10 +237,12 @@ impl hopr_api::graph::NetworkGraphUpdate for ChannelGraph {
                 let Some(edges) = resolve_round_trip_edges(&inner, &self.me, &telemetry.paths) else {
                     return;
                 };
-                // A neighbour ping's pong: it needs no ticket, so a relay dropping what it should forward still
-                // answers.
+                // Two edges (me -> X -> me) is one hop each way, which is what a neighbour ping's pong is. It
+                // needs no ticket, so a relay dropping what it should forward still answers, and its 1/1 would
+                // keep that relay's edge alive. A direct session reports the same two edges and is dropped
+                // with it: the telemetry cannot tell them apart.
                 if edges.len() == 2 {
-                    tracing::trace!("zero-hop surb round-trip says nothing about relaying, dropping it");
+                    tracing::trace!("two-edge (one-hop) surb round-trip says nothing about relaying, dropping it");
                     return;
                 }
 
@@ -658,7 +660,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_zero_hop_round_trip_should_credit_nothing() -> anyhow::Result<()> {
+    async fn a_two_edge_round_trip_should_credit_nothing() -> anyhow::Result<()> {
         let me = pubkey_from(&SECRET_0);
         let neighbour = pubkey_from(&SECRET_1);
         let graph = ChannelGraph::new(me);
@@ -681,6 +683,55 @@ mod tests {
                 .and_then(|q| q.traffic_rate());
             assert_eq!(traffic, None, "a pong must not read as relayed traffic");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn a_graph_should_reject_starvation_params_that_would_starve_every_relay_or_none() {
+        let me = pubkey_from(&SECRET_0);
+        for min_return_rate in [f64::NAN, f64::INFINITY, 0.0, -0.1, 1.5] {
+            let params = crate::StarvationParams {
+                min_loopbacks_for_rate: 3,
+                min_return_rate,
+            };
+            assert!(
+                ChannelGraph::new(me).with_starvation(params).is_err(),
+                "a return rate of {min_return_rate} must be rejected"
+            );
+        }
+        let params = crate::StarvationParams {
+            min_loopbacks_for_rate: 0,
+            min_return_rate: 0.5,
+        };
+        assert!(ChannelGraph::new(me).with_starvation(params).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_graph_should_hand_its_starvation_params_to_the_edges_it_creates() -> anyhow::Result<()> {
+        use hopr_api::graph::traits::{EdgeObservableWrite, EdgeWeightType};
+
+        let me = pubkey_from(&SECRET_0);
+        let other = pubkey_from(&SECRET_1);
+        // One loop in four returned: a quarter, under the half this graph asks of a relay.
+        let graph = ChannelGraph::new(me).with_starvation(crate::StarvationParams {
+            min_loopbacks_for_rate: 3,
+            min_return_rate: 0.5,
+        });
+        let graph = graph.map_err(|e| anyhow::anyhow!(e))?;
+        graph.add_node(other);
+        graph.add_edge(&me, &other)?;
+        graph.upsert_edge(&me, &other, |obs| {
+            obs.record(EdgeWeightType::Intermediate(Ok(std::time::Duration::from_millis(40))));
+            for _ in 0..3 {
+                obs.record(EdgeWeightType::Intermediate(Err(())));
+            }
+        });
+
+        let edge = graph.edge(&me, &other).context("edge should exist")?;
+        assert!(
+            edge.is_starved(),
+            "the graph's own params must reach the edges it creates"
+        );
         Ok(())
     }
 
