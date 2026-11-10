@@ -276,12 +276,13 @@ fn unrelated_loops_should_not_crowd_the_focused_ones_out_of_a_bounded_search() -
 fn unrelated_loops_inside_the_neighborhood_should_not_crowd_the_focused_ones_out_of_a_bounded_search()
 -> anyhow::Result<()> {
     // `a→p{i}` puts every `p{i}` within the focus radius of the path relay `a`, so the loops `me→p{i}→q{i}→me`
-    // are in the searched subgraph. None of them leads to the exit or touches a return path.
+    // are in the searched subgraph. None of them leads to the exit or touches a return path. The search lists up to
+    // ten times the bound, so 40 loops fit under the 50 it enumerates.
     let mut edges: Vec<(String, String)> = [("me", "a"), ("a", "x"), ("x", "me"), ("a", "f")]
         .into_iter()
         .map(|(from, to)| (from.to_string(), to.to_string()))
         .collect();
-    for i in 0..200 {
+    for i in 0..40 {
         edges.push(("a".to_string(), format!("p{i}")));
         edges.push(("me".to_string(), format!("p{i}")));
         edges.push((format!("p{i}"), format!("q{i}")));

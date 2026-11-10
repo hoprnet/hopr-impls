@@ -319,9 +319,9 @@ const MAX_PATH_EDGES: usize = MAX_LOOPBACK_HOPS + 1;
 /// relay before a return component. Two steps cover every loop of up to three relays.
 const FOCUS_RADIUS: usize = 2;
 
-/// Most loops one focused search enumerates before ranking. It bounds the work only; the caller's `take_count`
-/// bounds the result.
-const FOCUS_SEARCH_CAP: usize = 2_000;
+/// Loops one focused search enumerates before ranking, per loop the caller asks for. It bounds the work only; the
+/// caller's `take_count` bounds the result.
+const FOCUS_SEARCH_FACTOR: usize = 10;
 
 /// How a loop relates to the exits it was focused on, ordered by how much it is worth probing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -491,7 +491,7 @@ impl FocusedLoopback for ChannelGraph {
             hops,
             // Unrelated loops inside the neighborhood come out in no useful order, so the bound applies after
             // ranking. The cap only limits the work of the search.
-            take_count.map(|_| FOCUS_SEARCH_CAP),
+            take_count.map(|take| take.saturating_mul(FOCUS_SEARCH_FACTOR)),
             (),
             None,
             unscored,
