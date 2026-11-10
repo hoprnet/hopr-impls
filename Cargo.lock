@@ -4003,6 +4003,7 @@ dependencies = [
  "futures",
  "hex-literal",
  "hopr-api",
+ "hopr-state-dump",
  "hopr-utilities",
  "indexmap 2.14.2",
  "insta",
@@ -4083,7 +4084,7 @@ dependencies = [
 
 [[package]]
 name = "hopr-transport-p2p"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "anyhow",
  "async-broadcast",
@@ -4095,6 +4096,7 @@ dependencies = [
  "futures",
  "futures-timer",
  "hopr-api",
+ "hopr-state-dump",
  "hopr-utilities",
  "lazy_static",
  "libp2p",
@@ -4102,6 +4104,7 @@ dependencies = [
  "more-asserts",
  "pin-project",
  "quinn-udp 0.6.3",
+ "serde",
  "thiserror 2.0.21",
  "tokio",
  "tracing",

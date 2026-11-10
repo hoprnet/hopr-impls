@@ -11,7 +11,7 @@ name                   = "hopr-transport-p2p"
 readme                 = "README.md"
 repository.workspace   = true
 rust-version.workspace = true
-version                = "0.14.0"
+version                = "0.14.1"
 
 [lib]
 crate-type = ["rlib"]
@@ -19,6 +19,7 @@ crate-type = ["rlib"]
 [features]
 default        = []
 runtime-tokio  = ["libp2p/tokio"]
+state-dump     = ["dep:hopr-state-dump", "dep:serde"]
 telemetry      = ["dep:lazy_static", "hopr-api/types-telemetry"]
 testing        = []
 transport-quic = ["dep:quinn-udp", "libp2p/quic"]
@@ -43,6 +44,8 @@ libp2p-stream = { workspace = true }
 quinn-udp = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+serde = { workspace = true, optional = true }
+hopr-state-dump = { workspace = true, optional = true }
 
 dashmap     = { workspace = true }
 pin-project = { workspace = true }

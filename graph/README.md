@@ -14,8 +14,23 @@ report it at TRACE. Enable TRACE in a build that retains it for individual repor
 ## Bounded graph state
 
 `diagnostics::GraphStateRead::graph_state` reads the current graph independently of any chain-channel inventory. `ChannelGraph` implements
-it; references and `Arc` handles delegate to the same reader. With the connector's `state-dump` feature enabled, its periodic `state_dump`
-collector includes the result as its `graph` section, even when chain reads fail.
+it; references and `Arc` handles delegate to the same reader. Enable this crate's opt-in `state-dump` feature to use
+`state_dump::GraphDump`, an independent adapter implementing `hopr_state_dump::StateDump` with `GraphState` as its own payload. It requires
+no chain or transport view. A replacement graph can implement `StateDump` with its own schema instead of implementing `GraphStateRead`.
+
+```rust,ignore
+use hopr_network_graph::state_dump::GraphDump;
+use hopr_state_dump::{Config, Reporter};
+let source = GraphDump::new(graph.clone());
+let reporter = Reporter::new("graph", node_id.to_string(), source, Config::from_env()?);
+// Spawn reporter.run() independently of chain and transport reporters.
+```
+
+The adapter runs reads in blocking tasks. Its signal requests analysis for a missing local node, new empty searches, missing sampled path
+components or degraded sampled edges (connectivity, funding, acknowledgement rate, probes, score or health). Unavailable samples or wholly
+unobserved quality signal `Unknown`, which also requests analysis. Otherwise the sampled scope signals `Healthy`; it does not establish
+network-wide health. New empty-search detection has its own baseline, so historical cumulative failures do not latch the signal forever.
+Keep one adapter per reporting stream. Decision evidence remains cumulative and is never drained by the reporter.
 
 The snapshot includes graph-wide node/edge counts, whether the local node exists, ticket face value, edge penalty and minimum ack rate. It
 counts both incoming and outgoing local edges and samples up to eight incident edges, including healthy and transport-only edges. Each named
@@ -26,7 +41,8 @@ balance or zero probe success rate remains distinct. Unknown streams are not tre
 When supplied with paths, the reader inspects at most 32 forward/reply slot arrays and samples up to four unique directed edges from them,
 including remote edges. `paths` is null when the path source is unavailable and reports zero counts for an available idle source. Missing
 edges, missing nodes, ambiguous slots and invalid padding are explicit. These observations cover the supplied path sample, not all routes.
-The connector supplies its retained SURB path pairs; their own overflow counters describe omitted producer observations.
+A host may supply paths using `GraphDump::with_paths(|| bounded_paths())`. Path sampling runs in the same blocking task; the provider must
+bound allocation and supply a non-draining view. This avoids coupling the graph to a particular routing/SURB counter implementation.
 
 Samples prioritize missing path components, underfunding, disconnection/low acknowledgement rates, and poor probes/health, with
 deterministic endpoint ordering for ties. Both samples share a 3 KiB JSON budget, so fewer rows may fit than the count caps.
@@ -35,8 +51,8 @@ Self-loops count once in the sample and once in each direction.
 
 The implementation reads local adjacency and indexed path slots under one graph read lock. It does not enumerate remote topology or compute
 routes, and temporary memory is bounded independently of network size. Serialization for the byte budget happens after releasing the lock.
-The collector runs the read in a blocking task with its own source deadline. The graph read is independent of chain and transport reads; the
-combined node record is not an atomic snapshot. This crate does not own the snapshot timer or producer wiring.
+The shared `Reporter` applies an independent deadline and emits a separate `event=component_state` record with `component=graph`, signal,
+reason and `analysis_required`. Graph observations are not an atomic snapshot with any other component. The host owns timers and wiring.
 
 ## License
 
@@ -44,7 +60,7 @@ GPL-3.0-only
 
 ## Path-selection explanations by log level
 
-- **INFO:** the periodic node record includes `graph.value.searches`: cumulative search/empty counts, bounded latest query examples, sample
+- **INFO:** the graph component record includes `state.value.searches`: cumulative search/empty counts, bounded latest query examples, sample
   omission/contention counts and suppressed DEBUG count. The graph does not start another timer or install a subscriber.
 - **DEBUG:** an unsuccessful traversal emits one bounded `graph_search_failure` explanation at most once per minute per shared graph,
   retaining the caller's context. Further failures remain counted in the INFO snapshot. Successful traversals emit no DEBUG event or span.

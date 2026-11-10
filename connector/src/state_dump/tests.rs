@@ -292,11 +292,8 @@ async fn chain_failures_keep_successful_reads_and_request_analysis() -> anyhow::
     let faults = chain.faults();
     faults.set(ChainOp::Balance, Fault::Hang);
     faults.set(ChainOp::StreamChannels, Fault::Fail);
-    let adapter = ChainDump::new(
-        chain,
-        safe,
-        Config::default().with_source_timeout(Duration::from_millis(10))?,
-    );
+    let config = Config::default().with_source_timeout(Duration::from_millis(40))?;
+    let adapter = ChainDump::new(chain, safe, config.clone());
     let report = adapter.state_dump().await.map_err(anyhow::Error::msg)?;
     assert_eq!(report.signal, Signal::Unknown);
     assert!(report.signal.analysis_required());
@@ -311,6 +308,18 @@ async fn chain_failures_keep_successful_reads_and_request_analysis() -> anyhow::
     let report = adapter.state_dump().await.map_err(anyhow::Error::msg)?;
     assert!(matches!(report.state.channels, Section::Partial { ref value } if value.reads.timed_out));
     assert_eq!(report.signal, Signal::Unknown);
+    let reporter = Reporter::new("chain", "node", adapter, config);
+    let record = reporter.collect().await;
+    assert!(
+        record.state.value().is_some(),
+        "the component must return partial observations before its overall deadline"
+    );
+    assert_eq!(
+        record.state.value().unwrap().safe_allowance.value().map(|a| a.value()),
+        Some(7u32.into())
+    );
+    assert!(record.analysis_required);
+
     Ok(())
 }
 

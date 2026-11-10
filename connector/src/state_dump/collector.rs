@@ -31,7 +31,8 @@ where
         Self {
             chain: Arc::new(chain),
             safe_address,
-            timeout: config.source_timeout(),
+            // Leave time to return partial observations before the reporter's overall deadline.
+            timeout: (config.source_timeout() / 2).max(Duration::from_nanos(1)),
             funding_value: None,
         }
     }

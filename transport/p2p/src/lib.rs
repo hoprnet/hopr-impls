@@ -33,6 +33,9 @@ pub(crate) mod liveness;
 /// In-memory peer store for network multiaddresses.
 pub mod peer_store;
 
+/// Optional transport-owned state and analysis signals.
+#[cfg(feature = "state-dump")]
+pub mod state_dump;
 /// Raw swarm definition for the HOPR network.
 pub mod swarm;
 

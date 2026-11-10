@@ -27,6 +27,7 @@ all-benchmarks = []
 default        = ["petgraph"]
 graph-api      = ["petgraph"]
 petgraph       = ["dep:indexmap", "dep:petgraph", "dep:rand"]
+state-dump     = ["dep:hopr-state-dump", "hopr-utils/runtime-tokio"]
 telemetry      = ["hopr-api/types-telemetry"]
 
 [dependencies]
@@ -45,6 +46,7 @@ thiserror   = { workspace = true }
 tracing     = { workspace = true }
 
 hopr-api = { workspace = true, features = ["ct", "graph", "network"] }
+hopr-state-dump = { workspace = true, optional = true }
 
 hopr-utils = { workspace = true, features = [
   "statistics-types",

@@ -26,8 +26,9 @@ Connectivity and probe quality belong to the graph and transport dumps, not the 
 
 `state_dump()` interprets the collected state: incomplete reads signal `Unknown`; underfunding or pending closures signal `NeedsAnalysis`;
 unknown funding signals `Unknown`; otherwise the observed scope signals `Healthy`. Unknown observations request analysis as well.
-Read failures, timeouts, partial coverage and observed zero remain distinct. A timeout preserves channels already read. Error samples
-retain a capped entity/message. Reads are not atomic: `chain_freshness=unverified` and `channels.scope=source_visible` do not claim a
+Read failures, timeouts, partial coverage and observed zero remain distinct. A timeout preserves channels already read. Individual reads
+use half the configured component deadline, reserving time to return partial observations to the reporter. Error samples retain a capped
+entity/message. Reads are not atomic: `chain_freshness=unverified` and `channels.scope=source_visible` do not claim a
 verified full-chain inventory. Closed channels absent from the source are not reconstructed.
 
 The diagnostic `StateRead` interface preserves errors before the legacy best-effort streams discard them. The built-in reader enumerates
