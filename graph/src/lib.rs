@@ -32,7 +32,7 @@ use hopr_api::OffchainPublicKey;
 pub use petgraph::traverse::{MAX_LOOPBACK_HOPS, MIN_LOOPBACK_HOPS};
 #[cfg(feature = "petgraph")]
 pub use petgraph::*;
-pub use weight::Observations;
+pub use weight::{LOOPBACK_WINDOW, Observations};
 
 /// A thread-safe, shareable handle to a [`ChannelGraph`].
 ///
