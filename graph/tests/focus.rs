@@ -272,6 +272,38 @@ fn unrelated_loops_should_not_crowd_the_focused_ones_out_of_a_bounded_search() -
     Ok(())
 }
 
+#[test]
+fn unrelated_loops_inside_the_neighborhood_should_not_crowd_the_focused_ones_out_of_a_bounded_search()
+-> anyhow::Result<()> {
+    // `a→p{i}` puts every `p{i}` within the focus radius of the path relay `a`, so the loops `me→p{i}→q{i}→me`
+    // are in the searched subgraph. None of them leads to the exit or touches a return path.
+    let mut edges: Vec<(String, String)> = [("me", "a"), ("a", "x"), ("x", "me"), ("a", "f")]
+        .into_iter()
+        .map(|(from, to)| (from.to_string(), to.to_string()))
+        .collect();
+    for i in 0..200 {
+        edges.push(("a".to_string(), format!("p{i}")));
+        edges.push(("me".to_string(), format!("p{i}")));
+        edges.push((format!("p{i}"), format!("q{i}")));
+        edges.push((format!("q{i}"), "me".to_string()));
+    }
+    let refs: Vec<(&str, &str)> = edges.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+    let net = net(&refs, &[])?;
+
+    let found = net.focused_with(2, Some(5), &["f"]);
+
+    assert!(
+        found.iter().any(|(p, _, r)| *r == Forward && p == &["a", "x", "me"]),
+        "a search bounded to 5 loops must still return the forward loop, got {found:?}"
+    );
+    assert!(
+        found.len() <= 5,
+        "the result must stay within the bound, got {}",
+        found.len()
+    );
+    Ok(())
+}
+
 // ── Nothing to focus on ──────────────────────────────────────────────────
 
 #[test]
