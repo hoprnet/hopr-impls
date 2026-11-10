@@ -40,8 +40,8 @@ balance or zero probe success rate remains distinct. Unknown streams are not tre
 
 When supplied with paths, the reader inspects at most 32 forward/reply slot arrays and samples up to four unique directed edges from them,
 including remote edges. `paths` is null when the path source is unavailable and reports zero counts for an available idle source. Missing
-edges, missing nodes, ambiguous slots and invalid padding are explicit. These observations cover the supplied path sample, not all routes.
-A host may supply paths using `GraphDump::with_paths(|| bounded_paths())`. Path sampling runs in the same blocking task; the provider must
+edges, missing nodes, ambiguous slots and invalid padding are explicit. These observations cover the supplied path sample, not all routes. A
+host may supply paths using `GraphDump::with_paths(|| bounded_paths())`. Path sampling runs in the same blocking task; the provider must
 bound allocation and supply a non-draining view. This avoids coupling the graph to a particular routing/SURB counter implementation.
 
 Samples prioritize missing path components, underfunding, disconnection/low acknowledgement rates, and poor probes/health, with
@@ -60,8 +60,8 @@ GPL-3.0-only
 
 ## Path-selection explanations by log level
 
-- **INFO:** the graph component record includes `state.value.searches`: cumulative search/empty counts, bounded latest query examples, sample
-  omission/contention counts and suppressed DEBUG count. The graph does not start another timer or install a subscriber.
+- **INFO:** the graph component record includes `state.value.searches`: cumulative search/empty counts, bounded latest query examples,
+  sample omission/contention counts and suppressed DEBUG count. The graph does not start another timer or install a subscriber.
 - **DEBUG:** an unsuccessful traversal emits one bounded `graph_search_failure` explanation at most once per minute per shared graph,
   retaining the caller's context. Further failures remain counted in the INFO snapshot. Successful traversals emit no DEBUG event or span.
 - **TRACE:** query spans, individual branch decisions, returned candidate paths and query completions remain available. Routine edge

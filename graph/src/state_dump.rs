@@ -1,10 +1,12 @@
 //! Optional graph-owned dump adapter. Custom graph implementations can implement `StateDump` with their own schema.
-use crate::diagnostics::{GraphState, GraphStateRead};
-use hopr_state_dump::{Dump, Signal, StateDump};
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
+
+use hopr_state_dump::{Dump, Signal, StateDump};
+
+use crate::diagnostics::{GraphState, GraphStateRead};
 
 type Paths = Arc<dyn Fn() -> Vec<[u64; 5]> + Send + Sync>;
 
@@ -23,6 +25,7 @@ impl<G> GraphDump<G> {
             previous_empty: AtomicU64::new(0),
         }
     }
+
     /// Optional bounded path sample supplied by its owner, without a dependency on routing counters.
     /// An empty sample means available but idle. The reader inspects at most `MAX_GRAPH_PATHS` entries
     /// and counts omissions; the provider must bound its own allocation and must not drain another reporter's window.
@@ -33,6 +36,7 @@ impl<G> GraphDump<G> {
 }
 impl<G: GraphStateRead + Send + Sync + 'static> StateDump for GraphDump<G> {
     type State = GraphState;
+
     async fn state_dump(&self) -> Result<Dump<Self::State>, String> {
         let graph = self.graph.clone();
         let paths = self.paths.clone();
@@ -101,8 +105,8 @@ fn assess(state: &GraphState, new_empty_search: bool) -> (Signal, &'static str) 
 
 #[cfg(all(test, feature = "petgraph"))]
 mod tests {
-    use super::*;
-    use crate::ChannelGraph;
+    use std::time::Duration;
+
     use hopr_api::{
         graph::{
             NetworkGraphTraverse, NetworkGraphWrite,
@@ -112,7 +116,9 @@ mod tests {
         types::crypto::prelude::{Keypair, OffchainKeypair},
     };
     use hopr_state_dump::{Config, Reporter, Section};
-    use std::time::Duration;
+
+    use super::*;
+    use crate::ChannelGraph;
     fn key(i: u8) -> hopr_api::OffchainPublicKey {
         *OffchainKeypair::from_secret(&[i; 32]).unwrap().public()
     }

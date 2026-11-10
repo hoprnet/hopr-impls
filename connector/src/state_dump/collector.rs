@@ -1,5 +1,6 @@
 //! Chain-only diagnostics. No graph or network implementation is required.
-use super::{Amount, ChainState, ChannelDirection, ChannelSample, Channels, Section};
+use std::{collections::HashSet, sync::Arc, time::Duration};
+
 use futures::StreamExt;
 use futures_time::future::FutureExt;
 use hopr_api::{
@@ -10,7 +11,8 @@ use hopr_api::{
     },
 };
 use hopr_state_dump::{Dump, Signal, StateDump, section};
-use std::{collections::HashSet, sync::Arc, time::Duration};
+
+use super::{Amount, ChainState, ChannelDirection, ChannelSample, Channels, Section};
 
 pub const MAX_CHANNEL_SAMPLES: usize = 4;
 pub const MAX_UNDERFUNDED_SAMPLES: usize = 16;
@@ -36,12 +38,14 @@ where
             funding_value: None,
         }
     }
+
     /// Face value used by the host's funding policy, in decimal token base units.
     /// The host must refresh this adapter when that policy changes; absence is explicitly unknown.
     pub fn with_funding_value(mut self, value: hopr_api::graph::traits::Balance) -> Self {
         self.funding_value = Some(value);
         self
     }
+
     pub async fn collect(&self) -> ChainState {
         let (balance, allowance, channels, announced) = futures::join!(
             section(self.timeout, async {
@@ -71,6 +75,7 @@ where
             announced_peers: announced,
         }
     }
+
     async fn channels(&self, face: Option<hopr_api::graph::traits::Balance>) -> Section<Channels> {
         let mut summary = Channels {
             scope: "source_visible",
@@ -234,6 +239,7 @@ where
     C: ChainValues + ChainReadSafeOperations + ChainReadChannelOperations + super::StateRead + Send + Sync + 'static,
 {
     type State = ChainState;
+
     async fn state_dump(&self) -> Result<Dump<Self::State>, String> {
         let state = self.collect().await;
         let (signal, reason) =

@@ -45,7 +45,7 @@ smallvec    = { workspace = true }
 thiserror   = { workspace = true }
 tracing     = { workspace = true }
 
-hopr-api = { workspace = true, features = ["ct", "graph", "network"] }
+hopr-api        = { workspace = true, features = ["ct", "graph", "network"] }
 hopr-state-dump = { workspace = true, optional = true }
 
 hopr-utils = { workspace = true, features = [

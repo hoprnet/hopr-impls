@@ -47,12 +47,14 @@ pub trait StateDump: Send + Sync {
 }
 impl<T: StateDump + ?Sized> StateDump for Arc<T> {
     type State = T::State;
+
     async fn state_dump(&self) -> Result<Dump<Self::State>, String> {
         (**self).state_dump().await
     }
 }
 impl<T: StateDump + ?Sized> StateDump for &T {
     type State = T::State;
+
     async fn state_dump(&self) -> Result<Dump<Self::State>, String> {
         (**self).state_dump().await
     }
@@ -75,6 +77,7 @@ impl<T> Section<T> {
             _ => None,
         }
     }
+
     pub fn is_complete(&self) -> bool {
         matches!(self, Self::Ok { .. })
     }
@@ -119,6 +122,7 @@ impl Config {
             ..Self::default()
         })
     }
+
     pub fn from_env() -> Result<Self, ConfigError> {
         match std::env::var("HOPR_STATE_DUMP_INTERVAL") {
             Ok(v) => Self::new(
@@ -129,6 +133,7 @@ impl Config {
             Err(_) => Err(ConfigError("HOPR_STATE_DUMP_INTERVAL is not UTF-8")),
         }
     }
+
     pub fn with_source_timeout(mut self, timeout: Duration) -> Result<Self, ConfigError> {
         if timeout.is_zero() || timeout > Duration::from_secs(5) {
             return Err(ConfigError("source timeout must be positive and at most 5 seconds"));
@@ -136,9 +141,11 @@ impl Config {
         self.timeout = timeout;
         Ok(self)
     }
+
     pub fn interval(&self) -> Option<Duration> {
         self.interval
     }
+
     pub fn source_timeout(&self) -> Duration {
         self.timeout
     }
@@ -178,6 +185,7 @@ impl Write for BoundedJson {
         self.bytes.extend_from_slice(buf);
         Ok(buf.len())
     }
+
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
@@ -195,6 +203,7 @@ impl<T: Serialize> Record<T> {
         result?;
         Ok(String::from_utf8(writer.bytes).expect("JSON is UTF-8"))
     }
+
     /// Analysis fields remain structured even if the payload cannot be encoded.
     pub fn emit(&self) {
         match self.to_json() {
@@ -226,6 +235,7 @@ impl<T: StateDump> Reporter<T> {
             sequence: AtomicU64::new(0),
         }
     }
+
     /// Always collect on demand, even when periodic reporting is disabled.
     pub async fn collect(&self) -> Record<T::State> {
         let started = Instant::now();
@@ -268,12 +278,14 @@ impl<T: StateDump> Reporter<T> {
             state,
         }
     }
+
     pub async fn run(&self) {
         if let Some(interval) = self.config.interval {
             let ticks = futures_time::stream::interval(futures_time::time::Duration::from(interval)).map(|_| ());
             self.run_on(ticks).await;
         }
     }
+
     async fn run_on<S: Stream<Item = ()> + Unpin>(&self, mut ticks: S) {
         if self.config.interval.is_none() {
             return;

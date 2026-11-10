@@ -1,5 +1,5 @@
-use super::*;
-use crate::testing::BlokliTestStateBuilder;
+use std::time::Duration;
+
 use futures::StreamExt;
 use hopr_api::{
     OffchainPublicKey,
@@ -13,7 +13,9 @@ use hopr_api::{
         primitive::prelude::*,
     },
 };
-use std::time::Duration;
+
+use super::*;
+use crate::testing::BlokliTestStateBuilder;
 fn packet(i: u8) -> anyhow::Result<OffchainPublicKey> {
     Ok(*OffchainKeypair::from_secret(&[i; 32])?.public())
 }

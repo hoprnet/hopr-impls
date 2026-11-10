@@ -421,6 +421,7 @@ fn record_surb(
 /// Use a separate handle/reporter for each producer module. Reading drains only this handle's window.
 impl hopr_state_dump::StateDump for IntervalCounters {
     type State = IntervalSnapshot;
+
     async fn state_dump(&self) -> Result<hopr_state_dump::Dump<Self::State>, String> {
         let state = self.take_snapshot();
         let problematic = state.totals.problematic()

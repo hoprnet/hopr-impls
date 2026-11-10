@@ -2,7 +2,6 @@
 mod collector;
 mod counters;
 mod model;
-pub use crate::connector::state_reads::{ReadFailure, StateRead};
 pub use collector::{ChainDump, MAX_CHANNEL_SAMPLES, MAX_UNDERFUNDED_SAMPLES};
 pub use counters::{
     Direction, IntervalCounters, IntervalSnapshot, MAX_DESTINATIONS, MAX_PROBE_PEERS, MAX_SURB_DESTINATIONS,
@@ -14,5 +13,7 @@ pub use hopr_state_dump::{
 pub use model::{
     Amount, ChainState, ChannelDirection, ChannelPeers, ChannelSample, Channels, FundingCounts, ReadStats, StatusCounts,
 };
+
+pub use crate::connector::state_reads::{ReadFailure, StateRead};
 #[cfg(test)]
 pub(crate) mod tests;

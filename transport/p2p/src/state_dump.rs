@@ -1,8 +1,9 @@
 //! Transport-owned observations, independent of chain or graph topology.
-use crate::HoprNetwork;
 use hopr_api::network::{Health, NetworkView};
 use hopr_state_dump::{Dump, Signal, StateDump};
 use serde::Serialize;
+
+use crate::HoprNetwork;
 
 /// Counts only: no network-sized list is allocated for reporting.
 #[derive(Debug, Serialize)]
@@ -15,6 +16,7 @@ pub struct NetworkState {
 }
 impl StateDump for HoprNetwork {
     type State = NetworkState;
+
     async fn state_dump(&self) -> Result<Dump<Self::State>, String> {
         let health = self.health();
         let (signal, reason) = match health {
@@ -37,9 +39,10 @@ impl StateDump for HoprNetwork {
 
 #[cfg(all(test, feature = "runtime-tokio"))]
 mod tests {
-    use super::*;
     use hopr_api::types::crypto::prelude::{Keypair, OffchainKeypair};
     use hopr_state_dump::{Config, Reporter};
+
+    use super::*;
     #[tokio::test]
     async fn actual_transport_reports_degradation_and_recovery_independently() {
         let key = OffchainKeypair::from_secret(&[1; 32]).unwrap();

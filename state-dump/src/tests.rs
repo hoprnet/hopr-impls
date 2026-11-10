@@ -1,6 +1,8 @@
-use super::*;
-use serde_json::{Value, json};
 use std::sync::{Mutex, atomic::AtomicUsize};
+
+use serde_json::{Value, json};
+
+use super::*;
 
 struct Custom {
     reads: Arc<AtomicUsize>,
@@ -8,6 +10,7 @@ struct Custom {
 }
 impl StateDump for Custom {
     type State = Vec<u8>;
+
     async fn state_dump(&self) -> Result<Dump<Self::State>, String> {
         self.reads.fetch_add(1, Ordering::Relaxed);
         Ok(Dump {
@@ -20,6 +23,7 @@ impl StateDump for Custom {
 struct Replacement;
 impl StateDump for Replacement {
     type State = Value;
+
     async fn state_dump(&self) -> Result<Dump<Self::State>, String> {
         Ok(Dump {
             state: json!({"queue": 7}),
@@ -31,6 +35,7 @@ impl StateDump for Replacement {
 struct Fault(&'static str);
 impl StateDump for Fault {
     type State = ();
+
     async fn state_dump(&self) -> Result<Dump<()>, String> {
         match self.0 {
             "hang" => std::future::pending().await,
@@ -91,11 +96,13 @@ impl tracing::field::Visit for Visitor {
             self.analysis = value;
         }
     }
+
     fn record_str(&mut self, f: &tracing::field::Field, value: &str) {
         if f.name() == "reason" {
             self.reason = value.into();
         }
     }
+
     fn record_debug(&mut self, f: &tracing::field::Field, value: &dyn std::fmt::Debug) {
         if f.name() == "reason" {
             self.reason = format!("{value:?}");
@@ -106,11 +113,15 @@ impl tracing::Subscriber for Capture {
     fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
         true
     }
+
     fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
         tracing::span::Id::from_u64(1)
     }
+
     fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
     fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
     fn event(&self, event: &tracing::Event<'_>) {
         let mut v = Visitor {
             analysis: false,
@@ -119,7 +130,9 @@ impl tracing::Subscriber for Capture {
         event.record(&mut v);
         self.0.lock().unwrap().push((v.analysis, v.reason));
     }
+
     fn enter(&self, _: &tracing::span::Id) {}
+
     fn exit(&self, _: &tracing::span::Id) {}
 }
 #[tokio::test]
