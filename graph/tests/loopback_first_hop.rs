@@ -124,7 +124,7 @@ fn route(relays: &[&str]) -> Vec<String> {
 }
 
 #[test]
-fn relay_whose_loopbacks_never_return_should_be_starved_as_a_first_hop_for_one_to_three_hops() -> anyhow::Result<()> {
+fn relay_whose_loopbacks_never_return_should_be_excluded_as_a_first_hop_for_one_to_three_hops() -> anyhow::Result<()> {
     let one_hop = (1, route(&["good"]), route(&["bad"]));
     let two_hops = (2, route(&["good", "m1"]), route(&["bad", "m1"]));
     let three_hops = (3, route(&["good", "m1", "m2"]), route(&["bad", "m1", "m2"]));
@@ -140,20 +140,17 @@ fn relay_whose_loopbacks_never_return_should_be_starved_as_a_first_hop_for_one_t
 
         probe_everything(&net);
 
-        // Starved, not pruned (RFC-0010 4.2.3): still a candidate, with a negligible sampling share.
+        // Excluded from routing (RFC-0010 4.2.3, the active tier); probing still reaches it, which
+        // `relay_whose_loopbacks_never_return_should_stay_probe_able` pins.
         let routes = net.forward("exit", hops);
-        let good_value = routes
-            .value_of(&good.iter().map(String::as_str).collect::<Vec<_>>())
-            .ok_or_else(|| anyhow::anyhow!("{hops} hop(s): the relay whose loops return must stay routable"))?;
-        let bad_value = routes
-            .value_of(&bad.iter().map(String::as_str).collect::<Vec<_>>())
-            .ok_or_else(|| anyhow::anyhow!("{hops} hop(s): a starved relay must stay a candidate"))?;
-
-        assert!(bad_value > 0.0, "{hops} hop(s): a non-positive value prunes the edge");
-        let share = bad_value / (bad_value + good_value);
         assert!(
-            share < 1e-8,
-            "{hops} hop(s): a relay whose loops never return must draw a negligible share, got {share}"
+            routes.value_of(&as_strs(&good)).is_some_and(|value| value > 0.0),
+            "{hops} hop(s): the relay whose loops return must stay routable"
+        );
+        assert_eq!(
+            routes.value_of(&as_strs(&bad)),
+            None,
+            "{hops} hop(s): a relay whose loops never return must not be a candidate"
         );
     }
     Ok(())
@@ -326,7 +323,7 @@ fn dead_relay_that_is_not_my_neighbour_should_be_starved_for_two_and_three_hops(
 // ── Return paths ─────────────────────────────────────────────────────────
 
 #[test]
-fn return_path_through_a_dead_relay_should_be_starved() -> anyhow::Result<()> {
+fn return_path_through_a_dead_relay_should_be_excluded() -> anyhow::Result<()> {
     // `a1 → X → me` lies on the loopback cycle `me → a1 → X → me`, so loops that never return
     // judge `X` on a return path as they do on a forward one.
     let net = Net::from_json(LAYERED)?;
@@ -340,18 +337,14 @@ fn return_path_through_a_dead_relay_should_be_starved() -> anyhow::Result<()> {
     probe_with_dead(&net, &["bb"]);
 
     let after = net.returning("a1", 1);
-    let honest = after
-        .value_of(&["bg"])
-        .ok_or_else(|| anyhow::anyhow!("the honest relay must stay routable back"))?;
-    let dead = after
-        .value_of(&["bb"])
-        .ok_or_else(|| anyhow::anyhow!("a starved relay must stay a candidate"))?;
-
-    assert!(dead > 0.0, "a non-positive value prunes the edge");
-    let share = dead / (dead + honest);
     assert!(
-        share < 1e-6,
-        "a return path through a dead relay must draw a negligible share, got {share}"
+        after.value_of(&["bg"]).is_some_and(|value| value > 0.0),
+        "the honest relay must stay routable back"
+    );
+    assert_eq!(
+        after.value_of(&["bb"]),
+        None,
+        "a return path through a dead relay must not be a candidate"
     );
     Ok(())
 }
@@ -503,7 +496,7 @@ fn share_of(routes: &common::Routes, dead: &str) -> Option<f64> {
 }
 
 #[test]
-fn a_dead_relay_should_be_starved_at_every_position_for_zero_to_three_hops_in_both_directions() -> anyhow::Result<()> {
+fn a_dead_relay_should_be_excluded_at_every_position_for_zero_to_three_hops_in_both_directions() -> anyhow::Result<()> {
     let mut failures = Vec::new();
     let mut judged = 0;
 
@@ -537,29 +530,29 @@ fn a_dead_relay_should_be_starved_at_every_position_for_zero_to_three_hops_in_bo
                 ("forward", net.forward("exit", hops)),
                 ("return", net.returning("exit", hops)),
             ] {
-                let Some(share) = share_of(&routes, &dead) else {
-                    failures.push(format!(
-                        "{direction}, {hops} hop(s), layer {layer}: the dead relay vanished from the routes"
-                    ));
-                    continue;
-                };
                 judged += 1;
-                if share >= 1e-6 {
+                if routes.is_empty() {
                     failures.push(format!(
-                        "{direction}, {hops} hop(s), dead relay in layer {layer}: share {share}"
+                        "{direction}, {hops} hop(s), layer {layer}: every route is gone, the honest relays must stay"
+                    ));
+                }
+                // Every route through the relay enters it over an edge into it, which is a dead edge.
+                if let Some(route) = routes.names().into_iter().find(|names| names.contains(&dead)) {
+                    failures.push(format!(
+                        "{direction}, {hops} hop(s), dead relay in layer {layer}: still routable over {route:?}"
                     ));
                 }
             }
         }
         // 0 hops has no relay to judge: a dead relay elsewhere may blame the direct edge for loops it
-        // crossed, which dilutes it a little, but never starves it.
+        // crossed, which dilutes it a little, but never excludes it.
         let after = (
             net.forward("exit", 0).value_of(&[]),
             net.returning("exit", 0).value_of(&[]),
         );
         if after.0.is_none_or(|value| value < 0.1) || after.1.is_none_or(|value| value < 0.1) {
             failures.push(format!(
-                "0 hops, dead relay in layer {layer}: direct routes starved, {direct:?} became {after:?}"
+                "0 hops, dead relay in layer {layer}: direct routes excluded, {direct:?} became {after:?}"
             ));
         }
     }
@@ -586,7 +579,10 @@ fn with_surbs_into_exit(good: [u64; 2], bad: [u64; 2]) -> String {
             match surbs {
                 Some((_, [expected, observed])) => {
                     marked += 1;
-                    line.replace(" }", &format!(r#", "surbs": [{expected}, {observed}] }}"#))
+                    // Loops rarely cross the edge into the exit, so it carries no loop evidence: only the SURBs
+                    // speak for it (hopr-impls#81). A returned loop would otherwise outweigh them.
+                    line.replace(r#", "relayed_ms": 30"#, "")
+                        .replace(" }", &format!(r#", "surbs": [{expected}, {observed}] }}"#))
                 }
                 None => line.to_string(),
             }
@@ -597,22 +593,26 @@ fn with_surbs_into_exit(good: [u64; 2], bad: [u64; 2]) -> String {
 }
 
 #[test]
-fn a_relay_whose_surbs_into_the_exit_never_return_should_be_starved() -> anyhow::Result<()> {
+fn a_relay_whose_surbs_into_the_exit_never_return_should_be_excluded() -> anyhow::Result<()> {
     // Ten SURBs minted over the edge, none came back, while the other relay returns all of them.
     let net = Net::from_json(&with_surbs_into_exit([10, 10], [10, 0]))?;
 
     let routes = net.forward("exit", 1);
-    let share = share_of(&routes, "bad").ok_or_else(|| anyhow::anyhow!("a starved relay must stay a candidate"))?;
-
     assert!(
-        share < 1e-6,
-        "a relay none of whose SURBs return must draw a negligible share, got {share}"
+        routes.value_of(&["good"]).is_some_and(|value| value > 0.0),
+        "the relay whose SURBs return must stay routable"
+    );
+    assert_eq!(
+        routes.value_of(&["bad"]),
+        None,
+        "a relay none of whose SURBs return must not be a candidate, got {:?}",
+        routes.names()
     );
     Ok(())
 }
 
 #[test]
-fn a_relay_whose_surbs_into_the_exit_never_return_should_be_starved_for_one_to_three_hops() -> anyhow::Result<()> {
+fn a_relay_whose_surbs_into_the_exit_never_return_should_be_excluded_for_one_to_three_hops() -> anyhow::Result<()> {
     for hops in 1..=3usize {
         let dead = format!("d{hops}");
         // No edge here has a failed loop: only the SURBs over the edge from `dead` into the exit
@@ -631,34 +631,53 @@ fn a_relay_whose_surbs_into_the_exit_never_return_should_be_starved_for_one_to_t
                 } else {
                     10
                 };
-                line.replace(" }", &format!(r#", "surbs": [10, {observed}] }}"#))
+                line.replace(r#", "relayed_ms": 30"#, "")
+                    .replace(" }", &format!(r#", "surbs": [10, {observed}] }}"#))
             })
             .collect::<Vec<_>>()
             .join("\n");
         let net = Net::from_json(&topology)?;
 
-        // Routes that end in `dead`, against the best route that does not: `dead` also sits earlier on
-        // other routes, over edges that are healthy.
+        // No route may end over the edge into the exit from `dead`; routes that merely pass through it
+        // earlier use healthy edges, so they stay.
         let routes = net.forward("exit", hops);
-        let best = |ends_in_dead: bool| {
-            routes
-                .0
-                .iter()
-                .filter(|(names, _)| (names.last() == Some(&dead)) == ends_in_dead)
-                .map(|(_, value)| *value)
-                .fold(None, |best: Option<f64>, value| {
-                    Some(best.map_or(value, |b| b.max(value)))
-                })
-        };
-        let (through, around) = best(true)
-            .zip(best(false))
-            .ok_or_else(|| anyhow::anyhow!("{hops} hop(s): a starved relay must stay a candidate"))?;
-        let share = through / (through + around);
-
+        let ends_in_dead = routes.names().into_iter().find(|names| names.last() == Some(&dead));
+        assert_eq!(
+            ends_in_dead, None,
+            "{hops} hop(s): a relay whose SURBs into the exit never return must not be a candidate"
+        );
         assert!(
-            share < 1e-6,
-            "{hops} hop(s): a relay whose SURBs into the exit never return must draw a negligible share, got {share}"
+            !routes.is_empty(),
+            "{hops} hop(s): the honest relays must stay routable, got none"
         );
     }
+    Ok(())
+}
+
+// ── A starved relay is not routable (the active exclusion tier, RFC-0010 4.2.3) ──────────────
+
+fn as_strs(route: &[String]) -> Vec<&str> {
+    route.iter().map(String::as_str).collect()
+}
+
+#[test]
+fn a_starved_relay_should_be_routable_again_once_a_loop_returns() -> anyhow::Result<()> {
+    let net = Net::from_json(TOPOLOGY)?;
+    probe_everything(&net);
+    assert_eq!(
+        net.forward("exit", 1).value_of(&["bad"]),
+        None,
+        "the relay must be excluded first, or recovery proves nothing"
+    );
+
+    // The loops through it return from now on.
+    probe_with_dead(&net, &[]);
+
+    assert!(
+        net.forward("exit", 1)
+            .value_of(&["bad"])
+            .is_some_and(|value| value > 0.0),
+        "a relay whose loops return again must be a candidate again"
+    );
     Ok(())
 }
