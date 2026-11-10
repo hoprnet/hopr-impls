@@ -1,0 +1,23 @@
+[package]
+name = "hopr-state-dump"
+version = "0.1.0"
+description = "Component-owned operational state dumps and analysis signals"
+authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+include = ["Cargo.toml", "LICENSE", "README.md", "src/**/*.rs"]
+
+[dependencies]
+futures = { workspace = true }
+futures-time = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

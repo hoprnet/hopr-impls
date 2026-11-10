@@ -4041,6 +4041,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "hopr-state-dump"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "futures-time",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "hopr-ticket-manager"
 version = "0.10.0"
 dependencies = [

@@ -5,6 +5,7 @@ members = [
   "ct/immediate",
   "graph",
   "session-server-forwarder",
+  "state-dump",
   "ticket-manager",
   "transport/p2p",
 ]
@@ -30,6 +31,7 @@ rust-version = "1.97"
 # In-repo crates (path + version so they are publishable)
 hopr-chain-connector = { path = "connector", version = "0.32.0" }
 hopr-network-graph   = { path = "graph", version = "0.10.4", default-features = false }
+hopr-state-dump      = { path = "state-dump", version = "0.1.0" }
 
 # HOPR crates published to crates.io
 blokli-client = "0.37.0"
