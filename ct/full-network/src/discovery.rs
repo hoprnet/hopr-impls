@@ -982,6 +982,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn focus_should_still_lead_rounds_when_the_base_priority_is_zero() -> anyhow::Result<()> {
+        let (me, f, a, c, graph) = focus_network()?;
+        let cfg = EgressConfig {
+            base_priority: 0.0,
+            ..fast_cfg()
+        };
+        let prober = FullNetworkDiscovery::new(me, cfg, graph);
+        prober.control().set_focus([f]);
+        let stream = ProbingTrafficGeneration::build(&prober);
+        pin_mut!(stream);
+
+        let leaders = round_leaders(&mut stream, 300).await?;
+        let (forward, unrelated) = (share(&leaders, &a), share(&leaders, &c));
+
+        // A zero base scales every boost to zero, so all weights tie. The focused loops are listed first
+        // and the focus still leads the rounds.
+        assert!(
+            forward > unrelated,
+            "forward {forward} must lead more often than the rest {unrelated}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn focus_set_on_a_running_stream_should_take_effect_and_clear_again() -> anyhow::Result<()> {
         let (me, f, _, c, graph) = focus_network()?;
         let prober = FullNetworkDiscovery::new(me, fast_cfg(), graph);

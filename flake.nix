@@ -23,19 +23,24 @@
   # - flake-root: Utilities for finding flake root directory
   #
   # Input optimization strategy:
-  # All inputs follow nixpkgs where possible to reduce closure size and improve caching.
+  # nixpkgs, nixpkgs-unstable, rust-overlay and crane follow nix-lib, so every hoprnet flake on
+  # the same nix-lib release shares one set of revisions; the other inputs follow nixpkgs.
   inputs = {
     # Core Nix ecosystem dependencies
     flake-parts.url = "github:hercules-ci/flake-parts";
-    nixpkgs.url = "github:NixOS/nixpkgs/release-26.05";
-    nixpkgs-unstable.url = "github:NixOS/nixpkgs/nixos-unstable";
 
     # HOPR Nix Library (provides flake-utils and reusable build functions)
-    nix-lib.url = "github:hoprnet/nix-lib/v1.4.0";
+    nix-lib.url = "github:hoprnet/nix-lib/v2.1.7";
+    # nix-lib anchors the heavy pins (nixpkgs, nixpkgs-unstable, rust-overlay, crane) so every
+    # hoprnet flake on the same nix-lib release shares them. To bump them, point nix-lib.url at
+    # the new release tag, then run `nix flake update nix-lib`.
+    nixpkgs.follows = "nix-lib/nixpkgs";
+    nixpkgs-unstable.follows = "nix-lib/nixpkgs-unstable";
+    treefmt-nix.url = "github:numtide/treefmt-nix";
 
     # Rust build system
-    crane.url = "github:ipetkov/crane";
-    rust-overlay.url = "github:oxalica/rust-overlay";
+    crane.follows = "nix-lib/crane";
+    rust-overlay.follows = "nix-lib/rust-overlay";
 
     # Development tools and quality assurance
     pre-commit.url = "github:cachix/git-hooks.nix";
@@ -44,10 +49,9 @@
     # Input dependency optimization
     flake-parts.inputs.nixpkgs-lib.follows = "nixpkgs";
     pre-commit.inputs.nixpkgs.follows = "nixpkgs";
-    nix-lib.inputs.nixpkgs.follows = "nixpkgs";
-    nix-lib.inputs.crane.follows = "crane";
-    nix-lib.inputs.rust-overlay.follows = "rust-overlay";
-    rust-overlay.inputs.nixpkgs.follows = "nixpkgs";
+    nix-lib.inputs.treefmt-nix.follows = "treefmt-nix";
+    nix-lib.inputs.flake-parts.follows = "flake-parts";
+    treefmt-nix.inputs.nixpkgs.follows = "nixpkgs";
   };
 
   outputs =
@@ -92,6 +96,7 @@
           pkgs = import nixpkgs {
             inherit system overlays;
           };
+          pkgsUnstable = import nixpkgs-unstable { inherit system; };
 
           # Platform information
           buildPlatform = pkgs.stdenv.buildPlatform;
@@ -122,12 +127,15 @@
             rustToolchainFile = ./rust-toolchain.toml;
           };
 
+          craneLib = (crane.mkLib pkgs).overrideToolchain stableToolchain;
+
           hoprImplsPackages = import ./nix/packages/hopr-impls.nix {
             inherit
               builders
               sources
               rev
               nixLib
+              craneLib
               ;
           };
 
@@ -146,6 +154,7 @@
           utilityApps = {
             update-github-labels = nixLib.mkUpdateGithubLabelsApp;
             audit = nixLib.mkAuditApp { };
+            semver-checks = nixLib.mkSemverChecksApp { rustToolchain = stableToolchain; };
             check = nixLib.mkCheckApp { inherit system; };
             test = {
               type = "app";
@@ -214,7 +223,8 @@
               gh
               cargo-insta
               cargo-machete
-              cargo-release
+              # From unstable: cargo-release 1.1.7 needs rustc 1.97, release-26.05 ships 1.95.
+              pkgsUnstable.cargo-release
               cargo-shear
               yq
             ];
@@ -243,7 +253,7 @@
               treefmtPrograms = pkgs.lib.attrValues config.treefmt.build.programs;
               extraPackages = with pkgs; [
                 cargo-machete
-                cargo-release
+                pkgsUnstable.cargo-release
                 cargo-shear
                 zizmor
               ];
@@ -306,11 +316,11 @@
 
           # Export applications using nix-lib
           apps = utilityApps // {
-            coverage-unit = {
+            coverage = {
               type = "app";
               program = toString (
-                pkgs.writeShellScript "coverage-unit" ''
-                  nix develop .#coverage -c cargo llvm-cov --workspace --all-features --lib --lcov --output-path coverage.lcov
+                pkgs.writeShellScript "coverage" ''
+                  nix develop .#coverage -c cargo llvm-cov --workspace --all-features --lcov --output-path coverage.lcov
                 ''
               );
             };
@@ -321,7 +331,13 @@
           # require bootstrapping a full cross toolchain, which is not feasible
           # locally. On CI each target is built natively on its own runner.
           packages = {
-            inherit (packages) lib-hopr-impls clippy pre-commit-check;
+            inherit (packages)
+              lib-hopr-impls
+              clippy
+              doc
+              test-doc
+              pre-commit-check
+              ;
             # Set default package
             default = packages.lib-hopr-impls;
           }

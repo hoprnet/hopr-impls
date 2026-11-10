@@ -1751,9 +1751,9 @@ dependencies = [
 
 [[package]]
 name = "blokli-client"
-version = "0.36.1"
+version = "0.37.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e840b803920fa924e9b45ec5cbea1fc09d445aad73d87c727e55ad31e774df04"
+checksum = "b0316ef1a89d3d089b8534c12fa77403702dbbbef24a64361f74f4b5ec7e2edd"
 dependencies = [
  "anyhow",
  "async-broadcast",
@@ -1777,6 +1777,7 @@ dependencies = [
  "serde_json",
  "smart-default",
  "thiserror 2.0.21",
+ "tokio",
  "tracing",
  "url",
 ]
@@ -3918,7 +3919,7 @@ dependencies = [
 
 [[package]]
 name = "hopr-chain-connector"
-version = "0.30.1"
+version = "0.31.0"
 dependencies = [
  "ahash",
  "anyhow",
@@ -3953,7 +3954,7 @@ dependencies = [
 
 [[package]]
 name = "hopr-ct-full-network"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "cfg-if",
@@ -3991,7 +3992,7 @@ dependencies = [
 
 [[package]]
 name = "hopr-network-graph"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "assertables",
@@ -4017,7 +4018,7 @@ dependencies = [
 
 [[package]]
 name = "hopr-session-server-forwarder"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4039,7 +4040,7 @@ dependencies = [
 
 [[package]]
 name = "hopr-ticket-manager"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "ahash",
  "anyhow",
@@ -4067,7 +4068,7 @@ dependencies = [
 
 [[package]]
 name = "hopr-transport-p2p"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "async-broadcast",
@@ -4157,9 +4158,9 @@ dependencies = [
 
 [[package]]
 name = "hopr-utilities"
-version = "0.18.1"
+version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e0867f5d07c08480125226b573a7842d68d65241c0d5a1c871f1e3b28545991a"
+checksum = "a47d87130566d650aea8a10c3614c3ea3ddde51fb23df9ef10792deaab38531a"
 dependencies = [
  "anyhow",
  "arrayvec",
@@ -6438,7 +6439,7 @@ dependencies = [
  "quinn-udp 0.5.16",
  "rustc-hash",
  "rustls",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -6478,7 +6479,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "tracing",
  "windows-sys 0.61.2",
 ]
@@ -6491,7 +6492,7 @@ checksum = "47091c86514c2e11452cb228dee77037334b99d92a23e4c69aa5982261f39247"
 dependencies = [
  "cfg_aliases",
  "libc",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "windows-sys 0.61.2",
 ]
 

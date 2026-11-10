@@ -100,11 +100,11 @@ impl EgressControl {
         self.state.borrow().noise
     }
 
-    /// Biases loopback probing towards loops whose last relay is one of `exits`.
+    /// Biases loopback probing towards loops around `exits`.
     ///
     /// Replaces any earlier focus. Loops elsewhere in the network are still probed, at a lower
-    /// weight (see `EgressConfig::focus_boost`). Exits that are unknown to the graph, or that have
-    /// no usable closing edge to this node, produce no focused loops. An empty set clears the focus.
+    /// weight (see `EgressConfig::focus_boost`). Exits unknown to the graph produce no focused
+    /// loops. An empty set clears the focus.
     pub fn set_focus(&self, exits: impl IntoIterator<Item = OffchainPublicKey>) {
         let exits: HashSet<_> = exits.into_iter().collect();
         self.state.send_modify(|s| {
