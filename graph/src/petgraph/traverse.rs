@@ -1,4 +1,8 @@
-use std::{collections::HashSet, hash::RandomState, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    hash::RandomState,
+    sync::Arc,
+};
 
 use hopr_api::{
     OffchainPublicKey,
@@ -203,22 +207,7 @@ impl hopr_api::graph::NetworkGraphTraverse for ChannelGraph {
                 // a probe whose closing edge is absent, so requiring the incoming edge here is what
                 // keeps the probe attributable. A successful neighbor probe upserts both
                 // directions, so this excludes nothing that has actually been reached.
-                let connected_neighbors = inner
-                    .graph
-                    .neighbors_directed(*me_idx, petgraph::Direction::Incoming)
-                    .filter(|neighbor| {
-                        inner
-                            .graph
-                            .edges_connecting(*neighbor, *me_idx)
-                            .next()
-                            // The closing edge must exist; its connectivity must merely not be known
-                            // to be down. Excluding an unchecked neighbour would stop it being
-                            // probed, which is what would keep it unchecked.
-                            .is_some_and(|e| {
-                                e.weight().immediate_qos().and_then(|imm| imm.is_connected()) != Some(false)
-                            })
-                    })
-                    .collect::<HashSet<_>>();
+                let connected_neighbors = closing_neighbors(&inner, *me_idx);
 
                 // Deliberately more permissive than data path selection, and the one traversal that still
                 // walks a starved edge: a relay judged dead is excluded from routing (RFC-0010 §4.2.3, the
@@ -278,6 +267,292 @@ impl hopr_api::graph::NetworkGraphTraverse for ChannelGraph {
         }
 
         vec![]
+    }
+}
+
+/// Nodes that can close a loopback at `me`: those with an edge to `me` not known to be down.
+///
+/// The closing edge must exist; its connectivity must merely not be known to be down. Excluding an
+/// unchecked neighbour would stop it being probed, which is what would keep it unchecked.
+fn closing_neighbors(inner: &InnerGraph, me: NodeIndex) -> HashSet<NodeIndex> {
+    inner
+        .graph
+        .neighbors_directed(me, petgraph::Direction::Incoming)
+        .filter(|neighbor| {
+            inner
+                .graph
+                .edges_connecting(*neighbor, me)
+                .next()
+                .is_some_and(|e| e.weight().immediate_qos().and_then(|imm| imm.is_connected()) != Some(false))
+        })
+        .collect()
+}
+
+/// Loopback probe generation steered towards chosen exits.
+///
+/// Lets a caller that knows which exits it will use probe the subgraph around them, instead of
+/// sampling every loop in the network. An exit is the final hop of a data path, so it needs no
+/// channel: neither a channel into it nor an `exit → me` closing edge is required.
+pub trait FocusedLoopback {
+    /// Generates loopback paths of exactly `hops` relays around `exits`, each ranked by [`FocusRelevance`].
+    ///
+    /// The search runs on the subgraph around the exits' forward and return paths, so loops elsewhere
+    /// in the network do not appear. `take_count` bounds the result after ranking, forward loops first. The search
+    /// lists at most ten times `take_count` loops before ranking, so in a neighborhood with more loops than that a
+    /// focused loop may be left out even when fewer than `take_count` are returned. Closing
+    /// edges follow `simple_loopback_to_self`: they must exist and not be known to be down.
+    ///
+    /// Requests outside [`MIN_LOOPBACK_HOPS`]`..=`[`MAX_LOOPBACK_HOPS`], unknown exits and an empty
+    /// `exits` set yield nothing.
+    fn focused_loopback(
+        &self,
+        hops: usize,
+        take_count: Option<usize>,
+        exits: &HashSet<OffchainPublicKey>,
+    ) -> Vec<(Vec<OffchainPublicKey>, PathId, FocusRelevance)>;
+}
+
+/// Most edges a path can have: [`MAX_LOOPBACK_HOPS`] relays plus the final hop.
+const MAX_PATH_EDGES: usize = MAX_LOOPBACK_HOPS + 1;
+
+/// How far around the exits' paths a focused loop may stray, in edges.
+///
+/// Loops need relays beyond the paths themselves: a closing relay for a forward prefix, or an entry
+/// relay before a return component. Two steps cover every loop of up to three relays.
+const FOCUS_RADIUS: usize = 2;
+
+/// Loops one focused search enumerates before ranking, per loop the caller asks for. It bounds the work only; the
+/// caller's `take_count` bounds the result.
+const FOCUS_SEARCH_FACTOR: usize = 10;
+
+/// How a loop relates to the exits it was focused on, ordered by how much it is worth probing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum FocusRelevance {
+    /// The loop measures an edge of a return path from an exit back to `me`, at most [`MAX_LOOPBACK_HOPS`] relays long.
+    Return,
+    /// The loop's leading relays form a path to an exit: one of them has an edge into it.
+    Forward,
+}
+
+/// Edge distances from `sources` along `direction`, up to [`MAX_PATH_EDGES`].
+///
+/// `avoid` is reached but not expanded, since no path passes through `me`.
+fn distances(
+    inner: &InnerGraph,
+    sources: impl IntoIterator<Item = NodeIndex>,
+    direction: petgraph::Direction,
+    avoid: Option<NodeIndex>,
+) -> HashMap<NodeIndex, usize> {
+    let mut dist: HashMap<NodeIndex, usize> = sources.into_iter().map(|source| (source, 0)).collect();
+    let mut queue: VecDeque<NodeIndex> = dist.keys().copied().collect();
+
+    while let Some(node) = queue.pop_front() {
+        let reached = dist[&node];
+        if reached >= MAX_PATH_EDGES || Some(node) == avoid {
+            continue;
+        }
+        for next in inner.graph.neighbors_directed(node, direction) {
+            if let std::collections::hash_map::Entry::Vacant(slot) = dist.entry(next) {
+                slot.insert(reached + 1);
+                queue.push_back(next);
+            }
+        }
+    }
+    dist
+}
+
+/// What links the exits to `me`: the edges of their return paths, and the relays of forward paths.
+struct FocusPaths {
+    /// Edges `u → v` on some path from an exit to `me` with at most [`MAX_LOOPBACK_HOPS`] relays.
+    return_edges: HashSet<(NodeIndex, NodeIndex)>,
+    /// Relays on some path from `me` to an exit with at most [`MAX_LOOPBACK_HOPS`] relays.
+    forward_relays: HashSet<NodeIndex>,
+}
+
+impl FocusPaths {
+    fn new(inner: &InnerGraph, me: NodeIndex, exits: &HashSet<NodeIndex>) -> Self {
+        use petgraph::Direction::{Incoming, Outgoing};
+
+        let from_exits = distances(inner, exits.iter().copied(), Outgoing, Some(me));
+        let to_me = distances(inner, [me], Incoming, None);
+        let return_edges = from_exits
+            .iter()
+            .filter(|(node, _)| **node != me)
+            .flat_map(|(node, reached)| {
+                let to_me = &to_me;
+                inner
+                    .graph
+                    .neighbors_directed(*node, Outgoing)
+                    .filter(move |next| to_me.get(next).is_some_and(|left| reached + 1 + left <= MAX_PATH_EDGES))
+                    .map(|next| (*node, next))
+            })
+            .collect();
+
+        let from_me = distances(inner, [me], Outgoing, None);
+        let to_exits = distances(inner, exits.iter().copied(), Incoming, Some(me));
+        let forward_relays = from_me
+            .iter()
+            .filter(|(node, _)| **node != me)
+            .filter(|(node, reached)| to_exits.get(node).is_some_and(|left| *reached + left <= MAX_PATH_EDGES))
+            .map(|(node, _)| *node)
+            .collect();
+
+        Self {
+            return_edges,
+            forward_relays,
+        }
+    }
+
+    /// The paths, plus everything within [`FOCUS_RADIUS`] of them. `me` is kept but never grown from.
+    fn neighborhood(&self, inner: &InnerGraph, me: NodeIndex, exits: &HashSet<NodeIndex>) -> HashSet<NodeIndex> {
+        let mut nodes: HashSet<NodeIndex> = self
+            .forward_relays
+            .iter()
+            .chain(exits)
+            .copied()
+            .chain(self.return_edges.iter().flat_map(|(from, to)| [*from, *to]))
+            .collect();
+        nodes.insert(me);
+
+        let mut frontier: Vec<NodeIndex> = nodes.iter().copied().filter(|node| *node != me).collect();
+        for _ in 0..FOCUS_RADIUS {
+            frontier = frontier
+                .into_iter()
+                .flat_map(|node| {
+                    [petgraph::Direction::Outgoing, petgraph::Direction::Incoming]
+                        .into_iter()
+                        .flat_map(move |direction| inner.graph.neighbors_directed(node, direction))
+                })
+                .filter(|next| *next != me && nodes.insert(*next))
+                .collect();
+        }
+        nodes
+    }
+}
+
+/// Copy of `inner` holding only `keep`, with the edges between those nodes.
+fn induced(inner: &InnerGraph, keep: &HashSet<NodeIndex>) -> (InnerGraph, HashMap<NodeIndex, NodeIndex>) {
+    use petgraph::visit::{EdgeRef, IntoEdgeReferences};
+
+    let mut sub = InnerGraph::default();
+    let mut renamed = HashMap::new();
+    for old in keep {
+        if let Some(key) = inner.indices.get_by_right(old) {
+            let new = sub.graph.add_node(*key);
+            sub.indices.insert(*key, new);
+            renamed.insert(*old, new);
+        }
+    }
+    for edge in inner.graph.edge_references() {
+        if let (Some(source), Some(target)) = (renamed.get(&edge.source()), renamed.get(&edge.target())) {
+            sub.graph.add_edge(*source, *target, *edge.weight());
+        }
+    }
+    (sub, renamed)
+}
+
+impl FocusedLoopback for ChannelGraph {
+    fn focused_loopback(
+        &self,
+        hops: usize,
+        take_count: Option<usize>,
+        exits: &HashSet<OffchainPublicKey>,
+    ) -> Vec<(Vec<OffchainPublicKey>, PathId, FocusRelevance)> {
+        if !(MIN_LOOPBACK_HOPS..=MAX_LOOPBACK_HOPS).contains(&hops) || exits.is_empty() {
+            return vec![];
+        }
+
+        let inner = self.inner.read();
+        let Some(&me) = inner.indices.get_by_left(&self.me) else {
+            return vec![];
+        };
+        let exits: HashSet<NodeIndex> = exits
+            .iter()
+            .filter_map(|key| inner.indices.get_by_left(key).copied())
+            .filter(|idx| *idx != me)
+            .collect();
+        if exits.is_empty() {
+            return vec![];
+        }
+
+        let paths = FocusPaths::new(&inner, me, &exits);
+        let (sub, renamed) = induced(&inner, &paths.neighborhood(&inner, me, &exits));
+        let Some(&sub_me) = renamed.get(&me) else {
+            return vec![];
+        };
+        // Only the structure of a loop matters for the search, so no edge is scored or pruned.
+        let unscored: SharedValueFn<()> = Arc::new(|c, _, _| c);
+
+        let has_edge = |from: NodeIndex, to: NodeIndex| inner.graph.edges_connecting(from, to).next().is_some();
+        let index_of = |key: &OffchainPublicKey| inner.indices.get_by_left(key).copied();
+
+        let mut ranked = find_paths(
+            &sub,
+            sub_me,
+            &closing_neighbors(&sub, sub_me),
+            hops,
+            // Unrelated loops inside the neighborhood come out in no useful order, so the bound applies after
+            // ranking. The cap only limits the work of the search.
+            take_count.map(|take| take.saturating_mul(FOCUS_SEARCH_FACTOR)),
+            (),
+            None,
+            unscored,
+            // Focused loops probe, so they walk starved edges too: a returning loop is how a relay recovers.
+            StarvedEdges::Walk,
+        )
+        .into_iter()
+        .filter_map(|(mut relays, ..)| {
+            let ids: Vec<NodeIndex> = relays.iter().map(&index_of).collect::<Option<_>>()?;
+            if relays.len() != hops || ids.contains(&me) {
+                return None;
+            }
+
+            // A relay with an edge into an exit makes the relays up to it a path to that exit.
+            let forward = ids.iter().enumerate().any(|(at, relay)| {
+                exits
+                    .iter()
+                    .any(|exit| has_edge(*relay, *exit) && !ids[..=at].contains(exit))
+            });
+            let returning = ids
+                .windows(2)
+                .map(|pair| (pair[0], pair[1]))
+                .chain(ids.last().map(|last| (*last, me)))
+                .any(|edge| paths.return_edges.contains(&edge));
+            let relevance = match (forward, returning) {
+                (true, _) => FocusRelevance::Forward,
+                (false, true) => FocusRelevance::Return,
+                (false, false) => return None,
+            };
+
+            // Slots are key-derived and the closing `me` follows the last relay, as in
+            // `simple_loopback_to_self`.
+            let mut path_id: PathId = Default::default();
+            for (slot, key) in path_id.iter_mut().zip(std::iter::once(&self.me).chain(&relays)) {
+                *slot = path_id::encode(key);
+            }
+            *path_id.get_mut(hops + 1)? = path_id::encode(&self.me);
+            relays.push(self.me);
+            Some((relays, path_id, relevance))
+        })
+        .collect::<Vec<_>>();
+
+        // Forward loops lead, then return loops; the sort is stable, so equals keep the search order.
+        ranked.sort_by_key(|(_, _, relevance)| matches!(relevance, FocusRelevance::Return));
+        if let Some(take) = take_count {
+            ranked.truncate(take);
+        }
+        ranked
+    }
+}
+
+impl<T: FocusedLoopback> FocusedLoopback for Arc<T> {
+    fn focused_loopback(
+        &self,
+        hops: usize,
+        take_count: Option<usize>,
+        exits: &HashSet<OffchainPublicKey>,
+    ) -> Vec<(Vec<OffchainPublicKey>, PathId, FocusRelevance)> {
+        (**self).focused_loopback(hops, take_count, exits)
     }
 }
 
