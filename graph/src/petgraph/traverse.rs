@@ -297,7 +297,7 @@ pub trait FocusedLoopback {
     /// Generates loopback paths of exactly `hops` relays around `exits`, each ranked by [`FocusRelevance`].
     ///
     /// The search runs on the subgraph around the exits' forward and return paths, so loops elsewhere
-    /// in the network neither appear nor use up `take_count`, which bounds that one search. Closing
+    /// in the network do not appear. `take_count` bounds the result after ranking, forward loops first. Closing
     /// edges follow `simple_loopback_to_self`: they must exist and not be known to be down.
     ///
     /// Requests outside [`MIN_LOOPBACK_HOPS`]`..=`[`MAX_LOOPBACK_HOPS`], unknown exits and an empty
@@ -318,6 +318,10 @@ const MAX_PATH_EDGES: usize = MAX_LOOPBACK_HOPS + 1;
 /// Loops need relays beyond the paths themselves: a closing relay for a forward prefix, or an entry
 /// relay before a return component. Two steps cover every loop of up to three relays.
 const FOCUS_RADIUS: usize = 2;
+
+/// Most loops one focused search enumerates before ranking. It bounds the work only; the caller's `take_count`
+/// bounds the result.
+const FOCUS_SEARCH_CAP: usize = 2_000;
 
 /// How a loop relates to the exits it was focused on, ordered by how much it is worth probing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -480,12 +484,14 @@ impl FocusedLoopback for ChannelGraph {
         let has_edge = |from: NodeIndex, to: NodeIndex| inner.graph.edges_connecting(from, to).next().is_some();
         let index_of = |key: &OffchainPublicKey| inner.indices.get_by_left(key).copied();
 
-        find_paths(
+        let mut ranked = find_paths(
             &sub,
             sub_me,
             &closing_neighbors(&sub, sub_me),
             hops,
-            take_count,
+            // Unrelated loops inside the neighborhood come out in no useful order, so the bound applies after
+            // ranking. The cap only limits the work of the search.
+            take_count.map(|_| FOCUS_SEARCH_CAP),
             (),
             None,
             unscored,
@@ -526,7 +532,14 @@ impl FocusedLoopback for ChannelGraph {
             relays.push(self.me);
             Some((relays, path_id, relevance))
         })
-        .collect()
+        .collect::<Vec<_>>();
+
+        // Forward loops lead, then return loops; the sort is stable, so equals keep the search order.
+        ranked.sort_by_key(|(_, _, relevance)| matches!(relevance, FocusRelevance::Return));
+        if let Some(take) = take_count {
+            ranked.truncate(take);
+        }
+        ranked
     }
 }
 
