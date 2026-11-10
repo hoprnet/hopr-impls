@@ -57,7 +57,7 @@ hopr-utils = { workspace = true, features = ["runtime-tokio"] }
 blokli-client = { workspace = true, features = ["testing"] }
 const-hex = { workspace = true }
 hex-literal = { workspace = true }
-hopr-network-graph = { path = "../graph", version = "0.10.1" }
+hopr-network-graph = { workspace = true, features = ["petgraph"] }
 hopr-utils = { workspace = true, features = [
   "runtime-tokio",
   "testing-blokli",
