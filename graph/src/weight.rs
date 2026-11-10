@@ -519,7 +519,13 @@ impl TransportIntermediates {
     pub(crate) fn surb_delivery_rate_at(&self, now: std::time::Instant) -> Option<f64> {
         let value = self.surb.value(now)?;
         let peak = self.peak_at(now)?;
-        let against_peak = (peak > 0.0).then(|| (value / peak).clamp(0.0, 1.0))?;
+        // SURBs minted over the edge and none ever returned: there is no baseline to compare with,
+        // and that absence is the evidence. Reading it as "no evidence" let a relay that drops
+        // everything keep a full score (hopr-impls#81). The first returned SURB lifts the peak.
+        if peak <= 0.0 {
+            return (value <= 0.0).then_some(0.0);
+        }
+        let against_peak = (value / peak).clamp(0.0, 1.0);
 
         // A relay that has just stopped delivering still reads well against its peak for most of
         // the window, because eleven healthy slices outvote the one bad one. Folding the trend in
@@ -1148,14 +1154,28 @@ mod tests {
     }
 
     #[test]
-    fn traffic_that_never_returned_should_say_nothing() {
-        // The edge has never delivered one, so there is no baseline to have collapsed from: it may
-        // be a session that has only just started.
+    fn traffic_that_never_returned_should_read_dead() {
+        // SURBs were minted over the edge and none came back: with no peak to have collapsed from,
+        // the absence is the evidence (hopr-impls#81).
         let epoch = std::time::Instant::now();
         let mut m = fast_slices(epoch);
         let now = record_slices(&mut m, epoch, 4, 100, 0);
 
-        assert_eq!(m.traffic_rate_at(now), None);
+        assert_eq!(m.traffic_rate_at(now), Some(0.0));
+    }
+
+    #[test]
+    fn the_first_returned_surb_should_lift_an_edge_that_read_dead() {
+        let epoch = std::time::Instant::now();
+        let mut m = fast_slices(epoch);
+        let now = record_slices(&mut m, epoch, 4, 100, 0);
+        assert_eq!(m.traffic_rate_at(now), Some(0.0));
+
+        let later = record_slices(&mut m, now, 1, 100, 50);
+        assert!(
+            m.traffic_rate_at(later).is_some_and(|rate| rate > 0.0),
+            "a returning edge must recover"
+        );
     }
 
     #[test]

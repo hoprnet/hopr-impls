@@ -571,3 +571,94 @@ fn a_dead_relay_should_be_starved_at_every_position_for_zero_to_three_hops_in_bo
     assert!(failures.is_empty(), "{}", failures.join("\n"));
     Ok(())
 }
+
+// ── Evidence on the edge into the destination (hopr-impls#81) ────────────
+
+/// `TOPOLOGY` with SURB round trips on the edge from each relay into the exit.
+fn with_surbs_into_exit(good: [u64; 2], bad: [u64; 2]) -> String {
+    let mut marked = 0;
+    let lines: Vec<String> = TOPOLOGY
+        .lines()
+        .map(|line| {
+            let surbs = [("good", good), ("bad", bad)]
+                .into_iter()
+                .find(|(relay, _)| line.contains(&format!(r#""from": "{relay}""#)) && line.contains(r#""to": "exit""#));
+            match surbs {
+                Some((_, [expected, observed])) => {
+                    marked += 1;
+                    line.replace(" }", &format!(r#", "surbs": [{expected}, {observed}] }}"#))
+                }
+                None => line.to_string(),
+            }
+        })
+        .collect();
+    assert_eq!(marked, 2, "both edges into the exit must carry SURBs");
+    lines.join("\n")
+}
+
+#[test]
+fn a_relay_whose_surbs_into_the_exit_never_return_should_be_starved() -> anyhow::Result<()> {
+    // Ten SURBs minted over the edge, none came back, while the other relay returns all of them.
+    let net = Net::from_json(&with_surbs_into_exit([10, 10], [10, 0]))?;
+
+    let routes = net.forward("exit", 1);
+    let share = share_of(&routes, "bad").ok_or_else(|| anyhow::anyhow!("a starved relay must stay a candidate"))?;
+
+    assert!(
+        share < 1e-6,
+        "a relay none of whose SURBs return must draw a negligible share, got {share}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_relay_whose_surbs_into_the_exit_never_return_should_be_starved_for_one_to_three_hops() -> anyhow::Result<()> {
+    for hops in 1..=3usize {
+        let dead = format!("d{hops}");
+        // No edge here has a failed loop: only the SURBs over the edge from `dead` into the exit
+        // never come back, as for a relay that forwards but drops what is addressed to the exit.
+        let topology: String = layered_both_ways("none")
+            .lines()
+            .map(|line| {
+                let into_exit = line.contains(r#""to": "exit""#)
+                    && !line.contains(r#""from": "me""#)
+                    && !line.contains(r#""from": "exit""#);
+                if !into_exit {
+                    return line.to_string();
+                }
+                let observed = if line.contains(&format!(r#""from": "{dead}""#)) {
+                    0
+                } else {
+                    10
+                };
+                line.replace(" }", &format!(r#", "surbs": [10, {observed}] }}"#))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let net = Net::from_json(&topology)?;
+
+        // Routes that end in `dead`, against the best route that does not: `dead` also sits earlier on
+        // other routes, over edges that are healthy.
+        let routes = net.forward("exit", hops);
+        let best = |ends_in_dead: bool| {
+            routes
+                .0
+                .iter()
+                .filter(|(names, _)| (names.last() == Some(&dead)) == ends_in_dead)
+                .map(|(_, value)| *value)
+                .fold(None, |best: Option<f64>, value| {
+                    Some(best.map_or(value, |b| b.max(value)))
+                })
+        };
+        let (through, around) = best(true)
+            .zip(best(false))
+            .ok_or_else(|| anyhow::anyhow!("{hops} hop(s): a starved relay must stay a candidate"))?;
+        let share = through / (through + around);
+
+        assert!(
+            share < 1e-6,
+            "{hops} hop(s): a relay whose SURBs into the exit never return must draw a negligible share, got {share}"
+        );
+    }
+    Ok(())
+}
