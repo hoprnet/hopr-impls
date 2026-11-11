@@ -11,6 +11,19 @@ edges can disappear while telemetry is in flight; those unattributable reports d
 path structure still produces WARN diagnostics, and so does a missing local node in the SURB round-trip handler; the loopback handlers
 report it at TRACE. Enable TRACE in a build that retains it for individual reports; the workspace compiles TRACE out of release builds.
 
+## Traversal diagnostics
+
+`simple_paths`, `simple_paths_from`, and `simple_loopback_to_self` create TRACE spans named `graph.simple_paths`, `graph.simple_paths_from`,
+and `graph.simple_loopback_to_self` under the caller's active span. They carry query parameters and process-local selection/search
+identifiers. Completion records `returned_count`, `elapsed_us` (including lock wait), and `reason` on the same span and emits a TRACE
+completion event, including for early exits. Reasons include `completed`, `invalid_length`, `invalid_hops`, `zero_limit`, `source_missing`,
+`destination_missing`, and `no_eligible_paths`.
+
+Counts describe returned candidates, not all possible paths or the transport's final choice. TRACE candidates include canonical path IDs,
+nodes and correlation identifiers; generic cost values are logged by the selector where concrete metrics are known. Search records retain
+bounded decision-time evidence for operational dumps. Routine successes emit no DEBUG summary; empty-result DEBUG explanations share one
+per-graph, per-minute limit. TRACE is compiled out of release builds; bounded operational dumps and limited failure summaries remain.
+
 ## Bounded graph diagnostics
 
 Enable `serde` to implement `hopr_api::StateDump` on `ChannelGraph`. The asynchronous `dump().await` collects off the executor and returns
