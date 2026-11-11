@@ -11,7 +11,7 @@ name                   = "hopr-transport-p2p"
 readme                 = "README.md"
 repository.workspace   = true
 rust-version.workspace = true
-version                = "0.14.0"
+version                = "0.15.0"
 
 [lib]
 crate-type = ["rlib"]
@@ -20,7 +20,7 @@ crate-type = ["rlib"]
 default        = []
 runtime-tokio  = ["libp2p/tokio"]
 telemetry      = ["dep:lazy_static", "hopr-api/types-telemetry"]
-testing        = []
+testing        = ["dep:hickory-resolver"]
 transport-quic = ["dep:quinn-udp", "libp2p/quic"]
 
 [dependencies]
@@ -29,6 +29,7 @@ async-trait = { workspace = true }
 backon = { workspace = true }
 futures = { workspace = true }
 futures-timer = { workspace = true }
+hickory-resolver = { workspace = true, optional = true }
 lazy_static = { workspace = true, optional = true }
 libp2p = { workspace = true, features = [
   "autonat",
@@ -49,6 +50,9 @@ pin-project = { workspace = true }
 
 hopr-api   = { workspace = true, features = ["ct", "network"] }
 hopr-utils = { workspace = true, features = ["network-types"] }
+
+[target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
+hickory-resolver = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 quinn-udp = { workspace = true, optional = true, features = [

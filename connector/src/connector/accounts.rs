@@ -192,6 +192,17 @@ where
         Ok(self.send_tx(tx_req, None, Some(signer.clone())).await?.boxed())
     }
 
+    async fn send_erc777(
+        &self,
+        balance: HoprBalance,
+        recipient: &Address,
+        payload: &Erc777Payload,
+    ) -> Result<BoxFuture<'_, Result<ChainReceipt, Self::Error>>, Self::Error> {
+        let tx_req = self.payload_generator.send_erc777(*recipient, balance, payload)?;
+
+        Ok(self.send_tx(tx_req, None, None).await?.boxed())
+    }
+
     async fn register_safe(
         &self,
         safe_address: &Address,
