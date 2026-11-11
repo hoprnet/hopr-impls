@@ -282,4 +282,44 @@ mod tests {
             }
         }
     }
+    #[tokio::test]
+    async fn missing_local_nodes_and_unavailable_sampled_paths_request_analysis() -> anyhow::Result<()> {
+        let graph = ChannelGraph::new(key(10));
+        graph.remove_node(&key(10));
+        let report = GraphDump::new(graph).collect_dump().await.map_err(anyhow::Error::msg)?;
+        assert_eq!(report.reason, "local_node_missing");
+        let report = GraphDump::new(ChannelGraph::new(key(11)))
+            .with_paths(|| vec![[1, 2, 0, 0, 0]])
+            .collect_dump()
+            .await
+            .map_err(anyhow::Error::msg)?;
+        assert_eq!(report.reason, "sampled_path_unavailable");
+        assert!(report.analysis_required);
+        for scenario in ["0", "invalid"] {
+            let output = std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", "state_dump::tests::public_reporting_probe"])
+                .env("HOPR_COMPONENT_REPORT_TEST", scenario)
+                .env("HOPR_STATE_DUMP_INTERVAL", scenario)
+                .output()?;
+            assert!(
+                output.status.success(),
+                "{} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn public_reporting_probe() -> anyhow::Result<()> {
+        let Ok(scenario) = std::env::var("HOPR_COMPONENT_REPORT_TEST") else {
+            return Ok(());
+        };
+        let graph = ChannelGraph::new(key(12));
+        let result = graph.run_state_reporting("node", Vec::new).await;
+        assert_eq!(result.is_err(), scenario == "invalid");
+        Ok(())
+    }
 }

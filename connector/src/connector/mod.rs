@@ -1878,4 +1878,76 @@ pub(crate) mod tests {
             assert_eq!(health.load(AtomicOrdering::Relaxed), ChainHealthState::Dropped);
         }
     }
+    #[tokio::test]
+    async fn live_ticket_parameters_update_values_events_and_recover_after_cache_invalidation() -> anyhow::Result<()> {
+        use hopr_api::chain::{ChainEvents, ChainValues};
+        let client = BlokliTestStateBuilder::default()
+            .with_ticket_price(HoprBalance::new_base(1))
+            .build_static_client();
+        client.hidden_state_update(|state| state.chain_info.min_ticket_winning_probability = 0.5);
+        let mut connector = create_connector(client.clone())?;
+        connector.connect().await?;
+        assert!(matches!(
+            connector.connect().await,
+            Err(ConnectorError::InvalidState(_))
+        ));
+        let mut events = Box::pin(connector.subscribe()?);
+        for (price, probability, expected_price, expected_probability, count) in [
+            (Some(2u32), Some(0.75), 2u32, 0.75, 2),
+            (Some(3u32), None, 3u32, 0.75, 1),
+            (None, Some(0.25), 3u32, 0.25, 1),
+        ] {
+            client.update_price_and_win_prob(
+                price.map(|p| blokli_client::api::types::TokenValueString(HoprBalance::new_base(p).to_string())),
+                probability,
+            );
+            for _ in 0..count {
+                let event = events
+                    .next()
+                    .timeout(futures_time::time::Duration::from_secs(2))
+                    .await?
+                    .expect("chain event stream is open");
+                assert!(matches!(
+                    event,
+                    hopr_api::chain::ChainEvent::TicketPriceChanged(_)
+                        | hopr_api::chain::ChainEvent::WinningProbabilityIncreased(_)
+                        | hopr_api::chain::ChainEvent::WinningProbabilityDecreased(_)
+                ));
+            }
+            assert_eq!(
+                connector.minimum_ticket_price().await?,
+                HoprBalance::new_base(expected_price)
+            );
+            assert!(
+                connector
+                    .minimum_incoming_ticket_win_prob()
+                    .await?
+                    .approx_eq(&WinningProbability::try_from_f64(expected_probability)?)
+            );
+        }
+        connector.invalidate_caches();
+        client.update_price_and_win_prob(
+            Some(blokli_client::api::types::TokenValueString(
+                HoprBalance::new_base(4).to_string(),
+            )),
+            Some(0.5),
+        );
+        for _ in 0..2 {
+            assert!(
+                events
+                    .next()
+                    .timeout(futures_time::time::Duration::from_secs(2))
+                    .await?
+                    .is_some()
+            );
+        }
+        assert_eq!(connector.minimum_ticket_price().await?, HoprBalance::new_base(4));
+        assert!(
+            connector
+                .minimum_incoming_ticket_win_prob()
+                .await?
+                .approx_eq(&WinningProbability::try_from_f64(0.5)?)
+        );
+        Ok(())
+    }
 }

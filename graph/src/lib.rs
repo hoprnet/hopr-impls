@@ -60,3 +60,17 @@ impl From<GraphNode> for OffchainPublicKey {
 
 #[cfg(all(feature = "serde", feature = "petgraph"))]
 mod state_reporting;
+
+#[cfg(test)]
+mod node_tests {
+    use hopr_api::types::crypto::prelude::{Keypair, OffchainKeypair};
+
+    use super::*;
+
+    #[test]
+    fn graph_node_conversion_preserves_the_public_key() -> anyhow::Result<()> {
+        let key = *OffchainKeypair::from_secret(&[3; 32])?.public();
+        assert_eq!(OffchainPublicKey::from(GraphNode(key)), key);
+        Ok(())
+    }
+}

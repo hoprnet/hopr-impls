@@ -334,4 +334,266 @@ mod tests {
         assert!(matches!(record.to_json(), Err(EncodeError::TooLarge)));
         assert!(record.analysis_required);
     }
+    #[test]
+    fn interval_and_source_deadline_boundaries_are_validated() -> anyhow::Result<()> {
+        assert!(Config::new(0)?.interval.is_none());
+        for seconds in [5, 60, 86400] {
+            assert_eq!(Config::new(seconds)?.interval, Some(Duration::from_secs(seconds)));
+        }
+        for seconds in [1, 4, 86401, u64::MAX] {
+            assert!(
+                Config::new(seconds)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("report interval")
+            );
+        }
+        for timeout in [Duration::ZERO, Duration::from_secs(5) + Duration::from_nanos(1)] {
+            assert!(
+                Config::default()
+                    .with_source_timeout(timeout)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("source timeout")
+            );
+        }
+        assert_eq!(
+            Config::default().with_source_timeout(Duration::from_secs(5))?.timeout,
+            Duration::from_secs(5)
+        );
+        Ok(())
+    }
+
+    // Command::env changes only the child process; parallel tests never mutate the process environment.
+    #[test]
+    fn environment_configuration_is_validated_in_isolated_processes() -> anyhow::Result<()> {
+        use std::{ffi::OsString, process::Command};
+        let mut cases = vec![
+            (None, "default"),
+            (Some(OsString::from("0")), "disabled"),
+            (Some(OsString::from("5")), "enabled"),
+            (Some(OsString::from("4")), "range_error"),
+            (Some(OsString::from("oops")), "parse_error"),
+        ];
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            cases.push((Some(OsString::from_vec(vec![255])), "utf8_error"));
+        }
+        for (value, expected) in cases {
+            let mut child = Command::new(std::env::current_exe()?);
+            child
+                .args(["--exact", "state_reporting::tests::environment_probe"])
+                .env("HOPR_REPORTING_ENV_TEST", expected)
+                .env_remove("HOPR_STATE_DUMP_INTERVAL");
+            if let Some(value) = value {
+                child.env("HOPR_STATE_DUMP_INTERVAL", value);
+            }
+            let output = child.output()?;
+            assert!(
+                output.status.success(),
+                "{expected}: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn environment_probe() {
+        let Ok(expected) = std::env::var("HOPR_REPORTING_ENV_TEST") else {
+            return;
+        };
+        let config = Config::from_env();
+        match expected.as_str() {
+            "default" => assert_eq!(config.unwrap().interval, Some(Duration::from_secs(60))),
+            "disabled" => assert!(config.unwrap().interval.is_none()),
+            "enabled" => assert_eq!(config.unwrap().interval, Some(Duration::from_secs(5))),
+            "range_error" => assert!(config.unwrap_err().to_string().contains("report interval")),
+            "parse_error" => assert!(config.unwrap_err().to_string().contains("integer seconds")),
+            "utf8_error" => assert!(config.unwrap_err().to_string().contains("not UTF-8")),
+            _ => panic!("unexpected environment scenario"),
+        }
+    }
+
+    #[tokio::test]
+    async fn periodic_reporting_collects_each_tick_and_can_be_cancelled() -> anyhow::Result<()> {
+        use std::cell::RefCell;
+        let reads = AtomicU64::new(0);
+        let reporter = Reporter::new(
+            "test",
+            "node",
+            Config {
+                interval: Some(Duration::from_millis(1)),
+                ..Config::default()
+            },
+        );
+        let (done, completed) = futures::channel::oneshot::channel();
+        let done = RefCell::new(Some(done));
+        let running = reporter.run(|| {
+            if reads.fetch_add(1, Ordering::Relaxed) == 1 {
+                done.borrow_mut().take().unwrap().send(()).unwrap();
+            }
+            async {
+                Ok(Dump {
+                    state: 7,
+                    analysis_required: false,
+                    reason: "ok",
+                })
+            }
+        });
+        let result = futures::future::select(Box::pin(running), completed)
+            .timeout(futures_time::time::Duration::from_secs(2))
+            .await?;
+        let futures::future::Either::Right((completed, running)) = result else {
+            anyhow::bail!("enabled reporter unexpectedly stopped")
+        };
+        completed?;
+        drop(running);
+        assert_eq!(reads.load(Ordering::Relaxed), 2);
+        assert_eq!(reporter.sequence.load(Ordering::Relaxed), 2);
+        reporter
+            .run_on(futures::stream::iter([(), ()]), || async {
+                Ok(Dump {
+                    state: 8,
+                    analysis_required: true,
+                    reason: "needs_analysis",
+                })
+            })
+            .await;
+        assert_eq!(reporter.sequence.load(Ordering::Relaxed), 4);
+        Reporter::new("test", "node", Config::new(0)?)
+            .run(|| async {
+                panic!("disabled reporter must not poll its source");
+                #[allow(unreachable_code)]
+                Ok::<Dump<()>, String>(Dump {
+                    state: (),
+                    analysis_required: false,
+                    reason: "unreachable",
+                })
+            })
+            .await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn encoding_failures_emit_analysis_without_losing_component_identity() -> anyhow::Result<()> {
+        use std::{
+            collections::BTreeMap,
+            sync::{Arc, Mutex},
+        };
+
+        use tracing::{
+            Event, Metadata, Subscriber,
+            field::{Field, Visit},
+            span,
+        };
+        #[derive(Default)]
+        struct Fields(BTreeMap<String, String>);
+        impl Visit for Fields {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                self.0.insert(field.name().into(), format!("{value:?}"));
+            }
+
+            fn record_str(&mut self, field: &Field, value: &str) {
+                self.0.insert(field.name().into(), value.into());
+            }
+        }
+        #[derive(Clone, Default)]
+        struct Logs(Arc<Mutex<Vec<Fields>>>);
+        impl Subscriber for Logs {
+            fn enabled(&self, _: &Metadata<'_>) -> bool {
+                true
+            }
+
+            fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+                span::Id::from_u64(1)
+            }
+
+            fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+
+            fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+
+            fn enter(&self, _: &span::Id) {}
+
+            fn exit(&self, _: &span::Id) {}
+
+            fn event(&self, event: &Event<'_>) {
+                let mut fields = Fields::default();
+                event.record(&mut fields);
+                self.0.lock().unwrap().push(fields);
+            }
+        }
+        struct Unserializable;
+        impl Serialize for Unserializable {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("injected serialization failure"))
+            }
+        }
+        let reporter = Reporter::new("test", "x".repeat(200), Config::default());
+        let good = reporter
+            .collect(async {
+                Ok(Dump {
+                    state: 42,
+                    analysis_required: false,
+                    reason: "ok",
+                })
+            })
+            .await;
+        let bad = reporter
+            .collect(async {
+                Ok(Dump {
+                    state: Unserializable,
+                    analysis_required: false,
+                    reason: "ok",
+                })
+            })
+            .await;
+        assert!(matches!(bad.to_json(), Err(EncodeError::Json(_))));
+        assert!(
+            bad.to_json()
+                .unwrap_err()
+                .to_string()
+                .contains("injected serialization failure")
+        );
+        let large = reporter
+            .collect(async {
+                Ok(Dump {
+                    state: "x".repeat(MAX_SNAPSHOT_BYTES),
+                    analysis_required: true,
+                    reason: "large",
+                })
+            })
+            .await;
+        assert_eq!(good.instance.len(), 120);
+        let logs = Logs::default();
+        tracing::subscriber::with_default(logs.clone(), || {
+            good.emit();
+            bad.emit();
+            large.emit();
+        });
+        let events = logs.0.lock().unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].0["component"], "test");
+        let state: serde_json::Value = serde_json::from_str(&events[0].0["state"])?;
+        assert_eq!(state["state"]["value"], 42);
+        for event in &events[1..] {
+            assert_eq!(event.0["reason"], "encoding_error");
+            assert_eq!(event.0["analysis_required"], "true");
+            assert_eq!(event.0["component"], "test");
+            assert_eq!(event.0["instance"].len(), 120);
+        }
+        let mut writer = BoundedJson {
+            bytes: Vec::new(),
+            exceeded: false,
+        };
+        writer.write_all(&vec![b'x'; MAX_SNAPSHOT_BYTES])?;
+        writer.flush()?;
+        assert!(writer.write_all(b"!").is_err());
+        assert_eq!(writer.bytes.len(), MAX_SNAPSHOT_BYTES);
+        assert!(writer.exceeded);
+        Ok(())
+    }
 }

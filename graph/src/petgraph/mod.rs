@@ -120,3 +120,27 @@ pub(crate) mod path_id {
         }
     }
 }
+
+#[cfg(test)]
+mod identifier_rejection_tests {
+    use hopr_api::types::crypto::prelude::{Keypair, OffchainKeypair};
+
+    use super::*;
+
+    #[test]
+    fn padding_unknown_and_colliding_slots_are_not_attributed_to_a_node() -> anyhow::Result<()> {
+        let mut graph = graph::InnerGraph::default();
+        let first = graph.graph.add_node(*OffchainKeypair::from_secret(&[1; 32])?.public());
+        let second = graph.graph.add_node(*OffchainKeypair::from_secret(&[2; 32])?.public());
+        graph.slots.insert(9, vec![first, second]);
+        assert!(path_id::resolve(&graph, 0).is_none());
+        assert!(path_id::resolve(&graph, 10).is_none());
+        assert!(
+            path_id::resolve(&graph, 9).is_none(),
+            "a collision must never select an arbitrary node"
+        );
+        graph.slots.insert(9, vec![second]);
+        assert_eq!(path_id::resolve(&graph, 9), Some(second));
+        Ok(())
+    }
+}

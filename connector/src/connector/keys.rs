@@ -159,6 +159,9 @@ mod tests {
         );
 
         let mapper = connector.key_id_mapper_ref();
+        // Exercise a real successful backend lookup after the subscription warmed these caches.
+        mapper.key_to_id.invalidate_all();
+        mapper.id_to_key.invalidate_all();
 
         assert_eq!(Some(account.key_id), mapper.map_key_to_id(offchain_key.public()));
         assert_eq!(Some(*offchain_key.public()), mapper.map_id_to_public(&account.key_id));

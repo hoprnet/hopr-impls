@@ -227,3 +227,38 @@ impl SearchRecord {
             && self.value_function == other.value_function
     }
 }
+
+#[cfg(test)]
+mod coverage_tests {
+    use hopr_api::{
+        graph::NetworkGraphWrite,
+        types::crypto::prelude::{Keypair, OffchainKeypair},
+    };
+
+    use super::*;
+
+    #[test]
+    fn borrowed_graph_reads_and_path_trimming_preserve_coverage_totals() -> anyhow::Result<()> {
+        let key = |i| OffchainKeypair::from_secret(&[i; 32]).map(|key| *key.public());
+        let me = key(1)?;
+        let graph = crate::ChannelGraph::new(me);
+        graph.upsert_edge(&me, &key(2)?, |_| {});
+        let mut state = GraphStateRead::graph_state(&&graph, None);
+        assert_eq!(state.outgoing_edges, 1);
+        let row = state.local_edges[0].clone();
+        state.local_edges.clear();
+        state.paths = Some(PathGraphState {
+            sampled_paths: 8,
+            requested_edges: 8,
+            edges: vec![row; 8],
+            ..Default::default()
+        });
+        state.bound_bytes();
+        let paths = state.paths.as_ref().unwrap();
+        assert!(paths.edges_omitted > 0);
+        assert_eq!(paths.edges.len() + paths.edges_omitted, 8);
+        assert_eq!(paths.requested_edges, 8);
+        assert!(serde_json::to_vec(&state)?.len() <= MAX_GRAPH_STATE_BYTES);
+        Ok(())
+    }
+}

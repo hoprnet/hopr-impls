@@ -181,6 +181,8 @@ mod tests {
         async_thread: Arc<parking_lot::Mutex<Option<std::thread::ThreadId>>>,
         identity_reads: Arc<AtomicUsize>,
         failed: Arc<parking_lot::Mutex<Option<ChannelId>>>,
+        identity_fault: Arc<AtomicUsize>,
+        panic_channel: Arc<std::sync::atomic::AtomicBool>,
     }
     impl Backend for BackendProbe {
         type Error = std::io::Error;
@@ -206,6 +208,12 @@ mod tests {
         }
 
         fn get_account_by_address(&self, a: &Address) -> Result<Option<AccountEntry>, Self::Error> {
+            match self.identity_fault.load(Ordering::Relaxed) {
+                1 => return Err(std::io::Error::other("identity backend failed")),
+                2 => panic!("identity backend panicked"),
+                3 => return Ok(None),
+                _ => {}
+            }
             if let Some(async_thread) = *self.async_thread.lock() {
                 assert_ne!(
                     std::thread::current().id(),
@@ -218,6 +226,7 @@ mod tests {
         }
 
         fn get_channel_by_id(&self, id: &ChannelId) -> Result<Option<ChannelEntry>, Self::Error> {
+            assert!(!self.panic_channel.load(Ordering::Relaxed), "channel backend panicked");
             self.reads.fetch_add(1, Ordering::Relaxed);
             if self.failed.lock().as_ref() == Some(id) {
                 return Err(std::io::Error::other("injected backend failure"));
@@ -327,6 +336,26 @@ mod tests {
             Some(2)
         );
         assert!(backend.identity_reads.load(Ordering::Relaxed) >= 1);
+        let connector = Arc::new(connector);
+        assert_eq!(
+            StateRead::component_state(&connector),
+            hopr_api::ComponentState::Running
+        );
+        assert_eq!(StateRead::announced_count(&connector).map_err(anyhow::Error::msg)?, 0);
+        for (fault, kind) in [(1, "backend_read"), (2, "join"), (3, "missing")] {
+            backend.identity_fault.store(fault, Ordering::Relaxed);
+            let rows: Vec<_> = StateRead::local_channels(&connector)
+                .map_err(anyhow::Error::msg)?
+                .collect()
+                .await;
+            assert_eq!(rows.len(), 1);
+            assert!(matches!(&rows[0], Err(error) if error.kind == kind));
+        }
+        backend.identity_fault.store(0, Ordering::Relaxed);
+        backend.panic_channel.store(true, Ordering::Relaxed);
+        let rows: Vec<_> = connector.local_channels().map_err(anyhow::Error::msg)?.collect().await;
+        assert!(matches!(&rows[0], Err(error) if error.kind == "join" && error.entity == "channel_batch"));
+
         Ok(())
     }
     #[test]

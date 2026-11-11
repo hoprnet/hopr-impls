@@ -380,3 +380,27 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod error_conversion_tests {
+    use super::*;
+
+    #[test]
+    fn database_failures_preserve_their_error_category_and_message() {
+        let failures = [
+            TempDbError::from(redb::DatabaseError::DatabaseAlreadyOpen),
+            TempDbError::from(redb::TransactionError::Storage(redb::StorageError::Corrupted(
+                "transaction".into(),
+            ))),
+            TempDbError::from(redb::TableError::TableDoesNotExist("channels".into())),
+            TempDbError::from(redb::StorageError::Corrupted("storage".into())),
+            TempDbError::from(redb::CommitError::Storage(redb::StorageError::Corrupted(
+                "commit".into(),
+            ))),
+        ];
+        for failure in failures {
+            assert!(matches!(failure, TempDbError::Database(_)));
+            assert!(failure.to_string().starts_with("database error:"));
+        }
+    }
+}

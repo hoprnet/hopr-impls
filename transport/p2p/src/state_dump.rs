@@ -89,4 +89,45 @@ mod tests {
         assert!(!recovered.analysis_required);
         assert_eq!(recovered.state.value().unwrap().connected_peers, 4);
     }
+    #[tokio::test]
+    async fn public_state_and_reporting_configuration_are_available_to_callers() -> anyhow::Result<()> {
+        let key = OffchainKeypair::from_secret(&[8; 32])?;
+        let (network, _process) = crate::HoprLibp2pNetworkBuilder::new(futures::stream::empty())
+            .build(&key, vec![], "/hopr/public-state/1", true)
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let state = serde_json::to_value(network.state().await.map_err(anyhow::Error::msg)?)?;
+        assert_eq!(state["state"]["connected_peers"], 0);
+        assert_eq!(state["reason"], "transport_connectivity_degraded");
+        for scenario in ["0", "invalid"] {
+            let output = std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", "state_dump::tests::public_reporting_probe"])
+                .env("HOPR_COMPONENT_REPORT_TEST", scenario)
+                .env("HOPR_STATE_DUMP_INTERVAL", scenario)
+                .output()?;
+            assert!(
+                output.status.success(),
+                "{} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn public_reporting_probe() -> anyhow::Result<()> {
+        let Ok(scenario) = std::env::var("HOPR_COMPONENT_REPORT_TEST") else {
+            return Ok(());
+        };
+        let key = OffchainKeypair::from_secret(&[9; 32])?;
+        let (network, _process) = crate::HoprLibp2pNetworkBuilder::new(futures::stream::empty())
+            .build(&key, vec![], "/hopr/report-probe/1", true)
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let result = network.run_state_reporting("node").await;
+        assert_eq!(result.is_err(), scenario == "invalid");
+        Ok(())
+    }
 }
