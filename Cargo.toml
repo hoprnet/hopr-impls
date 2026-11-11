@@ -33,7 +33,7 @@ hopr-network-graph   = { path = "graph", version = "0.11.1", default-features = 
 
 # External HOPR crates
 blokli-client = "0.37.0"
-hopr-api      = "5.0.0"
+hopr-api      = "5.1.0"
 hopr-utils    = { package = "hopr-utilities", version = "0.19.0", default-features = false }
 
 # Third-party dependencies (versions mirror hoprnet's workspace to preserve compatibility)
@@ -102,7 +102,3 @@ tokio = { version = "1.53.1", features = [
 tokio-retry = "0.3.2"
 tracing = { version = "0.1.44", features = ["release_max_level_debug"] }
 validator = { version = "0.21.0", features = ["derive"] }
-
-# Keep transitive users on the same API branch until hopr-api 5.1.0 is published.
-[patch.crates-io]
-hopr-api = { git = "https://github.com/hoprnet/hopr-api", branch = "feature/core-1168-periodic-compact-state-dump-reduce-debug-cardinality-for" }
