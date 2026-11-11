@@ -39,7 +39,7 @@ pub struct InactiveNetwork {
 #[cfg(any(feature = "testing", target_os = "android", target_os = "ios"))]
 fn swarm_dns_config() -> (libp2p::dns::ResolverConfig, libp2p::dns::ResolverOpts) {
     (
-        libp2p::dns::ResolverConfig::cloudflare(),
+        libp2p::dns::ResolverConfig::udp_and_tcp(&hickory_resolver::config::CLOUDFLARE),
         libp2p::dns::ResolverOpts::default(),
     )
 }
@@ -479,7 +479,7 @@ mod tests {
             resolver_config
                 .name_servers()
                 .iter()
-                .any(|server| server.socket_addr.ip() == IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)))
+                .any(|server| server.ip == IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)))
         );
     }
 }
