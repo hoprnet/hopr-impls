@@ -1,6 +1,6 @@
 ## Optional transport diagnostics
 
-Enable `serde` to implement `hopr_api::StateDump` on `HoprNetwork`. Poll `state_dump().await` through that trait to obtain an opaque
+Enable `serde` to implement `hopr_api::StateDump` on `HoprNetwork`. Poll `dump().await` through that trait to obtain an opaque
 Serde-compatible object, including through `Arc` handles. `network.state().await` remains an inherent convenience method. Snapshot
 structures stay private to this crate and their schema may change. The legacy `state-dump` feature enables `serde` too; there is no
 standalone diagnostic crate.

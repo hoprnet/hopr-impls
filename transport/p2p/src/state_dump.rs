@@ -37,9 +37,7 @@ impl HoprNetwork {
 impl HoprNetwork {
     /// Collect transport diagnostics without exposing the internal snapshot schema.
     pub async fn state(&self) -> Result<impl serde::Serialize + serde::de::DeserializeOwned + Send, String> {
-        hopr_api::StateDump::state_dump(self)
-            .await
-            .map_err(|error| error.to_string())
+        hopr_api::StateDump::dump(self).await.map_err(|error| error.to_string())
     }
 
     /// Emit independent periodic diagnostics until the host cancels this future.
@@ -56,9 +54,7 @@ impl HoprNetwork {
 impl hopr_api::StateDump for HoprNetwork {
     type Error = std::io::Error;
 
-    async fn state_dump(
-        &self,
-    ) -> Result<impl serde::Serialize + serde::de::DeserializeOwned + Send + 'static, Self::Error> {
+    async fn dump(&self) -> Result<impl serde::Serialize + serde::de::DeserializeOwned + Send + 'static, Self::Error> {
         let dump = self.collect_dump().await.map_err(std::io::Error::other)?;
         serde_json::to_value(dump).map_err(std::io::Error::other)
     }
@@ -78,7 +74,7 @@ mod tests {
             .await
             .unwrap();
         let shared = std::sync::Arc::new(network.clone());
-        let snapshot = hopr_api::StateDump::state_dump(&shared).await.unwrap();
+        let snapshot = hopr_api::StateDump::dump(&shared).await.unwrap();
         let value = serde_json::to_value(snapshot).unwrap();
         assert_eq!(value["state"]["connected_peers"], 0);
         let reporter = Reporter::new("transport", "node", Config::default());

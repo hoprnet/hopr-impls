@@ -145,9 +145,7 @@ impl crate::ChannelGraph {
 impl<G: GraphStateRead + Send + Sync + 'static> hopr_api::StateDump for GraphDump<G> {
     type Error = std::io::Error;
 
-    async fn state_dump(
-        &self,
-    ) -> Result<impl serde::Serialize + serde::de::DeserializeOwned + Send + 'static, Self::Error> {
+    async fn dump(&self) -> Result<impl serde::Serialize + serde::de::DeserializeOwned + Send + 'static, Self::Error> {
         let dump = self.collect_dump().await.map_err(std::io::Error::other)?;
         serde_json::to_value(dump).map_err(std::io::Error::other)
     }
@@ -156,9 +154,7 @@ impl<G: GraphStateRead + Send + Sync + 'static> hopr_api::StateDump for GraphDum
 impl hopr_api::StateDump for crate::ChannelGraph {
     type Error = std::io::Error;
 
-    async fn state_dump(
-        &self,
-    ) -> Result<impl serde::Serialize + serde::de::DeserializeOwned + Send + 'static, Self::Error> {
+    async fn dump(&self) -> Result<impl serde::Serialize + serde::de::DeserializeOwned + Send + 'static, Self::Error> {
         let graph = self.clone();
         let state = hopr_utils::runtime::prelude::spawn_blocking(move || graph.graph_state(None))
             .await
@@ -239,7 +235,7 @@ mod tests {
     #[tokio::test]
     async fn generic_callers_can_collect_graphs_and_configured_path_views() -> anyhow::Result<()> {
         async fn collect<T: hopr_api::StateDump>(source: &T) -> anyhow::Result<serde_json::Value> {
-            Ok(serde_json::to_value(source.state_dump().await?)?)
+            Ok(serde_json::to_value(source.dump().await?)?)
         }
         let graph = ChannelGraph::new(key(1));
         assert_eq!(collect(&graph).await?["node_count"], 1);

@@ -278,9 +278,7 @@ where
 {
     type Error = std::io::Error;
 
-    async fn state_dump(
-        &self,
-    ) -> Result<impl serde::Serialize + serde::de::DeserializeOwned + Send + 'static, Self::Error> {
+    async fn dump(&self) -> Result<impl serde::Serialize + serde::de::DeserializeOwned + Send + 'static, Self::Error> {
         let dump = self.collect_dump().await.map_err(std::io::Error::other)?;
         serde_json::to_value(dump).map_err(std::io::Error::other)
     }

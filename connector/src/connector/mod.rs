@@ -1363,7 +1363,7 @@ pub(crate) mod tests {
     async fn opaque_chain_dumps_include_operational_state_independently_of_read_coverage() -> anyhow::Result<()> {
         use hopr_api::ComponentState;
         async fn snapshot<T: hopr_api::StateDump>(source: T) -> anyhow::Result<serde_json::Value> {
-            Ok(serde_json::to_value(source.state_dump().await?)?)
+            Ok(serde_json::to_value(source.dump().await?)?)
         }
         let client = BlokliTestStateBuilder::default().build_static_client();
         let mut connector = create_connector(client)?;

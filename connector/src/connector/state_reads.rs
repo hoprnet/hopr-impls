@@ -307,7 +307,7 @@ mod tests {
         *backend.async_thread.lock() = Some(std::thread::current().id());
         let value = {
             let view = connector.state_view(Address::from([99; 20]), None);
-            let opaque = hopr_api::StateDump::state_dump(&view).await?;
+            let opaque = hopr_api::StateDump::dump(&view).await?;
             serde_json::to_value(opaque)?
         };
         assert_eq!(value["state"]["channels"]["status"], "partial");

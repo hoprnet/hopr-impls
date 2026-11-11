@@ -5,14 +5,14 @@ Implementation of HOPR Chain APIs using Blokli client. Part of the [HOPR](https:
 ## Optional diagnostics
 
 Enable `serde` for diagnostics through `hopr_api::StateDump`. Configure the Safe address and funding policy with
-`connector.state_view(safe_address, funding_value)`, then poll the returned opaque view through `state_dump().await`. Generic callers use
-the same trait for chain, graph, transport, and producer diagnostics. Concrete view and snapshot types remain private to this crate; their
-schema may change. The legacy `state-dump` feature also enables `serde`.
+`connector.state_view(safe_address, funding_value)`, then poll the returned opaque view through `dump().await`. Generic callers use the same
+trait for chain, graph, transport, and producer diagnostics. Concrete view and snapshot types remain private to this crate; their schema may
+change. The legacy `state-dump` feature also enables `serde`.
 
 ```rust,ignore
 use hopr_api::StateDump;
 let view = connector.state_view(safe_address, funding_value);
-let snapshot = view.state_dump().await?;
+let snapshot = view.dump().await?;
 let json = serde_json::to_string(&snapshot)?;
 ```
 

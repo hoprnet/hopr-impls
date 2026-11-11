@@ -13,10 +13,10 @@ report it at TRACE. Enable TRACE in a build that retains it for individual repor
 
 ## Bounded graph diagnostics
 
-Enable `serde` to implement `hopr_api::StateDump` on `ChannelGraph`. The asynchronous `state_dump().await` collects off the executor and
-returns an opaque Serde-compatible object. For sampled paths, `graph.state_view(bounded_paths)` returns an opaque configured view
-implementing the same trait. Concrete snapshot types and the graph read seam are private; the diagnostic schema may change. The legacy
-`state-dump` feature enables `serde` too. There is no standalone diagnostic crate.
+Enable `serde` to implement `hopr_api::StateDump` on `ChannelGraph`. The asynchronous `dump().await` collects off the executor and returns
+an opaque Serde-compatible object. For sampled paths, `graph.state_view(bounded_paths)` returns an opaque configured view implementing the
+same trait. Concrete snapshot types and the graph read seam are private; the diagnostic schema may change. The legacy `state-dump` feature
+enables `serde` too. There is no standalone diagnostic crate.
 
 `graph.state(paths)` remains a synchronous inherent convenience method.
 
