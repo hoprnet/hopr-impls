@@ -3891,7 +3891,7 @@ dependencies = [
 
 [[package]]
 name = "hopr-chain-connector"
-version = "0.31.0"
+version = "0.32.0"
 dependencies = [
  "ahash",
  "anyhow",
@@ -4184,7 +4184,8 @@ dependencies = [
 [[package]]
 name = "hopr-utilities"
 version = "0.19.2"
-source = "git+https://github.com/hoprnet/hopr-utilities.git?branch=lukas%2Fcurvy-shield-router#d354a4e28e2cb5c48831ebefc414c49b0d85cb99"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b475115b213ef8b02a917bc5087a8c1a79dadb45272a5f418f9adb3913954b22"
 dependencies = [
  "anyhow",
  "arrayvec",

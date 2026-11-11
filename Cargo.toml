@@ -28,13 +28,13 @@ rust-version = "1.97"
 
 [workspace.dependencies]
 # In-repo crates (path + version so they are publishable)
-hopr-chain-connector = { path = "connector", version = "0.31.0" }
+hopr-chain-connector = { path = "connector", version = "0.32.0" }
 hopr-network-graph   = { path = "graph", version = "0.11.0", default-features = false }
 
 # HOPR crates published to crates.io
 blokli-client = "0.37.0"
 hopr-api      = "6.0.0"
-hopr-utils    = { package = "hopr-utilities", version = "0.19.1", default-features = false }
+hopr-utils    = { package = "hopr-utilities", version = "0.19.2", default-features = false }
 
 # Third-party dependencies (versions mirror hoprnet's workspace to preserve compatibility)
 ahash = "0.8.12"
@@ -104,6 +104,3 @@ tracing = { version = "0.1.44", features = ["release_max_level_debug"] }
 tracing-core = "0.1.36"
 validator = { version = "0.21.0", features = ["derive"] }
 
-# Until the 6.0.0-aligned hopr-utilities is released (its `network-types` must re-export hopr-types 6).
-[patch.crates-io]
-hopr-utilities = { git = "https://github.com/hoprnet/hopr-utilities.git", branch = "lukas/curvy-shield-router" }
