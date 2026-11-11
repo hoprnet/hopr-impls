@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     hash::RandomState,
     sync::Arc,
+    time::Instant,
 };
 
 use hopr_api::{
@@ -102,7 +103,11 @@ where
             .collect::<Vec<_>>();
         // After stripping source: intermediates + destination = length nodes.
         // `simple_paths` additionally pops the destination; the others return as-is.
-        (nodes.len() == length).then_some((nodes, path_id, final_cost))
+        if nodes.len() != length {
+            return None;
+        }
+        tracing::trace!(?path_id, path = ?nodes, "graph traversal candidate");
+        Some((nodes, path_id, final_cost))
     });
 
     if let Some(take_count) = take_count {
@@ -116,6 +121,10 @@ impl hopr_api::graph::NetworkGraphTraverse for ChannelGraph {
     type NodeId = OffchainPublicKey;
     type Observed = crate::Observations;
 
+    #[tracing::instrument(
+        name = "graph.simple_paths", level = "debug", skip_all,
+        fields(source = %source, destination = %destination, length = length, take_count = ?take_count, returned_count, elapsed_us, reason)
+    )]
     fn simple_paths<C: ValueFn<Weight = Self::Observed>>(
         &self,
         source: &Self::NodeId,
@@ -124,40 +133,68 @@ impl hopr_api::graph::NetworkGraphTraverse for ChannelGraph {
         take_count: Option<usize>,
         value_fn: C,
     ) -> Vec<(Vec<Self::NodeId>, PathId, C::Value)> {
-        if length == 0 {
-            return Default::default();
-        }
+        let started = Instant::now();
+        let mut empty_reason = "no_eligible_paths";
+        let paths: Vec<_> = 'traversal: {
+            if length == 0 {
+                empty_reason = "invalid_length";
+                break 'traversal vec![];
+            }
+            if take_count == Some(0) {
+                empty_reason = "zero_limit";
+                break 'traversal vec![];
+            }
 
-        let inner = self.inner.read();
-        let Some(start) = inner.indices.get_by_left(source) else {
-            return Default::default();
-        };
-        let Some(end) = inner.indices.get_by_left(destination) else {
-            return Default::default();
-        };
-        let end = HashSet::from_iter([*end]);
+            let inner = self.inner.read();
+            let Some(start) = inner.indices.get_by_left(source) else {
+                empty_reason = "source_missing";
+                break 'traversal vec![];
+            };
+            let Some(end) = inner.indices.get_by_left(destination) else {
+                empty_reason = "destination_missing";
+                break 'traversal vec![];
+            };
+            let end = HashSet::from_iter([*end]);
 
-        // find_paths returns [intermediates…, destination]; pop destination since caller
-        // supplies it as an explicit input argument and it must not repeat in the path body.
-        find_paths(
-            &inner,
-            *start,
-            &end,
-            length,
-            take_count,
-            value_fn.initial_value(),
-            value_fn.min_value(),
-            value_fn.into_value_fn(),
-            StarvedEdges::Exclude,
-        )
-        .into_iter()
-        .map(|(mut nodes, path_id, cost)| {
-            nodes.pop(); // strip destination — caller already knows it
-            (nodes, path_id, cost)
-        })
-        .collect()
+            // find_paths returns [intermediates…, destination]; pop destination since caller
+            // supplies it as an explicit input argument and it must not repeat in the path body.
+            find_paths(
+                &inner,
+                *start,
+                &end,
+                length,
+                take_count,
+                value_fn.initial_value(),
+                value_fn.min_value(),
+                value_fn.into_value_fn(),
+                StarvedEdges::Exclude,
+            )
+            .into_iter()
+            .map(|(mut nodes, path_id, cost)| {
+                nodes.pop(); // strip destination — caller already knows it
+                (nodes, path_id, cost)
+            })
+            .collect()
+        };
+        let elapsed_us = started.elapsed().as_micros() as u64;
+        let reason = if paths.is_empty() { empty_reason } else { "completed" };
+        tracing::Span::current()
+            .record("returned_count", paths.len() as u64)
+            .record("elapsed_us", elapsed_us)
+            .record("reason", reason);
+        tracing::debug!(
+            returned_count = paths.len(),
+            elapsed_us,
+            reason,
+            "graph traversal completed"
+        );
+        paths
     }
 
+    #[tracing::instrument(
+        name = "graph.simple_paths_from", level = "debug", skip_all,
+        fields(source = %source, length = length, take_count = ?take_count, returned_count, elapsed_us, reason)
+    )]
     fn simple_paths_from<C: ValueFn<Weight = Self::Observed>>(
         &self,
         source: &Self::NodeId,
@@ -165,28 +202,51 @@ impl hopr_api::graph::NetworkGraphTraverse for ChannelGraph {
         take_count: Option<usize>,
         value_fn: C,
     ) -> Vec<(Vec<Self::NodeId>, PathId, C::Value)> {
-        if length == 0 {
-            return Default::default();
-        }
+        let started = Instant::now();
+        let mut empty_reason = "no_eligible_paths";
+        let paths: Vec<_> = 'traversal: {
+            if length == 0 {
+                empty_reason = "invalid_length";
+                break 'traversal vec![];
+            }
+            if take_count == Some(0) {
+                empty_reason = "zero_limit";
+                break 'traversal vec![];
+            }
 
-        let inner = self.inner.read();
-        let Some(start) = inner.indices.get_by_left(source) else {
-            return Default::default();
+            let inner = self.inner.read();
+            let Some(start) = inner.indices.get_by_left(source) else {
+                empty_reason = "source_missing";
+                break 'traversal vec![];
+            };
+
+            let destinations: HashSet<NodeIndex> = inner.graph.node_indices().filter(|idx| idx != start).collect();
+
+            find_paths(
+                &inner,
+                *start,
+                &destinations,
+                length,
+                take_count,
+                value_fn.initial_value(),
+                value_fn.min_value(),
+                value_fn.into_value_fn(),
+                StarvedEdges::Exclude,
+            )
         };
-
-        let destinations: HashSet<NodeIndex> = inner.graph.node_indices().filter(|idx| idx != start).collect();
-
-        find_paths(
-            &inner,
-            *start,
-            &destinations,
-            length,
-            take_count,
-            value_fn.initial_value(),
-            value_fn.min_value(),
-            value_fn.into_value_fn(),
-            StarvedEdges::Exclude,
-        )
+        let elapsed_us = started.elapsed().as_micros() as u64;
+        let reason = if paths.is_empty() { empty_reason } else { "completed" };
+        tracing::Span::current()
+            .record("returned_count", paths.len() as u64)
+            .record("elapsed_us", elapsed_us)
+            .record("reason", reason);
+        tracing::debug!(
+            returned_count = paths.len(),
+            elapsed_us,
+            reason,
+            "graph traversal completed"
+        );
+        paths
     }
 
     /// Generates loopback paths of exactly `hops` intermediate relay nodes.
@@ -195,78 +255,103 @@ impl hopr_api::graph::NetworkGraphTraverse for ChannelGraph {
     /// the closing edge is appended after path-finding.
     ///
     /// Requests outside [`MIN_LOOPBACK_HOPS`]`..=`[`MAX_LOOPBACK_HOPS`] yield no paths.
+    #[tracing::instrument(
+        name = "graph.simple_loopback_to_self", level = "debug", skip_all,
+        fields(source = %self.me, hops = hops, take_count = ?take_count, returned_count, elapsed_us, reason)
+    )]
     fn simple_loopback_to_self(&self, hops: usize, take_count: Option<usize>) -> Vec<(Vec<Self::NodeId>, PathId)> {
-        if (MIN_LOOPBACK_HOPS..=MAX_LOOPBACK_HOPS).contains(&hops) {
+        let started = Instant::now();
+        let mut empty_reason = "no_eligible_paths";
+        let paths: Vec<_> = 'traversal: {
+            if !(MIN_LOOPBACK_HOPS..=MAX_LOOPBACK_HOPS).contains(&hops) {
+                empty_reason = "invalid_hops";
+                break 'traversal vec![];
+            }
+            if take_count == Some(0) {
+                empty_reason = "zero_limit";
+                break 'traversal vec![];
+            }
             let inner = self.inner.read();
-
-            if let Some(me_idx) = inner.indices.get_by_left(&self.me) {
-                // The candidate set holds the *last* node before the appended closing `me`, so the
-                // edge that matters is `neighbor → me`, not `me → neighbor`. Since
-                // `MIN_LOOPBACK_HOPS` is 2, the destination is never the first hop, and the
-                // outgoing edge plays no part in the emitted loop. `resolve_loopback_edges` rejects
-                // a probe whose closing edge is absent, so requiring the incoming edge here is what
-                // keeps the probe attributable. A successful neighbor probe upserts both
-                // directions, so this excludes nothing that has actually been reached.
-                let connected_neighbors = closing_neighbors(&inner, *me_idx);
-
-                // Deliberately more permissive than data path selection, and the one traversal that still
-                // walks a starved edge: a relay judged dead is excluded from routing (RFC-0010 §4.2.3, the
-                // active tier), and loops that keep crossing it are how it is seen to recover. RFC-0010 §4.2.1.4 wants
-                // low-scoring edges probed *more* urgently; applying the production `min_ack_rate`
-                // here would instead prune them, so they would stop being probed, never be
-                // resampled, and stay excluded permanently.
-                let value_fn = EdgeValueFn::forward_without_self_loopback(
-                    // The closing edge back to `me` is appended after path-finding.
-                    std::num::NonZeroUsize::new(hops + 1).expect("hop range is non-zero"),
-                    self.edge_penalty,
-                    0.0,
-                    // Whatever the producer last pushed; `None` until the first price is seen.
-                    hopr_api::graph::NetworkGraphView::ticket_face_value(self),
-                );
-
-                return find_paths(
-                    &inner,
-                    *me_idx,
-                    &connected_neighbors,
-                    hops,
-                    take_count,
-                    value_fn.initial_value(),
-                    value_fn.min_value(),
-                    value_fn.into_value_fn(),
-                    StarvedEdges::Walk,
-                )
-                .into_iter()
-                .filter_map(|(mut a, mut b, _c)| {
-                    // find_paths already strips the leading `me` (source), so `a` is
-                    // [intermediates…, connected_neighbor]. Append `me` to close the loopback;
-                    // this is the only sanctioned position where `me` appears as a "destination".
-                    //
-                    // b is filled by find_paths BEFORE skip(1), so b[0] = me_idx and
-                    // b[1..=path_node_count] = path nodes. Closing me goes at b[path_node_count + 1].
-                    //
-                    // The hop range above guarantees the slot exists. Without the closing marker
-                    // the PathId cannot be resolved back to a loop, so drop rather than emit it.
-                    let path_node_count = a.len();
-                    debug_assert!(
-                        path_node_count + 1 < b.len(),
-                        "loopback of {path_node_count} hops has no PathId slot for the closing node"
-                    );
-                    if path_node_count + 1 >= b.len() {
-                        tracing::warn!(
-                            hops = path_node_count,
-                            "loopback path has no PathId slot for the closing node, dropping"
-                        );
-                        return None;
-                    }
-                    b[path_node_count + 1] = path_id::encode(&self.me);
-                    a.push(self.me);
-                    Some((a, b))
-                })
-                .collect();
+            let Some(me_idx) = inner.indices.get_by_left(&self.me) else {
+                empty_reason = "source_missing";
+                break 'traversal vec![];
             };
-        }
 
-        vec![]
+            // The candidate set holds the *last* node before the appended closing `me`, so the
+            // edge that matters is `neighbor → me`, not `me → neighbor`. Since
+            // `MIN_LOOPBACK_HOPS` is 2, the destination is never the first hop, and the
+            // outgoing edge plays no part in the emitted loop. `resolve_loopback_edges` rejects
+            // a probe whose closing edge is absent, so requiring the incoming edge here is what
+            // keeps the probe attributable. A successful neighbor probe upserts both
+            // directions, so this excludes nothing that has actually been reached.
+            let connected_neighbors = closing_neighbors(&inner, *me_idx);
+
+            // Deliberately more permissive than data path selection. RFC-0010 §4.2.1.4 wants
+            // low-scoring edges probed *more* urgently; applying the production `min_ack_rate`
+            // here would instead prune them, so they would stop being probed, never be
+            // resampled, and stay excluded permanently.
+            let value_fn = EdgeValueFn::forward_without_self_loopback(
+                // The closing edge back to `me` is appended after path-finding.
+                std::num::NonZeroUsize::new(hops + 1).expect("hop range is non-zero"),
+                self.edge_penalty,
+                0.0,
+                // Whatever the producer last pushed; `None` until the first price is seen.
+                hopr_api::graph::NetworkGraphView::ticket_face_value(self),
+            );
+
+            find_paths(
+                &inner,
+                *me_idx,
+                &connected_neighbors,
+                hops,
+                take_count,
+                value_fn.initial_value(),
+                value_fn.min_value(),
+                value_fn.into_value_fn(),
+                StarvedEdges::Walk,
+            )
+            .into_iter()
+            .filter_map(|(mut a, mut b, _c)| {
+                // find_paths already strips the leading `me` (source), so `a` is
+                // [intermediates…, connected_neighbor]. Append `me` to close the loopback;
+                // this is the only sanctioned position where `me` appears as a "destination".
+                //
+                // b is filled by find_paths BEFORE skip(1), so b[0] = me_idx and
+                // b[1..=path_node_count] = path nodes. Closing me goes at b[path_node_count + 1].
+                //
+                // The hop range above guarantees the slot exists. Without the closing marker
+                // the PathId cannot be resolved back to a loop, so drop rather than emit it.
+                let path_node_count = a.len();
+                debug_assert!(
+                    path_node_count + 1 < b.len(),
+                    "loopback of {path_node_count} hops has no PathId slot for the closing node"
+                );
+                if path_node_count + 1 >= b.len() {
+                    tracing::warn!(
+                        hops = path_node_count,
+                        "loopback path has no PathId slot for the closing node, dropping"
+                    );
+                    return None;
+                }
+                b[path_node_count + 1] = path_id::encode(&self.me);
+                a.push(self.me);
+                Some((a, b))
+            })
+            .collect()
+        };
+        let elapsed_us = started.elapsed().as_micros() as u64;
+        let reason = if paths.is_empty() { empty_reason } else { "completed" };
+        tracing::Span::current()
+            .record("returned_count", paths.len() as u64)
+            .record("elapsed_us", elapsed_us)
+            .record("reason", reason);
+        tracing::debug!(
+            returned_count = paths.len(),
+            elapsed_us,
+            reason,
+            "graph traversal completed"
+        );
+        paths
     }
 }
 
@@ -1621,5 +1706,152 @@ mod tests {
         );
 
         Ok(())
+    }
+    #[test]
+    fn traversal_diagnostics_should_inherit_context_and_report_results() {
+        use std::collections::BTreeMap;
+
+        use tracing::{Event, Metadata, Subscriber, field::Visit, span};
+
+        #[derive(Default)]
+        struct Fields(BTreeMap<String, String>);
+        impl Visit for Fields {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0.insert(field.name().into(), format!("{value:?}"));
+            }
+
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                self.0.insert(field.name().into(), value.into());
+            }
+        }
+        #[derive(Default)]
+        struct Capture {
+            spans: Vec<(&'static str, Option<span::Id>, Fields)>,
+            metadata: Vec<&'static Metadata<'static>>,
+            stack: Vec<span::Id>,
+            events: Vec<(Option<span::Id>, Fields)>,
+        }
+        #[derive(Clone, Default)]
+        struct Logs(Arc<parking_lot::Mutex<Capture>>);
+        impl Subscriber for Logs {
+            fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+                *metadata.level() <= tracing::Level::DEBUG
+            }
+
+            fn new_span(&self, attrs: &span::Attributes<'_>) -> span::Id {
+                let mut capture = self.0.lock();
+                let parent = attrs
+                    .parent()
+                    .cloned()
+                    .or_else(|| attrs.is_contextual().then(|| capture.stack.last().cloned()).flatten());
+                let mut fields = Fields::default();
+                attrs.record(&mut fields);
+                capture.metadata.push(attrs.metadata());
+                capture.spans.push((attrs.metadata().name(), parent, fields));
+                span::Id::from_u64(capture.spans.len() as u64)
+            }
+
+            fn record(&self, id: &span::Id, values: &span::Record<'_>) {
+                values.record(&mut self.0.lock().spans[id.into_u64() as usize - 1].2);
+            }
+
+            fn current_span(&self) -> tracing_core::span::Current {
+                let capture = self.0.lock();
+                match capture.stack.last() {
+                    Some(id) => {
+                        tracing_core::span::Current::new(id.clone(), capture.metadata[id.into_u64() as usize - 1])
+                    }
+                    None => tracing_core::span::Current::none(),
+                }
+            }
+
+            fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+
+            fn enter(&self, id: &span::Id) {
+                self.0.lock().stack.push(id.clone());
+            }
+
+            fn exit(&self, id: &span::Id) {
+                assert_eq!(self.0.lock().stack.pop().as_ref(), Some(id));
+            }
+
+            fn event(&self, event: &Event<'_>) {
+                let mut fields = Fields::default();
+                event.record(&mut fields);
+                let mut capture = self.0.lock();
+                let parent = capture.stack.last().cloned();
+                capture.events.push((parent, fields));
+            }
+        }
+
+        let me = pubkey_from(&SECRET_0);
+        let dest = pubkey_from(&SECRET_1);
+        let missing = pubkey_from(&SECRET_2);
+        let graph = ChannelGraph::new(me);
+        mark_edge_connected(&graph, &me, &dest);
+        let value_fn = || {
+            EdgeValueFn::forward(
+                std::num::NonZeroUsize::new(1).unwrap(),
+                TEST_EDGE_PENALTY,
+                TEST_MIN_ACK_RATE,
+                None,
+            )
+        };
+        let missing_self = ChannelGraph::new(missing);
+        missing_self.remove_node(&missing);
+        let logs = Logs::default();
+        tracing::subscriber::with_default(logs.clone(), || {
+            let request = tracing::debug_span!("routing.resolve", request_id = 123);
+            let _entered = request.enter();
+            graph.upsert_edge(&me, &dest, |_| {});
+            assert_eq!(graph.simple_paths(&me, &dest, 1, Some(1), value_fn()).len(), 1);
+            assert!(graph.simple_paths(&me, &dest, 0, None, value_fn()).is_empty());
+            assert!(graph.simple_paths(&missing, &dest, 1, None, value_fn()).is_empty());
+            assert!(graph.simple_paths(&me, &missing, 1, None, value_fn()).is_empty());
+            assert!(graph.simple_paths(&dest, &me, 1, None, value_fn()).is_empty());
+            assert!(graph.simple_paths_from(&me, 1, Some(0), value_fn()).is_empty());
+            assert_eq!(graph.simple_paths_from(&me, 1, Some(1), value_fn()).len(), 1);
+            assert!(graph.simple_loopback_to_self(0, None).is_empty());
+            assert!(missing_self.simple_loopback_to_self(2, None).is_empty());
+            assert!(graph.simple_loopback_to_self(2, None).is_empty());
+        });
+        let capture = logs.0.lock();
+        let parent = span::Id::from_u64(1);
+        assert_eq!(capture.spans[0].2.0["request_id"], "123");
+        assert_eq!(
+            capture.events.len(),
+            10,
+            "one summary per traversal; no observation events at DEBUG"
+        );
+        for (i, (event_parent, fields)) in capture.events.iter().enumerate() {
+            let (name, span_parent, span_fields) = &capture.spans[i + 1];
+            assert!(name.starts_with("graph.simple_"));
+            assert_eq!(span_parent.as_ref(), Some(&parent));
+            assert_eq!(event_parent.as_ref(), Some(&span::Id::from_u64((i + 2) as u64)));
+            assert_eq!(fields.0["message"], "graph traversal completed");
+            assert!(fields.0["elapsed_us"].parse::<u64>().is_ok());
+            let (count, reason) = [
+                ("1", "completed"),
+                ("0", "invalid_length"),
+                ("0", "source_missing"),
+                ("0", "destination_missing"),
+                ("0", "no_eligible_paths"),
+                ("0", "zero_limit"),
+                ("1", "completed"),
+                ("0", "invalid_hops"),
+                ("0", "source_missing"),
+                ("0", "no_eligible_paths"),
+            ][i];
+            assert_eq!(fields.0["returned_count"], count);
+            assert_eq!(fields.0["reason"], reason);
+            assert_eq!(span_fields.0["returned_count"], count);
+            assert_eq!(span_fields.0["reason"], reason);
+            assert_eq!(span_fields.0["elapsed_us"], fields.0["elapsed_us"]);
+        }
+        let query = &capture.spans[1].2.0;
+        assert_eq!(query["source"], me.to_string());
+        assert_eq!(query["destination"], dest.to_string());
+        assert_eq!(query["length"], "1");
+        assert_eq!(query["take_count"], "Some(1)");
     }
 }
