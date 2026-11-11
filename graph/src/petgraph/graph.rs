@@ -82,6 +82,9 @@ pub struct ChannelGraph {
     pub(crate) ticket_face_value: Arc<RwLock<Option<hopr_api::graph::traits::Balance>>>,
     pub(crate) inner: Arc<RwLock<InnerGraph>>,
     pub(crate) searches: Arc<super::search_diagnostics::SearchJournal>,
+    /// Direct StateDump polls share a baseline across cloned handles.
+    #[cfg(feature = "serde")]
+    pub(crate) dump_previous_empty: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Multiplier applied to an edge with no probe observations, keeping it discoverable (RFC-0010
@@ -146,6 +149,8 @@ impl ChannelGraph {
             ticket_face_value: Arc::new(RwLock::new(None)),
             inner: Arc::new(RwLock::new(InnerGraph { graph, indices, slots })),
             searches: Arc::new(Default::default()),
+            #[cfg(feature = "serde")]
+            dump_previous_empty: Arc::new(Default::default()),
         }
     }
 

@@ -27,19 +27,22 @@ per-graph, per-minute limit. TRACE is compiled out of release builds; bounded op
 ## Bounded graph diagnostics
 
 Enable `serde` to implement `hopr_api::StateDump` on `ChannelGraph`. The asynchronous `dump().await` collects off the executor and returns
-an opaque Serde-compatible object. For sampled paths, `graph.state_view(bounded_paths)` returns an opaque configured view implementing the
-same trait. Concrete snapshot types and the graph read seam are private; the diagnostic schema may change. The legacy `state-dump` feature
-enables `serde` too. There is no standalone diagnostic crate.
+an opaque Serde-compatible object containing `state`, `analysis_required` and `reason`. For sampled paths, `graph.state_view(bounded_paths)`
+returns an opaque configured view implementing the same trait. Concrete snapshot types and the graph read seam are private; the diagnostic
+schema may change. The legacy `state-dump` feature enables `serde` too. There is no standalone diagnostic crate.
 
 `graph.state(paths)` remains a synchronous inherent convenience method.
 
 The on-demand method is synchronous and briefly locks the graph. For periodic reporting, run
 `graph.run_state_reporting(instance, bounded_paths)` in the host runtime. The path provider runs with collection in a blocking task, must
 bound its allocation, and must supply a non-draining view. The host owns cancellation and its tracing subscriber. Each reporting stream
-keeps its own empty-search baseline; cumulative search diagnostics are never drained.
+keeps its own empty-search baseline; cumulative search diagnostics are never drained. Direct `ChannelGraph::dump()` polls share a baseline
+across cloned handles; use a separate `state_view` for each independent reporting stream.
 
 Missing local nodes, new empty searches, missing sampled path elements, degraded sampled observations and incomplete observations request
-analysis. This diagnostic assessment does not assign operational `ComponentState::Failed`.
+analysis. Missing probe measurements on optional remote path edges alone do not request analysis: those edges may only have chain
+observations. Observed remote degradation and missing sampled path elements still request analysis. Incomplete local edge observations
+request analysis with or without a path provider. This diagnostic assessment does not assign operational `ComponentState::Failed`.
 
 The snapshot includes graph-wide node/edge counts, whether the local node exists, ticket face value, edge penalty and minimum ack rate. It
 counts both incoming and outgoing local edges and samples up to eight incident edges, including healthy and transport-only edges. Each named

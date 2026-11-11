@@ -60,7 +60,7 @@ impl SearchJournal {
                     phase=record.phase, direction=record.direction, source=%record.source, destination=?record.destination,
                     length=record.length, outcome=record.outcome, below_minimum=record.below_minimum,
                     rejected_reason=?record.rejected_reason, suppressed,
-                    "graph search returned no paths; repeated failures are summarized in node_state");
+                    "graph search returned no paths; repeated failures are summarized in the component_state record");
             } else {
                 self.suppressed_debug.fetch_add(1, Ordering::Relaxed);
                 self.since_debug.fetch_add(1, Ordering::Relaxed);

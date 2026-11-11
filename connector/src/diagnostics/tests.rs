@@ -256,7 +256,8 @@ async fn inventory_distinguishes_channel_status_funding_and_peer_direction() -> 
     .await?;
     let source = ChainView::new(chain, Address::from([88; 20]), Config::default());
     let unknown = source.collect_dump().await.map_err(anyhow::Error::msg)?;
-    assert_eq!(unknown.reason, "funding_value_unavailable");
+    assert_eq!(unknown.reason, "chain_observations_ok");
+    assert!(!unknown.analysis_required);
     assert_eq!(unknown.state.channels.value().unwrap().funding.unknown, 1);
     Ok(())
 }
@@ -295,9 +296,21 @@ async fn chain_public_views_keep_opaque_snapshots_and_healthy_assessment() -> an
     let me = ChainKeypair::from_secret(&crate::connector::tests::PRIVATE_KEY_1)?
         .public()
         .to_address();
+    let peer = Address::from([77; 20]);
+    let channel = ChannelEntry::builder()
+        .between(me, peer)
+        .amount(6u32)
+        .status(ChannelStatus::Open)
+        .build()?;
     let mut connector = crate::connector::tests::create_connector(
         BlokliTestStateBuilder::default()
-            .with_generated_accounts(&[&me], false, XDaiBalance::new_base(1), HoprBalance::new_base(10))
+            .with_generated_accounts(
+                &[&me, &peer],
+                false,
+                XDaiBalance::new_base(1),
+                HoprBalance::new_base(10),
+            )
+            .with_channels([channel])
             .with_balances::<WxHOPR>([(Address::from([88; 20]), HoprBalance::new_base(100))])
             .with_safe_allowances([(Address::from([88; 20]), HoprBalance::new_base(7))])
             .build_static_client(),
@@ -312,11 +325,16 @@ async fn chain_public_views_keep_opaque_snapshots_and_healthy_assessment() -> an
         )?;
         assert_eq!(value["reason"], "chain_observations_ok");
         assert_eq!(value["analysis_required"], false);
-        let view = connector.state_view(Address::from([88; 20]), funding);
+        assert_eq!(value["state"]["channels"]["value"]["outgoing"]["open"], 1);
         assert_eq!(
-            serde_json::to_value(view.dump().await?)?["state"]["component_state"],
-            "Running"
+            value["state"]["channels"]["value"]["funding"]["unknown"],
+            u64::from(funding.is_none())
         );
+        let view = connector.state_view(Address::from([88; 20]), funding);
+        let dump = serde_json::to_value(view.dump().await?)?;
+        assert_eq!(dump["state"]["component_state"], "Running");
+        assert_eq!(dump["analysis_required"], false);
+        assert_eq!(dump["reason"], "chain_observations_ok");
     }
     Ok(())
 }

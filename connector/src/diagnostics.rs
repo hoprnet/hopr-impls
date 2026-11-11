@@ -259,8 +259,6 @@ where
                 c.funding.below > 0 || c.incoming.pending_to_close > 0 || c.outgoing.pending_to_close > 0
             }) {
                 (true, "channel_funding_or_closure")
-            } else if state.channels.value().is_some_and(|c| c.funding.unknown > 0) {
-                (true, "funding_value_unavailable")
             } else {
                 (false, "chain_observations_ok")
             };

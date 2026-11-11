@@ -21,7 +21,9 @@ let json = serde_json::to_string(&snapshot)?;
 Collection reads Safe balance and allowance, announced accounts, and locally adjacent channels independently. Read errors, timeouts, partial
 coverage, missing funding values and observed zeros remain distinct. Amounts use decimal base units. Channel details retain up to four
 problematic channels and sixteen underfunded outgoing channels, with omission counts. Incoming channels are funded by their counterparties.
-The supplied funding value must reflect the caller's current policy.
+The supplied funding value must reflect the caller's current policy. Passing `None` skips funding assessment: open outgoing channels remain
+counted as `funding.unknown`, but this alone does not request analysis. Read failures, pending closures and operational degradation still
+request analysis.
 
 For periodic INFO telemetry, run `connector.run_state_reporting(instance, safe_address, funding_value)` in the host runtime. The host owns
 cancellation and its tracing subscriber. Each component reports independently with its own deadline and sequence. Records carry
@@ -55,6 +57,13 @@ repository). That handle consumes transport events, supplies a bounded non-drain
 
 For a changing funding policy, use `run_state_reporting_with_funding_policy(instance, safe_address, policy)`. The bounded, non-blocking
 policy callback is read once per collection, so a cached ticket face-value update appears in the next chain snapshot.
+
+## Backend migration for 0.32.0
+
+`Backend` implementors must now provide `count_announced_accounts(&self, me: &Address) -> Result<u64, Self::Error>`. Count accounts that
+have announced routing information, excluding `me`. This is a required method and a breaking change for custom backends; it seeds the
+announced-peer count at connection startup and reconnect. Returning a default zero would silently undercount pre-existing peers. Both
+bundled backends implement the count.
 
 ## License
 

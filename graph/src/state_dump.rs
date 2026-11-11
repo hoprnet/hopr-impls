@@ -16,14 +16,14 @@ type Paths = Arc<dyn Fn() -> Vec<[u64; 5]> + Send + Sync>;
 pub struct GraphDump<G> {
     graph: Arc<G>,
     paths: Option<Paths>,
-    previous_empty: AtomicU64,
+    previous_empty: Arc<AtomicU64>,
 }
 impl<G> GraphDump<G> {
     pub fn new(graph: G) -> Self {
         Self {
             graph: Arc::new(graph),
             paths: None,
-            previous_empty: AtomicU64::new(0),
+            previous_empty: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -92,7 +92,8 @@ fn assess(state: &GraphState, new_empty_search: bool) -> (bool, &'static str) {
         return (true, "sampled_edge_degraded");
     }
     if state.searches.samples_unavailable
-        || edges().any(|e| {
+        // Remote path edges may only have chain observations; no probe data is expected there.
+        || state.local_edges.iter().any(|e| {
             e.observation.as_ref().is_none_or(|o| {
                 o.is_connected.is_none()
                     && o.ack_rate.is_none()
@@ -155,11 +156,13 @@ impl hopr_api::StateDump for crate::ChannelGraph {
     type Error = std::io::Error;
 
     async fn dump(&self) -> Result<impl serde::Serialize + serde::de::DeserializeOwned + Send + 'static, Self::Error> {
-        let graph = self.clone();
-        let state = hopr_utils::runtime::prelude::spawn_blocking(move || graph.graph_state(None))
-            .await
-            .map_err(std::io::Error::other)?;
-        serde_json::to_value(state).map_err(std::io::Error::other)
+        let source = GraphDump {
+            graph: Arc::new(self.clone()),
+            paths: None,
+            previous_empty: self.dump_previous_empty.clone(),
+        };
+        let dump = source.collect_dump().await.map_err(std::io::Error::other)?;
+        serde_json::to_value(dump).map_err(std::io::Error::other)
     }
 }
 
@@ -238,10 +241,60 @@ mod tests {
             Ok(serde_json::to_value(source.dump().await?)?)
         }
         let graph = ChannelGraph::new(key(1));
-        assert_eq!(collect(&graph).await?["node_count"], 1);
+        let snapshot = collect(&graph).await?;
+        assert_eq!(snapshot["state"]["node_count"], 1);
+        assert_eq!(snapshot["analysis_required"], false);
+        assert_eq!(snapshot["reason"], "observed_graph_scope_ok");
         let view = graph.state_view(Vec::new);
         let snapshot = collect(&view).await?;
         assert!(snapshot["state"]["paths"].is_object());
+        assert_eq!(snapshot["analysis_required"], false);
+        graph.simple_paths(
+            &key(1),
+            &key(2),
+            1,
+            None,
+            EdgeValueFn::forward(1.try_into().unwrap(), 0.5, 0.1, None),
+        );
+        assert_eq!(collect(&graph).await?["reason"], "new_empty_searches");
+        assert_eq!(collect(&graph.clone()).await?["analysis_required"], false);
+        // A configured view has an independent reporting baseline.
+        assert_eq!(collect(&view).await?["reason"], "new_empty_searches");
+        graph.remove_node(&key(1));
+        for snapshot in [collect(&graph).await?, collect(&view).await?] {
+            assert_eq!(snapshot["analysis_required"], true);
+            assert_eq!(snapshot["reason"], "local_node_missing");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn optional_remote_probe_coverage_does_not_change_a_healthy_assessment() -> anyhow::Result<()> {
+        use hopr_api::{StateDump, graph::NetworkGraphView};
+        let graph = ChannelGraph::new(key(1));
+        graph.upsert_edge(&key(2), &key(3), |o| {
+            o.record(EdgeWeightType::Balance(Some(10u32.into())))
+        });
+        let path = [
+            graph.path_slot(&key(2)).unwrap(),
+            graph.path_slot(&key(3)).unwrap(),
+            0,
+            0,
+            0,
+        ];
+        let view = graph.state_view(move || vec![path]);
+        let direct = serde_json::to_value(graph.dump().await?)?;
+        let sampled = serde_json::to_value(view.dump().await?)?;
+        assert_eq!(sampled["state"]["paths"]["edges"].as_array().unwrap().len(), 1);
+        for snapshot in [direct, sampled] {
+            assert_eq!(snapshot["analysis_required"], false);
+            assert_eq!(snapshot["reason"], "observed_graph_scope_ok");
+        }
+        // Observed remote degradation still carries a signal.
+        graph.upsert_edge(&key(2), &key(3), |o| o.record(EdgeWeightType::Connected(false)));
+        let sampled = serde_json::to_value(view.dump().await?)?;
+        assert_eq!(sampled["analysis_required"], true);
+        assert_eq!(sampled["reason"], "sampled_edge_degraded");
         Ok(())
     }
 
