@@ -20,11 +20,11 @@ use futures::{
     channel::mpsc::{Receiver, Sender},
 };
 use hopr_api::{
+    Multiaddr, PeerId,
     network::{NetworkView, traits::NetworkStreamControl},
     types::crypto::{keypairs::Keypair, prelude::OffchainKeypair},
 };
 use hopr_transport_p2p::{HoprLibp2pNetworkBuilder, HoprNetwork, PeerDiscovery};
-use libp2p::{Multiaddr, PeerId};
 use more_asserts::assert_gt;
 use tokio::{
     task::{JoinHandle, spawn},

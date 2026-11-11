@@ -9,7 +9,6 @@
 //! See the [`HoprTicketManager`] and [`HoprTicketFactory`] documentation for complete details.
 
 mod backend;
-#[cfg(feature = "redb")]
 mod chain_sync;
 mod errors;
 mod factory;
@@ -17,15 +16,13 @@ mod manager;
 mod traits;
 mod utils;
 
+#[cfg(feature = "redb")]
+pub use crate::backend::{RedbStore, RedbTicketQueue};
 pub use crate::{
     backend::{MemoryStore, MemoryTicketQueue},
+    chain_sync::{ticket_factory_from_chain, ticket_manager_from_chain},
     errors::TicketManagerError,
     factory::HoprTicketFactory,
     manager::HoprTicketManager,
     traits::{OutgoingIndexStore, TicketQueue, TicketQueueStore},
-};
-#[cfg(feature = "redb")]
-pub use crate::{
-    backend::{RedbStore, RedbTicketQueue},
-    chain_sync::{ticket_factory_from_chain, ticket_manager_from_chain},
 };

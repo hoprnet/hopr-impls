@@ -21,7 +21,7 @@
 
 #![allow(dead_code)] // Each integration test binary uses a different subset of the harness.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use hopr_api::{
     OffchainPublicKey,
@@ -33,7 +33,8 @@ use hopr_api::{
     types::crypto::prelude::{Keypair, OffchainKeypair},
 };
 use hopr_network_graph::{
-    ChannelGraph, DEFAULT_EDGE_PENALTY, DEFAULT_MAX_PLAUSIBLE_LOOPBACK_RTT, DEFAULT_MIN_ACK_RATE, Observations,
+    ChannelGraph, DEFAULT_EDGE_PENALTY, DEFAULT_MAX_PLAUSIBLE_LOOPBACK_RTT, DEFAULT_MIN_ACK_RATE, FocusRelevance,
+    FocusedLoopback, Observations,
 };
 
 /// A whole network, as one JSON object.
@@ -298,6 +299,32 @@ impl Net {
             .simple_loopback_to_self(hops, None)
             .into_iter()
             .map(|(nodes, path_id)| (nodes.iter().map(|key| self.name(key)).collect(), path_id))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Focused loops of exactly `hops` relays around `exits`, by name with their relevance, sorted.
+    pub fn focused(&self, hops: usize, exits: &[&str]) -> Vec<(Vec<String>, FocusRelevance)> {
+        self.focused_with(hops, None, exits)
+            .into_iter()
+            .map(|(names, _, relevance)| (names, relevance))
+            .collect()
+    }
+
+    /// Like [`Self::focused`], with the bound on each underlying search and the `PathId` slots.
+    pub fn focused_with(
+        &self,
+        hops: usize,
+        take_count: Option<usize>,
+        exits: &[&str],
+    ) -> Vec<(Vec<String>, [u64; 5], FocusRelevance)> {
+        let exits: HashSet<OffchainPublicKey> = exits.iter().map(|name| self.key(name)).collect();
+        let mut out: Vec<(Vec<String>, [u64; 5], FocusRelevance)> = self
+            .graph
+            .focused_loopback(hops, take_count, &exits)
+            .into_iter()
+            .map(|(nodes, path_id, relevance)| (nodes.iter().map(|key| self.name(key)).collect(), path_id, relevance))
             .collect();
         out.sort();
         out

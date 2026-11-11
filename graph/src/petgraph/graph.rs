@@ -5,7 +5,7 @@ use hopr_api::OffchainPublicKey;
 use parking_lot::RwLock;
 use petgraph::{graph::NodeIndex, stable_graph::StableDiGraph};
 
-use crate::{Observations, errors::ChannelGraphError};
+use crate::{Observations, StarvationParams, errors::ChannelGraphError};
 
 /// Internal mutable state of a [`ChannelGraph`], protected by a lock.
 #[derive(Debug, Clone, Default)]
@@ -23,6 +23,21 @@ pub(crate) struct InnerGraph {
 }
 
 impl InnerGraph {
+    /// Records a node's health on every edge into it; `1.0` clears it. An edge added later starts
+    /// unjudged until the owner records again.
+    pub(crate) fn set_node_health(&mut self, idx: NodeIndex, health: f64) {
+        let health = (health < 1.0).then_some(health.max(0.0));
+        let mut incoming = self
+            .graph
+            .neighbors_directed(idx, petgraph::Direction::Incoming)
+            .detach();
+        while let Some((edge, _)) = incoming.next(&self.graph) {
+            if let Some(observations) = self.graph.edge_weight_mut(edge) {
+                observations.set_health(health);
+            }
+        }
+    }
+
     /// Registers a node's slot claim. Idempotent for a key already registered at that index.
     pub(crate) fn claim_slot(&mut self, key: &OffchainPublicKey, idx: NodeIndex) {
         let claimants = self.slots.entry(crate::petgraph::path_id::encode(key)).or_default();
@@ -60,6 +75,8 @@ pub struct ChannelGraph {
     pub(crate) edge_penalty: f64,
     pub(crate) min_ack_rate: f64,
     pub(crate) max_plausible_loopback_rtt: std::time::Duration,
+    /// How the loops over an edge judge its relay; handed to every edge this graph creates.
+    pub(crate) starvation: StarvationParams,
     /// Current single-hop ticket face value, pushed in whenever the price or winning probability
     /// changes. Held once for the whole graph so a change costs one write, not an edge sweep.
     pub(crate) ticket_face_value: Arc<RwLock<Option<hopr_api::graph::traits::Balance>>>,
@@ -124,9 +141,24 @@ impl ChannelGraph {
             edge_penalty,
             min_ack_rate,
             max_plausible_loopback_rtt,
+            starvation: StarvationParams::default(),
             ticket_face_value: Arc::new(RwLock::new(None)),
             inner: Arc::new(RwLock::new(InnerGraph { graph, indices, slots })),
         }
+    }
+
+    /// This graph with `starvation` deciding when the loops over an edge starve its relay. The defaults
+    /// stand otherwise. Call before the graph is shared; production code takes the values from the path
+    /// planner's configuration, as it does the edge parameters.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `starvation` does not pass [`StarvationParams::validate`]: a NaN or out-of-range rate would
+    /// starve every relay, or none.
+    pub fn with_starvation(mut self, starvation: StarvationParams) -> Result<Self, String> {
+        starvation.validate()?;
+        self.starvation = starvation;
+        Ok(self)
     }
 
     /// Returns the self-identity key of this graph.
@@ -271,7 +303,9 @@ impl hopr_api::graph::NetworkGraphWrite for ChannelGraph {
             .ok_or(ChannelGraphError::PublicKeyNodeNotFound(*dest))?;
 
         if inner.graph.find_edge(src_idx, dest_idx).is_none() {
-            inner.graph.add_edge(src_idx, dest_idx, Observations::default());
+            inner
+                .graph
+                .add_edge(src_idx, dest_idx, Observations::with_starvation(self.starvation));
         }
 
         Ok(())
@@ -293,7 +327,7 @@ impl hopr_api::graph::NetworkGraphWrite for ChannelGraph {
     /// If the edge does not exist, it gets created first.
     ///
     /// If the nodes do not exist, they are added as well.
-    #[tracing::instrument(level = "debug", skip(self, f))]
+    #[tracing::instrument(level = "trace", skip(self, f))]
     fn upsert_edge<F>(&self, src: &OffchainPublicKey, dest: &OffchainPublicKey, f: F)
     where
         F: FnOnce(&mut Observations),
@@ -320,14 +354,15 @@ impl hopr_api::graph::NetworkGraphWrite for ChannelGraph {
             idx
         };
 
-        let edge_idx = inner
-            .graph
-            .find_edge(src_idx, dest_idx)
-            .unwrap_or_else(|| inner.graph.add_edge(src_idx, dest_idx, Observations::default()));
+        let edge_idx = inner.graph.find_edge(src_idx, dest_idx).unwrap_or_else(|| {
+            inner
+                .graph
+                .add_edge(src_idx, dest_idx, Observations::with_starvation(self.starvation))
+        });
 
         if let Some(weight) = inner.graph.edge_weight_mut(edge_idx) {
             f(weight);
-            tracing::debug!(%src, %dest, ?weight, "updated edge weight with an observation");
+            tracing::trace!(%src, %dest, ?weight, "updated edge weight with an observation");
         }
     }
 }

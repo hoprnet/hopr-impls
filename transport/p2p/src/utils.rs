@@ -1,7 +1,6 @@
 use std::net::{Ipv4Addr, ToSocketAddrs};
 
-use libp2p::Multiaddr;
-use multiaddr::Protocol;
+use hopr_api::{Multiaddr, types::primitive::multiaddr::Protocol};
 
 use crate::errors::{P2PError, Result};
 

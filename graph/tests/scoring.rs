@@ -69,22 +69,27 @@ fn a_drained_channel_is_rejected_rather_than_scored() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A path `me -> r1 -> {r2 ->} exit` whose first edge holds `first_balance`, at face value 1000.
+fn funded_path(first_balance: u64) -> anyhow::Result<Net> {
+    Net::from_json(&format!(
+        r#"{{
+      "me": "me",
+      "ticket_face_value": 1000,
+      "edges": [
+        {{ "from": "me", "to": "r1",   "connected": true, "latency_ms": 20, "balance": {first_balance}, "relayed_ms": 30 }},
+        {{ "from": "r1", "to": "r2",   "connected": true, "latency_ms": 20, "balance": 100000, "relayed_ms": 30 }},
+        {{ "from": "r1", "to": "exit", "connected": true, "latency_ms": 20, "balance": 100000, "relayed_ms": 30 }},
+        {{ "from": "r2", "to": "exit", "connected": true, "latency_ms": 20, "balance": 100000, "relayed_ms": 30 }}
+      ]
+    }}"#
+    ))
+}
+
 #[test]
 fn funding_must_cover_every_remaining_hop() -> anyhow::Result<()> {
     // A first edge funds the whole downstream path, not just the next hop, so the same balance can
     // be enough for a short path and not for a long one.
-    let net = Net::from_json(
-        r#"{
-      "me": "me",
-      "ticket_face_value": 1000,
-      "edges": [
-        { "from": "me", "to": "r1",   "connected": true, "latency_ms": 20, "balance": 2500, "relayed_ms": 30 },
-        { "from": "r1", "to": "r2",   "connected": true, "latency_ms": 20, "balance": 100000, "relayed_ms": 30 },
-        { "from": "r1", "to": "exit", "connected": true, "latency_ms": 20, "balance": 100000, "relayed_ms": 30 },
-        { "from": "r2", "to": "exit", "connected": true, "latency_ms": 20, "balance": 100000, "relayed_ms": 30 }
-      ]
-    }"#,
-    )?;
+    let net = funded_path(1500)?;
 
     assert_eq!(
         net.forward("exit", 1).len(),
@@ -94,6 +99,22 @@ fn funding_must_cover_every_remaining_hop() -> anyhow::Result<()> {
     assert!(
         net.forward("exit", 2).is_empty(),
         "two remaining hops are not, so the longer path must be rejected"
+    );
+    Ok(())
+}
+
+#[test]
+fn funding_needs_exactly_remaining_hops_times_face_value() -> anyhow::Result<()> {
+    // The check is the bare `remaining_hops * face_value`, with no safety margin on top: a channel
+    // funded to exactly that amount is usable, and one wei less is not.
+    assert_eq!(
+        funded_path(2000)?.forward("exit", 2).len(),
+        1,
+        "a balance equal to two tickets funds two remaining hops"
+    );
+    assert!(
+        funded_path(1999)?.forward("exit", 2).is_empty(),
+        "a balance one below two tickets cannot fund two remaining hops"
     );
     Ok(())
 }
@@ -139,29 +160,28 @@ fn a_zero_face_value_waives_the_amount_but_not_the_channel() -> anyhow::Result<(
 // ── Presence versus measurement ──────────────────────────────────────────
 
 #[test]
-fn a_measured_dead_relay_is_starved_but_not_pruned() -> anyhow::Result<()> {
-    // RFC-0010 §4.2.3 requires unreliable edges to be "progressively starved rather than suddenly
-    // eliminated", with their score "continuously updated by the ongoing probe stream". A pruned
-    // edge receives no probes, so starvation must never reach zero candidates.
-    // Dead on every stream, which is what "measured dead" means. A relay that answers pings but
-    // relays nothing is the separate masking case below.
+fn a_measured_dead_relay_is_excluded_from_routing() -> anyhow::Result<()> {
+    // The active tier of RFC-0010 §4.2.3: a relay the graph has judged dead on every stream is left
+    // out of routing. The passive tier (a negligible share) is what an edge without such a verdict
+    // gets. Probing still walks the relay, so its score keeps being updated by the probe stream and it
+    // is routable again once a loop returns (see `loopback_first_hop.rs`).
+    // Dead on every stream, what "measured dead" means. The relay answers pings but relays nothing;
+    // a separate case below covers the masking.
     let net = Net::from_json(&two_relays(
         r#"{ "from": "me", "to": "ra", "connected": true, "latency_ms": 20, "balance": 100000, "relayed_ms": 30, "packets": 10, "acks": 10 }"#,
         r#"{ "from": "me", "to": "rb", "connected": true, "failed_probes": 20, "balance": 100000, "failed_relays": 20, "packets": 10, "acks": 10 }"#,
     ))?;
 
     let routes = net.forward("exit", 1);
-    let healthy = routes.value_of(&["ra"]).expect("ra should be a candidate");
-    let dead = routes.value_of(&["rb"]).expect("rb must remain a candidate");
-
     assert!(
-        dead > 0.0,
-        "a non-positive value prunes the edge from selection, so it could never recover"
+        routes.value_of(&["ra"]).is_some_and(|value| value > 0.0),
+        "the healthy relay must stay routable"
     );
-    let share = dead / (dead + healthy);
-    assert!(
-        share < 0.05,
-        "a measured-dead relay must draw a negligible share of the sampling weight, got {share}"
+    assert_eq!(
+        routes.value_of(&["rb"]),
+        None,
+        "a measured-dead relay must not be a candidate, got {:?}",
+        routes.names()
     );
     Ok(())
 }
@@ -284,5 +304,92 @@ fn the_configured_edge_penalty_should_govern_unmeasured_edges() -> anyhow::Resul
         harsh_value > 0.0,
         "even the harshest penalty must leave the edge discoverable, got {harsh_value}"
     );
+    Ok(())
+}
+
+// ── Relayer health ───────────────────────────────────────────────────────
+
+fn record_health(net: &Net, name: &str, health: f64) {
+    use hopr_api::graph::NetworkGraphUpdate;
+    net.graph.record_nodes_health(&[(net.key(name), health)]);
+}
+
+fn healthy_relays() -> anyhow::Result<Net> {
+    Net::from_json(&two_relays(
+        r#"{ "from": "me", "to": "ra", "connected": true, "latency_ms": 20, "balance": 100000, "relayed_ms": 30 }"#,
+        r#"{ "from": "me", "to": "rb", "connected": true, "latency_ms": 20, "balance": 100000, "relayed_ms": 30 }"#,
+    ))
+}
+
+#[test]
+fn a_dead_relayer_is_pruned_from_forward_paths() -> anyhow::Result<()> {
+    let net = healthy_relays()?;
+    assert_eq!(net.forward("exit", 1).len(), 2, "precondition: both relays usable");
+
+    record_health(&net, "rb", 0.0);
+
+    assert_eq!(net.forward("exit", 1).names(), vec![vec!["ra"]]);
+    Ok(())
+}
+
+#[test]
+fn a_degraded_relayer_draws_its_health_share_of_the_value() -> anyhow::Result<()> {
+    let net = healthy_relays()?;
+    let before = net.forward("exit", 1).value_of(&["rb"]).expect("rb is a candidate");
+
+    record_health(&net, "rb", 0.25);
+
+    let routes = net.forward("exit", 1);
+    let after = routes.value_of(&["rb"]).expect("a degraded relay stays a candidate");
+    assert!((after - before * 0.25).abs() < 1e-9, "{after} vs {before} * 0.25");
+    assert_eq!(routes.value_of(&["ra"]), Some(before), "the other relay is untouched");
+    Ok(())
+}
+
+#[test]
+fn a_recovered_relayer_regains_its_full_value() -> anyhow::Result<()> {
+    let net = healthy_relays()?;
+    let before = net.forward("exit", 1).value_of(&["rb"]);
+
+    record_health(&net, "rb", 0.0);
+    record_health(&net, "rb", 1.0);
+
+    assert_eq!(net.forward("exit", 1).value_of(&["rb"]), before);
+    Ok(())
+}
+
+#[test]
+fn the_destination_stays_reachable_whatever_its_health_as_a_relayer() -> anyhow::Result<()> {
+    let net = healthy_relays()?;
+    let before = net.forward("exit", 1);
+
+    record_health(&net, "exit", 0.0);
+
+    let after = net.forward("exit", 1);
+    for relay in ["ra", "rb"] {
+        assert_eq!(after.value_of(&[relay]), before.value_of(&[relay]), "via {relay}");
+    }
+    Ok(())
+}
+
+#[test]
+fn a_dead_relayer_is_pruned_from_return_paths() -> anyhow::Result<()> {
+    let net = Net::from_json(
+        r#"{
+      "me": "me",
+      "ticket_face_value": 100,
+      "edges": [
+        { "from": "exit", "to": "ra", "connected": true, "latency_ms": 20, "balance": 100000, "relayed_ms": 30 },
+        { "from": "exit", "to": "rb", "connected": true, "latency_ms": 20, "balance": 100000, "relayed_ms": 30 },
+        { "from": "ra",   "to": "me", "connected": true, "latency_ms": 20, "balance": 100000, "relayed_ms": 30 },
+        { "from": "rb",   "to": "me", "connected": true, "latency_ms": 20, "balance": 100000, "relayed_ms": 30 }
+      ]
+    }"#,
+    )?;
+    assert_eq!(net.returning("exit", 1).len(), 2, "precondition: both relays usable");
+
+    record_health(&net, "rb", 0.0);
+
+    assert_eq!(net.returning("exit", 1).names(), vec![vec!["ra"]]);
     Ok(())
 }

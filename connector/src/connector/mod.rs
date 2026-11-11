@@ -1,6 +1,9 @@
 use std::{cmp::Ordering, str::FromStr, sync::atomic::Ordering as AtomicOrdering, time::Duration};
 
-use blokli_client::api::{BlokliQueryClient, BlokliSubscriptionClient, BlokliTransactionClient};
+use blokli_client::{
+    BlokliClientError, SubscriptionHealth, SubscriptionHealthHandle, SubscriptionStatus,
+    api::{BlokliQueryClient, BlokliSubscriptionClient, BlokliTransactionClient},
+};
 use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt};
 use futures_concurrency::stream::Merge;
 use futures_time::future::FutureExt as FuturesTimeExt;
@@ -59,6 +62,151 @@ const DEFAULT_SYNC_TOLERANCE_PCT: usize = 90;
 const CHANNEL_CUSTOM_TIMEMOUT_MULTIPLIER: u32 = 4;
 const TICKET_CUSTOM_TIMEOUT_MULTIPLIER: u32 = 4;
 
+/// How often the health of the chain subscriptions is checked.
+const SUBSCRIPTION_HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Whether a subscription has stopped working for long enough to affect the chain health.
+///
+/// Short outages ([`Degraded`](SubscriptionStatus::Degraded)) do not count: blokli-client reconnects on its own and
+/// reports a [`Stalled`](SubscriptionStatus::Stalled) subscription once an outage has lasted its stall threshold.
+#[inline]
+fn subscription_is_failing(health: &SubscriptionHealth) -> bool {
+    matches!(
+        health.status,
+        SubscriptionStatus::Stalled | SubscriptionStatus::Rejected | SubscriptionStatus::Ended(_)
+    )
+}
+
+/// Chooses the subscription state without overwriting a connection failure or a dropped connector.
+fn chain_health_after_check(current: ChainHealthState, any_failing: bool, any_ended: bool) -> Option<ChainHealthState> {
+    let next = match current {
+        ChainHealthState::Connecting if any_ended => ChainHealthState::SubscriptionEnded,
+        ChainHealthState::Ready | ChainHealthState::SubscriptionDegraded => {
+            if any_ended {
+                ChainHealthState::SubscriptionEnded
+            } else if any_failing {
+                ChainHealthState::SubscriptionDegraded
+            } else {
+                ChainHealthState::Ready
+            }
+        }
+        _ => return None,
+    };
+    (next != current).then_some(next)
+}
+
+fn set_subscription_health(health: &AtomicChainHealthState, any_failing: bool, any_ended: bool) {
+    // Retry if connect() concurrently changes Connecting to Ready.
+    let mut current = health.load(AtomicOrdering::Relaxed);
+    while let Some(next) = chain_health_after_check(current, any_failing, any_ended) {
+        match health.compare_exchange(current, next, AtomicOrdering::Relaxed, AtomicOrdering::Relaxed) {
+            Ok(_) => break,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+/// Logs each subscription's transitions independently of the aggregate chain state.
+fn observe_subscription_health(
+    subscription: impl std::fmt::Display,
+    current: &SubscriptionHealth,
+    previous: &mut Option<SubscriptionStatus>,
+) {
+    if previous.as_ref() == Some(&current.status) {
+        return;
+    }
+    if subscription_is_failing(current) {
+        tracing::warn!(
+            %subscription,
+            status = ?current.status,
+            last_problem = ?current.last_problem,
+            "chain subscription not working"
+        );
+    } else if previous
+        .as_ref()
+        .is_some_and(|status| matches!(status, SubscriptionStatus::Stalled | SubscriptionStatus::Rejected))
+    {
+        tracing::info!(%subscription, status = ?current.status, "chain subscription recovering");
+    }
+    *previous = Some(current.status.clone());
+}
+
+fn update_chain_health(
+    health: &AtomicChainHealthState,
+    subscriptions: &[SubscriptionHealthHandle],
+    previous: &mut [Option<SubscriptionStatus>],
+) {
+    update_chain_health_from_snapshots(
+        health,
+        subscriptions.iter().map(|handle| (handle.subscription(), handle.get())),
+        previous,
+    );
+}
+
+/// Reduces one health snapshot per feed, keeping logging independent of aggregate state changes.
+fn update_chain_health_from_snapshots<N: std::fmt::Display>(
+    health: &AtomicChainHealthState,
+    subscriptions: impl IntoIterator<Item = (N, SubscriptionHealth)>,
+    previous: &mut [Option<SubscriptionStatus>],
+) {
+    let mut any_failing = false;
+    let mut any_ended = false;
+    for ((subscription, current), previous) in subscriptions.into_iter().zip(previous) {
+        observe_subscription_health(subscription, &current, previous);
+        any_failing |= subscription_is_failing(&current);
+        any_ended |= matches!(current.status, SubscriptionStatus::Ended(_));
+    }
+    set_subscription_health(health, any_failing, any_ended);
+}
+
+/// Observes actual completion even when the client's health handle is untracked.
+fn with_subscription_end<S>(
+    stream: S,
+    subscription: &'static str,
+    health: std::sync::Arc<AtomicChainHealthState>,
+) -> impl futures::Stream<Item = S::Item>
+where
+    S: futures::Stream,
+{
+    stream.chain(
+        futures::stream::once(async move {
+            tracing::warn!(subscription, "chain subscription ended, marking chain unavailable");
+            set_subscription_health(&health, false, true);
+            None::<S::Item>
+        })
+        .filter_map(futures::future::ready),
+    )
+}
+
+/// Polls checks fairly alongside the data, stopping as soon as the data stream ends.
+fn with_health_checks<S, C>(subscriptions: S, checks: C) -> impl futures::Stream<Item = S::Item>
+where
+    S: futures::Stream,
+    C: futures::Stream<Item = S::Item>,
+{
+    let subscriptions = subscriptions
+        .map(Some)
+        .chain(futures::stream::once(futures::future::ready(None)));
+    futures::stream::select(subscriptions, checks.map(Some))
+        .take_while(|event| futures::future::ready(event.is_some()))
+        .map(|event| event.expect("termination sentinel is consumed by take_while"))
+}
+
+/// An error from one of the chain subscriptions, together with the name of that subscription.
+///
+/// The names match the ones blokli-client uses for the subscription's health, so log lines from both can be matched.
+#[derive(Debug)]
+struct SubscriptionError {
+    subscription: &'static str,
+    error: ConnectorError,
+}
+
+impl SubscriptionError {
+    fn new(subscription: &'static str, error: ConnectorError) -> Self {
+        Self { subscription, error }
+    }
+}
+
 /// Connector health states.
 ///
 /// Each value maps to a `ComponentStatus` variant plus a fixed detail message.
@@ -70,11 +218,14 @@ enum ChainHealthState {
     Ready = 0,
     WaitingForConnection = 1,
     Connecting = 2,
+    /// At least one required subscription has permanently ended.
     SubscriptionEnded = 3,
     SyncTimedOut = 4,
     ServerNotHealthy = 5,
     ConnectionFailed = 6,
     Dropped = 7,
+    /// A subscription is stalled or rejected and is still being retried.
+    SubscriptionDegraded = 8,
 }
 
 impl From<ChainHealthState> for hopr_api::node::ComponentStatus {
@@ -83,11 +234,12 @@ impl From<ChainHealthState> for hopr_api::node::ComponentStatus {
             ChainHealthState::Ready => Self::Ready,
             ChainHealthState::WaitingForConnection => Self::Initializing("waiting for chain connection".into()),
             ChainHealthState::Connecting => Self::Initializing("connecting to blokli".into()),
-            ChainHealthState::SubscriptionEnded => Self::Degraded("chain subscription ended".into()),
+            ChainHealthState::SubscriptionEnded => Self::Unavailable("chain subscription ended".into()),
             ChainHealthState::SyncTimedOut => Self::Degraded("connection sync timed out".into()),
             ChainHealthState::ServerNotHealthy => Self::Unavailable("blokli server not healthy".into()),
             ChainHealthState::ConnectionFailed => Self::Unavailable("chain connection failed".into()),
             ChainHealthState::Dropped => Self::Unavailable("connector dropped".into()),
+            ChainHealthState::SubscriptionDegraded => Self::Degraded("chain subscription not working".into()),
         }
     }
 }
@@ -179,6 +331,12 @@ pub struct BlockchainConnectorConfig {
     /// Default is 2, minimum is 1.
     #[default(TX_TIMEOUT_MULTIPLIER)]
     pub tx_timeout_multiplier: u32,
+    /// How long the local nonce may stay ahead of an unchanging on-chain pending count before
+    /// it is resynced, so a lost transaction does not block the signer for good.
+    ///
+    /// Default is 5 minutes, matching Blokli's transaction tracking timeout.
+    #[default(Duration::from_mins(5))]
+    pub nonce_gap_tolerance: Duration,
 }
 
 /// A connector acting as middleware between the HOPR APIs (see the [`hopr_api`] crate) and the Blokli Client API (see
@@ -250,7 +408,7 @@ where
             ))),
             backend: backend.clone(),
             connection_handle: None,
-            sequencer: TransactionSequencer::new(chain_key.clone(), client.clone()),
+            sequencer: TransactionSequencer::new(chain_key.clone(), client.clone(), cfg.nonce_gap_tolerance),
             events: (events_tx, events_rx.deactivate()),
             client,
             chain_key,
@@ -348,6 +506,8 @@ where
             /// give the remaining seven. `ServiceEvent` rather than the whole `ChainEvent`, so a
             /// registry stream cannot smuggle an account or channel event through here.
             Service(ServiceEvent),
+            /// Time to check the health of the subscriptions.
+            HealthCheck,
         }
 
         let ticket_values = self.ticket_values.clone();
@@ -371,53 +531,57 @@ where
             let (mut replayed_services, mut replayed_service_types) =
                 read_replayed_registry(&client, registry_read_budget).await;
 
-            let connections = client
-                .subscribe_accounts(blokli_client::api::AccountSelector::Any)
-                .and_then(|accounts| Ok((accounts, client.subscribe_graph()?)))
-                .and_then(|(accounts, channels)| Ok((accounts, channels, client.subscribe_ticket_params()?)))
-                .and_then(|(accounts, channels, ticket_params)| {
-                    Ok((
-                        accounts,
-                        channels,
-                        ticket_params,
-                        client.subscribe_services(blokli_client::api::ServiceSelector::Any)?,
-                    ))
-                })
-                .and_then(|(accounts, channels, ticket_params, services)| {
-                    Ok((
-                        accounts,
-                        channels,
-                        ticket_params,
-                        services,
-                        client.subscribe_service_types(None)?,
-                    ))
-                })
-                .and_then(|(accounts, channels, ticket_params, services, service_types)| {
-                    Ok((
+            // Each subscription comes with its own health, checked below to tell whether the chain
+            // feed still works.
+            let connections = (|| -> Result<_, BlokliClientError> {
+                let (accounts, accounts_health) =
+                    client.subscribe_accounts_with_health(blokli_client::api::AccountSelector::Any)?;
+                let (channels, channels_health) = client.subscribe_graph_with_health()?;
+                let (ticket_params, ticket_params_health) = client.subscribe_ticket_params_with_health()?;
+                let (services, services_health) =
+                    client.subscribe_services_with_health(blokli_client::api::ServiceSelector::Any)?;
+                let (service_types, service_types_health) = client.subscribe_service_types_with_health(None)?;
+                let (registry_config, registry_config_health) =
+                    client.subscribe_service_registry_config_with_health()?;
+                Ok((
+                    (
                         accounts,
                         channels,
                         ticket_params,
                         services,
                         service_types,
-                        client.subscribe_service_registry_config()?,
-                    ))
-                });
-
-            if let Err(error) = connections {
-                if let Some(connection_ready_tx) = connection_ready_tx.take() {
-                    let _ = connection_ready_tx.send(Err(error));
-                }
-                return;
-            }
+                        registry_config,
+                    ),
+                    vec![
+                        accounts_health,
+                        channels_health,
+                        ticket_params_health,
+                        services_health,
+                        service_types_health,
+                        registry_config_health,
+                    ],
+                ))
+            })();
 
             let (
-                account_stream,
-                channel_stream,
-                ticket_params_stream,
-                service_stream,
-                service_type_stream,
-                service_registry_config_stream,
-            ) = connections.unwrap();
+                (
+                    account_stream,
+                    channel_stream,
+                    ticket_params_stream,
+                    service_stream,
+                    service_type_stream,
+                    service_registry_config_stream,
+                ),
+                subscription_health,
+            ) = match connections {
+                Ok(connections) => connections,
+                Err(error) => {
+                    if let Some(connection_ready_tx) = connection_ready_tx.take() {
+                        let _ = connection_ready_tx.send(Err(error));
+                    }
+                    return;
+                }
+            };
 
             // Stream of Account events (Announcements)
             let graph_clone = graph.clone();
@@ -456,6 +620,7 @@ where
                             .map(SubscribedEventType::Account)
                     })
                 })
+                .map_err(|error| SubscriptionError::new("accounts", error))
                 .fuse();
 
             // Stream of channel graph updates
@@ -486,6 +651,7 @@ where
                         futures::future::ready(res.map(SubscribedEventType::Channel).map_err(ConnectorError::backend))
                     })
                 })
+                .map_err(|error| SubscriptionError::new("graph", error))
                 .fuse();
 
             // Stream of ticket parameter updates (ticket price, minimum winning probability)
@@ -557,6 +723,7 @@ where
                     }
                 })
                 .try_flatten()
+                .map_err(|error| SubscriptionError::new("ticket_params", error))
                 .fuse();
 
             // Stream of service registry entry changes (registrations, updates, deregistrations)
@@ -568,6 +735,7 @@ where
                 // established, so a delivered registration always means it happened afterwards.
                 .try_filter(move |event| futures::future::ready(!replayed_services.consumes(event)))
                 .map_ok(SubscribedEventType::Service)
+                .map_err(|error| SubscriptionError::new("services", error))
                 .fuse();
 
             // Stream of service type and registry-wide configuration changes
@@ -581,6 +749,7 @@ where
                 // established.
                 .try_filter(move |event| futures::future::ready(!replayed_service_types.consumes(event)))
                 .map_ok(SubscribedEventType::Service)
+                .map_err(|error| SubscriptionError::new("service_types", error))
                 .fuse();
 
             // The first configuration initializes both registry-wide values. Later complete-state
@@ -606,6 +775,7 @@ where
                 })
                 .map_ok(|events| futures::stream::iter(events).map(Ok::<_, ConnectorError>))
                 .try_flatten()
+                .map_err(|error| SubscriptionError::new("service_registry_config", error))
                 .fuse();
 
             let mut account_counter = 0;
@@ -615,20 +785,27 @@ where
                 let _ = connection_ready_tx.take().unwrap().send(Ok(()));
             }
 
-            futures::stream::Abortable::new(
-                (
-                    account_stream,
-                    channel_stream,
-                    ticket_params_stream,
-                    service_stream,
-                    service_type_stream,
+            let health_checks =
+                futures_time::stream::interval(futures_time::time::Duration::from(SUBSCRIPTION_HEALTH_CHECK_INTERVAL))
+                    .map(|_| Ok::<_, SubscriptionError>(SubscribedEventType::HealthCheck));
+            let mut previous_health = vec![None; subscription_health.len()];
+            let checked_health = health.clone();
+            let subscriptions = (
+                with_subscription_end(account_stream, "accounts", health.clone()),
+                with_subscription_end(channel_stream, "graph", health.clone()),
+                with_subscription_end(ticket_params_stream, "ticket_params", health.clone()),
+                with_subscription_end(service_stream, "services", health.clone()),
+                with_subscription_end(service_type_stream, "service_types", health.clone()),
+                with_subscription_end(
                     service_registry_config_stream,
-                )
-                    .merge(),
-                abort_reg,
+                    "service_registry_config",
+                    health.clone(),
+                ),
             )
+                .merge();
+            futures::stream::Abortable::new(with_health_checks(subscriptions, health_checks), abort_reg)
             .inspect_ok(move |event_type| {
-                if connection_ready_tx.is_some() {
+                if connection_ready_tx.is_some() && !matches!(event_type, SubscribedEventType::HealthCheck) {
                     match event_type {
                         SubscribedEventType::Account(_) => account_counter += 1,
                         SubscribedEventType::Channel(_) => channel_counter += 1,
@@ -656,7 +833,10 @@ where
                     }
                 }
             })
-            .for_each(|event_type| {
+            .for_each(move |event_type| {
+                if matches!(event_type, Ok(SubscribedEventType::HealthCheck)) {
+                    update_chain_health(&checked_health, &subscription_health, &mut previous_health);
+                }
                 let event_tx = event_tx.clone();
                 async move {
                     match event_type {
@@ -717,29 +897,17 @@ where
                             tracing::debug!(%event, "service registry changed");
                             let _ = event_tx.broadcast_direct(event).await;
                         }
-                        Err(error) => {
-                            tracing::error!(
-                                %error,
-                                "error processing account/graph/ticket params/service registry subscription"
-                            );
+                        Ok(SubscribedEventType::HealthCheck) => {}
+                        Err(SubscriptionError { subscription, error }) => {
+                            tracing::error!(subscription, %error, "error in chain subscription");
                         }
                     }
                 }
             })
             .await;
 
-            // Only transition to SubscriptionEnded if currently Ready or Connecting —
-            // don't overwrite terminal error states (ServerNotHealthy, ConnectionFailed, etc.)
-            tracing::warn!("chain subscription stream ended, marking chain health as degraded");
-            let current = health.load(AtomicOrdering::Relaxed);
-            if matches!(current, ChainHealthState::Connecting | ChainHealthState::Ready) {
-                let _ = health.compare_exchange(
-                    current,
-                    ChainHealthState::SubscriptionEnded,
-                    AtomicOrdering::Relaxed,
-                    AtomicOrdering::Relaxed,
-                );
-            }
+            // Do not overwrite connection failures or a dropped connector when the task is aborted.
+            set_subscription_health(&health, false, true);
         });
 
         connection_ready_rx
@@ -1106,6 +1274,7 @@ pub(crate) mod tests {
             ChainHealthState::ServerNotHealthy,
             ChainHealthState::ConnectionFailed,
             ChainHealthState::Dropped,
+            ChainHealthState::SubscriptionDegraded,
         ];
         for state in variants {
             let _: ComponentStatus = state.into();
@@ -1119,10 +1288,334 @@ pub(crate) mod tests {
         assert!(status.is_ready());
     }
 
+    fn subscription_health(status: SubscriptionStatus) -> SubscriptionHealth {
+        SubscriptionHealth {
+            status,
+            status_since: std::time::Instant::now(),
+            last_transport_activity: None,
+            last_update: None,
+            failures: 0,
+            last_problem: None,
+            connections: 0,
+        }
+    }
+
+    #[test]
+    fn only_stalled_rejected_or_ended_subscriptions_count_as_failing() {
+        use blokli_client::SubscriptionEnd;
+
+        let failing = [
+            SubscriptionStatus::Stalled,
+            SubscriptionStatus::Rejected,
+            SubscriptionStatus::Ended(SubscriptionEnd::Completed),
+            SubscriptionStatus::Ended(SubscriptionEnd::Failed),
+        ];
+        for status in failing {
+            assert!(
+                subscription_is_failing(&subscription_health(status.clone())),
+                "{status:?}"
+            );
+        }
+
+        // A short outage is retried by the client and must not flip the chain health back and forth.
+        let working = [
+            SubscriptionStatus::Connecting,
+            SubscriptionStatus::Healthy,
+            SubscriptionStatus::Degraded,
+            SubscriptionStatus::Recovered {
+                outage: Duration::from_secs(3),
+            },
+            SubscriptionStatus::Untracked,
+        ];
+        for status in working {
+            assert!(
+                !subscription_is_failing(&subscription_health(status.clone())),
+                "{status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failing_subscription_degrades_a_ready_chain_and_recovery_restores_it() {
+        assert_eq!(
+            chain_health_after_check(ChainHealthState::Ready, true, false),
+            Some(ChainHealthState::SubscriptionDegraded)
+        );
+        assert_eq!(
+            chain_health_after_check(ChainHealthState::SubscriptionDegraded, false, false),
+            Some(ChainHealthState::Ready)
+        );
+        assert_eq!(chain_health_after_check(ChainHealthState::Ready, false, false), None);
+        assert_eq!(
+            chain_health_after_check(ChainHealthState::SubscriptionDegraded, true, false),
+            None
+        );
+    }
+
+    #[test]
+    fn subscription_health_never_overrides_the_connection_state() {
+        let connection_states = [
+            ChainHealthState::WaitingForConnection,
+            ChainHealthState::Connecting,
+            ChainHealthState::SubscriptionEnded,
+            ChainHealthState::SyncTimedOut,
+            ChainHealthState::ServerNotHealthy,
+            ChainHealthState::ConnectionFailed,
+            ChainHealthState::Dropped,
+        ];
+        for state in connection_states {
+            assert_eq!(chain_health_after_check(state, true, false), None, "{state:?}");
+            assert_eq!(chain_health_after_check(state, false, false), None, "{state:?}");
+        }
+    }
+
+    #[test]
+    fn untracked_subscriptions_restore_a_degraded_chain() {
+        let subscriptions = [
+            SubscriptionHealthHandle::untracked("accounts"),
+            SubscriptionHealthHandle::untracked("graph"),
+        ];
+
+        let health = AtomicChainHealthState::new(ChainHealthState::SubscriptionDegraded);
+        update_chain_health(&health, &subscriptions, &mut [None, None]);
+        assert_eq!(health.load(AtomicOrdering::Relaxed), ChainHealthState::Ready);
+
+        update_chain_health(&health, &subscriptions, &mut [None, None]);
+        assert_eq!(health.load(AtomicOrdering::Relaxed), ChainHealthState::Ready);
+    }
+
+    #[tokio::test]
+    async fn untracked_streams_end_without_waiting_for_health_checks() {
+        #[derive(Debug, PartialEq)]
+        enum Event {
+            Update,
+            Check,
+        }
+        let handles = [SubscriptionHealthHandle::untracked("accounts")];
+        let health = std::sync::Arc::new(AtomicChainHealthState::new(ChainHealthState::Ready));
+        let (tx, rx) = futures::channel::mpsc::unbounded::<Result<Event, ()>>();
+        let events = with_health_checks(
+            with_subscription_end(rx, "accounts", health.clone()),
+            futures::stream::repeat_with(|| Ok(Event::Check)),
+        );
+        futures::pin_mut!(events);
+
+        // The health checks run while a subscription is idle.
+        assert_eq!(events.next().await, Some(Ok(Event::Check)));
+        update_chain_health(&health, &handles, &mut [None]);
+        assert_eq!(health.load(AtomicOrdering::Relaxed), ChainHealthState::Ready);
+        tx.unbounded_send(Ok(Event::Update)).unwrap();
+        drop(tx);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            let mut updates = 0;
+            while let Some(event) = events.next().await {
+                // A broken completion path would otherwise spin on ready ticks and starve the timeout.
+                tokio::task::yield_now().await;
+                match event.unwrap() {
+                    Event::Update => updates += 1,
+                    Event::Check => update_chain_health(&health, &handles, &mut [None]),
+                }
+            }
+            assert_eq!(updates, 1);
+        })
+        .await
+        .expect("health checks must not keep ended subscriptions alive");
+        assert_eq!(
+            health.load(AtomicOrdering::Relaxed),
+            ChainHealthState::SubscriptionEnded
+        );
+        assert!(matches!(handles[0].get().status, SubscriptionStatus::Untracked));
+    }
+
+    #[tokio::test]
+    async fn untracked_streams_can_end_at_different_times() {
+        let health = std::sync::Arc::new(AtomicChainHealthState::new(ChainHealthState::Ready));
+        let (accounts_tx, accounts) = futures::channel::mpsc::unbounded::<Result<&str, ()>>();
+        let (graph_tx, graph) = futures::channel::mpsc::unbounded::<Result<&str, ()>>();
+        let handles = [
+            SubscriptionHealthHandle::untracked("accounts"),
+            SubscriptionHealthHandle::untracked("graph"),
+        ];
+        let streams = (
+            with_subscription_end(accounts, "accounts", health.clone()),
+            with_subscription_end(graph, "graph", health.clone()),
+        )
+            .merge();
+        let events = with_health_checks(streams, futures::stream::pending());
+        futures::pin_mut!(events);
+        drop(accounts_tx);
+        assert!(events.next().now_or_never().is_none());
+        assert_eq!(
+            health.load(AtomicOrdering::Relaxed),
+            ChainHealthState::SubscriptionEnded
+        );
+        update_chain_health(&health, &handles, &mut [None, None]);
+        assert_eq!(
+            health.load(AtomicOrdering::Relaxed),
+            ChainHealthState::SubscriptionEnded
+        );
+        graph_tx.unbounded_send(Ok("last graph update")).unwrap();
+        drop(graph_tx);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            assert_eq!(events.next().await, Some(Ok("last graph update")));
+            assert_eq!(events.next().await, None);
+        })
+        .await
+        .expect("all ended streams must complete without a timer tick");
+    }
+
+    #[tokio::test]
+    async fn one_ended_stream_is_unavailable_while_another_remains_open() {
+        let health = std::sync::Arc::new(AtomicChainHealthState::new(ChainHealthState::Ready));
+        let (tx, rx) = futures::channel::mpsc::unbounded::<Result<&str, ()>>();
+        let subscriptions = (
+            with_subscription_end(futures::stream::empty(), "graph", health.clone()),
+            with_subscription_end(rx, "accounts", health.clone()),
+        )
+            .merge();
+        let events = with_health_checks(subscriptions, futures::stream::pending());
+        futures::pin_mut!(events);
+        // Polling observes the ended graph even though accounts is still pending.
+        assert!(events.next().now_or_never().is_none());
+        let status: hopr_api::node::ComponentStatus = health.load(AtomicOrdering::Relaxed).into();
+        assert!(status.is_unavailable());
+
+        // A healthy/untracked check cannot revive a permanently ended feed.
+        update_chain_health(&health, &[SubscriptionHealthHandle::untracked("accounts")], &mut [None]);
+        assert_eq!(
+            health.load(AtomicOrdering::Relaxed),
+            ChainHealthState::SubscriptionEnded
+        );
+        tx.unbounded_send(Ok("account update")).unwrap();
+        assert_eq!(events.next().await, Some(Ok("account update")));
+        assert!(events.next().now_or_never().is_none());
+    }
+
+    #[test]
+    fn subscription_logs_include_additional_failures_and_individual_recovery() {
+        use std::sync::{Arc, Mutex};
+
+        use tracing::{Event, Metadata, Subscriber, field::Visit, span};
+
+        #[derive(Clone, Default)]
+        struct Logs(Arc<Mutex<Vec<String>>>);
+        impl Subscriber for Logs {
+            fn enabled(&self, _: &Metadata<'_>) -> bool {
+                true
+            }
+
+            fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+                span::Id::from_u64(1)
+            }
+
+            fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+
+            fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+
+            fn enter(&self, _: &span::Id) {}
+
+            fn exit(&self, _: &span::Id) {}
+
+            fn event(&self, event: &Event<'_>) {
+                struct Fields(String);
+                impl Visit for Fields {
+                    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                        use std::fmt::Write;
+                        write!(&mut self.0, "{}={value:?} ", field.name()).unwrap();
+                    }
+                }
+                let mut fields = Fields(String::new());
+                event.record(&mut fields);
+                self.0.lock().unwrap().push(fields.0);
+            }
+        }
+        let logs = Logs::default();
+        tracing::subscriber::with_default(logs.clone(), || {
+            let health = AtomicChainHealthState::new(ChainHealthState::Ready);
+            let mut previous = [None, None];
+            let mut check = |accounts, graph| {
+                update_chain_health_from_snapshots(
+                    &health,
+                    [
+                        ("accounts", subscription_health(accounts)),
+                        ("graph", subscription_health(graph)),
+                    ],
+                    &mut previous,
+                );
+                health.load(AtomicOrdering::Relaxed)
+            };
+            assert_eq!(
+                check(SubscriptionStatus::Stalled, SubscriptionStatus::Healthy),
+                ChainHealthState::SubscriptionDegraded
+            );
+            // Both feeds are inspected even when the first is already failing.
+            assert_eq!(
+                check(SubscriptionStatus::Stalled, SubscriptionStatus::Rejected),
+                ChainHealthState::SubscriptionDegraded
+            );
+            assert_eq!(
+                check(SubscriptionStatus::Stalled, SubscriptionStatus::Rejected),
+                ChainHealthState::SubscriptionDegraded
+            );
+            // Individual recovery is logged while the other feed keeps the chain degraded.
+            assert_eq!(
+                check(SubscriptionStatus::Healthy, SubscriptionStatus::Rejected),
+                ChainHealthState::SubscriptionDegraded
+            );
+            assert_eq!(
+                check(SubscriptionStatus::Healthy, SubscriptionStatus::Healthy),
+                ChainHealthState::Ready
+            );
+        });
+        let entries = logs.0.lock().unwrap();
+        assert_eq!(
+            entries.len(),
+            4,
+            "unchanged failures must not repeat warnings: {entries:?}"
+        );
+        assert!(entries[0].contains("accounts") && entries[0].contains("Stalled"));
+        assert!(entries[1].contains("graph") && entries[1].contains("Rejected"));
+        assert!(entries[2].contains("accounts") && entries[2].contains("recovering"));
+        assert!(entries[3].contains("graph") && entries[3].contains("recovering"));
+    }
+
+    #[test]
+    fn ended_subscriptions_preserve_connection_errors_and_prevent_recovery() {
+        for state in [
+            ChainHealthState::Connecting,
+            ChainHealthState::Ready,
+            ChainHealthState::SubscriptionDegraded,
+        ] {
+            let health = AtomicChainHealthState::new(state);
+            set_subscription_health(&health, false, true);
+            assert_eq!(
+                health.load(AtomicOrdering::Relaxed),
+                ChainHealthState::SubscriptionEnded
+            );
+            set_subscription_health(&health, false, false);
+            assert_eq!(
+                health.load(AtomicOrdering::Relaxed),
+                ChainHealthState::SubscriptionEnded
+            );
+        }
+        for state in [
+            ChainHealthState::WaitingForConnection,
+            ChainHealthState::SyncTimedOut,
+            ChainHealthState::ServerNotHealthy,
+            ChainHealthState::ConnectionFailed,
+            ChainHealthState::Dropped,
+        ] {
+            let health = AtomicChainHealthState::new(state);
+            set_subscription_health(&health, true, true);
+            assert_eq!(health.load(AtomicOrdering::Relaxed), state);
+        }
+    }
+
     #[test]
     fn chain_health_degraded_states() {
         use hopr_api::node::ComponentStatus;
-        let s: ComponentStatus = ChainHealthState::SubscriptionEnded.into();
+        let s: ComponentStatus = ChainHealthState::SubscriptionDegraded.into();
         assert!(s.is_degraded());
         let s: ComponentStatus = ChainHealthState::SyncTimedOut.into();
         assert!(s.is_degraded());
@@ -1131,6 +1624,8 @@ pub(crate) mod tests {
     #[test]
     fn chain_health_unavailable_states() {
         use hopr_api::node::ComponentStatus;
+        let s: ComponentStatus = ChainHealthState::SubscriptionEnded.into();
+        assert!(s.is_unavailable());
         let s: ComponentStatus = ChainHealthState::ServerNotHealthy.into();
         assert!(s.is_unavailable());
         let s: ComponentStatus = ChainHealthState::ConnectionFailed.into();

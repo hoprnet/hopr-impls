@@ -44,8 +44,10 @@ use std::{collections::HashSet, sync::Arc};
 use dashmap::DashSet;
 use futures::{AsyncRead, AsyncWrite, StreamExt};
 pub use hopr_api::network::Health;
-use hopr_api::network::{NetworkView, traits::NetworkStreamControl};
-use libp2p::{Multiaddr, PeerId};
+use hopr_api::{
+    Multiaddr, PeerId,
+    network::{NetworkView, traits::NetworkStreamControl},
+};
 
 use crate::liveness::{LivenessRegistry, LivenessStream};
 
