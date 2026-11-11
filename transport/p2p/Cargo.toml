@@ -29,6 +29,7 @@ async-trait = { workspace = true }
 backon = { workspace = true }
 futures = { workspace = true }
 futures-timer = { workspace = true }
+hickory-resolver = { workspace = true }
 lazy_static = { workspace = true, optional = true }
 libp2p = { workspace = true, features = [
   "autonat",

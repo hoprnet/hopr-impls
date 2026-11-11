@@ -33,8 +33,8 @@ hopr-network-graph   = { path = "graph", version = "0.11.0", default-features = 
 
 # HOPR crates published to crates.io
 blokli-client = "0.37.0"
-hopr-api      = "5.1.0"
-hopr-utils    = { package = "hopr-utilities", version = "0.19.0", default-features = false }
+hopr-api      = { git = "https://github.com/hoprnet/hopr-api", rev = "1e2bc79351d28b53ee7138de8bbe7ae01785bff3" }
+hopr-utils    = { package = "hopr-utilities", git = "https://github.com/hoprnet/hopr-utilities", rev = "b92d6c7a7e3458d4b4856889fec14627232d0955", default-features = false }
 
 # Third-party dependencies (versions mirror hoprnet's workspace to preserve compatibility)
 ahash = "0.8.12"
@@ -61,7 +61,8 @@ futures = { version = "0.3.34", default-features = false, features = [
 ] }
 futures-concurrency = "7.7.1"
 futures-time = "3.1.0"
-futures-timer = "3.0.3"
+futures-timer = "=3.0.3"
+hickory-resolver = "0.26.3"
 hashbrown = "0.17.1"
 hex-literal = "1.1.0"
 humantime-serde = "1.1.1"
@@ -69,8 +70,8 @@ indexmap = { version = "2.14.1" }
 insta = { version = "1.48.0", features = ["redactions", "yaml"] }
 ipnet = "2.12.1"
 lazy_static = "1.5.0"
-libp2p = { version = "0.56.0", default-features = false }
-libp2p-stream = { version = "0.4.0-alpha" }
+libp2p = { version = "0.57.1", default-features = false }
+libp2p-stream = { version = "0.5.0-alpha" }
 moka = { version = "0.12.16", features = ["future", "sync"] }
 more-asserts = "0.3.1"
 parking_lot = "0.12.5"
