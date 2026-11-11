@@ -29,10 +29,12 @@ pub mod weight;
 
 use hopr_api::OffchainPublicKey;
 #[cfg(feature = "petgraph")]
-pub use petgraph::traverse::{MAX_LOOPBACK_HOPS, MIN_LOOPBACK_HOPS};
+pub use petgraph::traverse::{FocusRelevance, FocusedLoopback, MAX_LOOPBACK_HOPS, MIN_LOOPBACK_HOPS};
 #[cfg(feature = "petgraph")]
 pub use petgraph::*;
-pub use weight::Observations;
+pub use weight::{
+    DEFAULT_MIN_LOOPBACK_RETURN_RATE, DEFAULT_MIN_LOOPBACKS_FOR_RATE, LOOPBACK_WINDOW, Observations, StarvationParams,
+};
 
 /// A thread-safe, shareable handle to a [`ChannelGraph`].
 ///
