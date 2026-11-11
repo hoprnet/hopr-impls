@@ -8,9 +8,10 @@ Part of the [HOPR](https://hoprnet.org/) protocol implementation.
 
 `simple_paths`, `simple_paths_from`, and `simple_loopback_to_self` create DEBUG spans named `graph.simple_paths`, `graph.simple_paths_from`,
 and `graph.simple_loopback_to_self` under the caller's active span. The spans carry the source, destination (when specified), requested edge
-length or loopback relay hops, and `take_count`. Each call emits one DEBUG completion event with `returned_count`, `elapsed_us` (including
-lock wait), and `reason`: `completed`, `invalid_length`, `invalid_hops`, `zero_limit`, `source_missing`, `destination_missing`, or
-`no_eligible_paths`. `no_eligible_paths` reports the search outcome; it does not identify why individual branches were rejected.
+length or loopback relay hops, and `take_count`. On completion the same span records `returned_count`, `elapsed_us`, and `reason`, including
+for early exits. Each call also emits one DEBUG completion event with these fields. `elapsed_us` includes lock wait. `reason` is one of:
+`completed`, `invalid_length`, `invalid_hops`, `zero_limit`, `source_missing`, `destination_missing`, or `no_eligible_paths`.
+`no_eligible_paths` reports the search outcome; it does not identify why individual branches were rejected.
 
 Counts describe returned candidates, not all possible paths. A result limit does not imply that the best paths were found or that the search
 was exhaustive. At TRACE, each returned traversal candidate includes its `path_id` and nodes after the source, including the destination.
