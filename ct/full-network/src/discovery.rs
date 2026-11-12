@@ -801,6 +801,43 @@ mod tests {
         Ok((me, f, a, c, graph))
     }
 
+    #[tokio::test]
+    async fn no_loopback_probes_should_be_emitted_without_outgoing_channels() -> anyhow::Result<()> {
+        use hopr_api::graph::traits::{EdgeObservableWrite, EdgeWeightType};
+
+        // `me → a → x → me` with `a → f` focused, and `me → f → y → me`. The relays fund their channels,
+        // but `me` has none: its edges are only connected and pinged.
+        let (me, a, x, f, y) = (random_key(), random_key(), random_key(), random_key(), random_key());
+        let graph = Arc::new(ChannelGraph::new(me));
+        for node in [a, x, f, y] {
+            graph.add_node(node);
+        }
+        for (src, dst) in [(me, a), (a, x), (x, me), (a, f), (me, f), (f, y), (y, me)] {
+            graph.add_edge(&src, &dst)?;
+            if src == me {
+                graph.upsert_edge(&src, &dst, |obs| {
+                    obs.record(EdgeWeightType::Connected(true));
+                    obs.record(EdgeWeightType::Immediate(Ok(std::time::Duration::from_millis(50))));
+                });
+            } else {
+                mark_edge_ready(&graph, &src, &dst);
+            }
+        }
+        let prober = FullNetworkDiscovery::new(me, fast_cfg(), graph);
+        prober.control().set_focus([f]);
+        let stream = ProbingTrafficGeneration::build(&prober);
+        pin_mut!(stream);
+
+        let items: Vec<ProbeRouting> = timeout(TINY_TIMEOUT * 100, stream.take(60).collect::<Vec<_>>()).await?;
+
+        assert!(!items.is_empty(), "neighbours should still be probed");
+        assert!(
+            items.iter().all(|r| matches!(r, ProbeRouting::Neighbor(_))),
+            "a loopback without a channel on its first hop can never be delivered"
+        );
+        Ok(())
+    }
+
     /// Number of items `stream` yields within `window`.
     async fn emitted_within(stream: impl futures::Stream<Item = ProbeRouting>, window: std::time::Duration) -> usize {
         pin_mut!(stream);
