@@ -52,7 +52,8 @@ jobs:
             ignore-semantic-pull-request
   label:
     name: Add labels
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    # Fork PRs get a read-only token and cannot write labels; stay green so the gate passes.
     continue-on-error: true
     runs-on: depot-ubuntu-24.04-2
     permissions:
@@ -132,9 +133,9 @@ jobs:
     needs: changes
     permissions:
       contents: read
-    uses: hoprnet/hopr-workflows/.github/workflows/checks.yaml@3ee95c480962bb3c1fc0061887da9ba735f537c7 # workflow-checks-v2.1.1
+    uses: hoprnet/hopr-workflows/.github/workflows/checks.yaml@43c833e72dffe4f2f3be60193733e5657f8aa0d7 # workflow-checks-v3.0.0
     with:
-      source_branch: ${{ github.event.pull_request.head.ref || github.ref }}
+      repo_sha: ${{ github.event.pull_request.head.sha || github.sha }}
       lint_command: "nix run -L .#check"
       audit_command: "nix run -L .#audit"
       deps: false
@@ -152,9 +153,9 @@ jobs:
     permissions:
       contents: read
       id-token: write # Codecov OIDC upload in the coverage job
-    uses: hoprnet/hopr-workflows/.github/workflows/tests.yaml@3ee95c480962bb3c1fc0061887da9ba735f537c7 # workflow-tests-v6.1.1
+    uses: hoprnet/hopr-workflows/.github/workflows/tests.yaml@43c833e72dffe4f2f3be60193733e5657f8aa0d7 # workflow-tests-v7.0.0
     with:
-      source_branch: ${{ github.event.pull_request.head.ref || github.ref }}
+      repo_sha: ${{ github.event.pull_request.head.sha || github.sha }}
       enable_unit_tests: ${{ needs.changes.outputs.rust == 'true' }}
       unit_test_command: "nix run -L .#test"
       enable_unit_coverage: ${{ needs.changes.outputs.rust == 'true' }}
@@ -180,12 +181,12 @@ jobs:
           - architecture: aarch64-darwin
             runner: depot-macos-15
             required_label: "binary:aarch64-darwin"
-    uses: hoprnet/hopr-workflows/.github/workflows/build-library.yaml@b10acc76183dc89007d30a8c97c00d7f1b75c8d3 # build-library-v3.1.4
+    uses: hoprnet/hopr-workflows/.github/workflows/build-library.yaml@43c833e72dffe4f2f3be60193733e5657f8aa0d7 # build-library-v4.0.0
     permissions:
       contents: read
       id-token: write
     with:
-      source_branch: ${{ github.event.pull_request.head.ref || github.ref }}
+      repo_sha: ${{ github.event.pull_request.head.sha || github.sha }}
       version_type: commit
       architecture: ${{ matrix.architecture }}
       build_file: Cargo.toml
@@ -207,11 +208,11 @@ jobs:
       contents: read
     steps:
       - name: Check semver
-        uses: hoprnet/hopr-workflows/actions/nix-action@ff4c0b7afc400ee6cf217841dc576f8a1289bcc0 # nix-action-v1.2.1
+        uses: hoprnet/hopr-workflows/actions/nix-action@43c833e72dffe4f2f3be60193733e5657f8aa0d7 # nix-action-v2.0.0
         env:
           SEMVER_BASE_REV: ${{ github.event.pull_request.base.sha }}
         with:
-          source_branch: ${{ github.event.pull_request.head.sha }}
+          repo_sha: ${{ github.event.pull_request.head.sha || github.sha }}
           cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
           command: "nix run -L .#semver-checks"
   # Single aggregate merge gate: green only if every other job in this run
