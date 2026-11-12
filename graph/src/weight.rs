@@ -506,8 +506,17 @@ impl TransportIntermediates {
 
     /// [`EdgeLinkObservable::average_probe_rate`] against a caller-supplied clock.
     pub(crate) fn average_probe_rate_at(&self, now: std::time::Instant) -> Option<f64> {
-        self.surb_delivery_rate_at(now)
-            .or_else(|| self.link.average_probe_rate())
+        let traffic = self.surb_delivery_rate_at(now);
+        let probe = self.link.average_probe_rate();
+        // An edge whose own loops come back is forwarding: SURBs minted over it that are not home yet may be
+        // waiting in the replier's stock, and must not pull it below what its loops measure.
+        if self.loopback.delivers_at(now, self.starvation) == Some(true) {
+            return match (traffic, probe) {
+                (Some(traffic), Some(probe)) => Some(traffic.max(probe)),
+                (traffic, probe) => traffic.or(probe),
+            };
+        }
+        traffic.or(probe)
     }
 
     /// The score of an edge whose relay is not starved, against a caller-supplied clock.
@@ -677,6 +686,15 @@ impl EdgeLinkObservable for TransportIntermediates {
     /// Traffic comes first: it reacts at data rates where probing runs on an interval, and it says more
     /// about the loop than a probe does, so probing is only needed where no traffic went through. Once
     /// the traffic stops, its window empties and the probes speak again.
+    ///
+    /// Except while the loops over the edge come back: then traffic cannot pull the edge below their
+    /// rate. A SURB is judged within the SURB window, seconds, but waits in the replier's stock until the
+    /// stock turns over, minutes at a deployed size, so SURBs minted over an edge and not spent yet read
+    /// exactly like SURBs lost on it. Read as dead, every edge a session starts to use after its first
+    /// seconds drops out of routing until its SURBs come home, and the session's stock ends up behind the
+    /// few relays its first replies came through (hoprnet/hoprnet#8650). A relay cannot tell a loop from a reply,
+    /// so loops that come back show the edge forwards. An edge no loop crosses, such as the one into the
+    /// destination, keeps its traffic as the only witness (#81).
     ///
     /// Evidence, not merely a number: an unprobed edge's probe rate reads `None`, not `0.0`, so a
     /// SURB-only edge is not scored as dead.
@@ -1453,7 +1471,9 @@ mod tests {
     // ── Two witnesses in the score ──────────────────────────────────────
 
     // Traffic comes first and probing fills in where none crossed the edge, so failed probes cannot zero
-    // an edge whose traffic came back, and returned probes cannot save an edge whose traffic stopped.
+    // an edge whose traffic came back. Returned probes cannot save an edge whose traffic stopped either,
+    // unless they are loops over the edge itself: those keep it at their rate, since its SURBs may still
+    // be waiting in the replier's stock.
 
     /// An edge with healthy SURBs, and the clock at the last of them.
     fn with_healthy_surbs(epoch: std::time::Instant) -> (TransportIntermediates, std::time::Instant) {
@@ -1482,23 +1502,59 @@ mod tests {
     }
 
     #[test]
-    fn collapsed_surbs_should_zero_the_rate_of_an_edge_whose_probes_came_back() {
+    fn collapsed_surbs_should_not_zero_an_edge_whose_loops_still_return() {
         let (mut m, now) = with_healthy_surbs(std::time::Instant::now());
         let now = record_slices(&mut m, now + TEST_SLICE, 2, 100, 0);
         for _ in 0..5 {
             m.record(Ok(std::time::Duration::from_millis(30)));
         }
 
-        assert_eq!(m.surb_delivery_rate_at(now), Some(0.0), "traffic stopped coming back");
-        assert!(
-            m.link.average_probe_rate().is_some_and(|rate| rate > 0.9),
-            "while probes come back"
+        assert_eq!(
+            m.surb_delivery_rate_at(now),
+            Some(0.0),
+            "no SURB minted lately came back"
         );
+        let probe = m.link.average_probe_rate().expect("the loops were timed");
+        assert!(probe > 0.9, "while the loops over the edge come back");
         assert_eq!(
             m.average_probe_rate_at(now),
-            Some(0.0),
-            "probes that came back do not save an edge whose traffic stopped"
+            Some(probe),
+            "loops that come back keep the edge at their rate: its SURBs may still be in the replier's stock"
         );
+    }
+
+    /// The SURBs of an edge a session has just started to use wait in the replier's stock until it turns
+    /// over, minutes at a deployed size, so "minted, none home yet" must not zero an edge whose loops come
+    /// back (hoprnet/hoprnet#8650).
+    #[test]
+    fn surbs_still_in_flight_should_not_zero_an_edge_whose_loops_return() {
+        let epoch = std::time::Instant::now();
+        let mut m = fast_slices(epoch);
+        for _ in 0..3 {
+            m.record(Ok(std::time::Duration::from_millis(30)));
+        }
+        let now = record_slices(&mut m, epoch, 3, 200, 0);
+
+        assert_eq!(m.surb_delivery_rate_at(now), Some(0.0), "none of its SURBs is home yet");
+        assert!(!m.relay_starved_at(now), "its loops return");
+        let rate = m.average_probe_rate_at(now).expect("the edge is measured");
+        assert!(rate > 0.9, "the loops decide while its SURBs are in flight, got {rate}");
+        assert!(
+            m.live_score_at(now).is_some_and(|score| score > 0.0),
+            "the edge stays routable"
+        );
+    }
+
+    /// With no loop across it, an edge's traffic is its only witness, and SURBs that never return still
+    /// read it dead (#81).
+    #[test]
+    fn surbs_that_never_return_should_still_zero_an_edge_no_loop_crosses() {
+        let epoch = std::time::Instant::now();
+        let mut m = fast_slices(epoch);
+        let now = record_slices(&mut m, epoch, 3, 200, 0);
+
+        assert_eq!(m.average_probe_rate_at(now), Some(0.0));
+        assert!(m.relay_starved_at(now), "nothing came back over it");
     }
 
     #[test]
@@ -1530,19 +1586,21 @@ mod tests {
         );
     }
 
-    /// A relay that stops returning SURBs must score below one that keeps delivering.
+    /// A relay that returns fewer SURBs must score below one that keeps delivering.
     ///
     /// Regression: `TransportIntermediates::average_probe_rate` correctly prefers the SURB window,
     /// but `score()` delegated to `link.score()`, which recomputes from the raw probe EMA -- so the
     /// SURB evidence reached a diagnostic accessor and nothing else. Path selection weights come
     /// from `score()`, which meant real return-path traffic could never influence a route.
     #[test]
-    fn a_relay_that_stops_returning_surbs_should_score_below_one_that_keeps_delivering() {
-        // Identical probe history: same latency, same probe successes. The only difference is what
-        // the SURB round-trips say, so any score difference is attributable to them alone.
+    fn a_relay_returning_fewer_surbs_should_score_below_one_that_keeps_delivering() {
+        // Identical neighbour probe history: same latency, same pings answered. No loop crosses either
+        // edge, so the SURB round-trips are the only evidence on the edge itself, and any score
+        // difference is attributable to them alone. Neither edge reads dead, so the starvation verdict
+        // does not decide it either: only `score()` reading the SURB window can.
         let probe_history = |o: &mut Observations| {
             for _ in 0..10 {
-                o.record(EdgeWeightType::Intermediate(Ok(std::time::Duration::from_millis(50))));
+                o.record(EdgeWeightType::Immediate(Ok(std::time::Duration::from_millis(50))));
             }
         };
 
@@ -1951,9 +2009,10 @@ mod loopback_window_tests {
         without.record(EdgeWeightType::Balance(None));
     }
 
-    /// Traffic that stopped is a verdict by itself, whatever the probes say.
+    /// Traffic that stopped does not outweigh loops that still return: the SURBs may be waiting in the
+    /// replier's stock rather than lost.
     #[test]
-    fn traffic_that_stopped_should_outweigh_probes_that_returned() {
+    fn traffic_that_stopped_should_not_outweigh_loops_that_still_return() {
         let t0 = std::time::Instant::now();
         let mut intermediates = TransportIntermediates::default();
         intermediates.record_surb_round_trips_at(10, 10, t0);
@@ -1965,11 +2024,39 @@ mod loopback_window_tests {
         intermediates.record_surb_round_trips_at(10, 0, later);
 
         assert_eq!(intermediates.traffic_rate_at(later), Some(0.0));
-        assert!(intermediates.loopback_rate_at(t0).is_some_and(|rate| rate > 0.0));
+        assert!(
+            intermediates.loopback_rate_at(later).is_some_and(|rate| rate > 0.0),
+            "the loops are still in their window"
+        );
+        assert_eq!(
+            intermediates.average_probe_rate_at(later),
+            intermediates.link.average_probe_rate(),
+            "the loops that return speak for the edge"
+        );
+    }
+
+    /// Once the loops have left their window, traffic that stopped is the verdict again.
+    #[test]
+    fn traffic_that_stopped_should_decide_once_the_loops_have_left_their_window() {
+        let t0 = std::time::Instant::now();
+        let mut intermediates = TransportIntermediates::default();
+        intermediates.record_surb_round_trips_at(10, 10, t0);
+        for _ in 0..5 {
+            intermediates.record(Ok(std::time::Duration::from_millis(40)));
+        }
+        let later = t0 + LOOPBACK_WINDOW + std::time::Duration::from_secs(5);
+        intermediates.record_surb_round_trips_at(10, 0, later);
+
+        assert_eq!(intermediates.traffic_rate_at(later), Some(0.0));
+        assert_eq!(
+            intermediates.loopback_rate_at(later),
+            None,
+            "no loop left in the window"
+        );
         assert_eq!(
             intermediates.average_probe_rate_at(later),
             Some(0.0),
-            "the probes that returned do not dilute traffic that stopped"
+            "with no loop to speak for it, traffic that stopped decides"
         );
     }
 }
