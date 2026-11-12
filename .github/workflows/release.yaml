@@ -13,21 +13,6 @@ on:
           - patch
           - minor
           - major
-      yank_crate:
-        description: "Yank mode: crate name to yank or restore instead of closing a release. Leave empty to close a release."
-        required: false
-        type: string
-        default: ""
-      yank_version:
-        description: Exact version to yank or restore, such as 0.12.0
-        required: false
-        type: string
-        default: ""
-      yank_undo:
-        description: Restore a yanked version instead of yanking it
-        required: false
-        type: boolean
-        default: false
 permissions: {}
 concurrency:
   group: release
@@ -35,7 +20,6 @@ concurrency:
 jobs:
   build-library:
     name: Build Library
-    if: inputs.yank_crate == ''
     uses: hoprnet/hopr-workflows/.github/workflows/build-library.yaml@45221eb1aadfc5c46751306c5c7d6d291c8a24b3 # build-library-v3.1.2
     permissions:
       contents: read
@@ -53,7 +37,6 @@ jobs:
       cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
   release:
     name: Close release
-    if: inputs.yank_crate == ''
     needs:
       - build-library
     runs-on: depot-ubuntu-24.04-2
@@ -79,53 +62,3 @@ jobs:
           zulip_channel: hopr-impls
           zulip_topic: Releases
           github_app_private_key: ${{ secrets.GH_APP_HOPRNET_BOT_PRIVATE_KEY }}
-  yank:
-    name: Yank ${{ inputs.yank_crate }} ${{ inputs.yank_version }}
-    if: inputs.yank_crate != ''
-    runs-on: depot-ubuntu-24.04-2
-    permissions:
-      id-token: write # crates.io trusted publishing, bound to this workflow file
-    env:
-      CRATE: ${{ inputs.yank_crate }}
-      VERSION: ${{ inputs.yank_version }}
-      UNDO: ${{ inputs.yank_undo }}
-    steps:
-      - name: Validate inputs
-        run: |
-          set -euo pipefail
-          if ! [[ "$CRATE" =~ ^[A-Za-z0-9_-]+$ ]]; then
-            echo "::error::yank_crate must contain only letters, digits, '-' and '_'" >&2
-            exit 1
-          fi
-          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::yank_version must be an exact semver version such as 0.12.0" >&2
-            exit 1
-          fi
-      - name: Authenticate with crates.io
-        id: auth
-        uses: rust-lang/crates-io-auth-action@bbd81622f20ce9e2dd9622e3218b975523e45bbe # v1.0.4
-      - name: Yank or restore version on crates.io
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-        run: |
-          set -euo pipefail
-          if [[ "$UNDO" == "true" ]]; then
-            action=unyank
-            method=PUT
-          else
-            action=yank
-            method=DELETE
-          fi
-          url="https://crates.io/api/v1/crates/${CRATE}/${VERSION}/${action}"
-          status=$(curl --silent --show-error --output /tmp/response.json --write-out '%{http_code}' \
-            --request "$method" \
-            --user-agent "hopr-impls-yank-workflow (github actions)" \
-            --header "Authorization: ${CARGO_REGISTRY_TOKEN}" \
-            "$url")
-          cat /tmp/response.json
-          echo
-          if [[ "$status" != "200" ]]; then
-            echo "::error::crates.io answered HTTP $status for ${action} of ${CRATE} ${VERSION}" >&2
-            exit 1
-          fi
-          echo "${action} of ${CRATE} ${VERSION} succeeded"
