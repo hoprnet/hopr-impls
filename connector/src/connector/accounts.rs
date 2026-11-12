@@ -122,16 +122,19 @@ where
     ///
     /// | Error | Outcome |
     /// |---|---|
-    /// | [`ConnectorError::is_refused_before_broadcast`], or RPC code `FEE_TOO_LOW` / `INSUFFICIENT_FUNDS` | [`SubmissionFailure::NotSubmitted`] |
-    /// | [`ConnectorError::as_transaction_rejection_error`], or [`ConnectorError::InnerTxFailed`] | [`SubmissionFailure::Reverted`] |
+    /// | [`ConnectorError::is_refused_before_broadcast`], RPC code `FEE_TOO_LOW` / `INSUFFICIENT_FUNDS`, or Blokli's `ValidationFailed` (rejected before submission) | [`SubmissionFailure::NotSubmitted`] |
+    /// | a `Reverted` transaction, or [`ConnectorError::InnerTxFailed`] | [`SubmissionFailure::Reverted`] |
     /// | anything else (other RPC codes, timeouts, transport failures) | [`SubmissionFailure::Unknown`], as an earlier copy may be in the mempool |
     fn submission_failure(&self, error: &Self::Error) -> SubmissionFailure {
+        use blokli_client::errors::TrackingErrorKind;
+
+        let rejection = error.as_transaction_rejection_error();
         if error.is_refused_before_broadcast()
             || matches!(error.rpc_rejection_code(), Some("FEE_TOO_LOW" | "INSUFFICIENT_FUNDS"))
+            || matches!(rejection, Some(TrackingErrorKind::ValidationFailed))
         {
             SubmissionFailure::NotSubmitted
-        } else if error.as_transaction_rejection_error().is_some() || matches!(error, ConnectorError::InnerTxFailed(_))
-        {
+        } else if rejection.is_some() || matches!(error, ConnectorError::InnerTxFailed(_)) {
             SubmissionFailure::Reverted
         } else {
             SubmissionFailure::Unknown
@@ -871,6 +874,11 @@ mod tests {
         assert_eq!(
             classify(ConnectorError::InnerTxFailed("n/a".into())),
             SubmissionFailure::Reverted
+        );
+        // Blokli rejected it before it was submitted to the chain, so it can never land.
+        assert_eq!(
+            classify(client(ErrorKind::TrackingError(TrackingErrorKind::ValidationFailed))),
+            SubmissionFailure::NotSubmitted
         );
         assert_eq!(
             classify(client(ErrorKind::TrackingError(TrackingErrorKind::Timeout))),
