@@ -11,10 +11,12 @@ name                   = "hopr-chain-connector"
 readme                 = "README.md"
 repository.workspace   = true
 rust-version.workspace = true
-version                = "0.31.0"
+version                = "0.33.0"
 
 [features]
 runtime-tokio = ["hopr-utils/runtime-tokio"]
+serde         = ["dep:serde", "hopr-api/serde"]
+state-dump    = ["serde"]
 testing       = ["hopr-utils/testing-blokli"]
 
 [dependencies]
@@ -34,6 +36,7 @@ parking_lot         = { workspace = true }
 petgraph            = { workspace = true, features = ["graphmap", "rayon"] }
 postcard            = { workspace = true }
 redb                = { workspace = true }
+serde               = { workspace = true, optional = true }
 serde_json          = { workspace = true }
 smart-default       = { workspace = true }
 tempfile            = { workspace = true }
@@ -43,6 +46,7 @@ validator           = { workspace = true }
 
 hopr-api = { workspace = true, features = [
   "chain",
+  "component",
   "node",
   "serde",
   "types-random",

@@ -5,6 +5,7 @@
 
 {
   packages,
+  pkgs,
 }:
 
 {
@@ -15,6 +16,15 @@
   hopr-impls-doc = packages.doc;
   hopr-impls-test-doc = packages.test-doc;
   hopr-impls-deny = packages.deny;
+
+  hopr-impls-semver-policy =
+    pkgs.runCommand "semver-policy-tests" { nativeBuildInputs = [ pkgs.python3 ]; }
+      ''
+        cp ${./semver-checks.py} semver-checks.py
+        cp ${./test_semver_checks.py} test_semver_checks.py
+        python -m unittest discover -p 'test_semver_checks.py' -v
+        touch "$out"
+      '';
 
   # Repository hygiene checks
   pre-commit = packages.pre-commit-check;

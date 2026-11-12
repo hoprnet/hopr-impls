@@ -92,11 +92,11 @@ fn resolve_loopback_edges(
         ) else {
             // Padding mid-path, a node removed while the probe was in flight, or a slot no node
             // claims. All three mean the sample cannot be attributed to a known edge.
-            tracing::warn!("loopback path slot does not resolve to a known node, cannot attribute");
+            tracing::trace!("loopback path slot does not resolve to a known node, cannot attribute");
             return None;
         };
         let Some(edge) = inner.graph.find_edge(from, to) else {
-            tracing::warn!(
+            tracing::trace!(
                 resolved = edges.len(),
                 expected = end_pos,
                 "loopback path edge missing from graph, cannot attribute"
@@ -167,7 +167,7 @@ fn resolve_round_trip_edges(
             crate::petgraph::path_id::resolve(inner, pair[0]),
             crate::petgraph::path_id::resolve(inner, pair[1]),
         ) else {
-            tracing::warn!("surb round-trip slot does not resolve to a known node, cannot attribute");
+            tracing::trace!("surb round-trip slot does not resolve to a known node, cannot attribute");
             return None;
         };
         // A missing edge means the path is stale; attributing the rest would credit edges the
@@ -221,11 +221,11 @@ impl hopr_api::graph::NetworkGraphUpdate for ChannelGraph {
                     .unwrap_or_default()
                     .as_millis();
                 let Some(age_ms) = now_ms.checked_sub(telemetry.timestamp) else {
-                    tracing::debug!("surb round-trip timestamp in the future, dropping the report");
+                    tracing::trace!("surb round-trip timestamp in the future, dropping the report");
                     return;
                 };
                 if age_ms > crate::weight::surb_window().as_millis() {
-                    tracing::debug!(age_ms, "surb round-trip report older than the window, dropping it");
+                    tracing::trace!(age_ms, "surb round-trip report older than the window, dropping it");
                     return;
                 }
 
@@ -292,11 +292,11 @@ impl hopr_api::graph::NetworkGraphUpdate for ChannelGraph {
 
                 let mut inner = self.inner.write();
                 let Some(_me_idx) = inner.indices.get_by_left(&self.me).copied() else {
-                    tracing::debug!("failed to resolve index of myself for loopback probe attribution");
+                    tracing::trace!("failed to resolve index of myself for loopback probe attribution");
                     return;
                 };
                 let Some(edges) = resolve_loopback_edges(&inner, &self.me, telemetry.path()) else {
-                    tracing::debug!("failed to resolve loopback path for probe attribution");
+                    tracing::trace!("failed to resolve loopback path for probe attribution");
                     return;
                 };
 
@@ -316,12 +316,12 @@ impl hopr_api::graph::NetworkGraphUpdate for ChannelGraph {
                     .unwrap_or_default()
                     .as_millis();
                 let Some(elapsed_ms) = now_ms.checked_sub(telemetry.timestamp()) else {
-                    tracing::debug!("loopback probe timestamp in the future, skipping attribution");
+                    tracing::trace!("loopback probe timestamp in the future, skipping attribution");
                     return;
                 };
                 let total_rtt = std::time::Duration::from_millis(elapsed_ms as u64);
                 if total_rtt > self.max_plausible_loopback_rtt {
-                    tracing::debug!(
+                    tracing::trace!(
                         rtt_ms = total_rtt.as_millis(),
                         "implausible loopback probe RTT, skipping attribution"
                     );
@@ -346,7 +346,7 @@ impl hopr_api::graph::NetworkGraphUpdate for ChannelGraph {
                             known_latency += lat;
                         }
                     } else {
-                        tracing::debug!("failed to find edge for loopback probe attribution");
+                        tracing::trace!("failed to find edge for loopback probe attribution");
                     }
                 }
 
@@ -393,7 +393,7 @@ impl hopr_api::graph::NetworkGraphUpdate for ChannelGraph {
                             .graph
                             .edge_weight(edges[target_idx])
                             .and_then(|w| w.intermediate_qos().and_then(|q| q.average_latency()));
-                        tracing::debug!(
+                        tracing::trace!(
                             total_rtt_ms = total_rtt.as_millis(),
                             known_ms = known_latency.as_millis(),
                             "known latencies already account for the loopback RTT, no new latency to attribute"
@@ -416,7 +416,7 @@ impl hopr_api::graph::NetworkGraphUpdate for ChannelGraph {
                 if let Some(weight) = inner.graph.edge_weight_mut(edges[target_idx]) {
                     weight.record(EdgeWeightType::Intermediate(Ok(attributed_duration)));
                 } else {
-                    tracing::debug!("failed to find target edge for loopback probe attribution");
+                    tracing::trace!("failed to find target edge for loopback probe attribution");
                 }
             }
             MeasurableEdge::Probe(Err(hopr_api::graph::NetworkGraphError::ProbeNeighborTimeout(ref peer))) => {
@@ -443,11 +443,11 @@ impl hopr_api::graph::NetworkGraphUpdate for ChannelGraph {
 
                 let mut inner = self.inner.write();
                 let Some(_me_idx) = inner.indices.get_by_left(&self.me).copied() else {
-                    tracing::debug!("failed to resolve index of myself");
+                    tracing::trace!("failed to resolve index of myself");
                     return;
                 };
                 let Some(edges) = resolve_loopback_edges(&inner, &self.me, telemetry.path()) else {
-                    tracing::debug!("failed to resolve loopback path for probe timeout, cannot attribute");
+                    tracing::trace!("failed to resolve loopback path for probe timeout, cannot attribute");
                     return;
                 };
 
@@ -2073,6 +2073,140 @@ mod tests {
             "single-edge timeout should not produce intermediate measurement"
         );
 
+        Ok(())
+    }
+
+    #[derive(Clone)]
+    struct LogCounts {
+        level: tracing::Level,
+        events: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        spans: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl LogCounts {
+        fn new(level: tracing::Level) -> Self {
+            Self {
+                level,
+                events: Default::default(),
+                spans: Default::default(),
+            }
+        }
+
+        fn events(&self) -> usize {
+            self.events.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
+        fn spans(&self) -> usize {
+            self.spans.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    impl tracing::Subscriber for LogCounts {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() <= self.level
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            let id = self.spans.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            tracing::span::Id::from_u64(id as u64)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, _: &tracing::Event<'_>) {
+            self.events.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    #[test]
+    fn routine_and_stale_reports_do_not_flood_info_or_debug() -> anyhow::Result<()> {
+        use hopr_api::graph::traits::EdgeNetworkObservableRead;
+        for level in [tracing::Level::INFO, tracing::Level::DEBUG] {
+            let logs = LogCounts::new(level);
+            let _subscriber = tracing::subscriber::set_default(logs.clone());
+            let (graph, exit, relay, me) = round_trip_graph()?;
+            let paths = hopr_api::graph::ForwardAndReturnPath {
+                forward: [slot_of(&graph, &me), slot_of(&graph, &exit), 0, 0, 0],
+                reply: [
+                    slot_of(&graph, &exit),
+                    slot_of(&graph, &relay),
+                    slot_of(&graph, &me),
+                    0,
+                    0,
+                ],
+            };
+            // Nodes/edges may disappear while their probes or SURB reports are in flight.
+            graph.remove_node(&relay);
+            for _ in 0..1000 {
+                graph.record_edge::<TestNeighbor, TestPath>(MeasurableEdge::Probe(Err(
+                    NetworkGraphError::ProbeNeighborTimeout(Box::new(exit)),
+                )));
+                graph.record_edge::<TestNeighbor, TestPath>(MeasurableEdge::ConnectionStatus {
+                    peer: exit,
+                    connected: false,
+                });
+                graph.record_edge::<TestNeighbor, TestPath>(MeasurableEdge::Balance(Box::new(
+                    hopr_api::graph::EdgeBalanceUpdate {
+                        src: me,
+                        dest: exit,
+                        balance: Some(1000u64.into()),
+                    },
+                )));
+                graph.record_edge::<TestNeighbor, TestPath>(MeasurableEdge::Surb(surb_stamped(paths, 4, 3, 0)));
+                graph.record_edge::<TestNeighbor, TestPath>(MeasurableEdge::Surb(surb_stamped(paths, 4, 3, u128::MAX)));
+                graph.record_edge::<TestNeighbor, TestPath>(MeasurableEdge::Surb(surb(paths, 4, 3)));
+                send_loopback_timeout(&graph, &[me, exit, relay, me]);
+            }
+            assert_eq!(logs.events(), 0, "per-report events leaked at {level}");
+            assert_eq!(logs.spans(), 0, "per-report spans leaked at {level}");
+            // The existing read API still exposes the fields needed by a node snapshot.
+            let observation = graph.edge(&me, &exit).context("local edge")?;
+            let immediate = observation.immediate_qos().context("immediate observations")?;
+            assert_eq!(immediate.is_connected(), Some(false));
+            assert_eq!(immediate.average_probe_rate(), Some(0.0));
+            assert_eq!(
+                observation.intermediate_qos().and_then(|q| q.balance()),
+                Some(1000u64.into())
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn trace_preserves_report_details_and_debug_preserves_malformed_path_warnings() -> anyhow::Result<()> {
+        let (graph, exit, relay, me) = round_trip_graph()?;
+        let paths = hopr_api::graph::ForwardAndReturnPath {
+            forward: [slot_of(&graph, &me), slot_of(&graph, &exit), 0, 0, 0],
+            reply: [
+                slot_of(&graph, &exit),
+                slot_of(&graph, &relay),
+                slot_of(&graph, &me),
+                0,
+                0,
+            ],
+        };
+        let trace = LogCounts::new(tracing::Level::TRACE);
+        tracing::subscriber::with_default(trace.clone(), || {
+            graph.record_edge::<TestNeighbor, TestPath>(MeasurableEdge::Surb(surb_stamped(paths, 4, 3, u128::MAX)));
+        });
+        if tracing::level_filters::STATIC_MAX_LEVEL >= tracing::level_filters::LevelFilter::TRACE {
+            assert!(trace.events() > 0);
+            assert!(trace.spans() > 0);
+        }
+        let debug = LogCounts::new(tracing::Level::DEBUG);
+        tracing::subscriber::with_default(debug.clone(), || {
+            let mut invalid = paths;
+            invalid.forward[0] = slot_of(&graph, &exit);
+            graph.record_edge::<TestNeighbor, TestPath>(MeasurableEdge::Surb(surb(invalid, 4, 3)));
+        });
+        assert_eq!(debug.events(), 1, "malformed path warning should remain visible");
+        assert_eq!(debug.spans(), 0);
         Ok(())
     }
 }

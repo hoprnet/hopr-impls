@@ -4,7 +4,7 @@ use blokli_client::api::{BlokliQueryClient, BlokliSubscriptionClient, BlokliTran
 use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt, future::BoxFuture, pin_mut, stream::BoxStream};
 use futures_time::future::FutureExt as TimeFutureExt;
 use hopr_api::{
-    chain::{AccountSelector, AnnouncementError, ChainReceipt, Multiaddr, SafeRegistrationError},
+    chain::{AccountSelector, AnnouncementError, ChainReceipt, Multiaddr, SafeRegistrationError, SubmissionFailure},
     types::{
         chain::prelude::*,
         crypto::prelude::*,
@@ -19,6 +19,27 @@ use hopr_api::{
 use crate::{
     backend::Backend, connector::HoprBlockchainConnector, errors::ConnectorError, utils::model_to_account_entry,
 };
+
+/// Apply a successful backend replacement to the public remote-account count.
+/// The backend's previous value makes replayed announcements idempotent.
+pub(super) fn update_announced(
+    announced: &std::sync::atomic::AtomicU64,
+    account: &AccountEntry,
+    old: Option<&AccountEntry>,
+    me: &Address,
+) {
+    use std::sync::atomic::Ordering;
+    let public = |a: &AccountEntry| a.chain_addr != *me && a.has_announced_with_routing_info();
+    match (old.is_some_and(public), public(account)) {
+        (false, true) => {
+            announced.fetch_add(1, Ordering::Relaxed);
+        }
+        (true, false) => {
+            announced.fetch_sub(1, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+}
 
 impl<B, C, P, R> HoprBlockchainConnector<C, B, P, R>
 where
@@ -118,6 +139,29 @@ where
 {
     type Error = ConnectorError;
 
+    /// Classifies the error the way the connector's sequencer decides whether a nonce was consumed:
+    ///
+    /// | Error | Outcome |
+    /// |---|---|
+    /// | [`ConnectorError::is_refused_before_broadcast`], RPC code `FEE_TOO_LOW` / `INSUFFICIENT_FUNDS`, or Blokli's `ValidationFailed` (rejected before submission) | [`SubmissionFailure::NotSubmitted`] |
+    /// | a `Reverted` transaction, or [`ConnectorError::InnerTxFailed`] | [`SubmissionFailure::Reverted`] |
+    /// | anything else (other RPC codes, timeouts, transport failures) | [`SubmissionFailure::Unknown`], as an earlier copy may be in the mempool |
+    fn submission_failure(&self, error: &Self::Error) -> SubmissionFailure {
+        use blokli_client::errors::TrackingErrorKind;
+
+        let rejection = error.as_transaction_rejection_error();
+        if error.is_refused_before_broadcast()
+            || matches!(error.rpc_rejection_code(), Some("FEE_TOO_LOW" | "INSUFFICIENT_FUNDS"))
+            || matches!(rejection, Some(TrackingErrorKind::ValidationFailed))
+        {
+            SubmissionFailure::NotSubmitted
+        } else if rejection.is_some() || matches!(error, ConnectorError::InnerTxFailed(_)) {
+            SubmissionFailure::Reverted
+        } else {
+            SubmissionFailure::Unknown
+        }
+    }
+
     async fn announce(
         &self,
         multiaddrs: &[Multiaddr],
@@ -177,6 +221,17 @@ where
         recipient: &Address,
     ) -> Result<BoxFuture<'_, Result<ChainReceipt, Self::Error>>, Self::Error> {
         let tx_req = self.payload_generator.transfer(*recipient, balance)?;
+
+        Ok(self.send_tx(tx_req, None, None).await?.boxed())
+    }
+
+    async fn send_erc777(
+        &self,
+        balance: HoprBalance,
+        recipient: &Address,
+        payload: &Erc777Payload,
+    ) -> Result<BoxFuture<'_, Result<ChainReceipt, Self::Error>>, Self::Error> {
+        let tx_req = self.payload_generator.send_erc777(*recipient, balance, payload)?;
 
         Ok(self.send_tx(tx_req, None, None).await?.boxed())
     }
@@ -548,6 +603,57 @@ mod tests {
         Ok(())
     }
 
+    /// `send_erc777` moves the funds out of the Safe: the snapshot shows the Safe debited, the
+    /// recipient credited and a single transaction submitted.
+    ///
+    /// That is all it shows. The emulator settles an ERC777 `send` as a plain token withdrawal,
+    /// so this snapshot would be the same for an ERC20 `transfer` and says nothing about the
+    /// payload. The calldata encoding is pinned by hopr-types' reference-vector test
+    /// `send_erc777_matches_the_reference_encoding`.
+    #[tokio::test]
+    async fn connector_should_send_erc777_with_a_payload() -> anyhow::Result<()> {
+        let me = ChainKeypair::from_secret(&PRIVATE_KEY_1)?.public().to_address();
+        let safe: Address = [2u8; Address::SIZE].into();
+
+        let blokli_client = BlokliTestStateBuilder::default()
+            .with_balances([([1u8; Address::SIZE].into(), HoprBalance::zero())])
+            .with_accounts([(
+                AccountEntry {
+                    public_key: *OffchainKeypair::from_secret(&PRIVATE_KEY_1)?.public(),
+                    chain_addr: me,
+                    entry_type: AccountType::NotAnnounced,
+                    safe_address: Some(safe),
+                    key_id: 0u32.into(),
+                },
+                HoprBalance::new_base(1000),
+                XDaiBalance::new_base(10),
+            )])
+            .with_hopr_network_chain_info("piz-palu-staging")
+            .build_dynamic_client(MODULE_ADDR.into());
+
+        let mut connector = create_connector(blokli_client)?;
+        connector.connect().await?;
+
+        let payload = Erc777Payload::Curvy(CurvyErc777Payload::DirectShield {
+            aggregator: [0xcc; Address::SIZE].into(),
+            note: CurvyNote {
+                owner_hash: 1.into(),
+                token: 2.into(),
+                amount: 1000.into(),
+                ephemeral_key: [4.into(), 5.into()],
+                view_tag: 6,
+            },
+        });
+        connector
+            .send_erc777(HoprBalance::new_base(10), &[1u8; Address::SIZE].into(), &payload)
+            .await?
+            .await?;
+
+        insta::assert_yaml_snapshot!(*connector.client.snapshot());
+
+        Ok(())
+    }
+
     /// `withdraw_from_signer` cannot move an arbitrary signer's funds through a
     /// [`SafePayloadGenerator`], and this pins that down rather than asserting it works.
     ///
@@ -730,6 +836,76 @@ mod tests {
         );
 
         insta::assert_yaml_snapshot!(*connector.client.snapshot());
+
+        Ok(())
+    }
+
+    /// A failed transaction is classified by the connector's own predicates: a refusal before
+    /// broadcast leaves the value in place, a rejection by the chain reverted, and anything else
+    /// may have been broadcast.
+    #[tokio::test]
+    async fn a_failed_transaction_is_classified_by_the_connectors_own_predicates() -> anyhow::Result<()> {
+        use blokli_client::errors::{ErrorKind, TrackingErrorKind};
+
+        let connector = create_connector(BlokliTestStateBuilder::default().build_static_client())?;
+        let client = |kind: ErrorKind| ConnectorError::ClientError(kind.into());
+        let classify = |error: ConnectorError| connector.submission_failure(&error);
+        let rpc = |code: &str| {
+            client(ErrorKind::BlokliError {
+                kind: "rpc error",
+                code: code.into(),
+                message: "refused".into(),
+            })
+        };
+
+        assert_eq!(
+            classify(client(ErrorKind::BlokliError {
+                kind: "overloaded",
+                code: "OVERLOADED".into(),
+                message: "busy".into(),
+            })),
+            SubmissionFailure::NotSubmitted
+        );
+        assert_eq!(
+            classify(client(ErrorKind::BlokliError {
+                kind: "contract not allowed",
+                code: "X".into(),
+                message: "no".into(),
+            })),
+            SubmissionFailure::NotSubmitted
+        );
+        // The codes for which the sequencer knows no nonce was consumed.
+        for code in ["FEE_TOO_LOW", "INSUFFICIENT_FUNDS"] {
+            assert_eq!(classify(rpc(code)), SubmissionFailure::NotSubmitted, "{code}");
+        }
+        // Every other code may have left an earlier copy in the mempool.
+        for code in [
+            "NONCE_TOO_LOW",
+            "NONCE_TOO_HIGH",
+            "ALREADY_KNOWN",
+            "REPLACEMENT_UNDERPRICED",
+            "SOMETHING_ELSE",
+        ] {
+            assert_eq!(classify(rpc(code)), SubmissionFailure::Unknown, "{code}");
+        }
+        assert_eq!(
+            classify(client(ErrorKind::TrackingError(TrackingErrorKind::Reverted))),
+            SubmissionFailure::Reverted
+        );
+        assert_eq!(
+            classify(ConnectorError::InnerTxFailed("n/a".into())),
+            SubmissionFailure::Reverted
+        );
+        // Blokli rejected it before it was submitted to the chain, so it can never land.
+        assert_eq!(
+            classify(client(ErrorKind::TrackingError(TrackingErrorKind::ValidationFailed))),
+            SubmissionFailure::NotSubmitted
+        );
+        assert_eq!(
+            classify(client(ErrorKind::TrackingError(TrackingErrorKind::Timeout))),
+            SubmissionFailure::Unknown
+        );
+        assert_eq!(classify(ConnectorError::ConnectionTimeout), SubmissionFailure::Unknown);
 
         Ok(())
     }

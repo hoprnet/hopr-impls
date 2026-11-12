@@ -392,3 +392,25 @@ fn focused_loops_should_carry_path_ids_that_close_at_me() -> anyhow::Result<()> 
     );
     Ok(())
 }
+
+#[cfg(feature = "serde")]
+#[test]
+fn focused_probing_preserves_search_diagnostics_after_ranking() -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    let net = net(&[("me", "a"), ("a", "b"), ("b", "me"), ("b", "f")], &[])?;
+    assert_eq!(net.focused(2, &["f"]), loops(&[&["a", "b", "me"]], Forward));
+
+    let dump = serde_json::to_value(net.graph.state(None)?)?;
+    let sample = dump["searches"]["samples"]
+        .as_array()
+        .context("search samples")?
+        .iter()
+        .find(|sample| sample["kind"] == "focused_loopback")
+        .context("focused probing must retain a diagnostic search record")?;
+    assert_eq!(sample["direction"], "loopback");
+    assert_eq!(sample["outcome"], "completed");
+    assert_eq!(sample["returned"], 1);
+    assert!(sample["returned_path"].is_array());
+    Ok(())
+}
