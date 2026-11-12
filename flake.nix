@@ -154,7 +154,21 @@
           utilityApps = {
             update-github-labels = nixLib.mkUpdateGithubLabelsApp;
             audit = nixLib.mkAuditApp { };
-            semver-checks = nixLib.mkSemverChecksApp { rustToolchain = stableToolchain; };
+            semver-checks =
+              let
+                checker = nixLib.mkSemverChecksApp { rustToolchain = stableToolchain; };
+              in
+              {
+                type = "app";
+                program = toString (
+                  pkgs.writeShellScript "semver-checks" ''
+                    exec ${pkgs.python3}/bin/python ${./nix/semver-checks.py} \
+                      --checker ${checker.program} \
+                      --cargo ${stableToolchain}/bin/cargo \
+                      --git ${pkgs.git}/bin/git "$@"
+                  ''
+                );
+              };
             check = nixLib.mkCheckApp { inherit system; };
             test = {
               type = "app";
@@ -267,7 +281,7 @@
 
           # Import checks
           checks = import ./nix/checks.nix {
-            inherit packages;
+            inherit packages pkgs;
           };
         in
         {
