@@ -3864,6 +3864,7 @@ dependencies = [
  "futures-concurrency",
  "hopr-types 6.0.0",
  "libp2p-identity",
+ "num_enum",
  "serde",
  "serde_bytes",
  "strum",
@@ -3914,6 +3915,7 @@ dependencies = [
  "petgraph",
  "postcard",
  "redb",
+ "serde",
  "serde_json",
  "smart-default",
  "tempfile",
@@ -3964,13 +3966,14 @@ dependencies = [
 
 [[package]]
 name = "hopr-network-graph"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "anyhow",
  "assertables",
  "bimap",
  "criterion",
  "futures",
+ "futures-time",
  "hex-literal",
  "hopr-api",
  "hopr-utilities",
@@ -4041,7 +4044,7 @@ dependencies = [
 
 [[package]]
 name = "hopr-transport-p2p"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "anyhow",
  "async-broadcast",
@@ -4051,6 +4054,7 @@ dependencies = [
  "bytes",
  "dashmap",
  "futures",
+ "futures-time",
  "futures-timer",
  "hopr-api",
  "hopr-utilities",
@@ -4060,6 +4064,8 @@ dependencies = [
  "more-asserts",
  "pin-project",
  "quinn-udp 0.6.3",
+ "serde",
+ "serde_json",
  "thiserror 2.0.21",
  "tokio",
  "tracing",

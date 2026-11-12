@@ -42,6 +42,8 @@ mod sequencer;
 #[cfg(test)]
 pub(crate) mod service_fixtures;
 mod services;
+#[cfg(feature = "serde")]
+pub(crate) mod state_reads;
 mod tickets;
 mod values;
 
@@ -228,6 +230,24 @@ enum ChainHealthState {
     SubscriptionDegraded = 8,
 }
 
+// Coarse operational state of the live chain workflow. Keep the richer lifecycle as the
+// single source of truth so subscription retries, terminal failures and their reasons remain intact.
+impl From<ChainHealthState> for hopr_api::ComponentState {
+    fn from(state: ChainHealthState) -> Self {
+        match state {
+            ChainHealthState::Ready => Self::Running,
+            ChainHealthState::WaitingForConnection
+            | ChainHealthState::Connecting
+            | ChainHealthState::SyncTimedOut
+            | ChainHealthState::SubscriptionDegraded => Self::Degraded,
+            ChainHealthState::SubscriptionEnded
+            | ChainHealthState::ServerNotHealthy
+            | ChainHealthState::ConnectionFailed
+            | ChainHealthState::Dropped => Self::Failed,
+        }
+    }
+}
+
 impl From<ChainHealthState> for hopr_api::node::ComponentStatus {
     fn from(state: ChainHealthState) -> Self {
         match state {
@@ -349,6 +369,8 @@ pub struct HoprBlockchainConnector<C, B, P, R> {
     client: std::sync::Arc<C>,
     graph: std::sync::Arc<parking_lot::RwLock<DiGraphMap<HoprKeyIdent, ChannelId, ahash::RandomState>>>,
     backend: std::sync::Arc<B>,
+    // Public remote accounts in the backend; initialized once per connection.
+    announced: std::sync::Arc<std::sync::atomic::AtomicU64>,
     connection_handle: Option<AbortHandle>,
     sequencer: TransactionSequencer<C, R>,
     events: EventsChannel,
@@ -407,6 +429,7 @@ where
                 ahash::RandomState::default(),
             ))),
             backend: backend.clone(),
+            announced: Default::default(),
             connection_handle: None,
             sequencer: TransactionSequencer::new(chain_key.clone(), client.clone(), cfg.nonce_gap_tolerance),
             events: (events_tx, events_rx.deactivate()),
@@ -441,6 +464,17 @@ where
     }
 
     async fn do_connect(&self, timeout: Duration) -> Result<AbortHandle, ConnectorError> {
+        // Seed from stored accounts before any subscription updates. This also supports
+        // pre-populated backends and reconnects without retaining duplicate identities.
+        let backend = self.backend.clone();
+        let me = self.chain_key.public().to_address();
+        let count = hopr_utils::runtime::prelude::spawn_blocking(move || {
+            backend.count_announced_accounts(&me).map_err(ConnectorError::backend)
+        })
+        .await
+        .map_err(ConnectorError::backend)??;
+        self.announced.store(count, AtomicOrdering::Relaxed);
+
         let sync_quota = self.cfg.sync_tolerance.clamp(1, 100) as f64 / 100.0;
         let min_accounts = (self
             .client
@@ -476,6 +510,7 @@ where
         let mapper = self.mapper.clone();
         let backend = self.backend.clone();
         let graph = self.graph.clone();
+        let announced = self.announced.clone();
         let event_tx = self.events.0.clone();
         let me = self.chain_key.public().to_address();
         let values_cache = self.values.clone();
@@ -592,6 +627,7 @@ where
                 .and_then(move |account| {
                     let graph = graph_clone.clone();
                     let mapper = mapper.clone();
+                    let announced = announced.clone();
                     let chain_to_packet = chain_to_packet.clone();
                     let packet_to_chain = packet_to_chain.clone();
                     hopr_utils::runtime::prelude::spawn_blocking(move || {
@@ -604,6 +640,7 @@ where
                             .backend
                             .insert_account(account.clone())
                             .map_err(ConnectorError::backend)?;
+                        accounts::update_announced(&announced, &account, old.as_ref(), &me);
                         if let Some(old_account) = &old {
                             if old_account.chain_addr != account.chain_addr {
                                 chain_to_packet.invalidate(&old_account.chain_addr);
@@ -1043,6 +1080,22 @@ where
     }
 }
 
+impl<C, B, P, R> HoprBlockchainConnector<C, B, P, R> {
+    /// Current operational state of the connector's live chain workflow.
+    ///
+    /// `Running` means the required subscriptions are operational. `Degraded` covers startup,
+    /// incomplete synchronization or subscription retries. `Failed` means a required subscription
+    /// ended or the connection workflow cannot run. Reconnection is required after terminal failure.
+    /// Metadata and cached reads may remain available in that state.
+    ///
+    /// This reads the existing atomic lifecycle; diagnostic collection errors do not change it.
+    /// [`component_status`](hopr_api::node::ComponentStatusReporter::component_status) retains the
+    /// more detailed status and reason for existing callers.
+    pub fn component_state(&self) -> hopr_api::ComponentState {
+        self.health.load(AtomicOrdering::Relaxed).into()
+    }
+}
+
 impl<B, C, P, R> hopr_api::node::ComponentStatusReporter for HoprBlockchainConnector<C, B, P, R> {
     fn component_status(&self) -> hopr_api::node::ComponentStatus {
         self.health.load(AtomicOrdering::Relaxed).into()
@@ -1259,6 +1312,83 @@ pub(crate) mod tests {
         let err = res.await;
         assert!(matches!(err, Err(hopr_api::chain::TicketRedeemError::Rejected(_, _))));
 
+        Ok(())
+    }
+
+    #[test]
+    fn shared_component_states_follow_the_live_chain_lifecycle() {
+        use hopr_api::ComponentState;
+        for (lifecycle, expected) in [
+            (ChainHealthState::Ready, ComponentState::Running),
+            (ChainHealthState::WaitingForConnection, ComponentState::Degraded),
+            (ChainHealthState::Connecting, ComponentState::Degraded),
+            (ChainHealthState::SyncTimedOut, ComponentState::Degraded),
+            (ChainHealthState::SubscriptionDegraded, ComponentState::Degraded),
+            (ChainHealthState::SubscriptionEnded, ComponentState::Failed),
+            (ChainHealthState::ServerNotHealthy, ComponentState::Failed),
+            (ChainHealthState::ConnectionFailed, ComponentState::Failed),
+            (ChainHealthState::Dropped, ComponentState::Failed),
+        ] {
+            assert_eq!(ComponentState::from(lifecycle), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn component_state_observes_existing_lifecycle_transitions_and_recovery() -> anyhow::Result<()> {
+        use hopr_api::ComponentState;
+        let client = BlokliTestStateBuilder::default().build_static_client();
+        let mut connector = create_connector(client)?;
+        assert_eq!(connector.component_state(), ComponentState::Degraded);
+        connector.connect().await?;
+        assert_eq!(connector.component_state(), ComponentState::Running);
+        connector
+            .health
+            .store(ChainHealthState::SubscriptionDegraded, AtomicOrdering::Relaxed);
+        assert_eq!(connector.component_state(), ComponentState::Degraded);
+        set_subscription_health(&connector.health, false, false);
+        assert_eq!(connector.component_state(), ComponentState::Running);
+        set_subscription_health(&connector.health, false, true);
+        assert_eq!(connector.component_state(), ComponentState::Failed);
+        set_subscription_health(&connector.health, false, false);
+        assert_eq!(
+            connector.component_state(),
+            ComponentState::Failed,
+            "an ended subscription needs reconnecting"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "serde")]
+    #[tokio::test]
+    async fn opaque_chain_dumps_include_operational_state_independently_of_read_coverage() -> anyhow::Result<()> {
+        use hopr_api::ComponentState;
+        async fn snapshot<T: hopr_api::StateDump>(source: T) -> anyhow::Result<serde_json::Value> {
+            Ok(serde_json::to_value(source.dump().await?)?)
+        }
+        let client = BlokliTestStateBuilder::default().build_static_client();
+        let mut connector = create_connector(client)?;
+        let safe = Address::from([99; 20]);
+        let degraded = snapshot(connector.state_view(safe, None)).await?;
+        assert_eq!(
+            degraded["state"]["component_state"],
+            serde_json::to_value(ComponentState::Degraded)?
+        );
+        assert_eq!(degraded["reason"], "chain_component_degraded");
+        assert_eq!(degraded["analysis_required"], true);
+        connector.connect().await?;
+        let running = snapshot(connector.state_view(safe, None)).await?;
+        assert_eq!(
+            running["state"]["component_state"],
+            serde_json::to_value(ComponentState::Running)?
+        );
+        set_subscription_health(&connector.health, false, true);
+        let failed = snapshot(connector.state_view(safe, None)).await?;
+        assert_eq!(
+            failed["state"]["component_state"],
+            serde_json::to_value(ComponentState::Failed)?
+        );
+        assert_eq!(failed["reason"], "chain_component_failed");
+        assert_eq!(failed["analysis_required"], true);
         Ok(())
     }
 
@@ -1673,6 +1803,7 @@ pub(crate) mod tests {
         let mut connector = create_connector(blokli_client)?;
         let _ = connector.connect().await;
         assert!(connector.component_status().is_unavailable());
+        assert_eq!(connector.component_state(), hopr_api::ComponentState::Failed);
         Ok(())
     }
 
@@ -1746,5 +1877,77 @@ pub(crate) mod tests {
             health.store(ChainHealthState::Dropped, AtomicOrdering::Relaxed);
             assert_eq!(health.load(AtomicOrdering::Relaxed), ChainHealthState::Dropped);
         }
+    }
+    #[tokio::test]
+    async fn live_ticket_parameters_update_values_events_and_recover_after_cache_invalidation() -> anyhow::Result<()> {
+        use hopr_api::chain::{ChainEvents, ChainValues};
+        let client = BlokliTestStateBuilder::default()
+            .with_ticket_price(HoprBalance::new_base(1))
+            .build_static_client();
+        client.hidden_state_update(|state| state.chain_info.min_ticket_winning_probability = 0.5);
+        let mut connector = create_connector(client.clone())?;
+        connector.connect().await?;
+        assert!(matches!(
+            connector.connect().await,
+            Err(ConnectorError::InvalidState(_))
+        ));
+        let mut events = Box::pin(connector.subscribe()?);
+        for (price, probability, expected_price, expected_probability, count) in [
+            (Some(2u32), Some(0.75), 2u32, 0.75, 2),
+            (Some(3u32), None, 3u32, 0.75, 1),
+            (None, Some(0.25), 3u32, 0.25, 1),
+        ] {
+            client.update_price_and_win_prob(
+                price.map(|p| blokli_client::api::types::TokenValueString(HoprBalance::new_base(p).to_string())),
+                probability,
+            );
+            for _ in 0..count {
+                let event = events
+                    .next()
+                    .timeout(futures_time::time::Duration::from_secs(2))
+                    .await?
+                    .expect("chain event stream is open");
+                assert!(matches!(
+                    event,
+                    hopr_api::chain::ChainEvent::TicketPriceChanged(_)
+                        | hopr_api::chain::ChainEvent::WinningProbabilityIncreased(_)
+                        | hopr_api::chain::ChainEvent::WinningProbabilityDecreased(_)
+                ));
+            }
+            assert_eq!(
+                connector.minimum_ticket_price().await?,
+                HoprBalance::new_base(expected_price)
+            );
+            assert!(
+                connector
+                    .minimum_incoming_ticket_win_prob()
+                    .await?
+                    .approx_eq(&WinningProbability::try_from_f64(expected_probability)?)
+            );
+        }
+        connector.invalidate_caches();
+        client.update_price_and_win_prob(
+            Some(blokli_client::api::types::TokenValueString(
+                HoprBalance::new_base(4).to_string(),
+            )),
+            Some(0.5),
+        );
+        for _ in 0..2 {
+            assert!(
+                events
+                    .next()
+                    .timeout(futures_time::time::Duration::from_secs(2))
+                    .await?
+                    .is_some()
+            );
+        }
+        assert_eq!(connector.minimum_ticket_price().await?, HoprBalance::new_base(4));
+        assert!(
+            connector
+                .minimum_incoming_ticket_win_prob()
+                .await?
+                .approx_eq(&WinningProbability::try_from_f64(0.5)?)
+        );
+        Ok(())
     }
 }

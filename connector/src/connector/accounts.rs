@@ -20,6 +20,27 @@ use crate::{
     backend::Backend, connector::HoprBlockchainConnector, errors::ConnectorError, utils::model_to_account_entry,
 };
 
+/// Apply a successful backend replacement to the public remote-account count.
+/// The backend's previous value makes replayed announcements idempotent.
+pub(super) fn update_announced(
+    announced: &std::sync::atomic::AtomicU64,
+    account: &AccountEntry,
+    old: Option<&AccountEntry>,
+    me: &Address,
+) {
+    use std::sync::atomic::Ordering;
+    let public = |a: &AccountEntry| a.chain_addr != *me && a.has_announced_with_routing_info();
+    match (old.is_some_and(public), public(account)) {
+        (false, true) => {
+            announced.fetch_add(1, Ordering::Relaxed);
+        }
+        (true, false) => {
+            announced.fetch_sub(1, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+}
+
 impl<B, C, P, R> HoprBlockchainConnector<C, B, P, R>
 where
     B: Backend + Send + Sync + 'static,
