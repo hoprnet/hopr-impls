@@ -12,7 +12,7 @@ publish                = false
 readme                 = "README.md"
 repository.workspace   = true
 rust-version.workspace = true
-version                = "0.2.1"
+version                = "0.3.0"
 
 # Never published (also `publish = false` above): exclude it from cargo-release so
 # a `--workspace` release neither versions, tags, nor attempts to publish it.
