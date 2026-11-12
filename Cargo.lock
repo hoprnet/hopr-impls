@@ -3852,9 +3852,9 @@ dependencies = [
 
 [[package]]
 name = "hopr-api"
-version = "6.0.0"
+version = "6.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "185ba1d4f4dc2cd1f13cd9a06469617533c7a888efe760494dcdb37100687404"
+checksum = "52fa34d384c9a17f088253c7f9292f940fef017f357f044ebcf67bb28a99ad05"
 dependencies = [
  "async-trait",
  "atomic_enum",
@@ -3864,6 +3864,7 @@ dependencies = [
  "futures-concurrency",
  "hopr-types 6.0.0",
  "libp2p-identity",
+ "num_enum",
  "serde",
  "serde_bytes",
  "strum",
@@ -3891,7 +3892,7 @@ dependencies = [
 
 [[package]]
 name = "hopr-chain-connector"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "ahash",
  "anyhow",
@@ -3914,6 +3915,7 @@ dependencies = [
  "petgraph",
  "postcard",
  "redb",
+ "serde",
  "serde_json",
  "smart-default",
  "tempfile",
@@ -3971,6 +3973,7 @@ dependencies = [
  "bimap",
  "criterion",
  "futures",
+ "futures-time",
  "hex-literal",
  "hopr-api",
  "hopr-utilities",
@@ -4041,7 +4044,7 @@ dependencies = [
 
 [[package]]
 name = "hopr-transport-p2p"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "anyhow",
  "async-broadcast",
@@ -4051,6 +4054,7 @@ dependencies = [
  "bytes",
  "dashmap",
  "futures",
+ "futures-time",
  "futures-timer",
  "hopr-api",
  "hopr-utilities",
@@ -4060,6 +4064,8 @@ dependencies = [
  "more-asserts",
  "pin-project",
  "quinn-udp 0.6.3",
+ "serde",
+ "serde_json",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -6475,7 +6481,7 @@ dependencies = [
  "quinn-udp 0.5.16",
  "rustc-hash",
  "rustls",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -6515,7 +6521,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.61.2",
 ]
@@ -6528,7 +6534,7 @@ checksum = "47091c86514c2e11452cb228dee77037334b99d92a23e4c69aa5982261f39247"
 dependencies = [
  "cfg_aliases",
  "libc",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "windows-sys 0.61.2",
 ]
 

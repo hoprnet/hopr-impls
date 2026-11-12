@@ -9,7 +9,7 @@ use hopr_api::{
         primitive::prelude::{Address, BytesRepresentable},
     },
 };
-use redb::{ReadableDatabase, TableDefinition};
+use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 
 /// Errors from the temporary database backend.
 #[derive(Debug, thiserror::Error)]
@@ -96,6 +96,20 @@ const KEY_TO_ID: TableDefinition<[u8; OffchainPublicKey::SIZE], u32> = TableDefi
 
 impl super::Backend for TempDbBackend {
     type Error = TempDbError;
+
+    fn count_announced_accounts(&self, me: &Address) -> Result<u64, Self::Error> {
+        let tx = self.db.begin_read()?;
+        let accounts = tx.open_table(ACCOUNTS_TABLE_DEF)?;
+        let mut count = 0;
+        for entry in accounts.iter()? {
+            let (_, value) = entry?;
+            let account: AccountEntry = postcard::from_bytes(&value.value())?;
+            if account.chain_addr != *me && account.has_announced_with_routing_info() {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
 
     fn insert_account(&self, account: AccountEntry) -> Result<Option<AccountEntry>, Self::Error> {
         let write_tx = self.db.begin_write()?;
@@ -364,5 +378,29 @@ mod tests {
         assert_eq!(by_addr, Some(account));
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod error_conversion_tests {
+    use super::*;
+
+    #[test]
+    fn database_failures_preserve_their_error_category_and_message() {
+        let failures = [
+            TempDbError::from(redb::DatabaseError::DatabaseAlreadyOpen),
+            TempDbError::from(redb::TransactionError::Storage(redb::StorageError::Corrupted(
+                "transaction".into(),
+            ))),
+            TempDbError::from(redb::TableError::TableDoesNotExist("channels".into())),
+            TempDbError::from(redb::StorageError::Corrupted("storage".into())),
+            TempDbError::from(redb::CommitError::Storage(redb::StorageError::Corrupted(
+                "commit".into(),
+            ))),
+        ];
+        for failure in failures {
+            assert!(matches!(failure, TempDbError::Database(_)));
+            assert!(failure.to_string().starts_with("database error:"));
+        }
     }
 }

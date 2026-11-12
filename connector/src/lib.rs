@@ -1,5 +1,8 @@
 mod backend;
 mod connector;
+/// Optional chain-owned diagnostic collection.
+#[cfg(feature = "serde")]
+mod diagnostics;
 pub mod errors;
 mod reader;
 #[cfg(any(test, feature = "testing"))]
@@ -317,5 +320,52 @@ mod blokli_client_tests {
 
         assert_eq!(cfg.url, url());
         assert_eq!(cfg.dns_override, Some(dns_override));
+    }
+}
+
+#[cfg(feature = "serde")]
+mod state_reporting;
+
+#[cfg(test)]
+mod factory_tests {
+    use hopr_api::chain::ChainReadChannelOperations;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn trustful_and_explicit_factories_connect_with_safe_and_eoa_signers() -> anyhow::Result<()> {
+        let key = ChainKeypair::from_secret(&[31; 32])?;
+        let contracts = hopr_api::types::chain::contract_addresses_for_network("piz-palu-staging")
+            .unwrap()
+            .1;
+        let client = testing::BlokliTestStateBuilder::default().build_static_client();
+        let mut explicit_safe = create_trustless_hopr_blokli_connector(
+            &key,
+            Default::default(),
+            client.clone(),
+            Address::from([7; 20]),
+            contracts,
+        )?;
+        let mut explicit_eoa =
+            create_trustless_safeless_hopr_blokli_connector(&key, Default::default(), client.clone(), contracts)?;
+        let mut discovered_safe =
+            create_trustful_hopr_blokli_connector(&key, Default::default(), client.clone(), Address::from([7; 20]))
+                .await?;
+        let mut discovered_eoa =
+            create_trustful_safeless_hopr_blokli_connector(&key, Default::default(), client).await?;
+        explicit_safe.connect().await?;
+        explicit_eoa.connect().await?;
+        discovered_safe.connect().await?;
+        discovered_eoa.connect().await?;
+        for (address, state) in [
+            (*explicit_safe.me(), explicit_safe.component_state()),
+            (*explicit_eoa.me(), explicit_eoa.component_state()),
+            (*discovered_safe.me(), discovered_safe.component_state()),
+            (*discovered_eoa.me(), discovered_eoa.component_state()),
+        ] {
+            assert_eq!(address, key.public().to_address());
+            assert_eq!(state, hopr_api::ComponentState::Running);
+        }
+        Ok(())
     }
 }

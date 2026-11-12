@@ -22,9 +22,14 @@
 #[cfg(feature = "petgraph")]
 pub mod petgraph;
 
+pub mod correlation;
+#[cfg(feature = "petgraph")]
+mod diagnostics;
 pub mod errors;
 #[cfg(feature = "graph-api")]
 pub mod render;
+#[cfg(all(feature = "serde", feature = "petgraph"))]
+mod state_dump;
 pub mod weight;
 
 use hopr_api::OffchainPublicKey;
@@ -50,5 +55,22 @@ pub struct GraphNode(OffchainPublicKey);
 impl From<GraphNode> for OffchainPublicKey {
     fn from(val: GraphNode) -> Self {
         val.0
+    }
+}
+
+#[cfg(all(feature = "serde", feature = "petgraph"))]
+mod state_reporting;
+
+#[cfg(test)]
+mod node_tests {
+    use hopr_api::types::crypto::prelude::{Keypair, OffchainKeypair};
+
+    use super::*;
+
+    #[test]
+    fn graph_node_conversion_preserves_the_public_key() -> anyhow::Result<()> {
+        let key = *OffchainKeypair::from_secret(&[3; 32])?.public();
+        assert_eq!(OffchainPublicKey::from(GraphNode(key)), key);
+        Ok(())
     }
 }

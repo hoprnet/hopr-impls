@@ -33,6 +33,9 @@ pub(crate) mod liveness;
 /// In-memory peer store for network multiaddresses.
 pub mod peer_store;
 
+/// Optional transport-owned state and analysis signals.
+#[cfg(feature = "serde")]
+mod state_dump;
 /// Raw swarm definition for the HOPR network.
 pub mod swarm;
 
@@ -151,5 +154,60 @@ impl NetworkStreamControl for HoprNetwork {
             .open_stream(peer, self.protocol)
             .await
             .map(|inner| LivenessStream::new(inner, flag))
+    }
+}
+
+#[cfg(feature = "serde")]
+mod state_reporting;
+
+#[cfg(all(test, feature = "runtime-tokio"))]
+mod network_view_tests {
+    use hopr_api::{
+        network::NetworkEvent,
+        types::crypto::prelude::{Keypair, OffchainKeypair},
+    };
+
+    use super::*;
+
+    #[tokio::test]
+    async fn network_views_follow_discovery_connections_and_broadcast_events() -> anyhow::Result<()> {
+        let key = OffchainKeypair::from_secret(&[19; 32])?;
+        let address: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse()?;
+        let (mut network, _process) = HoprLibp2pNetworkBuilder::new(futures::stream::empty())
+            .build(&key, vec![address.clone()], "/hopr/network-view-test/1", true)
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        // Explicitly retain the configured local address independently of swarm startup.
+        network.store = Arc::new(crate::peer_store::NetworkPeerStore::new(
+            (*key.public()).into(),
+            HashSet::from([address.clone()]),
+        ));
+        assert!(format!("{network:?}").contains("HoprNetwork"));
+        assert_eq!(network.listening_as(), HashSet::from([address.clone()]));
+        assert_eq!(network.health(), Health::Red);
+        assert!(network.discovered_peers().is_empty());
+        let peer = PeerId::random();
+        network.store.add(peer, HashSet::from([address.clone()]))?;
+        assert_eq!(network.discovered_peers(), HashSet::from([peer]));
+        assert_eq!(network.multiaddress_of(&peer), Some(HashSet::from([address])));
+        assert!(network.multiaddress_of(&PeerId::random()).is_none());
+        network.tracker.insert(peer);
+        assert_eq!(network.connected_peers(), HashSet::from([peer]));
+        assert!(network.is_connected(&peer));
+        assert_eq!(network.health(), Health::Orange);
+        for _ in 0..3 {
+            network.tracker.insert(PeerId::random());
+        }
+        assert_eq!(network.health(), Health::Green);
+        network.tracker.remove(&peer);
+        assert_eq!(network.health(), Health::Yellow);
+        assert!(!network.is_connected(&peer));
+        let (sender, receiver) = async_broadcast::broadcast(4);
+        network.event_rx = receiver.deactivate();
+        let mut events = Box::pin(network.subscribe_network_events());
+        // Subscribe is shared with the swarm's broadcast channel.
+        sender.broadcast(NetworkEvent::PeerConnected(peer)).await?;
+        assert!(matches!(events.next().await, Some(NetworkEvent::PeerConnected(id)) if id == peer));
+        Ok(())
     }
 }
