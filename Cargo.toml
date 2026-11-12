@@ -28,12 +28,12 @@ rust-version = "1.97"
 
 [workspace.dependencies]
 # In-repo crates (path + version so they are publishable)
-hopr-chain-connector = { path = "connector", version = "0.32.0" }
+hopr-chain-connector = { path = "connector", version = "0.33.0" }
 hopr-network-graph   = { path = "graph", version = "0.11.1", default-features = false }
 
 # External HOPR crates
 blokli-client = "0.37.0"
-hopr-api      = "6.0.0"
+hopr-api      = "6.1.0"
 hopr-utils    = { package = "hopr-utilities", version = "0.20.0", default-features = false }
 
 # Third-party dependencies (versions mirror hoprnet's workspace to preserve compatibility)
@@ -103,7 +103,3 @@ tokio-retry = "0.3.2"
 tracing = { version = "0.1.44", features = ["release_max_level_debug"] }
 tracing-core = "0.1.36"
 validator = { version = "0.21.0", features = ["derive"] }
-
-# Build against hoprnet/hopr-api's `submission_failure` until it is released.
-[patch.crates-io]
-hopr-api = { git = "https://github.com/hoprnet/hopr-api", branch = "lukas/submission-failure-and-accepts-funding" }

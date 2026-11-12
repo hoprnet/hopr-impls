@@ -3853,7 +3853,8 @@ dependencies = [
 [[package]]
 name = "hopr-api"
 version = "6.1.0"
-source = "git+https://github.com/hoprnet/hopr-api?branch=lukas%2Fsubmission-failure-and-accepts-funding#500b0b5f1bfd7a7d1431ee5d6f90798ad0b70c89"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52fa34d384c9a17f088253c7f9292f940fef017f357f044ebcf67bb28a99ad05"
 dependencies = [
  "async-trait",
  "atomic_enum",
@@ -3891,7 +3892,7 @@ dependencies = [
 
 [[package]]
 name = "hopr-chain-connector"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "ahash",
  "anyhow",
