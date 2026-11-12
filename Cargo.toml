@@ -33,8 +33,8 @@ hopr-network-graph   = { path = "graph", version = "0.11.1", default-features = 
 
 # External HOPR crates
 blokli-client = "0.37.0"
-hopr-api      = "5.1.0"
-hopr-utils    = { package = "hopr-utilities", version = "0.19.0", default-features = false }
+hopr-api      = "6.0.0"
+hopr-utils    = { package = "hopr-utilities", version = "0.20.0", default-features = false }
 
 # Third-party dependencies (versions mirror hoprnet's workspace to preserve compatibility)
 ahash = "0.8.12"
