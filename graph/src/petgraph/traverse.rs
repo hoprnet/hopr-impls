@@ -602,14 +602,19 @@ fn closing_neighbors(inner: &InnerGraph, me: NodeIndex) -> HashSet<NodeIndex> {
 /// Lets a caller that knows which exits it will use probe the subgraph around them, instead of
 /// sampling every loop in the network. An exit is the final hop of a data path, so it needs no
 /// channel: neither a channel into it nor an `exit → me` closing edge is required.
+///
+/// Every other edge of a returned loop, like those of `simple_loopback_to_self`, must have a
+/// funding channel; only the closing `last relay → me` edge is exempt.
 pub trait FocusedLoopback {
     /// Generates loopback paths of exactly `hops` relays around `exits`, each ranked by [`FocusRelevance`].
     ///
     /// The search runs on the subgraph around the exits' forward and return paths, so loops elsewhere
     /// in the network do not appear. `take_count` bounds the result after ranking, forward loops first. The search
     /// lists at most ten times `take_count` loops before ranking, so in a neighborhood with more loops than that a
-    /// focused loop may be left out even when fewer than `take_count` are returned. Closing
-    /// edges follow `simple_loopback_to_self`: they must exist and not be known to be down.
+    /// focused loop may be left out even when fewer than `take_count` are returned. Every edge of the loop except
+    /// the closing `last relay → me` edge follows `simple_loopback_to_self`: the first edge must be connected and
+    /// its channel balance must fund the rest of the path, every later one must have a funding channel, and the
+    /// closing edge must exist and not be known to be down.
     ///
     /// Requests outside [`MIN_LOOPBACK_HOPS`]`..=`[`MAX_LOOPBACK_HOPS`], unknown exits and an empty
     /// `exits` set yield nothing.
@@ -799,8 +804,15 @@ impl FocusedLoopback for ChannelGraph {
             let Some(&sub_me) = renamed.get(&me) else {
                 return vec![];
             };
-            // Only the structure of a loop matters for the search, so no edge is scored or pruned.
-            let unscored: SharedValueFn<()> = Arc::new(|c, _, _| c);
+            // Only loops that can actually be sent may be probed: the same value function as
+            // `simple_loopback_to_self` rejects an unfunded edge, except for the closing edge back to `me`
+            // which is appended after path-finding.
+            let value_fn = EdgeValueFn::forward_without_self_loopback(
+                std::num::NonZeroUsize::new(hops + 1).expect("hop range is non-zero"),
+                self.edge_penalty,
+                0.0,
+                hopr_api::graph::NetworkGraphView::ticket_face_value(self),
+            );
 
             let has_edge = |from: NodeIndex, to: NodeIndex| inner.graph.edges_connecting(from, to).next().is_some();
             let index_of = |key: &OffchainPublicKey| inner.indices.get_by_left(key).copied();
@@ -813,9 +825,9 @@ impl FocusedLoopback for ChannelGraph {
                 // Unrelated loops inside the neighborhood come out in no useful order, so the bound applies after
                 // ranking. The cap only limits the work of the search.
                 take_count.map(|take| take.saturating_mul(FOCUS_SEARCH_FACTOR)),
-                (),
-                None,
-                unscored,
+                value_fn.initial_value(),
+                value_fn.min_value(),
+                value_fn.into_value_fn(),
                 // Focused loops probe, so they walk starved edges too: a returning loop is how a relay recovers.
                 StarvedEdges::Walk,
                 &mut search,
@@ -1661,6 +1673,73 @@ mod tests {
         assert!(
             graph.simple_loopback_to_self(2, None).is_empty(),
             "edge a→b lacks capacity, so EdgeValueFn::forward_without_self_loopback prunes the path"
+        );
+
+        Ok(())
+    }
+
+    // ── focused_loopback tests ─────────────────────────────────────────
+
+    #[test]
+    fn focused_loopback_returns_empty_when_first_hop_lacks_capacity() -> anyhow::Result<()> {
+        // me → a → b → me exists, and a → f makes me → a a forward path to the focused exit.
+        // me→a is connected but has NO channel balance, so the loop cannot be sent.
+        let me = pubkey_from(&SECRET_0);
+        let a = pubkey_from(&SECRET_1);
+        let b = pubkey_from(&SECRET_2);
+        let f = pubkey_from(&SECRET_3);
+
+        let graph = ChannelGraph::new(me);
+        for node in [a, b, f] {
+            graph.add_node(node);
+        }
+        for (src, dst) in [(me, a), (a, b), (b, me), (a, f)] {
+            graph.add_edge(&src, &dst)?;
+        }
+        // me→a: connected but no capacity (only Connected + Immediate).
+        mark_edge_connected(&graph, &me, &a);
+        mark_edge_with_capacity(&graph, &a, &b);
+        // b→me closes the loop and needs no channel.
+        mark_edge_connected(&graph, &b, &me);
+        mark_edge_connected(&graph, &a, &f);
+
+        let exits = HashSet::from([f]);
+        assert!(
+            graph.focused_loopback(2, None, &exits).is_empty(),
+            "edge me→a lacks a funding channel, so me→a→b→me cannot be sent"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn focused_loopback_returns_empty_when_middle_edge_lacks_capacity() -> anyhow::Result<()> {
+        // me → a → b → me exists, and a → f focuses the search. me→a is funded, but a→b has NO
+        // channel balance, so the loop cannot be sent.
+        let me = pubkey_from(&SECRET_0);
+        let a = pubkey_from(&SECRET_1);
+        let b = pubkey_from(&SECRET_2);
+        let f = pubkey_from(&SECRET_3);
+
+        let graph = ChannelGraph::new(me);
+        for node in [a, b, f] {
+            graph.add_node(node);
+        }
+        for (src, dst) in [(me, a), (a, b), (b, me), (a, f)] {
+            graph.add_edge(&src, &dst)?;
+        }
+        // me→a passes the first-edge check.
+        mark_edge_loopback_ready(&graph, &me, &a);
+        // a→b: connected but NO capacity.
+        mark_edge_connected(&graph, &a, &b);
+        // b→me closes the loop and needs no channel.
+        mark_edge_connected(&graph, &b, &me);
+        mark_edge_connected(&graph, &a, &f);
+
+        let exits = HashSet::from([f]);
+        assert!(
+            graph.focused_loopback(2, None, &exits).is_empty(),
+            "edge a→b lacks a funding channel, so me→a→b→me cannot be sent"
         );
 
         Ok(())
