@@ -692,7 +692,7 @@ impl EdgeLinkObservable for TransportIntermediates {
     /// stock turns over, minutes at a deployed size, so SURBs minted over an edge and not spent yet read
     /// exactly like SURBs lost on it. Read as dead, every edge a session starts to use after its first
     /// seconds drops out of routing until its SURBs come home, and the session's stock ends up behind the
-    /// few relays its first replies came through (hoprnet#8650). A relay cannot tell a loop from a reply,
+    /// few relays its first replies came through (hoprnet/hoprnet#8650). A relay cannot tell a loop from a reply,
     /// so loops that come back show the edge forwards. An edge no loop crosses, such as the one into the
     /// destination, keeps its traffic as the only witness (#81).
     ///
@@ -1525,7 +1525,7 @@ mod tests {
 
     /// The SURBs of an edge a session has just started to use wait in the replier's stock until it turns
     /// over, minutes at a deployed size, so "minted, none home yet" must not zero an edge whose loops come
-    /// back (hoprnet#8650).
+    /// back (hoprnet/hoprnet#8650).
     #[test]
     fn surbs_still_in_flight_should_not_zero_an_edge_whose_loops_return() {
         let epoch = std::time::Instant::now();
