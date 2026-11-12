@@ -3852,8 +3852,8 @@ dependencies = [
 
 [[package]]
 name = "hopr-api"
-version = "6.0.1"
-source = "git+https://github.com/hoprnet/hopr-api?branch=lukas%2Fsubmission-failure-and-accepts-funding#7b13899c56c78955e569cc64e7f59ef70233af84"
+version = "6.1.0"
+source = "git+https://github.com/hoprnet/hopr-api?branch=lukas%2Fsubmission-failure-and-accepts-funding#500b0b5f1bfd7a7d1431ee5d6f90798ad0b70c89"
 dependencies = [
  "async-trait",
  "atomic_enum",
@@ -6474,7 +6474,7 @@ dependencies = [
  "quinn-udp 0.5.16",
  "rustc-hash",
  "rustls",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -6514,7 +6514,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.61.2",
 ]
@@ -6527,7 +6527,7 @@ checksum = "47091c86514c2e11452cb228dee77037334b99d92a23e4c69aa5982261f39247"
 dependencies = [
  "cfg_aliases",
  "libc",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "windows-sys 0.61.2",
 ]
 
