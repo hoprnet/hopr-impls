@@ -4,7 +4,7 @@ use blokli_client::api::{BlokliQueryClient, BlokliSubscriptionClient, BlokliTran
 use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt, future::BoxFuture, pin_mut, stream::BoxStream};
 use futures_time::future::FutureExt as TimeFutureExt;
 use hopr_api::{
-    chain::{AccountSelector, AnnouncementError, ChainReceipt, Multiaddr, SafeRegistrationError},
+    chain::{AccountSelector, AnnouncementError, ChainReceipt, Multiaddr, SafeRegistrationError, SubmissionFailure},
     types::{
         chain::prelude::*,
         crypto::prelude::*,
@@ -117,6 +117,26 @@ where
     P::TxRequest: Send + Sync + 'static,
 {
     type Error = ConnectorError;
+
+    /// Classifies the error the way the connector's sequencer decides whether a nonce was consumed:
+    ///
+    /// | Error | Outcome |
+    /// |---|---|
+    /// | [`ConnectorError::is_refused_before_broadcast`], or RPC code `FEE_TOO_LOW` / `INSUFFICIENT_FUNDS` | [`SubmissionFailure::NotSubmitted`] |
+    /// | [`ConnectorError::as_transaction_rejection_error`], or [`ConnectorError::InnerTxFailed`] | [`SubmissionFailure::Reverted`] |
+    /// | anything else (other RPC codes, timeouts, transport failures) | [`SubmissionFailure::Unknown`], as an earlier copy may be in the mempool |
+    fn submission_failure(&self, error: &Self::Error) -> SubmissionFailure {
+        if error.is_refused_before_broadcast()
+            || matches!(error.rpc_rejection_code(), Some("FEE_TOO_LOW" | "INSUFFICIENT_FUNDS"))
+        {
+            SubmissionFailure::NotSubmitted
+        } else if error.as_transaction_rejection_error().is_some() || matches!(error, ConnectorError::InnerTxFailed(_))
+        {
+            SubmissionFailure::Reverted
+        } else {
+            SubmissionFailure::Unknown
+        }
+    }
 
     async fn announce(
         &self,
@@ -792,6 +812,71 @@ mod tests {
         );
 
         insta::assert_yaml_snapshot!(*connector.client.snapshot());
+
+        Ok(())
+    }
+
+    /// A failed transaction is classified by the connector's own predicates: a refusal before
+    /// broadcast leaves the value in place, a rejection by the chain reverted, and anything else
+    /// may have been broadcast.
+    #[tokio::test]
+    async fn a_failed_transaction_is_classified_by_the_connectors_own_predicates() -> anyhow::Result<()> {
+        use blokli_client::errors::{ErrorKind, TrackingErrorKind};
+
+        let connector = create_connector(BlokliTestStateBuilder::default().build_static_client())?;
+        let client = |kind: ErrorKind| ConnectorError::ClientError(kind.into());
+        let classify = |error: ConnectorError| connector.submission_failure(&error);
+        let rpc = |code: &str| {
+            client(ErrorKind::BlokliError {
+                kind: "rpc error",
+                code: code.into(),
+                message: "refused".into(),
+            })
+        };
+
+        assert_eq!(
+            classify(client(ErrorKind::BlokliError {
+                kind: "overloaded",
+                code: "OVERLOADED".into(),
+                message: "busy".into(),
+            })),
+            SubmissionFailure::NotSubmitted
+        );
+        assert_eq!(
+            classify(client(ErrorKind::BlokliError {
+                kind: "contract not allowed",
+                code: "X".into(),
+                message: "no".into(),
+            })),
+            SubmissionFailure::NotSubmitted
+        );
+        // The codes for which the sequencer knows no nonce was consumed.
+        for code in ["FEE_TOO_LOW", "INSUFFICIENT_FUNDS"] {
+            assert_eq!(classify(rpc(code)), SubmissionFailure::NotSubmitted, "{code}");
+        }
+        // Every other code may have left an earlier copy in the mempool.
+        for code in [
+            "NONCE_TOO_LOW",
+            "NONCE_TOO_HIGH",
+            "ALREADY_KNOWN",
+            "REPLACEMENT_UNDERPRICED",
+            "SOMETHING_ELSE",
+        ] {
+            assert_eq!(classify(rpc(code)), SubmissionFailure::Unknown, "{code}");
+        }
+        assert_eq!(
+            classify(client(ErrorKind::TrackingError(TrackingErrorKind::Reverted))),
+            SubmissionFailure::Reverted
+        );
+        assert_eq!(
+            classify(ConnectorError::InnerTxFailed("n/a".into())),
+            SubmissionFailure::Reverted
+        );
+        assert_eq!(
+            classify(client(ErrorKind::TrackingError(TrackingErrorKind::Timeout))),
+            SubmissionFailure::Unknown
+        );
+        assert_eq!(classify(ConnectorError::ConnectionTimeout), SubmissionFailure::Unknown);
 
         Ok(())
     }

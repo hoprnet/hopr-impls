@@ -103,3 +103,7 @@ tokio-retry = "0.3.2"
 tracing = { version = "0.1.44", features = ["release_max_level_debug"] }
 tracing-core = "0.1.36"
 validator = { version = "0.21.0", features = ["derive"] }
+
+# Build against hoprnet/hopr-api's `submission_failure` until it is released.
+[patch.crates-io]
+hopr-api = { git = "https://github.com/hoprnet/hopr-api", branch = "lukas/submission-failure-and-accepts-funding" }
