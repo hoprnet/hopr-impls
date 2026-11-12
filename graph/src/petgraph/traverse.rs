@@ -2129,6 +2129,9 @@ mod tests {
         };
         let missing_self = ChannelGraph::new(missing);
         missing_self.remove_node(&missing);
+        // Keep two dispatchers alive so tracing checks callsite interest across subscribers.
+        // Otherwise, a parallel test without a subscriber can cache a shared callsite as disabled.
+        let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
         let logs = Logs::default();
         tracing::subscriber::with_default(logs.clone(), || {
             let request = tracing::debug_span!("routing.resolve", request_id = 123);
