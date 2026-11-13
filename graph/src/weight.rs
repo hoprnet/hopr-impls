@@ -334,6 +334,17 @@ pub const DEFAULT_MIN_LOOPBACKS_FOR_RATE: u32 = 3;
 /// the odd loop (on piz-palu-prod they peaked at 0.09, working first hops stayed above 0.25).
 pub const DEFAULT_MIN_LOOPBACK_RETURN_RATE: f64 = 0.1;
 
+/// How unlikely the loops lost in a row over an edge must be, at the edge's own return rate, before they end
+/// the in-flight floor of [`TransportIntermediates::average_probe_rate_at`].
+///
+/// A relay that has just died keeps the loops it returned in the window for up to [`LOOPBACK_WINDOW`], and
+/// while they read as delivering the floor keeps the edge routable. Loops lost in a row end the floor sooner,
+/// but only once the edge's own loss no longer explains them: on a lossless edge with ten or more loops in the
+/// window the first lost loop does, while an edge that returns a quarter of its loops (the working first hops
+/// above) needs about ten in a row. By construction a run that long comes by chance on fewer than one loop in
+/// twenty.
+const LOST_RUN_SIGNIFICANCE: f64 = 0.05;
+
 /// How the loops over an edge judge its relay. Built from the path planner's configuration by whoever
 /// constructs the graph, see [`ChannelGraph::with_starvation`](crate::ChannelGraph::with_starvation).
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -389,6 +400,8 @@ struct LoopbackBucket {
 struct LoopbackWindow {
     epoch: std::time::Instant,
     buckets: [LoopbackBucket; LOOPBACK_BUCKETS],
+    /// Loops lost in a row since the latest one that came back.
+    lost_run: u32,
 }
 
 impl LoopbackWindow {
@@ -396,7 +409,25 @@ impl LoopbackWindow {
         Self {
             epoch,
             buckets: [LoopbackBucket::default(); LOOPBACK_BUCKETS],
+            lost_run: 0,
         }
+    }
+
+    /// Whether the loops lost in a row since the latest one that came back are more than the edge's return
+    /// rate explains, at [`LOST_RUN_SIGNIFICANCE`].
+    ///
+    /// The rate is that of the window's loops before the run, smoothed as `(returned + 0.5) / (before + 1)` so
+    /// that a few returned loops do not read as a perfect link: after five, one lost loop is still plausible
+    /// and it takes a second.
+    fn lost_run_implausible_at(&self, now: std::time::Instant) -> bool {
+        if self.lost_run == 0 {
+            return false;
+        }
+        let (sent, returned) = self.counts_at(now);
+        let before = sent.saturating_sub(self.lost_run);
+        let rate = ((f64::from(returned) + 0.5) / (f64::from(before) + 1.0)).min(1.0);
+        let run = i32::try_from(self.lost_run).unwrap_or(i32::MAX);
+        (1.0 - rate).powi(run) < LOST_RUN_SIGNIFICANCE
     }
 
     fn slot_of(&self, now: std::time::Instant) -> u64 {
@@ -417,6 +448,7 @@ impl LoopbackWindow {
         if returned {
             bucket.returned = bucket.returned.saturating_add(1);
         }
+        self.lost_run = if returned { 0 } else { self.lost_run.saturating_add(1) };
     }
 
     /// Loops that crossed the edge in the window, and how many of them returned.
@@ -509,8 +541,11 @@ impl TransportIntermediates {
         let traffic = self.surb_delivery_rate_at(now);
         let probe = self.link.average_probe_rate();
         // An edge whose own loops come back is forwarding: SURBs minted over it that are not home yet may be
-        // waiting in the replier's stock, and must not pull it below what its loops measure.
-        if self.loopback.delivers_at(now, self.starvation) == Some(true) {
+        // waiting in the replier's stock, and must not pull it below what its loops measure. Not once the loops
+        // lost in a row since the latest that came back are more than the edge's loss explains: a relay that has
+        // just died still reads as delivering until its returned loops leave the window.
+        if self.loopback.delivers_at(now, self.starvation) == Some(true) && !self.loopback.lost_run_implausible_at(now)
+        {
             return match (traffic, probe) {
                 (Some(traffic), Some(probe)) => Some(traffic.max(probe)),
                 (traffic, probe) => traffic.or(probe),
@@ -1790,6 +1825,69 @@ mod loopback_window_tests {
         assert_eq!(window.rate_at(lap), Some(1.0));
     }
 
+    /// Records `outcomes` in order, `true` for a loop that came back.
+    fn record_in_order(window: &mut LoopbackWindow, at: Instant, outcomes: impl IntoIterator<Item = bool>) {
+        for returned in outcomes {
+            window.record_at(returned, at);
+        }
+    }
+
+    #[test]
+    fn the_first_lost_loop_of_a_lossless_edge_should_be_implausible() {
+        let epoch = Instant::now();
+        let mut window = LoopbackWindow::new(epoch);
+        record_in_order(&mut window, epoch, std::iter::repeat_n(true, 20).chain([false]));
+        assert_eq!(window.lost_run, 1);
+        assert!(window.lost_run_implausible_at(epoch));
+    }
+
+    #[test]
+    fn after_a_few_returned_loops_a_second_lost_loop_should_be_needed() {
+        let epoch = Instant::now();
+        let mut window = LoopbackWindow::new(epoch);
+        record_in_order(&mut window, epoch, std::iter::repeat_n(true, 5).chain([false]));
+        assert!(
+            !window.lost_run_implausible_at(epoch),
+            "five returned loops do not make one lost loop implausible"
+        );
+        window.record_at(false, epoch);
+        assert!(window.lost_run_implausible_at(epoch));
+    }
+
+    #[test]
+    fn a_lossy_edge_should_need_a_run_its_return_rate_does_not_explain() {
+        let epoch = Instant::now();
+        // 6 of 21 loops came back, the latest of them last: a smoothed rate of 6.5 / 22, so 1 - rate ≈ 0.705, and
+        // 0.705^8 ≈ 0.061 is still above 0.05 while 0.705^9 ≈ 0.043 is below it.
+        let history: Vec<bool> = (0..20).map(|i| i % 4 == 0).chain([true]).collect();
+        for run in 1..=12 {
+            let mut window = LoopbackWindow::new(epoch);
+            record_in_order(
+                &mut window,
+                epoch,
+                history.iter().copied().chain(std::iter::repeat_n(false, run)),
+            );
+            assert_eq!(
+                window.lost_run_implausible_at(epoch),
+                run >= 9,
+                "{run} lost in a row at a return rate of about a quarter"
+            );
+        }
+    }
+
+    #[test]
+    fn a_returned_loop_should_end_the_run() {
+        let epoch = Instant::now();
+        let mut window = LoopbackWindow::new(epoch);
+        record_in_order(
+            &mut window,
+            epoch,
+            std::iter::repeat_n(true, 20).chain([false, false, true]),
+        );
+        assert_eq!(window.lost_run, 0);
+        assert!(!window.lost_run_implausible_at(epoch));
+    }
+
     // ── Cadence ─────────────────────────────────────────────────────────
 
     // Loops are sent once per probing round (30 s by default) and a lost one is recorded after the
@@ -2057,6 +2155,65 @@ mod loopback_window_tests {
             intermediates.average_probe_rate_at(later),
             Some(0.0),
             "with no loop to speak for it, traffic that stopped decides"
+        );
+    }
+
+    /// A relay that has just died keeps the loops it returned in the window for up to a minute. A lost loop
+    /// that the edge's own rate cannot explain ends the floor before they expire.
+    #[test]
+    fn a_lost_loop_a_lossless_edge_cannot_explain_should_end_the_floor() {
+        let t0 = std::time::Instant::now();
+        let mut intermediates = TransportIntermediates::default();
+        intermediates.record_surb_round_trips_at(10, 10, t0);
+        for _ in 0..20 {
+            intermediates.record(Ok(std::time::Duration::from_millis(40)));
+        }
+        let later = t0 + std::time::Duration::from_secs(30);
+        intermediates.record_surb_round_trips_at(10, 0, later);
+        assert_eq!(
+            intermediates.average_probe_rate_at(later),
+            intermediates.link.average_probe_rate(),
+            "the loops that return speak for the edge"
+        );
+
+        intermediates.record(Err(()));
+
+        assert_eq!(
+            intermediates.loopback.delivers_at(later, intermediates.starvation),
+            Some(true),
+            "the window still reads as delivering"
+        );
+        assert_eq!(
+            intermediates.average_probe_rate_at(later),
+            Some(0.0),
+            "but its latest loop was lost, which a lossless edge does not explain: traffic that stopped decides"
+        );
+    }
+
+    /// An edge that loses most of its loops keeps the floor through a run of losses its rate explains.
+    #[test]
+    fn a_lost_loop_a_lossy_edge_explains_should_keep_the_floor() {
+        let t0 = std::time::Instant::now();
+        let mut intermediates = TransportIntermediates::default();
+        intermediates.record_surb_round_trips_at(10, 10, t0);
+        for i in 0..20 {
+            if i % 4 == 0 {
+                intermediates.record(Ok(std::time::Duration::from_millis(40)));
+            } else {
+                intermediates.record(Err(()));
+            }
+        }
+        intermediates.record(Ok(std::time::Duration::from_millis(40)));
+        let later = t0 + std::time::Duration::from_secs(30);
+        intermediates.record_surb_round_trips_at(10, 0, later);
+        for _ in 0..3 {
+            intermediates.record(Err(()));
+        }
+
+        assert_eq!(
+            intermediates.average_probe_rate_at(later),
+            intermediates.link.average_probe_rate(),
+            "three lost in a row are what a quarter return rate leads to: the loops still speak for the edge"
         );
     }
 }
