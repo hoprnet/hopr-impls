@@ -16,6 +16,9 @@ ignore = [
   "RUSTSEC-2026-0511", # hickory-proto 0.25: NXDOMAIN accepted for a proven empty non-terminal in DNSSEC validation — no fixed upgrade; requires a libp2p major upgrade
   "RUSTSEC-2026-0512", # hickory-proto 0.25: DNSSEC validation accepted an unrelated signed RRset — no fixed upgrade; requires a libp2p major upgrade
   "RUSTSEC-2026-0514", # hickory-resolver 0.25: lookups returned records that failed DNSSEC validation — fix (>=0.26.2) requires a libp2p major upgrade
+  "RUSTSEC-2026-0530", # hickory-proto 0.25: parent-side NSEC at a zone cut accepted as proof of nonexistence in DNSSEC validation — no fixed upgrade; requires a libp2p major upgrade
+  "RUSTSEC-2026-0531", # hickory-proto 0.25: child-side NSEC/NSEC3 accepted as proof that a delegation has no DS record in DNSSEC validation — no fixed upgrade; requires a libp2p major upgrade
+  "RUSTSEC-2026-0532", # hickory-proto 0.25: parent-side NSEC3 at a zone cut accepted as proof of nonexistence in DNSSEC validation — no fixed upgrade; requires a libp2p major upgrade
   # pin-utils 0.1.1 is unmaintained and enters the lockfile via wasmtimer 0.4.3.
   # Drop this ignore once upstream removes pin-utils or replaces it with a maintained crate.
   "RUSTSEC-2026-0441", # pin-utils: unmaintained transitive dependency
