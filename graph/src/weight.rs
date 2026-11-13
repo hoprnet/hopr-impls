@@ -339,10 +339,10 @@ pub const DEFAULT_MIN_LOOPBACK_RETURN_RATE: f64 = 0.1;
 ///
 /// A relay that has just died keeps the loops it returned in the window for up to [`LOOPBACK_WINDOW`], and
 /// while they read as delivering the floor keeps the edge routable. Loops lost in a row end the floor sooner,
-/// but only once the edge's own loss no longer explains them: on a lossless edge with ten or more loops in the
-/// window the first lost loop does, while an edge that returns a quarter of its loops (the working first hops
-/// above) needs about ten in a row. By construction a run that long comes by chance on fewer than one loop in
-/// twenty.
+/// but only once the edge's own loss no longer explains them: on a lossless edge with ten or more returned
+/// loops in the window the first lost loop does, while an edge that returns a quarter of its loops (the working
+/// first hops above) needs about ten in a row. By construction a run that long comes by chance on fewer than one
+/// loop in twenty.
 const LOST_RUN_SIGNIFICANCE: f64 = 0.05;
 
 /// How the loops over an edge judge its relay. Built from the path planner's configuration by whoever
@@ -1833,12 +1833,20 @@ mod loopback_window_tests {
     }
 
     #[test]
-    fn the_first_lost_loop_of_a_lossless_edge_should_be_implausible() {
+    fn the_first_lost_loop_of_a_lossless_edge_should_be_implausible_from_ten_returned_loops() {
         let epoch = Instant::now();
-        let mut window = LoopbackWindow::new(epoch);
-        record_in_order(&mut window, epoch, std::iter::repeat_n(true, 20).chain([false]));
-        assert_eq!(window.lost_run, 1);
-        assert!(window.lost_run_implausible_at(epoch));
+        // One lost loop after `returned` that came back: 1 - rate is 0.5 / (returned + 1), which is 0.05 after
+        // nine returned loops (not below it) and below it from ten on.
+        for returned in 1..=20 {
+            let mut window = LoopbackWindow::new(epoch);
+            record_in_order(&mut window, epoch, std::iter::repeat_n(true, returned).chain([false]));
+            assert_eq!(window.lost_run, 1);
+            assert_eq!(
+                window.lost_run_implausible_at(epoch),
+                returned >= 10,
+                "one lost loop after {returned} returned"
+            );
+        }
     }
 
     #[test]
@@ -2190,9 +2198,10 @@ mod loopback_window_tests {
         );
     }
 
-    /// An edge that loses most of its loops keeps the floor through a run of losses its rate explains.
-    #[test]
-    fn a_lost_loop_a_lossy_edge_explains_should_keep_the_floor() {
+    /// An edge that returned 6 of its first 21 loops, the latest of them last, whose traffic stopped coming back,
+    /// and then `lost` loops lost in a row. Its smoothed rate is 6.5 / 22, so 1 - rate ≈ 0.705: 0.705^8 ≈ 0.061 is
+    /// still above 0.05 and 0.705^9 ≈ 0.043 is below it. Returns the edge and the instant to read it at.
+    fn lossy_edge_after_lost_run(lost: usize) -> (TransportIntermediates, std::time::Instant) {
         let t0 = std::time::Instant::now();
         let mut intermediates = TransportIntermediates::default();
         intermediates.record_surb_round_trips_at(10, 10, t0);
@@ -2206,14 +2215,40 @@ mod loopback_window_tests {
         intermediates.record(Ok(std::time::Duration::from_millis(40)));
         let later = t0 + std::time::Duration::from_secs(30);
         intermediates.record_surb_round_trips_at(10, 0, later);
-        for _ in 0..3 {
+        for _ in 0..lost {
             intermediates.record(Err(()));
         }
+        assert_eq!(
+            intermediates.loopback.delivers_at(later, intermediates.starvation),
+            Some(true),
+            "a return rate of about a fifth still reads as delivering, so only the run can end the floor"
+        );
+        assert!(
+            intermediates.link.average_probe_rate().is_some_and(|rate| rate > 0.0),
+            "the loops' rate is above the stopped traffic's zero, so the floor shows"
+        );
+        (intermediates, later)
+    }
 
+    /// An edge that loses most of its loops keeps the floor through a run of losses its rate explains.
+    #[test]
+    fn eight_lost_loops_a_lossy_edge_explains_should_keep_the_floor() {
+        let (intermediates, later) = lossy_edge_after_lost_run(8);
         assert_eq!(
             intermediates.average_probe_rate_at(later),
             intermediates.link.average_probe_rate(),
-            "three lost in a row are what a quarter return rate leads to: the loops still speak for the edge"
+            "eight lost in a row are what a quarter return rate explains: the loops still speak for the edge"
+        );
+    }
+
+    /// One loop more than the edge's rate explains ends the floor, while the window still reads as delivering.
+    #[test]
+    fn a_ninth_lost_loop_a_lossy_edge_cannot_explain_should_end_the_floor() {
+        let (intermediates, later) = lossy_edge_after_lost_run(9);
+        assert_eq!(
+            intermediates.average_probe_rate_at(later),
+            Some(0.0),
+            "nine lost in a row are not: traffic that stopped decides"
         );
     }
 }
