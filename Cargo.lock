@@ -4016,7 +4016,7 @@ dependencies = [
 
 [[package]]
 name = "hopr-ticket-manager"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "ahash",
  "anyhow",
