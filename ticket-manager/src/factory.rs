@@ -241,7 +241,14 @@ where
     ///
     /// ### Implementation details
     /// The `current_path_pos` indicates the position of the current hop in the multi-hop path.
-    /// It is used to determine the value of the ticket: `price * (current_path_pos - 1) / winning_prob`.
+    /// It is used to determine the value of the ticket: `(price / winning_prob) * (current_path_pos - 1)`.
+    ///
+    /// The price is divided by the winning probability once and only then integer-multiplied by the hop count.
+    /// Folding the hop count into the numerator first (i.e. `price * (current_path_pos - 1) / winning_prob`)
+    /// would truncate at a different step and prices the ticket above what path selection and the
+    /// channel-funding strategy compute, so a channel funded to exactly that floor would pass selection and
+    /// then fail the balance check here.
+    ///
     /// The function does not make sense for `current_path_pos <= 1` and returns an error if such an argument is
     /// provided.
     ///
@@ -271,18 +278,19 @@ where
             )));
         }
 
-        // The next ticket is worth: price * remaining hop count / winning probability\
-        // The check will also not allow creation of tickets with 0 winning probability.
+        // The next ticket is worth: (price / winning probability) * remaining hop count.
+        // Divide first, then multiply: the same operation order the path selector and the channel-funding
+        // strategy use, so the three agree on the required amount to the wei (hoprnet/hoprnet#8661).
+        // Dividing also rejects a non-positive winning probability, so `NEVER` fails here.
+        let single_hop_amount = price_per_hop.div_f64(winning_probability.into()).map_err(|_| {
+            TicketManagerError::Other(anyhow::anyhow!(
+                "invalid winning probability for outgoing ticket: {winning_probability}"
+            ))
+        })?;
         let amount = HoprBalance::from(
-            price_per_hop
+            single_hop_amount
                 .amount()
-                .saturating_mul(U256::from(current_path_pos - 1))
-                .div_f64(winning_probability.into())
-                .map_err(|_| {
-                    TicketManagerError::Other(anyhow::anyhow!(
-                        "invalid winning probability for outgoing ticket: {winning_probability}"
-                    ))
-                })?,
+                .saturating_mul(U256::from(current_path_pos - 1)),
         );
 
         if channel.balance.lt(&amount) {
@@ -467,6 +475,66 @@ mod tests {
                 .new_multihop_ticket(&channel, 1.try_into()?, WinningProbability::ALWAYS, 10.into())
                 .is_err()
         );
+
+        Ok(())
+    }
+
+    /// A channel funded to exactly the floor that path selection (`balance_suffices`) and the channel-funding
+    /// strategy (`winning_ticket_face_value`) compute must be able to issue its next multihop ticket, and that
+    /// ticket must be worth exactly that floor.
+    ///
+    /// The floor is `hops * (price / win_prob)` — divide first, then integer-multiply by the hop count.
+    /// The factory used to compute `(price * hops) / win_prob` instead; since `div_f64` truncates, the two
+    /// orders truncate a different remainder and the factory demanded 7500000000200666150 wei while the
+    /// selector and the strategy compute 7500000000200666148, so a channel funded to the floor failed here
+    /// with a `balance of channel ... is too low: 7.50000000020066615 wxHOPR` error.
+    #[test]
+    fn ticket_factory_should_price_a_multihop_ticket_at_the_selector_floor() -> anyhow::Result<()> {
+        const HOPS: u64 = 3;
+
+        let factory = create_factory()?;
+
+        // Production economics from hoprnet/hoprnet#8661: price 1e-5 wxHOPR, winning probability 4e-6
+        let price = HoprBalance::from(10_000_000_000_000_u64);
+        let win_prob = WinningProbability::try_from_f64(4e-6)?;
+
+        // The floor as the selector and the funding strategy compute it: divide first, then multiply
+        let floor = HoprBalance::from(
+            price
+                .div_f64(win_prob.into())?
+                .amount()
+                .saturating_mul(U256::from(HOPS)),
+        );
+
+        // The test proves something only while the two orderings disagree at these economics. Spelling the
+        // old one out here makes a future change that flips the fixture's own computation (or picks inputs
+        // where both orders coincide) fail loudly instead of passing vacuously.
+        let old_order = HoprBalance::from(
+            price
+                .amount()
+                .saturating_mul(U256::from(HOPS))
+                .div_f64(win_prob.into())?,
+        );
+        assert_ne!(floor, old_order, "these economics must distinguish the two orderings");
+
+        let channel = ChannelEntry::builder()
+            .between(&ChainKeypair::random(), &ChainKeypair::random())
+            .balance(floor)
+            .ticket_index(0)
+            .status(ChannelStatus::Open)
+            .epoch(1)
+            .build()?;
+
+        // path_position counts the current hop, so 4 leaves 3 onward hops
+        let position = NonZeroU8::try_from(HOPS as u8 + 1)?;
+
+        let ticket = factory
+            .new_multihop_ticket(&channel, position, win_prob, price)?
+            .eth_challenge(Default::default())
+            .build()?;
+
+        assert_eq!(floor, ticket.amount);
+        assert_eq!(win_prob.as_encoded(), ticket.win_prob().as_encoded());
 
         Ok(())
     }
