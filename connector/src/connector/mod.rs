@@ -404,7 +404,7 @@ where
     B: Backend + Send + Sync + 'static,
     C: BlokliSubscriptionClient + BlokliQueryClient + BlokliTransactionClient + Send + Sync + 'static,
     P: PayloadGenerator + Send + Sync + 'static,
-    P::TxRequest: Send + Sync + 'static,
+    P::TxRequest: Clone + Send + Sync + 'static,
 {
     /// Creates a new instance.
     pub fn new(

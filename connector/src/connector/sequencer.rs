@@ -88,7 +88,7 @@ impl moka::Expiry<Address, std::sync::Arc<AtomicU64>> for FixedTti {
 impl<C, R> TransactionSequencer<C, R>
 where
     C: BlokliQueryClient + BlokliTransactionClient + Send + Sync + 'static,
-    R: SignableTransaction + Send + Sync + 'static,
+    R: SignableTransaction + Clone + Send + Sync + 'static,
 {
     pub fn new(signer: ChainKeypair, client: std::sync::Arc<C>, nonce_gap_tolerance: Duration) -> Self {
         tracing::debug!(signer = %signer.public().to_address(), "starting transaction sequencer");
@@ -146,16 +146,34 @@ where
                             let local_nonce = current_nonce.entry(signer_addr).or_default().into_value();
                             let nonce =
                                 sync_nonce(&local_nonce, &nonce_gaps, signer_addr, pending, nonce_gap_tolerance);
-                            tracing::Span::current().record("nonce", nonce);
 
-                            let tx = tx
-                                .sign_and_encode_to_eip2718(nonce, chain_id, gas_estimation.into(), &signer)
-                                .await?;
-                            tracing::debug!("submitting transaction");
-                            Ok(client
-                                .submit_and_track_transaction(&tx)
-                                .map_err(ConnectorError::from)
-                                .await)
+                            submit_with_nonce_retry(
+                                nonce,
+                                &local_nonce,
+                                |nonce| {
+                                    tracing::Span::current().record("nonce", nonce);
+                                    let tx = tx.clone();
+                                    let client = &client;
+                                    let signer = &signer;
+                                    async move {
+                                        let tx = tx
+                                            .sign_and_encode_to_eip2718(nonce, chain_id, gas_estimation.into(), signer)
+                                            .await?;
+                                        tracing::debug!("submitting transaction");
+                                        Ok(client
+                                            .submit_and_track_transaction(&tx)
+                                            .map_err(ConnectorError::from)
+                                            .await)
+                                    }
+                                },
+                                || async {
+                                    client
+                                        .query_transaction_count(&signer_addr.into())
+                                        .map_err(ConnectorError::from)
+                                        .await
+                                },
+                            )
+                            .await
                         }
                         .await;
 
@@ -206,6 +224,48 @@ where
         );
 
         Self { sender, client }
+    }
+}
+
+type Submission = errors::Result<errors::Result<blokli_client::api::TxId>>;
+
+/// Signs and submits a transaction with `nonce` through `attempt`.
+///
+/// When Blokli refuses it as `NONCE_TOO_HIGH`, the nonce is not consumed and the local nonce is
+/// ahead of what the chain expects. The chain's pending count is then re-read through
+/// `read_pending`, adopted as the local nonce, and the transaction is signed and submitted once
+/// more with it. The retry happens at most once per submission: a second refusal is returned as is.
+async fn submit_with_nonce_retry<A, AFut, P, PFut>(
+    nonce: u64,
+    local: &AtomicU64,
+    mut attempt: A,
+    read_pending: P,
+) -> Submission
+where
+    A: FnMut(u64) -> AFut,
+    AFut: Future<Output = Submission>,
+    P: FnOnce() -> PFut,
+    PFut: Future<Output = errors::Result<u64>>,
+{
+    let first = attempt(nonce).await;
+    if !matches!(&first, Ok(Err(error)) if error.rpc_rejection_code() == Some("NONCE_TOO_HIGH")) {
+        return first;
+    }
+
+    match read_pending().await {
+        Ok(pending) => {
+            tracing::warn!(
+                nonce,
+                pending,
+                "nonce refused as too high, retrying once with the chain's pending count"
+            );
+            local.store(pending, std::sync::atomic::Ordering::Relaxed);
+            attempt(pending).await
+        }
+        Err(error) => {
+            tracing::warn!(%error, "failed to re-read the pending count after a too high nonce");
+            first
+        }
     }
 }
 
@@ -291,7 +351,7 @@ fn nonce_consumed(
     match error.rpc_rejection_code() {
         Some("NONCE_TOO_LOW" | "REPLACEMENT_UNDERPRICED") => Some(true),
         Some("FEE_TOO_LOW" | "INSUFFICIENT_FUNDS") => Some(false),
-        // NONCE_TOO_HIGH, unverified ALREADY_KNOWN, unclassified RPC errors, transport failures
+        // NONCE_TOO_HIGH refused twice, unverified ALREADY_KNOWN, unclassified RPC errors, transport failures
         _ => None,
     }
 }
@@ -392,10 +452,89 @@ mod tests {
 
     #[test]
     fn nonce_consumption_is_unknown_when_the_result_does_not_tell() {
+        // NONCE_TOO_HIGH reaches here only after its single retry was refused as well
         for code in ["NONCE_TOO_HIGH", "ALREADY_KNOWN", "RPC_ERROR"] {
             assert_eq!(None, nonce_consumed(&rpc_refusal(code), false), "{code}");
         }
         assert_eq!(None, nonce_consumed(&failed(ErrorKind::Timeout), false), "transport");
+    }
+
+    /// Runs [`submit_with_nonce_retry`] with `outcomes` as the results of successive attempts.
+    ///
+    /// Returns the nonces the attempts were signed with, the final local nonce and the result.
+    async fn run_retry(first_nonce: u64, pending: u64, outcomes: Vec<Submission>) -> (Vec<u64>, u64, Submission) {
+        let used = std::sync::Mutex::new(Vec::new());
+        let outcomes = std::sync::Mutex::new(outcomes.into_iter());
+        let local = AtomicU64::new(first_nonce);
+        let result = submit_with_nonce_retry(
+            first_nonce,
+            &local,
+            |nonce| {
+                used.lock().unwrap().push(nonce);
+                let outcome = outcomes.lock().unwrap().next().expect("unexpected extra attempt");
+                async move { outcome }
+            },
+            || async move { Ok(pending) },
+        )
+        .await;
+        let used = used.into_inner().unwrap();
+        (used, local.load(std::sync::atomic::Ordering::Relaxed), result)
+    }
+
+    #[tokio::test]
+    async fn too_high_nonce_is_resubmitted_once_with_the_pending_count() {
+        let (used, local, result) = run_retry(9, 5, vec![rpc_refusal("NONCE_TOO_HIGH"), Ok(Ok("tx-1".into()))]).await;
+
+        assert_eq!(vec![9, 5], used, "re-signed with the re-read nonce");
+        assert_eq!(5, local, "pending count adopted as the local nonce");
+        assert_eq!(Some(true), nonce_consumed(&result, false));
+    }
+
+    #[tokio::test]
+    async fn too_high_nonce_is_not_retried_twice() {
+        let (used, local, result) =
+            run_retry(9, 5, vec![rpc_refusal("NONCE_TOO_HIGH"), rpc_refusal("NONCE_TOO_HIGH")]).await;
+
+        assert_eq!(vec![9, 5], used);
+        assert_eq!(5, local);
+        assert_eq!(None, nonce_consumed(&result, false), "left for a re-read");
+    }
+
+    #[tokio::test]
+    async fn other_refusals_and_successes_are_not_resubmitted() {
+        for code in [
+            "NONCE_TOO_LOW",
+            "REPLACEMENT_UNDERPRICED",
+            "FEE_TOO_LOW",
+            "INSUFFICIENT_FUNDS",
+            "ALREADY_KNOWN",
+        ] {
+            let (used, local, _) = run_retry(9, 5, vec![rpc_refusal(code)]).await;
+            assert_eq!(vec![9], used, "{code}");
+            assert_eq!(9, local, "{code}");
+        }
+        let (used, local, _) = run_retry(9, 5, vec![Ok(Ok("tx-1".into()))]).await;
+        assert_eq!((vec![9], 9), (used, local));
+    }
+
+    #[tokio::test]
+    async fn too_high_nonce_is_returned_when_the_pending_count_cannot_be_read() {
+        let used = std::sync::Mutex::new(Vec::new());
+        let local = AtomicU64::new(9);
+        let result = submit_with_nonce_retry(
+            9,
+            &local,
+            |nonce| {
+                used.lock().unwrap().push(nonce);
+                async { rpc_refusal("NONCE_TOO_HIGH") }
+            },
+            || async { Err(ConnectorError::ServerNotHealthy) },
+        )
+        .await;
+
+        assert_eq!(vec![9], used.into_inner().unwrap());
+        assert_eq!(9, local.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(None, nonce_consumed(&result, false));
     }
 
     #[test]
