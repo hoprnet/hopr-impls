@@ -33,4 +33,10 @@ ignore = [
   # The fix (>=0.7.6) needs a k256/elliptic-curve major bump that alloy 2.5.0 does not pull in
   # yet; drop this ignore once alloy moves to a k256 0.14+ line.
   "RUSTSEC-2026-0387", # crypto-bigint 0.5.5: constant-time timing variability
+  # chrono is unmaintained with no patched release (alternatives: jiff, time). It enters the tree
+  # via blokli-client and hopr-api; drop this ignore once those crates stop depending on it.
+  "RUSTSEC-2026-0543", # chrono: unmaintained
+  # humantime (via humantime-serde in the ct crates) is flagged only because it wraps chrono;
+  # drop this ignore together with the chrono one.
+  "RUSTSEC-2026-0542", # humantime: unmaintained
 ]
