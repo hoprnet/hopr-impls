@@ -149,6 +149,7 @@ where
 
                             submit_with_nonce_retry(
                                 nonce,
+                                pending,
                                 &local_nonce,
                                 |nonce| {
                                     tracing::Span::current().record("nonce", nonce);
@@ -234,9 +235,12 @@ type Submission = errors::Result<errors::Result<blokli_client::api::TxId>>;
 /// When Blokli refuses it as `NONCE_TOO_HIGH`, the nonce is not consumed and the local nonce is
 /// ahead of what the chain expects. The chain's pending count is then re-read through
 /// `read_pending`, adopted as the local nonce, and the transaction is signed and submitted once
-/// more with it. The retry happens at most once per submission: a second refusal is returned as is.
+/// more with it. The pending count never goes below `first_pending`, the one read at the start of
+/// the submission, and a count that does not lie below the refused nonce is not worth a retry.
+/// The retry happens at most once per submission: a second refusal is returned as is.
 async fn submit_with_nonce_retry<A, AFut, P, PFut>(
     nonce: u64,
+    first_pending: u64,
     local: &AtomicU64,
     mut attempt: A,
     read_pending: P,
@@ -253,7 +257,16 @@ where
     }
 
     match read_pending().await {
-        Ok(pending) => {
+        Ok(re_read) => {
+            let pending = re_read.max(first_pending);
+            if pending >= nonce {
+                tracing::warn!(
+                    nonce,
+                    pending,
+                    "nonce refused as too high, but not above the pending count"
+                );
+                return first;
+            }
             tracing::warn!(
                 nonce,
                 pending,
@@ -463,11 +476,22 @@ mod tests {
     ///
     /// Returns the nonces the attempts were signed with, the final local nonce and the result.
     async fn run_retry(first_nonce: u64, pending: u64, outcomes: Vec<Submission>) -> (Vec<u64>, u64, Submission) {
+        run_retry_from(first_nonce, pending, pending, outcomes).await
+    }
+
+    /// Like [`run_retry`], with `first_pending` read at the start and `pending` re-read after the refusal.
+    async fn run_retry_from(
+        first_nonce: u64,
+        first_pending: u64,
+        pending: u64,
+        outcomes: Vec<Submission>,
+    ) -> (Vec<u64>, u64, Submission) {
         let used = std::sync::Mutex::new(Vec::new());
         let outcomes = std::sync::Mutex::new(outcomes.into_iter());
         let local = AtomicU64::new(first_nonce);
         let result = submit_with_nonce_retry(
             first_nonce,
+            first_pending,
             &local,
             |nonce| {
                 used.lock().unwrap().push(nonce);
@@ -488,6 +512,24 @@ mod tests {
         assert_eq!(vec![9, 5], used, "re-signed with the re-read nonce");
         assert_eq!(5, local, "pending count adopted as the local nonce");
         assert_eq!(Some(true), nonce_consumed(&result, false));
+    }
+
+    #[tokio::test]
+    async fn too_high_nonce_never_retries_below_the_first_pending_count() {
+        let (used, local, _) =
+            run_retry_from(9, 7, 5, vec![rpc_refusal("NONCE_TOO_HIGH"), Ok(Ok("tx-1".into()))]).await;
+
+        assert_eq!(vec![9, 7], used, "re-signed with the larger pending count");
+        assert_eq!(7, local, "the lower re-read count is not adopted");
+    }
+
+    #[tokio::test]
+    async fn too_high_nonce_is_not_resigned_when_pending_reaches_it() {
+        let (used, local, result) = run_retry_from(9, 9, 5, vec![rpc_refusal("NONCE_TOO_HIGH")]).await;
+
+        assert_eq!(vec![9], used, "same nonce is not signed again");
+        assert_eq!(9, local);
+        assert_eq!(None, nonce_consumed(&result, false));
     }
 
     #[tokio::test]
@@ -523,6 +565,7 @@ mod tests {
         let local = AtomicU64::new(9);
         let result = submit_with_nonce_retry(
             9,
+            5,
             &local,
             |nonce| {
                 used.lock().unwrap().push(nonce);
