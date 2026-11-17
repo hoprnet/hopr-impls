@@ -99,7 +99,12 @@ where
         tracing::debug!(%balance, %admin, "deploying safe");
 
         Ok(self
-            .send_tx(tx_req, DEPLOY_SAFE_CUSTOM_TX_TIMEOUT_MULTIPLIER.into(), None)
+            .send_tx(
+                tx_req,
+                DEPLOY_SAFE_CUSTOM_TX_TIMEOUT_MULTIPLIER.into(),
+                None,
+                "deploy_safe",
+            )
             .await?
             .boxed())
     }
