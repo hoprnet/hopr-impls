@@ -37,14 +37,21 @@ topology. Reconnects reseed the announced-account counter.
 
 ## Chain metrics
 
-Enable `telemetry` to export Prometheus metrics for chain writes and chain state. The feature adds `hopr-api/types-telemetry` and `lazy_static`; without it, no instrument exists and the recording calls compile to nothing.
+Enable `telemetry` to export Prometheus metrics for chain writes and chain state. The feature adds `hopr-api/types-telemetry` and
+`lazy_static`; without it, no instrument exists and the recording calls compile to nothing.
 
-- `hopr_chain_tx_outcomes_total{operation,phase,outcome}` counts every write per API operation, such as `open_channel`, in the `submit` and `track` phase. A tracking timeout is `tracking_timeout`, never `reverted`: the transaction can still confirm.
-- `hopr_chain_tx_duration_seconds{operation,phase}` times the submit phase (dequeue to tracking id) and the track phase (tracking id to final outcome).
-- `hopr_chain_tx_queue_length`, `hopr_chain_nonce{kind="local"|"chain_pending"}` and `hopr_chain_caller_abandoned_total{operation}` expose queueing, nonce state and writes whose caller stopped waiting while the transaction stayed live.
-- `hopr_chain_safe_balance`, `hopr_chain_safe_allowance`, `hopr_chain_channels{direction,status}`, `hopr_chain_usable_outgoing_channels`, `hopr_chain_blokli_indexed_head` and `hopr_chain_blokli_info_age_seconds` are refreshed every 60 seconds from the connected workflow, independently of `HOPR_STATE_DUMP_INTERVAL`. Amounts use wxHOPR base units. `open` is counted apart from `pending_to_close`.
+- `hopr_chain_tx_outcomes_total{operation,phase,outcome}` counts every write per API operation, such as `open_channel`, in the `submit` and
+  `track` phase. A tracking timeout is `tracking_timeout`, never `reverted`: the transaction can still confirm.
+- `hopr_chain_tx_duration_seconds{operation,phase}` times the submit phase (dequeue to tracking id) and the track phase (tracking id to
+  final outcome).
+- `hopr_chain_tx_queue_length`, `hopr_chain_nonce{kind="local"|"chain_pending"}` and `hopr_chain_caller_abandoned_total{operation}` expose
+  queueing, nonce state and writes whose caller stopped waiting while the transaction stayed live.
+- `hopr_chain_safe_balance`, `hopr_chain_safe_allowance`, `hopr_chain_channels{direction,status}`, `hopr_chain_usable_outgoing_channels`,
+  `hopr_chain_blokli_indexed_head` and `hopr_chain_blokli_info_age_seconds` are refreshed every 60 seconds from the connected workflow,
+  independently of `HOPR_STATE_DUMP_INTERVAL`. Amounts use wxHOPR base units. `open` is counted apart from `pending_to_close`.
 
-Blokli reports one block number, the latest it indexed or observed, so head lag is not measurable from the connector. `hopr_chain_blokli_info_age_seconds` is the freshness signal instead.
+Blokli reports one block number, the latest it indexed or observed, so head lag is not measurable from the connector.
+`hopr_chain_blokli_info_age_seconds` is the freshness signal instead.
 
 ## Operational state
 

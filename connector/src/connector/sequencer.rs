@@ -215,8 +215,8 @@ where
                         .map(move |(res, outcome, submitted_in)| {
                             if notifier.send(res).is_err() {
                                 tracing::debug!(
-                                    "failed to notify transaction result - the caller may not want to await the result \
-                                 anymore."
+                                    "failed to notify transaction result - the caller may not want to await the \
+                                     result anymore."
                                 );
                                 // The write may still confirm: count the abandoned caller instead of a failure.
                                 record_caller_abandoned(operation);
