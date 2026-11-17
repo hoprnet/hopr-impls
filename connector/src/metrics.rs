@@ -289,8 +289,8 @@ impl InfoFreshness {
 
 /// Token base units as a gauge value.
 ///
-/// A gauge holds an `f64`, which represents integers exactly up to 2^53. Larger amounts are
-/// rounded by less than one base unit, far below any alert threshold.
+/// A gauge holds an `f64`, which represents integers exactly up to 2^53. Larger amounts round to
+/// the nearest representable value, a relative error under 2^-53, far below any alert threshold.
 #[cfg(feature = "telemetry")]
 fn base_units(amount: hopr_api::graph::traits::Balance) -> f64 {
     amount.low_u128() as f64
