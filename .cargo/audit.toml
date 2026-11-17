@@ -19,6 +19,9 @@ ignore = [
   "RUSTSEC-2026-0530", # hickory-proto 0.25: parent-side NSEC at a zone cut accepted as proof of nonexistence in DNSSEC validation — no fixed upgrade; requires a libp2p major upgrade
   "RUSTSEC-2026-0531", # hickory-proto 0.25: child-side NSEC/NSEC3 accepted as proof that a delegation has no DS record in DNSSEC validation — no fixed upgrade; requires a libp2p major upgrade
   "RUSTSEC-2026-0532", # hickory-proto 0.25: parent-side NSEC3 at a zone cut accepted as proof of nonexistence in DNSSEC validation — no fixed upgrade; requires a libp2p major upgrade
+  "RUSTSEC-2026-0549", # hickory-proto 0.25: NSEC3 NODATA at a zone apex accepted without a matching NSEC3 record in DNSSEC validation — no fixed upgrade; requires a libp2p major upgrade
+  "RUSTSEC-2026-0550", # hickory-proto 0.25: unsigned NSEC or NSEC3 record used in a nonexistence proof — no fixed upgrade; requires a libp2p major upgrade
+  "RUSTSEC-2026-0551", # hickory-proto 0.25: records with a DNS class other than the query's marked secure without validation — no fixed upgrade; requires a libp2p major upgrade
   # pin-utils 0.1.1 is unmaintained and enters the lockfile via wasmtimer 0.4.3.
   # Drop this ignore once upstream removes pin-utils or replaces it with a maintained crate.
   "RUSTSEC-2026-0441", # pin-utils: unmaintained transitive dependency
@@ -30,4 +33,10 @@ ignore = [
   # The fix (>=0.7.6) needs a k256/elliptic-curve major bump that alloy 2.5.0 does not pull in
   # yet; drop this ignore once alloy moves to a k256 0.14+ line.
   "RUSTSEC-2026-0387", # crypto-bigint 0.5.5: constant-time timing variability
+  # chrono is unmaintained with no patched release (alternatives: jiff, time). It enters the tree
+  # via blokli-client and hopr-api; drop this ignore once those crates stop depending on it.
+  "RUSTSEC-2026-0543", # chrono: unmaintained
+  # humantime (via humantime-serde in the ct crates) is flagged only because it wraps chrono;
+  # drop this ignore together with the chrono one.
+  "RUSTSEC-2026-0542", # humantime: unmaintained
 ]
