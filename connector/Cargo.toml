@@ -64,6 +64,7 @@ hopr-utils = { workspace = true, features = [
 ] }
 insta = { workspace = true }
 lazy_static = { workspace = true }
+reqwest = { workspace = true }
 test-log = { workspace = true }
 tokio = { workspace = true }
 

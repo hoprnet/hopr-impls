@@ -3915,6 +3915,7 @@ dependencies = [
  "petgraph",
  "postcard",
  "redb",
+ "reqwest",
  "serde",
  "serde_json",
  "smart-default",
