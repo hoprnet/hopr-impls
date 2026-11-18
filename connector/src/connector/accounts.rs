@@ -147,11 +147,14 @@ where
     /// | a `Reverted` transaction, or [`ConnectorError::InnerTxFailed`] | [`SubmissionFailure::Reverted`] |
     /// | anything else (other RPC codes, timeouts, transport failures) | [`SubmissionFailure::Unknown`], as an earlier copy may be in the mempool |
     fn submission_failure(&self, error: &Self::Error) -> SubmissionFailure {
-        use blokli_client::errors::TrackingErrorKind;
+        use blokli_client::errors::{RefusalCode, TrackingErrorKind};
 
         let rejection = error.as_transaction_rejection_error();
         if error.is_refused_before_broadcast()
-            || matches!(error.rpc_rejection_code(), Some("FEE_TOO_LOW" | "INSUFFICIENT_FUNDS"))
+            || matches!(
+                error.rpc_rejection_code(),
+                Some(RefusalCode::FeeTooLow | RefusalCode::InsufficientFunds)
+            )
             || matches!(rejection, Some(TrackingErrorKind::ValidationFailed))
         {
             SubmissionFailure::NotSubmitted

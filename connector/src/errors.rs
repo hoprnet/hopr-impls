@@ -1,6 +1,6 @@
 use blokli_client::{
     api::types::TransactionDiagnosis,
-    errors::{BlokliClientError, ErrorKind, TrackingErrorKind},
+    errors::{BlokliClientError, ErrorKind, RefusalCode, TrackingErrorKind},
 };
 use hopr_api::types::{internal::prelude::ChannelId, primitive::prelude::Address};
 use thiserror::Error;
@@ -119,14 +119,17 @@ impl ConnectorError {
             )
     }
 
-    /// Returns Blokli's classification of the RPC node's refusal to broadcast, such as `NONCE_TOO_LOW`.
-    pub fn rpc_rejection_code(&self) -> Option<&str> {
+    /// Returns Blokli's classification of the RPC node's refusal to broadcast, such as
+    /// [`RefusalCode::NonceTooLow`].
+    ///
+    /// A code this client version does not know is returned as [`RefusalCode::Unknown`].
+    pub fn rpc_rejection_code(&self) -> Option<RefusalCode> {
         match self.client_error_kind()? {
             ErrorKind::BlokliError {
                 kind: "rpc error",
                 code,
                 ..
-            } => Some(code.as_str()),
+            } => Some(RefusalCode::from(code.as_str())),
             _ => None,
         }
     }
@@ -266,7 +269,7 @@ mod tests {
             message: "nonce too high".into(),
         })));
 
-        assert_eq!(Some("NONCE_TOO_HIGH"), error.rpc_rejection_code());
+        assert_eq!(Some(RefusalCode::NonceTooHigh), error.rpc_rejection_code());
         assert!(!error.is_refused_before_broadcast());
         assert_eq!(None, client_error(ErrorKind::Timeout).rpc_rejection_code());
     }

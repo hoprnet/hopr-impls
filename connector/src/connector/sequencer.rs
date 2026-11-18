@@ -5,7 +5,7 @@ use std::{
 
 use blokli_client::{
     api::{BlokliQueryClient, BlokliTransactionClient, TransactionTrackingOutcome},
-    errors::TrackingErrorKind,
+    errors::{RefusalCode, TrackingErrorKind},
 };
 use futures::{FutureExt, SinkExt, StreamExt, TryFutureExt};
 use hopr_api::{
@@ -290,33 +290,38 @@ where
     };
 
     match error.rpc_rejection_code() {
-        Some(code @ ("NONCE_TOO_HIGH" | "NONCE_TOO_LOW")) => match read_pending().await {
+        Some(code @ (RefusalCode::NonceTooHigh | RefusalCode::NonceTooLow)) => match read_pending().await {
             Ok(re_read) => {
                 let pending = re_read.max(first_pending);
-                let usable = if code == "NONCE_TOO_HIGH" {
+                let usable = if code == RefusalCode::NonceTooHigh {
                     pending < nonce
                 } else {
                     pending > nonce
                 };
                 if !usable {
-                    tracing::warn!(nonce, pending, code, "pending count does not correct the refused nonce");
+                    tracing::warn!(
+                        nonce,
+                        pending,
+                        ?code,
+                        "pending count does not correct the refused nonce"
+                    );
                     return first;
                 }
                 tracing::warn!(
                     nonce,
                     pending,
-                    code,
+                    ?code,
                     "nonce refused, retrying once with the chain's pending count"
                 );
                 local.store(pending, std::sync::atomic::Ordering::Relaxed);
                 attempt(pending, gas).await
             }
             Err(error) => {
-                tracing::warn!(%error, code, "failed to re-read the pending count after a refused nonce");
+                tracing::warn!(%error, ?code, "failed to re-read the pending count after a refused nonce");
                 first
             }
         },
-        Some("FEE_TOO_LOW") => match read_gas().await {
+        Some(RefusalCode::FeeTooLow) => match read_gas().await {
             Ok(new_gas)
                 if new_gas.max_fee_per_gas > gas.max_fee_per_gas
                     || new_gas.max_priority_fee_per_gas > gas.max_priority_fee_per_gas =>
@@ -441,8 +446,8 @@ fn nonce_consumed(
     }
     match error.rpc_rejection_code() {
         // a transaction already holds this nonce, mined or pending: it is consumed whatever the cache says
-        Some("REPLACEMENT_UNDERPRICED") => Some(true),
-        Some("FEE_TOO_LOW" | "INSUFFICIENT_FUNDS") => Some(false),
+        Some(RefusalCode::ReplacementUnderpriced) => Some(true),
+        Some(RefusalCode::FeeTooLow | RefusalCode::InsufficientFunds) => Some(false),
         // NONCE_TOO_LOW or NONCE_TOO_HIGH refused again after their correction, unverified ALREADY_KNOWN,
         // unclassified RPC errors, transport failures
         _ => None,
