@@ -302,10 +302,10 @@ impl InfoFreshness {
 /// the nearest representable value, a relative error under 2^-53, far below any alert threshold.
 #[cfg(feature = "telemetry")]
 fn base_units(amount: hopr_api::graph::traits::Balance) -> f64 {
-    // Assemble the value from all four limbs. `low_u128` would drop the upper half of a large
-    // amount and report it as a small one.
-    let [low, low_mid, high_mid, high] = amount.0;
-    high as f64 * 2f64.powi(192) + high_mid as f64 * 2f64.powi(128) + low_mid as f64 * 2f64.powi(64) + low as f64
+    // Parse the exact decimal so the value is rounded once, to the nearest `f64`. Summing the four
+    // limbs rounds each limb first, which can exceed the documented bound, and `low_u128` would drop
+    // the upper half of a large amount and report it as a small one.
+    amount.to_string().parse().unwrap_or(f64::NAN)
 }
 
 /// Set while a gauge refresh runs, so a slow refresh cannot pile up behind the ticker.
@@ -678,5 +678,11 @@ mod tests {
             base_units(hopr_api::graph::traits::Balance::from(1u8) << 200),
             "an amount above 2^128 must not be reported as zero"
         );
+
+        // The nearest `f64` here is 2^255 + 2^203: rounding each limb before adding would give 2^255.
+        let boundary = (hopr_api::graph::traits::Balance::from(1u8) << 255)
+            + (hopr_api::graph::traits::Balance::from(1024u32) << 192)
+            + (hopr_api::graph::traits::Balance::from(u64::MAX) << 128);
+        assert_eq!(2f64.powi(255) + 2f64.powi(203), base_units(boundary));
     }
 }
