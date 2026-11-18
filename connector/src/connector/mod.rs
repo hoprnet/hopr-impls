@@ -1080,6 +1080,26 @@ where
         Ok(())
     }
 
+    /// Runs one chain state gauge refresh, outside the periodic tick.
+    ///
+    /// A test hook: the gauges normally refresh every 60 seconds from the connected workflow, which
+    /// a test cannot wait for. Requires the `telemetry` feature.
+    #[cfg(all(feature = "testing", feature = "telemetry"))]
+    pub async fn refresh_chain_state_metrics(&self)
+    where
+        C: BlokliQueryClient + BlokliSubscriptionClient + Send + Sync + 'static,
+        B: Backend + Send + Sync + 'static,
+    {
+        crate::metrics::refresh_chain_gauges(
+            self.client.clone(),
+            self.backend.clone(),
+            self.graph.clone(),
+            self.chain_key.public().to_address(),
+            std::sync::Arc::new(crate::metrics::InfoFreshness::default()),
+        )
+        .await;
+    }
+
     /// Returns the reference to the underlying client.
     pub fn client(&self) -> &C {
         self.client.as_ref()

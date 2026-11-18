@@ -278,6 +278,88 @@ async fn a_dropped_receipt_future_counts_the_caller_as_abandoned() -> anyhow::Re
     Ok(())
 }
 
+/// One gauge refresh must publish the Safe, channel and Blokli state the issue asks for.
+#[cfg(feature = "telemetry")]
+#[tokio::test]
+async fn a_gauge_refresh_exports_the_chain_state() -> anyhow::Result<()> {
+    use hex_literal::hex;
+    use hopr_api::{
+        chain::DeployedSafe,
+        types::{internal::channels::ChannelStatus, primitive::prelude::WxHOPR, telemetry::gather_all_metrics},
+    };
+
+    let me = ChainKeypair::from_secret(&hex!(
+        "c14b8faa0a9b8a5fa4453664996f23a7e7de606d42297d723fc4a794f375e260"
+    ))?;
+    let peer = ChainKeypair::from_secret(&hex!(
+        "492057cf93e99b31d2a85bc5e98a9c3aa0021feec52c227cc8170e8f7d047775"
+    ))?;
+    let me_address = me.public().to_address();
+    let safe = Address::new(&[1u8; Address::SIZE]);
+    let module = Address::new(&[0x11u8; Address::SIZE]);
+    let node = AccountEntry {
+        public_key: *OffchainKeypair::random().public(),
+        chain_addr: me_address,
+        entry_type: AccountType::NotAnnounced,
+        safe_address: Some(safe),
+        key_id: 1.into(),
+    };
+    let other = AccountEntry {
+        public_key: *OffchainKeypair::random().public(),
+        chain_addr: peer.public().to_address(),
+        entry_type: AccountType::NotAnnounced,
+        safe_address: Some(Address::new(&[2u8; Address::SIZE])),
+        key_id: 2.into(),
+    };
+    let channel = ChannelEntry::builder()
+        .between(&me, &peer)
+        .amount(5u32)
+        .status(ChannelStatus::Open)
+        .build()?;
+    let mock_client = BlokliTestStateBuilder::default()
+        .with_accounts([
+            (node, HoprBalance::new_base(100), XDaiBalance::new_base(1)),
+            (other, HoprBalance::new_base(100), XDaiBalance::new_base(1)),
+        ])
+        .with_channels([channel])
+        .with_deployed_safes([DeployedSafe {
+            address: safe,
+            owners: vec![me_address],
+            module,
+            registered_nodes: vec![me_address],
+            deployer: me_address,
+        }])
+        .with_balances::<WxHOPR>([(safe, 150_u32.into())])
+        .with_safe_allowances([(safe, 7_u32.into())])
+        .with_hopr_network_chain_info("piz-palu-staging")
+        .build_dynamic_client(module);
+
+    let contracts = hopr_api::types::chain::contract_addresses_for_network("piz-palu-staging")
+        .expect("network contracts")
+        .1;
+    let mut connector =
+        create_trustless_hopr_blokli_connector(&me, Default::default(), mock_client, module, contracts)?;
+    connector.connect().await?;
+    connector.refresh_chain_state_metrics().await;
+
+    let metrics = gather_all_metrics()?;
+    for (name, labels) in [
+        ("hopr_chain_safe_balance", &[][..]),
+        ("hopr_chain_safe_allowance", &[][..]),
+        (
+            "hopr_chain_channels",
+            &[r#"direction="outgoing""#, r#"status="open""#][..],
+        ),
+        ("hopr_chain_usable_outgoing_channels", &[][..]),
+        ("hopr_chain_blokli_indexed_head", &[][..]),
+        ("hopr_chain_blokli_info_age_seconds", &[][..]),
+    ] {
+        assert!(has_sample(&metrics, name, labels), "no {name} sample in:\n{metrics}");
+    }
+
+    Ok(())
+}
+
 /// Whether the Prometheus text has a sample of `name` carrying every given label.
 fn has_sample(metrics: &str, name: &str, labels: &[&str]) -> bool {
     metrics.lines().any(|line| {
