@@ -312,6 +312,36 @@ fn base_units(amount: hopr_api::graph::traits::Balance) -> f64 {
 #[cfg(feature = "telemetry")]
 static REFRESH_IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// How long one gauge refresh may take. Shorter than the tick, so a stalled read cannot block the
+/// next one.
+#[cfg(feature = "telemetry")]
+const GAUGE_REFRESH_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Runs one gauge refresh unless another is running, and gives up after `budget`.
+///
+/// A stalled backend read is dropped together with the refresh, which releases the in-flight slot
+/// so the next tick can start. Returns `false` when a refresh was already running.
+#[cfg(feature = "telemetry")]
+async fn refresh_within_budget<F>(refresh: F, budget: std::time::Duration) -> bool
+where
+    F: std::future::Future<Output = ()>,
+{
+    use futures_time::future::FutureExt;
+
+    if REFRESH_IN_FLIGHT.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return false;
+    }
+    let _in_flight = RefreshInFlight;
+    if refresh
+        .timeout(futures_time::time::Duration::from(budget))
+        .await
+        .is_err()
+    {
+        tracing::warn!(?budget, "chain gauge refresh timed out");
+    }
+    true
+}
+
 /// Clears [`REFRESH_IN_FLIGHT`] however the refresh ends, including an abort.
 #[cfg(feature = "telemetry")]
 struct RefreshInFlight;
@@ -347,12 +377,36 @@ pub(crate) async fn refresh_chain_gauges<C, B>(
     C: blokli_client::api::BlokliQueryClient + blokli_client::api::BlokliSubscriptionClient + Send + Sync + 'static,
     B: crate::Backend + Send + Sync + 'static,
 {
-    if REFRESH_IN_FLIGHT.swap(true, std::sync::atomic::Ordering::AcqRel) {
+    let ran = refresh_within_budget(
+        read_and_set_gauges(client, backend, graph, me, freshness),
+        GAUGE_REFRESH_BUDGET,
+    )
+    .await;
+    if !ran {
         tracing::debug!("skipping the chain gauge refresh, the previous one is still running");
-        return;
     }
-    let _in_flight = RefreshInFlight;
+}
 
+/// Reads the chain state and sets the gauges. Bounded by [`refresh_within_budget`].
+#[cfg(feature = "telemetry")]
+async fn read_and_set_gauges<C, B>(
+    client: std::sync::Arc<C>,
+    backend: std::sync::Arc<B>,
+    graph: std::sync::Arc<
+        parking_lot::RwLock<
+            petgraph::prelude::DiGraphMap<
+                hopr_api::chain::HoprKeyIdent,
+                hopr_api::types::internal::prelude::ChannelId,
+                ahash::RandomState,
+            >,
+        >,
+    >,
+    me: hopr_api::Address,
+    freshness: std::sync::Arc<InfoFreshness>,
+) where
+    C: blokli_client::api::BlokliQueryClient + blokli_client::api::BlokliSubscriptionClient + Send + Sync + 'static,
+    B: crate::Backend + Send + Sync + 'static,
+{
     match client.query_chain_info().await {
         Ok(info) => {
             record_blokli_indexed_head(u64::try_from(info.block_number).unwrap_or_default());
@@ -588,6 +642,27 @@ mod tests {
                 .age_at(now + Duration::from_secs(5))
                 .is_some_and(|age| age >= 10.0)
         );
+    }
+
+    #[cfg(feature = "telemetry")]
+    #[tokio::test]
+    async fn a_stalled_refresh_releases_its_slot_for_the_next_one() {
+        let budget = Duration::from_millis(50);
+
+        // A refresh that never finishes is dropped at its deadline.
+        assert!(
+            refresh_within_budget(std::future::pending(), budget).await,
+            "the first refresh runs"
+        );
+        assert!(
+            refresh_within_budget(async {}, budget).await,
+            "a later refresh runs once the stalled one was dropped"
+        );
+
+        // While one refresh runs, the next tick is skipped.
+        let stalled = refresh_within_budget(std::future::pending(), budget);
+        let overlapping = refresh_within_budget(async {}, budget);
+        assert_eq!((true, false), futures::join!(stalled, overlapping));
     }
 
     #[cfg(feature = "telemetry")]
