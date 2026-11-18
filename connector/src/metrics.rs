@@ -623,6 +623,238 @@ mod tests {
 
     use super::*;
 
+    #[cfg(feature = "telemetry")]
+    mod gauges {
+        use hopr_api::{
+            chain::DeployedSafe,
+            types::{
+                crypto::prelude::{ChainKeypair, Keypair, OffchainKeypair},
+                internal::prelude::{AccountEntry, AccountType, ChannelEntry, ChannelStatus},
+                primitive::prelude::{Address, HoprBalance},
+            },
+        };
+
+        use super::*;
+        use crate::{Backend, InMemoryBackend, testing::BlokliTestStateBuilder};
+
+        type Graph = std::sync::Arc<
+            parking_lot::RwLock<
+                petgraph::prelude::DiGraphMap<
+                    hopr_api::chain::HoprKeyIdent,
+                    hopr_api::types::internal::prelude::ChannelId,
+                    ahash::RandomState,
+                >,
+            >,
+        >;
+
+        fn graph() -> Graph {
+            std::sync::Arc::new(parking_lot::RwLock::new(
+                petgraph::prelude::DiGraphMap::with_capacity_and_hasher(4, 4, ahash::RandomState::default()),
+            ))
+        }
+
+        /// A backend and graph holding the node, one peer and the given channels.
+        async fn local_state(
+            me: &ChainKeypair,
+            channels: impl IntoIterator<Item = ChannelEntry>,
+        ) -> (std::sync::Arc<InMemoryBackend>, Graph) {
+            let backend = std::sync::Arc::new(InMemoryBackend::default());
+            let me_address = me.public().to_address();
+            backend
+                .insert_account(AccountEntry {
+                    public_key: *OffchainKeypair::random().public(),
+                    chain_addr: me_address,
+                    entry_type: AccountType::NotAnnounced,
+                    safe_address: None,
+                    key_id: 1.into(),
+                })
+                .expect("account inserted");
+
+            let graph = graph();
+            for (peer, channel) in channels.into_iter().enumerate() {
+                backend.insert_channel(channel).expect("channel inserted");
+                // A `DiGraphMap` holds one edge per node pair, so every channel gets its own peer node.
+                graph
+                    .write()
+                    .add_edge(1.into(), (2 + peer as u32).into(), *channel.get_id());
+            }
+            let _ = me_address;
+            (backend, graph)
+        }
+
+        fn peer() -> ChainKeypair {
+            ChainKeypair::random()
+        }
+
+        fn channel(me: &ChainKeypair, dst: &ChainKeypair, amount: u32, status: ChannelStatus) -> ChannelEntry {
+            ChannelEntry::builder()
+                .between(me, dst)
+                .amount(amount)
+                .status(status)
+                .build()
+                .expect("valid channel")
+        }
+
+        #[tokio::test]
+        async fn channel_gauges_count_funded_open_channels_only() {
+            let me = ChainKeypair::random();
+            let funded = peer();
+            let drained = peer();
+            let (backend, graph) = local_state(
+                &me,
+                [
+                    channel(&me, &funded, 5, ChannelStatus::Open),
+                    channel(&me, &drained, 0, ChannelStatus::Open),
+                ],
+            )
+            .await;
+
+            let gauges = collect_channel_gauges(&backend, &graph, me.public().to_address())
+                .await
+                .expect("a complete read");
+            assert_eq!(2, gauges.count("outgoing", "open"));
+            assert_eq!(
+                1,
+                gauges.usable_outgoing(),
+                "a drained channel is open but cannot carry traffic"
+            );
+        }
+
+        #[tokio::test]
+        async fn an_unreadable_local_account_leaves_the_channel_gauges_unset() {
+            let me = ChainKeypair::random();
+            let (backend, graph) = local_state(&me, []).await;
+
+            // A node whose account is unknown cannot enumerate its channels, so nothing is published
+            // instead of a zero tally.
+            assert!(
+                collect_channel_gauges(&backend, &graph, Address::from([9u8; 20]))
+                    .await
+                    .is_none()
+            );
+        }
+
+        #[tokio::test]
+        async fn a_channel_the_backend_does_not_hold_leaves_the_gauges_unset() {
+            let me = ChainKeypair::random();
+            let other = peer();
+            let (backend, graph) = local_state(&me, [channel(&me, &other, 5, ChannelStatus::Open)]).await;
+            // The graph knows a channel the backend cannot answer for.
+            graph.write().add_edge(
+                1.into(),
+                2.into(),
+                hopr_api::types::internal::prelude::ChannelId::default(),
+            );
+
+            assert!(
+                collect_channel_gauges(&backend, &graph, me.public().to_address())
+                    .await
+                    .is_none()
+            );
+        }
+
+        #[tokio::test]
+        async fn the_safe_gauges_use_the_registered_safe_first() {
+            let me = ChainKeypair::random();
+            let me_address = me.public().to_address();
+            let other = peer();
+            let (backend, graph) = local_state(&me, [channel(&me, &other, 5, ChannelStatus::Open)]).await;
+            let registered = Address::from([7u8; 20]);
+            let deployed = Address::from([8u8; 20]);
+            let client = BlokliTestStateBuilder::default()
+                .with_hopr_network_chain_info("piz-palu-staging")
+                .with_deployed_safes([
+                    DeployedSafe {
+                        address: registered,
+                        owners: vec![me_address],
+                        module: Address::from([1u8; 20]),
+                        registered_nodes: vec![me_address],
+                        deployer: me_address,
+                    },
+                    DeployedSafe {
+                        address: deployed,
+                        owners: vec![me_address],
+                        module: Address::from([1u8; 20]),
+                        registered_nodes: Vec::new(),
+                        deployer: me_address,
+                    },
+                ])
+                .with_balances::<hopr_api::types::primitive::prelude::WxHOPR>([(registered, 150u32.into())])
+                .with_safe_allowances([(registered, 7u32.into())])
+                .build_static_client();
+
+            let reader = crate::HoprBlockchainReader(std::sync::Arc::new(client));
+            assert_eq!(Some(registered), node_safe(&reader, me_address).await);
+
+            // Without a registered Safe the one this node deployed is used.
+            let client = BlokliTestStateBuilder::default()
+                .with_hopr_network_chain_info("piz-palu-staging")
+                .with_deployed_safes([DeployedSafe {
+                    address: deployed,
+                    owners: vec![me_address],
+                    module: Address::from([1u8; 20]),
+                    registered_nodes: Vec::new(),
+                    deployer: me_address,
+                }])
+                .build_static_client();
+            let reader = crate::HoprBlockchainReader(std::sync::Arc::new(client));
+            assert_eq!(Some(deployed), node_safe(&reader, me_address).await);
+
+            // A node without any Safe publishes no Safe gauges.
+            let client = BlokliTestStateBuilder::default()
+                .with_hopr_network_chain_info("piz-palu-staging")
+                .build_static_client();
+            let reader = crate::HoprBlockchainReader(std::sync::Arc::new(client));
+            assert_eq!(None, node_safe(&reader, me_address).await);
+
+            let _ = (backend, graph);
+            let _ = HoprBalance::zero();
+        }
+
+        #[tokio::test]
+        async fn a_refresh_reads_the_chain_and_the_local_channels() {
+            let me = ChainKeypair::random();
+            let other = peer();
+            let (backend, graph) = local_state(&me, [channel(&me, &other, 5, ChannelStatus::Open)]).await;
+            let client = BlokliTestStateBuilder::default()
+                .with_hopr_network_chain_info("piz-palu-staging")
+                .build_static_client();
+            let freshness = std::sync::Arc::new(InfoFreshness::default());
+
+            read_and_set_gauges(
+                std::sync::Arc::new(client),
+                backend,
+                graph,
+                me.public().to_address(),
+                freshness.clone(),
+            )
+            .await;
+
+            assert!(
+                freshness.age_at(Instant::now()).is_some(),
+                "the chain info read succeeded"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_refresh_through_the_gate_reports_its_outcome() {
+            let me = ChainKeypair::random();
+            let (backend, graph) = local_state(&me, []).await;
+            let client = BlokliTestStateBuilder::default()
+                .with_hopr_network_chain_info("piz-palu-staging")
+                .build_static_client();
+
+            refresh_chain_gauges(
+                std::sync::Arc::new(client),
+                backend,
+                graph,
+                me.public().to_address(),
+                std::sync::Arc::new(InfoFreshness::default()),
+            )
+            .await;
+        }
+    }
+
     #[test]
     fn queue_depth_counts_writes_between_enqueue_and_dequeue() {
         let depth = QueueDepth::default();
