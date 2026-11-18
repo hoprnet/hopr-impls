@@ -43,7 +43,7 @@ Enable `telemetry` to export Prometheus metrics for chain writes and chain state
 - `hopr_chain_tx_outcomes_total{operation,phase,outcome}` counts queued writes per API operation, such as `open_channel`. A write enters the
   `submit` phase when the sequencer takes it from the queue, and the `track` phase only when the caller awaits the tracking result. A write
   whose payload cannot be built, or that fails before the queue, enters neither. A tracking timeout is `tracking_timeout`, never `reverted`:
-  the transaction can still confirm.
+  the transaction can still confirm. A confirmed transaction whose Safe execution reverted is `inner_failed`, not `confirmed`.
 - `hopr_chain_tx_duration_seconds{operation,phase}` times the submit phase (dequeue to the tracking id Blokli returns) and the track phase
   (from the moment the awaiting caller consumes that id and calls tracking, to the final tracking outcome).
 - `hopr_chain_tx_queue_length`, `hopr_chain_nonce{kind="local"|"chain_pending"}` and `hopr_chain_caller_abandoned_total{operation}` expose

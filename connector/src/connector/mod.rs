@@ -27,6 +27,7 @@ use crate::{
         values::CHAIN_INFO_CACHE_KEY,
     },
     errors::ConnectorError,
+    metrics::{PHASE_TRACK, record_tx_outcome},
     utils::{
         ParsedChainInfo, model_to_account_entry, model_to_graph_entry, model_to_service_registry_config,
         model_to_ticket_params, process_channel_changes_into_events,
@@ -1111,7 +1112,14 @@ where
             .sequencer
             .enqueue_transaction(tx_req, tx_timeout.max(MIN_TX_CONFIRM_TIMEOUT), custom_signer, operation)
             .await?
-            .and_then(|tx| {
+            .and_then(move |tx| {
+                // A confirmed transaction can still have reverted inside its Safe execution, so the
+                // outcome is recorded here, where that result is known.
+                record_tx_outcome(
+                    operation,
+                    PHASE_TRACK,
+                    sequencer::confirmed_outcome(tx.safe_execution.as_ref().map(|exec| exec.success)),
+                );
                 if let Some(tx_exec) = tx.safe_execution
                     && !tx_exec.success
                 {

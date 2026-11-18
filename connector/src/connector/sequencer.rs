@@ -347,21 +347,29 @@ fn submit_outcome(
     }
 }
 
-/// Outcome of the track phase of a chain write.
+/// Outcome of a chain write whose tracking failed.
 ///
 /// A tracking timeout is its own outcome: the transaction may still confirm, so reporting it as a
 /// failure hides writes that are alive and makes a caller's retry look like a chain fault.
-fn track_outcome(result: Result<(), &ConnectorError>) -> &'static str {
-    let error = match result {
-        Ok(()) => return "confirmed",
-        Err(error) => error,
-    };
+fn track_failure_outcome(error: &ConnectorError) -> &'static str {
     match error.tracking_error() {
         Some(blokli_client::errors::TrackingErrorKind::Timeout) => "tracking_timeout",
         Some(blokli_client::errors::TrackingErrorKind::Reverted) => "reverted",
         Some(blokli_client::errors::TrackingErrorKind::ValidationFailed) => "validation_failed",
         Some(blokli_client::errors::TrackingErrorKind::SubmissionFailed) => "submission_failed",
         None => "transport_error",
+    }
+}
+
+/// Outcome of a chain write that confirmed.
+///
+/// A Safe-wrapped transaction can confirm while the action inside it reverted, which the caller
+/// receives as `InnerTxFailed`. Reporting that as `confirmed` would count a failed write as a
+/// success.
+pub(crate) fn confirmed_outcome(safe_execution_succeeded: Option<bool>) -> &'static str {
+    match safe_execution_succeeded {
+        Some(false) => "inner_failed",
+        _ => "confirmed",
     }
 }
 
@@ -431,7 +439,10 @@ where
                     .await
                     .map_err(ConnectorError::from);
                 tracing::debug!(?tracked, "transaction tracking done");
-                record_tx_outcome(operation, PHASE_TRACK, track_outcome(tracked.as_ref().map(|_| ())));
+                // A confirmed transaction is classified where the Safe execution result is known.
+                if let Err(error) = &tracked {
+                    record_tx_outcome(operation, PHASE_TRACK, track_failure_outcome(error));
+                }
                 record_tx_duration(
                     operation,
                     PHASE_TRACK,
@@ -562,9 +573,9 @@ mod tests {
     fn a_tracking_timeout_is_its_own_outcome_and_never_a_revert() {
         let timeout = ConnectorError::ClientError(ErrorKind::TrackingError(TrackingErrorKind::Timeout).into());
 
-        assert_eq!("tracking_timeout", track_outcome(Err(&timeout)));
-        assert_ne!("reverted", track_outcome(Err(&timeout)));
-        assert_ne!("transport_error", track_outcome(Err(&timeout)));
+        assert_eq!("tracking_timeout", track_failure_outcome(&timeout));
+        assert_ne!("reverted", track_failure_outcome(&timeout));
+        assert_ne!("transport_error", track_failure_outcome(&timeout));
     }
 
     #[test]
@@ -575,12 +586,18 @@ mod tests {
             (TrackingErrorKind::SubmissionFailed, "submission_failed"),
         ] {
             let error = ConnectorError::ClientError(ErrorKind::TrackingError(kind).into());
-            assert_eq!(outcome, track_outcome(Err(&error)), "{kind:?}");
+            assert_eq!(outcome, track_failure_outcome(&error), "{kind:?}");
         }
 
         let client_timeout = ConnectorError::ClientError(ErrorKind::Timeout.into());
-        assert_eq!("transport_error", track_outcome(Err(&client_timeout)));
-        assert_eq!("confirmed", track_outcome(Ok(())));
+        assert_eq!("transport_error", track_failure_outcome(&client_timeout));
+    }
+
+    #[test]
+    fn a_confirmed_transaction_with_a_reverted_safe_execution_is_a_failure() {
+        assert_eq!("confirmed", confirmed_outcome(None), "no Safe execution");
+        assert_eq!("confirmed", confirmed_outcome(Some(true)));
+        assert_eq!("inner_failed", confirmed_outcome(Some(false)));
     }
 
     #[test]
