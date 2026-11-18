@@ -116,6 +116,22 @@ impl ConnectorError {
             )
     }
 
+    /// Whether the client itself gave up waiting, rather than Blokli reporting an outcome.
+    pub(crate) fn is_client_timeout(&self) -> bool {
+        matches!(self.client_error_kind(), Some(ErrorKind::Timeout))
+    }
+
+    /// Returns how the transaction tracking of this write failed, if it did.
+    ///
+    /// A tracking timeout is reported as such and is not a chain failure: Blokli stopped
+    /// tracking the transaction, the transaction itself may still confirm.
+    pub(crate) fn tracking_error(&self) -> Option<TrackingErrorKind> {
+        match self.client_error_kind()? {
+            ErrorKind::TrackingError(kind) => Some(*kind),
+            _ => None,
+        }
+    }
+
     /// Returns Blokli's classification of the RPC node's refusal to broadcast, such as `NONCE_TOO_LOW`.
     pub fn rpc_rejection_code(&self) -> Option<&str> {
         match self.client_error_kind()? {

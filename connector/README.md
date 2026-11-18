@@ -35,6 +35,30 @@ performs no reads or counter resets. Chain subreads have a 2.5-second timeout, l
 overall 5-second deadline. Local channel reads run in blocking batches of at most 64; memory scales with local adjacency rather than remote
 topology. Reconnects reseed the announced-account counter.
 
+## Chain metrics
+
+Enable `telemetry` to export Prometheus metrics for chain writes and chain state. The feature adds `hopr-api/types-telemetry` and
+`lazy_static`; without it, no instrument exists and the recording calls compile to nothing.
+
+- `hopr_chain_tx_outcomes_total{operation,phase,outcome}` counts queued writes per API operation, such as `open_channel`. A write enters the
+  `submit` phase when the sequencer takes it from the queue, and the `track` phase only when the caller awaits the tracking result. A write
+  whose payload cannot be built, or that fails before the queue, enters neither. A tracking timeout is `tracking_timeout`, never `reverted`:
+  the transaction can still confirm. A confirmed transaction whose Safe execution reverted is `inner_failed`, not `confirmed`.
+- `hopr_chain_tx_duration_seconds{operation,phase}` times the submit phase (dequeue to the tracking id Blokli returns) and the track phase
+  (from the moment the awaiting caller consumes that id and calls tracking, to the final tracking outcome).
+- `hopr_chain_tx_queue_length`, `hopr_chain_nonce{kind="local"|"chain_pending"}` and `hopr_chain_caller_abandoned_total{operation}` expose
+  queueing, nonce state and writes whose caller stopped waiting while the transaction stayed live. The abandoned counter also covers a
+  caller that drops the tracking result.
+- `hopr_chain_safe_balance`, `hopr_chain_safe_allowance`, `hopr_chain_channels{direction,status}`, `hopr_chain_usable_outgoing_channels`,
+  `hopr_chain_blokli_indexed_head` and `hopr_chain_blokli_info_age_seconds` are refreshed every 60 seconds from the connected workflow,
+  independently of `HOPR_STATE_DUMP_INTERVAL`. Amounts use wxHOPR base units. `open` is counted apart from `pending_to_close`.
+  `hopr_chain_usable_outgoing_channels` counts peers with a funded, open outgoing channel: an open channel without funds still counts as
+  `open`, but path finding drops its edge, so it is not usable.
+
+Blokli reports one block number, the latest it indexed or observed, so head lag is not measurable from the connector.
+`hopr_chain_blokli_info_age_seconds` is the age of the last successful chain info query, not of the indexed block: a stalled index still
+answers, so this gauge cannot detect one and does not measure head lag.
+
 ## Operational state
 
 `connector.component_state()` returns the shared `hopr_api::ComponentState`, even without enabling diagnostics. It reads the existing atomic

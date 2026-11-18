@@ -27,6 +27,7 @@ use crate::{
         values::CHAIN_INFO_CACHE_KEY,
     },
     errors::ConnectorError,
+    metrics::{PHASE_TRACK, record_tx_outcome},
     utils::{
         ParsedChainInfo, model_to_account_entry, model_to_graph_entry, model_to_service_registry_config,
         model_to_ticket_params, process_channel_changes_into_events,
@@ -66,6 +67,10 @@ const TICKET_CUSTOM_TIMEOUT_MULTIPLIER: u32 = 4;
 
 /// How often the health of the chain subscriptions is checked.
 const SUBSCRIPTION_HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How often the chain state gauges are refreshed. Independent of the state dump interval.
+#[cfg(feature = "telemetry")]
+const CHAIN_GAUGE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Whether a subscription has stopped working for long enough to affect the chain health.
 ///
@@ -543,6 +548,21 @@ where
             Service(ServiceEvent),
             /// Time to check the health of the subscriptions.
             HealthCheck,
+            /// Time to refresh the chain state gauges.
+            #[cfg(feature = "telemetry")]
+            MetricsRefresh,
+        }
+
+        impl SubscribedEventType {
+            /// Whether the value is a timer tick rather than chain data.
+            fn is_tick(&self) -> bool {
+                match self {
+                    SubscribedEventType::HealthCheck => true,
+                    #[cfg(feature = "telemetry")]
+                    SubscribedEventType::MetricsRefresh => true,
+                    _ => false,
+                }
+            }
         }
 
         let ticket_values = self.ticket_values.clone();
@@ -618,6 +638,13 @@ where
                 }
             };
 
+            #[cfg(feature = "telemetry")]
+            let (gauge_client, gauge_backend, gauge_graph, gauge_freshness) = (
+                client.clone(),
+                backend.clone(),
+                graph.clone(),
+                std::sync::Arc::new(crate::metrics::InfoFreshness::default()),
+            );
             // Stream of Account events (Announcements)
             let graph_clone = graph.clone();
             let account_stream = account_stream
@@ -825,6 +852,13 @@ where
             let health_checks =
                 futures_time::stream::interval(futures_time::time::Duration::from(SUBSCRIPTION_HEALTH_CHECK_INTERVAL))
                     .map(|_| Ok::<_, SubscriptionError>(SubscribedEventType::HealthCheck));
+            #[cfg(feature = "telemetry")]
+            let health_checks = (
+                health_checks,
+                futures_time::stream::interval(futures_time::time::Duration::from(CHAIN_GAUGE_REFRESH_INTERVAL))
+                    .map(|_| Ok::<_, SubscriptionError>(SubscribedEventType::MetricsRefresh)),
+            )
+                .merge();
             let mut previous_health = vec![None; subscription_health.len()];
             let checked_health = health.clone();
             let subscriptions = (
@@ -842,7 +876,7 @@ where
                 .merge();
             futures::stream::Abortable::new(with_health_checks(subscriptions, health_checks), abort_reg)
             .inspect_ok(move |event_type| {
-                if connection_ready_tx.is_some() && !matches!(event_type, SubscribedEventType::HealthCheck) {
+                if connection_ready_tx.is_some() && !event_type.is_tick() {
                     match event_type {
                         SubscribedEventType::Account(_) => account_counter += 1,
                         SubscribedEventType::Channel(_) => channel_counter += 1,
@@ -873,6 +907,17 @@ where
             .for_each(move |event_type| {
                 if matches!(event_type, Ok(SubscribedEventType::HealthCheck)) {
                     update_chain_health(&checked_health, &subscription_health, &mut previous_health);
+                }
+                // The gauge refresh reads the chain and must not hold up the subscription stream.
+                #[cfg(feature = "telemetry")]
+                if matches!(event_type, Ok(SubscribedEventType::MetricsRefresh)) {
+                    hopr_utils::runtime::prelude::spawn(crate::metrics::refresh_chain_gauges(
+                        gauge_client.clone(),
+                        gauge_backend.clone(),
+                        gauge_graph.clone(),
+                        me,
+                        gauge_freshness.clone(),
+                    ));
                 }
                 let event_tx = event_tx.clone();
                 async move {
@@ -935,6 +980,8 @@ where
                             let _ = event_tx.broadcast_direct(event).await;
                         }
                         Ok(SubscribedEventType::HealthCheck) => {}
+                        #[cfg(feature = "telemetry")]
+                        Ok(SubscribedEventType::MetricsRefresh) => {}
                         Err(SubscriptionError { subscription, error }) => {
                             tracing::error!(subscription, %error, "error in chain subscription");
                         }
@@ -1033,6 +1080,26 @@ where
         Ok(())
     }
 
+    /// Runs one chain state gauge refresh, outside the periodic tick.
+    ///
+    /// A test hook: the gauges normally refresh every 60 seconds from the connected workflow, which
+    /// a test cannot wait for. Requires the `telemetry` feature.
+    #[cfg(all(feature = "testing", feature = "telemetry"))]
+    pub async fn refresh_chain_state_metrics(&self)
+    where
+        C: BlokliQueryClient + BlokliSubscriptionClient + Send + Sync + 'static,
+        B: Backend + Send + Sync + 'static,
+    {
+        crate::metrics::refresh_chain_gauges(
+            self.client.clone(),
+            self.backend.clone(),
+            self.graph.clone(),
+            self.chain_key.public().to_address(),
+            std::sync::Arc::new(crate::metrics::InfoFreshness::default()),
+        )
+        .await;
+    }
+
     /// Returns the reference to the underlying client.
     pub fn client(&self) -> &C {
         self.client.as_ref()
@@ -1055,6 +1122,7 @@ where
         tx_req: P::TxRequest,
         custom_tx_multiplier: Option<u32>,
         custom_signer: Option<ChainKeypair>,
+        operation: &'static str,
     ) -> Result<impl Future<Output = Result<ChainReceipt, ConnectorError>> + Send + 'a, ConnectorError> {
         let chain_info = self.query_cached_chain_info().await?;
         let tx_timeout = custom_tx_multiplier.unwrap_or(self.cfg.tx_timeout_multiplier).max(1)
@@ -1062,9 +1130,16 @@ where
             * chain_info.expected_block_time;
         Ok(self
             .sequencer
-            .enqueue_transaction(tx_req, tx_timeout.max(MIN_TX_CONFIRM_TIMEOUT), custom_signer)
+            .enqueue_transaction(tx_req, tx_timeout.max(MIN_TX_CONFIRM_TIMEOUT), custom_signer, operation)
             .await?
-            .and_then(|tx| {
+            .and_then(move |tx| {
+                // A confirmed transaction can still have reverted inside its Safe execution, so the
+                // outcome is recorded here, where that result is known.
+                record_tx_outcome(
+                    operation,
+                    PHASE_TRACK,
+                    sequencer::confirmed_outcome(tx.safe_execution.as_ref().map(|exec| exec.success)),
+                );
                 if let Some(tx_exec) = tx.safe_execution
                     && !tx_exec.success
                 {
@@ -1779,6 +1854,52 @@ pub(crate) mod tests {
         let blokli_client = BlokliTestStateBuilder::default().build_static_client();
         let connector = create_connector(blokli_client)?;
         assert!(connector.component_status().is_initializing());
+        Ok(())
+    }
+
+    /// The gauge refresh reads the chain on its own; it must not touch the reported chain state.
+    #[cfg(feature = "telemetry")]
+    #[tokio::test]
+    async fn a_gauge_refresh_leaves_the_chain_component_status_untouched() -> anyhow::Result<()> {
+        use hopr_api::{ComponentState, node::ComponentStatusReporter};
+
+        let client = BlokliTestStateBuilder::default()
+            .with_hopr_network_chain_info("piz-palu-staging")
+            .build_static_client();
+        let mut connector = create_connector(client.clone())?;
+        connector.connect().await?;
+        assert_eq!(ComponentState::Running, connector.component_state());
+        assert!(matches!(
+            connector.component_status(),
+            hopr_api::node::ComponentStatus::Ready
+        ));
+
+        crate::metrics::refresh_chain_gauges(
+            std::sync::Arc::new(client),
+            connector.backend.clone(),
+            connector.graph.clone(),
+            connector.chain_key.public().to_address(),
+            std::sync::Arc::new(crate::metrics::InfoFreshness::default()),
+        )
+        .await;
+
+        assert_eq!(
+            ComponentState::Running,
+            connector.component_state(),
+            "a gauge refresh does not degrade the chain"
+        );
+        assert!(matches!(
+            connector.component_status(),
+            hopr_api::node::ComponentStatus::Ready
+        ));
+
+        // A dead subscription is still reported after a refresh.
+        set_subscription_health(&connector.health, false, true);
+        assert_eq!(ComponentState::Failed, connector.component_state());
+        assert!(matches!(
+            connector.component_status(),
+            hopr_api::node::ComponentStatus::Unavailable(_)
+        ));
         Ok(())
     }
 

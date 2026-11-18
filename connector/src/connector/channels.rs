@@ -143,7 +143,7 @@ where
         tracing::debug!( %dst, %amount, "opening channel");
 
         Ok(self
-            .send_tx(tx_req, Some(CHANNEL_CUSTOM_TIMEMOUT_MULTIPLIER), None)
+            .send_tx(tx_req, Some(CHANNEL_CUSTOM_TIMEMOUT_MULTIPLIER), None, "open_channel")
             .await?
             .boxed())
     }
@@ -163,7 +163,7 @@ where
         tracing::debug!(%channel_id, %amount, "funding channel");
 
         Ok(self
-            .send_tx(tx_req, Some(CHANNEL_CUSTOM_TIMEMOUT_MULTIPLIER), None)
+            .send_tx(tx_req, Some(CHANNEL_CUSTOM_TIMEMOUT_MULTIPLIER), None, "fund_channel")
             .await?
             .boxed())
     }
@@ -210,7 +210,7 @@ where
         };
 
         Ok(self
-            .send_tx(tx_req, Some(CHANNEL_CUSTOM_TIMEMOUT_MULTIPLIER), None)
+            .send_tx(tx_req, Some(CHANNEL_CUSTOM_TIMEMOUT_MULTIPLIER), None, "close_channel")
             .await?
             .boxed())
     }

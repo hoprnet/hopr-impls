@@ -185,6 +185,59 @@ async fn chain_failures_keep_successful_reads_and_request_analysis() -> anyhow::
     Ok(())
 }
 
+#[cfg(feature = "telemetry")]
+#[test]
+fn channel_gauges_count_open_apart_from_pending_to_close_and_only_reachable_peers() -> anyhow::Result<()> {
+    use crate::metrics::ChannelGauges;
+
+    let me = Address::from([1; 20]);
+    let peer = Address::from([2; 20]);
+    let mut gauges = ChannelGauges::default();
+
+    for status in [
+        ChannelStatus::Open,
+        ChannelStatus::PendingToClose(std::time::SystemTime::now()),
+        ChannelStatus::Closed,
+    ] {
+        for (source, destination) in [(me, peer), (peer, me)] {
+            let channel = ChannelEntry::builder()
+                .between(source, destination)
+                .amount(5u32)
+                .status(status)
+                .build()?;
+            gauges.record(&channel, me);
+        }
+    }
+
+    assert_eq!(1, gauges.count("outgoing", "open"));
+    assert_eq!(1, gauges.count("outgoing", "pending_to_close"));
+    assert_eq!(1, gauges.count("outgoing", "closed"));
+    assert_eq!(1, gauges.count("incoming", "open"));
+    assert_eq!(
+        1,
+        gauges.usable_outgoing(),
+        "a pending-to-close channel is not usable, an open incoming one is not ours to use"
+    );
+
+    let second_peer = Address::from([3; 20]);
+    gauges.record(
+        &ChannelEntry::builder()
+            .between(me, second_peer)
+            .amount(0u32)
+            .status(ChannelStatus::Open)
+            .build()?,
+        me,
+    );
+    assert_eq!(2, gauges.count("outgoing", "open"));
+    assert_eq!(
+        1,
+        gauges.usable_outgoing(),
+        "a drained open channel counts as open but path finding drops its edge"
+    );
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn inventory_distinguishes_channel_status_funding_and_peer_direction() -> anyhow::Result<()> {
     use crate::testing::create_test_blokli_connector;

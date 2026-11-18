@@ -130,7 +130,7 @@ where
         let tx_req = self
             .payload_generator
             .register_service(service_type, metadata, config.registration_burn)?;
-        Ok(self.send_tx(tx_req, None, None).await?.boxed())
+        Ok(self.send_tx(tx_req, None, None, "register_service").await?.boxed())
     }
 
     async fn update_service<'a>(
@@ -146,7 +146,7 @@ where
         let tx_req = self
             .payload_generator
             .update_service(service_type, metadata, config.update_burn)?;
-        Ok(self.send_tx(tx_req, None, None).await?.boxed())
+        Ok(self.send_tx(tx_req, None, None, "update_service").await?.boxed())
     }
 
     async fn deregister_service<'a>(
@@ -155,7 +155,7 @@ where
     ) -> Result<BoxFuture<'a, Result<hopr_api::chain::ChainReceipt, Self::Error>>, Self::Error> {
         self.check_connection_state()?;
         let tx_req = self.payload_generator.deregister_service(service_type)?;
-        Ok(self.send_tx(tx_req, None, None).await?.boxed())
+        Ok(self.send_tx(tx_req, None, None, "deregister_service").await?.boxed())
     }
 }
 
