@@ -1837,6 +1837,52 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// The gauge refresh reads the chain on its own; it must not touch the reported chain state.
+    #[cfg(feature = "telemetry")]
+    #[tokio::test]
+    async fn a_gauge_refresh_leaves_the_chain_component_status_untouched() -> anyhow::Result<()> {
+        use hopr_api::{ComponentState, node::ComponentStatusReporter};
+
+        let client = BlokliTestStateBuilder::default()
+            .with_hopr_network_chain_info("piz-palu-staging")
+            .build_static_client();
+        let mut connector = create_connector(client.clone())?;
+        connector.connect().await?;
+        assert_eq!(ComponentState::Running, connector.component_state());
+        assert!(matches!(
+            connector.component_status(),
+            hopr_api::node::ComponentStatus::Ready
+        ));
+
+        crate::metrics::refresh_chain_gauges(
+            std::sync::Arc::new(client),
+            connector.backend.clone(),
+            connector.graph.clone(),
+            connector.chain_key.public().to_address(),
+            std::sync::Arc::new(crate::metrics::InfoFreshness::default()),
+        )
+        .await;
+
+        assert_eq!(
+            ComponentState::Running,
+            connector.component_state(),
+            "a gauge refresh does not degrade the chain"
+        );
+        assert!(matches!(
+            connector.component_status(),
+            hopr_api::node::ComponentStatus::Ready
+        ));
+
+        // A dead subscription is still reported after a refresh.
+        set_subscription_health(&connector.health, false, true);
+        assert_eq!(ComponentState::Failed, connector.component_state());
+        assert!(matches!(
+            connector.component_status(),
+            hopr_api::node::ComponentStatus::Unavailable(_)
+        ));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn connector_health_ready_after_connect() -> anyhow::Result<()> {
         use hopr_api::node::ComponentStatusReporter;
