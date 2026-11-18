@@ -3,7 +3,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use blokli_client::api::{BlokliQueryClient, BlokliTransactionClient};
+use blokli_client::{
+    api::{BlokliQueryClient, BlokliTransactionClient, TransactionTrackingOutcome},
+    errors::TrackingErrorKind,
+};
 use futures::{FutureExt, SinkExt, StreamExt, TryFutureExt};
 use hopr_api::{
     Address,
@@ -402,6 +405,18 @@ where
                     .track_transaction(tx_id, timeout)
                     .map_err(ConnectorError::from)
                     .inspect(|res| tracing::debug!(?res, "transaction tracking done"))
+                    .and_then(|outcome| async move {
+                        match outcome {
+                            TransactionTrackingOutcome::Confirmed(tx) => Ok(tx),
+                            // The client deadline elapsed without a terminal status. This was reported as a
+                            // timeout before the client distinguished the two, and is kept that way here.
+                            TransactionTrackingOutcome::StatusUnknown { .. } => {
+                                Err(ConnectorError::from(blokli_client::errors::BlokliClientError::from(
+                                    blokli_client::errors::ErrorKind::TrackingError(TrackingErrorKind::Timeout),
+                                )))
+                            }
+                        }
+                    })
             }))
     }
 }
