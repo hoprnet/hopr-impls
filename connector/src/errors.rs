@@ -1,4 +1,7 @@
-use blokli_client::errors::{ErrorKind, TrackingErrorKind};
+use blokli_client::{
+    api::types::TransactionDiagnosis,
+    errors::{BlokliClientError, ErrorKind, TrackingErrorKind},
+};
 use hopr_api::types::{internal::prelude::ChannelId, primitive::prelude::Address};
 use thiserror::Error;
 
@@ -128,13 +131,39 @@ impl ConnectorError {
         }
     }
 
-    /// The underlying Blokli client error kind, looking through cached errors.
-    fn client_error_kind(&self) -> Option<&ErrorKind> {
+    /// Returns Blokli's explanation of why a timed out transaction was not mined, if it gave one.
+    ///
+    /// Only the timeout of a tracked transaction can carry one, and only when Blokli serves diagnoses.
+    /// The transaction was broadcast: this is no refusal, and the nonce it used is not free. See
+    /// [`ConnectorError::unmined_retry_after`] for the delay Blokli suggests.
+    pub fn unmined_diagnosis(&self) -> Option<&TransactionDiagnosis> {
+        self.blokli_client_error()?.unmined_diagnosis()
+    }
+
+    /// Returns how long Blokli suggests to wait before checking or retrying a timed out, unmined transaction.
+    ///
+    /// `None` when Blokli gave no diagnosis or a hint of zero seconds: no hint means no back-off.
+    ///
+    /// This is deliberately not part of [`ConnectorError::retry_after`]. That one describes a refusal before
+    /// broadcast, from which [`ConnectorError::is_refused_before_broadcast`] concludes that the nonce was not
+    /// consumed. A timed out transaction was broadcast and may still be mined.
+    pub fn unmined_retry_after(&self) -> Option<std::time::Duration> {
+        let seconds = self.unmined_diagnosis()?.retry_after_seconds;
+        (seconds > 0).then(|| std::time::Duration::from_secs(u64::from(seconds)))
+    }
+
+    /// The underlying Blokli client error, looking through cached errors.
+    fn blokli_client_error(&self) -> Option<&BlokliClientError> {
         match self {
-            ConnectorError::ClientError(client_error) => Some(client_error.kind()),
-            ConnectorError::CacheError(inner) => inner.client_error_kind(),
+            ConnectorError::ClientError(client_error) => Some(client_error),
+            ConnectorError::CacheError(inner) => inner.blokli_client_error(),
             _ => None,
         }
+    }
+
+    /// The underlying Blokli client error kind, looking through cached errors.
+    fn client_error_kind(&self) -> Option<&ErrorKind> {
+        self.blokli_client_error().map(BlokliClientError::kind)
     }
 
     pub fn other(e: impl Into<anyhow::Error>) -> Self {
@@ -251,5 +280,76 @@ mod tests {
         })));
 
         assert!(error.as_hopr_action_rejection().is_some());
+    }
+
+    async fn timed_out_error(retry_after_seconds: u32) -> ConnectorError {
+        use blokli_client::{
+            BlokliTestClient, BlokliTestState, NopStateMutator,
+            api::{
+                BlokliTransactionClient,
+                types::{TransactionStatus, UnminedReason},
+            },
+        };
+
+        let client = BlokliTestClient::new(BlokliTestState::default(), NopStateMutator)
+            .with_tx_simulation_delay(Duration::from_millis(1));
+        let tx_id = client.submit_and_track_transaction(&[0x02]).await.unwrap();
+        let client = client.with_unmined_diagnosis(
+            tx_id.clone(),
+            TransactionDiagnosis {
+                reason: UnminedReason::Underpriced,
+                signed_fees: None,
+                recommended_fees: None,
+                min_replacement_fees: None,
+                retry_after_seconds,
+            },
+        );
+        client.hidden_state_update(|state| {
+            state.active_txs.get_mut(&tx_id).expect("tracked").status = TransactionStatus::Timeout;
+        });
+
+        ConnectorError::from(
+            client
+                .track_transaction(tx_id, Duration::from_secs(1))
+                .await
+                .expect_err("the transaction timed out"),
+        )
+    }
+
+    #[tokio::test]
+    async fn diagnosed_timeout_exposes_its_hint_but_is_not_a_refusal() {
+        let error = timed_out_error(30).await;
+
+        assert_eq!(Some(Duration::from_secs(30)), error.unmined_retry_after());
+        assert!(error.unmined_diagnosis().is_some());
+        // the transaction was broadcast: its nonce is consumed and no refusal back-off applies
+        assert!(!error.is_refused_before_broadcast());
+        assert_eq!(None, error.retry_after());
+        assert!(error.as_transaction_rejection_error().is_none());
+    }
+
+    #[tokio::test]
+    async fn diagnosis_is_seen_through_cached_errors() {
+        let error = ConnectorError::CacheError(std::sync::Arc::new(timed_out_error(12).await));
+
+        assert_eq!(Some(Duration::from_secs(12)), error.unmined_retry_after());
+        assert!(!error.is_refused_before_broadcast());
+    }
+
+    #[tokio::test]
+    async fn zero_second_hint_means_no_back_off() {
+        let error = timed_out_error(0).await;
+
+        assert!(error.unmined_diagnosis().is_some());
+        assert_eq!(None, error.unmined_retry_after());
+    }
+
+    #[test]
+    fn timeout_without_diagnosis_has_no_back_off() {
+        let error = client_error(ErrorKind::TrackingError(TrackingErrorKind::Timeout));
+
+        assert!(error.unmined_diagnosis().is_none());
+        assert_eq!(None, error.unmined_retry_after());
+        assert!(!ConnectorError::InvalidTicket.unmined_diagnosis().is_some());
     }
 }
