@@ -218,8 +218,6 @@ where
                                     "failed to notify transaction result - the caller may not want to await the \
                                      result anymore."
                                 );
-                                // The write may still confirm: count the abandoned caller instead of a failure.
-                                record_caller_abandoned(operation);
                             }
                             record_tx_outcome(operation, PHASE_SUBMIT, outcome);
                             if let Some(seconds) = submitted_in {
@@ -300,6 +298,36 @@ fn nonce_gap_age(
         _ => {
             gaps.insert(signer, (pending, Instant::now()));
             Some(Duration::ZERO)
+        }
+    }
+}
+
+/// Records a chain write as abandoned when it is dropped before it produced a result.
+///
+/// The caller of a chain write can stop waiting after the transaction was submitted, which leaves
+/// the write in flight. Counting that as an abandoned caller keeps it visible; the transaction then
+/// records no phase outcome, because it has none yet.
+struct AbandonGuard<F: FnOnce()> {
+    on_abandon: Option<F>,
+}
+
+impl<F: FnOnce()> AbandonGuard<F> {
+    fn new(on_abandon: F) -> Self {
+        Self {
+            on_abandon: Some(on_abandon),
+        }
+    }
+
+    /// Disarms the guard. Call this once the result reached the caller.
+    fn complete(mut self) {
+        self.on_abandon = None;
+    }
+}
+
+impl<F: FnOnce()> Drop for AbandonGuard<F> {
+    fn drop(&mut self) {
+        if let Some(on_abandon) = self.on_abandon.take() {
+            on_abandon();
         }
     }
 }
@@ -386,29 +414,35 @@ where
                 ConnectorError::InvalidState("transaction queue dropped")
             })?;
 
-        Ok(notifier_rx
-            .inspect_ok(|res| tracing::debug!(?res, "transaction tracking id received"))
-            .map(move |result| {
-                result
-                    .map_err(|_| ConnectorError::InvalidState("transaction notifier dropped"))
-                    .and_then(|tx_res| tx_res.map(|id| (id, timeout_until_finalized)))
-            })
-            .and_then(move |(tx_id, timeout)| {
+        Ok(async move {
+            // A dropped future, such as a caller-side timeout, leaves the write alive on chain: count
+            // the caller as abandoned rather than let the write disappear from the metrics.
+            let abandoned = AbandonGuard::new(move || record_caller_abandoned(operation));
+            let result = async {
+                let tx_id = notifier_rx
+                    .await
+                    .map_err(|_| ConnectorError::InvalidState("transaction notifier dropped"))??;
+                tracing::debug!(?tx_id, "transaction tracking id received");
+
                 let tracking_started = Instant::now();
-                self.client
-                    .track_transaction(tx_id, timeout)
-                    .map_err(ConnectorError::from)
-                    .inspect(|res| tracing::debug!(?res, "transaction tracking done"))
-                    .then(move |result| {
-                        record_tx_outcome(operation, PHASE_TRACK, track_outcome(result.as_ref().map(|_| ())));
-                        record_tx_duration(
-                            operation,
-                            PHASE_TRACK,
-                            elapsed_seconds(tracking_started, Instant::now()),
-                        );
-                        futures::future::ready(result)
-                    })
-            }))
+                let tracked = self
+                    .client
+                    .track_transaction(tx_id, timeout_until_finalized)
+                    .await
+                    .map_err(ConnectorError::from);
+                tracing::debug!(?tracked, "transaction tracking done");
+                record_tx_outcome(operation, PHASE_TRACK, track_outcome(tracked.as_ref().map(|_| ())));
+                record_tx_duration(
+                    operation,
+                    PHASE_TRACK,
+                    elapsed_seconds(tracking_started, Instant::now()),
+                );
+                tracked
+            }
+            .await;
+            abandoned.complete();
+            result
+        })
     }
 }
 
@@ -467,6 +501,30 @@ mod tests {
             message: "too many tracked transactions".into(),
         });
         assert_eq!(Some(false), nonce_consumed(&overloaded, false));
+    }
+
+    #[test]
+    fn a_dropped_future_counts_as_an_abandoned_caller() {
+        let abandoned = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = {
+            let abandoned = abandoned.clone();
+            move || {
+                abandoned.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        };
+
+        {
+            let _guard = AbandonGuard::new(count.clone());
+        }
+        assert_eq!(1, abandoned.load(std::sync::atomic::Ordering::SeqCst));
+
+        let completed = AbandonGuard::new(count);
+        completed.complete();
+        assert_eq!(
+            1,
+            abandoned.load(std::sync::atomic::Ordering::SeqCst),
+            "a caller that received the result is not abandoned"
+        );
     }
 
     #[test]

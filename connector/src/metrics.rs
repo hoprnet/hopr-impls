@@ -7,10 +7,7 @@
 //!
 //! Without the feature, every function here records nothing and no instrument exists.
 
-use std::{
-    sync::atomic::{AtomicU64, Ordering},
-    time::Instant,
-};
+use std::time::Instant;
 
 #[cfg(feature = "telemetry")]
 use hopr_api::types::internal::prelude::{ChannelDirection, ChannelEntry, ChannelStatus};
@@ -158,29 +155,31 @@ pub(crate) fn elapsed_seconds(since: Instant, now: Instant) -> f64 {
 /// Chain writes queued between `enqueue` and dequeue.
 ///
 /// The queue length gauge is set from this counter, so it also covers writes whose caller left: a
-/// write that nobody waits for still occupies a queue slot until the sequencer takes it.
+/// write that nobody waits for still occupies a queue slot until the sequencer takes it. The gauge
+/// is published under the lock that moves the counter, so a concurrent dequeue cannot leave the
+/// previous length behind as the last published value.
 #[derive(Debug, Default)]
-pub(crate) struct QueueDepth(AtomicU64);
+pub(crate) struct QueueDepth(parking_lot::Mutex<u64>);
 
 impl QueueDepth {
     /// Counts a write that entered the queue.
     pub(crate) fn enqueued(&self) {
-        record_queue_length(self.0.fetch_add(1, Ordering::Relaxed) + 1);
+        let mut length = self.0.lock();
+        *length += 1;
+        record_queue_length(*length);
     }
 
     /// Counts a write the sequencer took out of the queue.
     pub(crate) fn dequeued(&self) {
-        if let Ok(previous) = self.0.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |length| {
-            Some(length.saturating_sub(1))
-        }) {
-            record_queue_length(previous.saturating_sub(1));
-        }
+        let mut length = self.0.lock();
+        *length = length.saturating_sub(1);
+        record_queue_length(*length);
     }
 
     /// Number of writes waiting in the queue.
     #[cfg(test)]
     pub(crate) fn get(&self) -> u64 {
-        self.0.load(Ordering::Relaxed)
+        *self.0.lock()
     }
 }
 
@@ -203,7 +202,8 @@ fn status_index(status: ChannelStatus) -> usize {
 /// Local channel counts per direction and on-chain status.
 ///
 /// Open is counted apart from pending-to-close: a draining channel still exists on chain but can no
-/// longer carry traffic.
+/// longer carry traffic. An open channel without funds counts as open but not as usable, because
+/// path finding drops its edge.
 #[derive(Debug, Default)]
 #[cfg(feature = "telemetry")]
 pub(crate) struct ChannelGauges {
@@ -224,8 +224,9 @@ impl ChannelGauges {
         };
         let status = status_index(channel.status);
         self.counts[direction][status] += 1;
-        // Only an open outgoing channel can carry traffic this node initiates.
-        if direction == 1 && status == 0 {
+        // Only a funded, open outgoing channel can carry traffic this node initiates: path finding
+        // drops the edge of a drained channel, which is what a lost usable channel looks like.
+        if direction == 1 && status == 0 && !channel.balance.amount().is_zero() {
             self.usable_peers.insert(channel.destination);
         }
     }
@@ -260,7 +261,8 @@ impl ChannelGauges {
 /// Age of the last successful Blokli chain info query.
 ///
 /// Blokli reports one block number, the latest it indexed or observed, so head lag cannot be
-/// measured directly. Staleness of the chain info read is the available freshness signal.
+/// measured. This tracks how long ago the connector last got an answer at all: a stalled index
+/// still answers, so the age stays low and the indexed-head gauge stays put.
 #[derive(Debug, Default)]
 #[cfg(feature = "telemetry")]
 pub(crate) struct InfoFreshness(parking_lot::Mutex<Option<Instant>>);
@@ -269,21 +271,28 @@ pub(crate) struct InfoFreshness(parking_lot::Mutex<Option<Instant>>);
 impl InfoFreshness {
     /// Records a successful chain info query. The info age drops to zero.
     pub(crate) fn success(&self) {
-        *self.0.lock() = Some(Instant::now());
+        self.success_at(Instant::now());
+    }
+
+    fn success_at(&self, at: Instant) {
+        *self.0.lock() = Some(at);
         record_blokli_info_age(0.0);
     }
 
     /// Records a failed chain info query. The info age grows since the last success.
     pub(crate) fn failure(&self) {
+        let now = Instant::now();
         if let Some(since) = *self.0.lock() {
-            record_blokli_info_age(since.elapsed().as_secs_f64());
+            record_blokli_info_age(elapsed_seconds(since, now));
         }
     }
 
-    /// Seconds since the last successful query, `None` before the first success.
+    /// Seconds since the last successful query at `now`, `None` before the first success.
     #[cfg(test)]
-    pub(crate) fn age(&self) -> Option<f64> {
-        self.0.lock().map(|since| since.elapsed().as_secs_f64())
+    fn age_at(&self, now: Instant) -> Option<f64> {
+        // Deref the guard before mapping: `MutexGuard` already projects to the inner `Option`.
+        let since = *self.0.lock();
+        since.map(|since| elapsed_seconds(since, now))
     }
 }
 
@@ -293,14 +302,32 @@ impl InfoFreshness {
 /// the nearest representable value, a relative error under 2^-53, far below any alert threshold.
 #[cfg(feature = "telemetry")]
 fn base_units(amount: hopr_api::graph::traits::Balance) -> f64 {
-    amount.low_u128() as f64
+    // Assemble the value from all four limbs. `low_u128` would drop the upper half of a large
+    // amount and report it as a small one.
+    let [low, low_mid, high_mid, high] = amount.0;
+    high as f64 * 2f64.powi(192) + high_mid as f64 * 2f64.powi(128) + low_mid as f64 * 2f64.powi(64) + low as f64
+}
+
+/// Set while a gauge refresh runs, so a slow refresh cannot pile up behind the ticker.
+#[cfg(feature = "telemetry")]
+static REFRESH_IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Clears [`REFRESH_IN_FLIGHT`] however the refresh ends, including an abort.
+#[cfg(feature = "telemetry")]
+struct RefreshInFlight;
+
+#[cfg(feature = "telemetry")]
+impl Drop for RefreshInFlight {
+    fn drop(&mut self) {
+        REFRESH_IN_FLIGHT.store(false, std::sync::atomic::Ordering::Release);
+    }
 }
 
 /// Reads the chain state and sets the state gauges.
 ///
-/// Every gauge is set to an absolute value, so a refresh that outlives the interval overlaps the
-/// next one without corrupting the reported state. Read failures leave the last value in place and
-/// only the info age moves.
+/// Every gauge is set to an absolute value. A refresh that is still running when the next tick
+/// arrives makes that tick a no-op, so slow reads cannot queue up. Read failures leave the last
+/// value in place: a partial channel count would look like the node lost channels.
 #[cfg(feature = "telemetry")]
 pub(crate) async fn refresh_chain_gauges<C, B>(
     client: std::sync::Arc<C>,
@@ -320,6 +347,12 @@ pub(crate) async fn refresh_chain_gauges<C, B>(
     C: blokli_client::api::BlokliQueryClient + blokli_client::api::BlokliSubscriptionClient + Send + Sync + 'static,
     B: crate::Backend + Send + Sync + 'static,
 {
+    if REFRESH_IN_FLIGHT.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        tracing::debug!("skipping the chain gauge refresh, the previous one is still running");
+        return;
+    }
+    let _in_flight = RefreshInFlight;
+
     match client.query_chain_info().await {
         Ok(info) => {
             record_blokli_indexed_head(u64::try_from(info.block_number).unwrap_or_default());
@@ -337,7 +370,10 @@ pub(crate) async fn refresh_chain_gauges<C, B>(
         None => tracing::debug!(%me, "node has no safe, safe gauges are not set"),
     }
 
-    collect_channel_gauges(&backend, &graph, me).await.apply();
+    match collect_channel_gauges(&backend, &graph, me).await {
+        Some(gauges) => gauges.apply(),
+        None => tracing::debug!("chain gauges not refreshed, the local channel read was incomplete"),
+    }
 }
 
 /// The Safe the node signs with: the one it is registered with, else the one it deployed.
@@ -348,14 +384,23 @@ where
 {
     use hopr_api::chain::{ChainReadSafeOperations, SafeSelector};
 
-    for selector in [SafeSelector::NodeAddress(me), SafeSelector::Deployer(me)] {
-        match reader.safe_info(selector).await {
-            Ok(Some(safe)) => return Some(safe.address),
-            Ok(None) => {}
-            Err(error) => tracing::debug!(%error, "cannot read the node's safe for metrics"),
+    match reader.safe_info(SafeSelector::NodeAddress(me)).await {
+        Ok(Some(safe)) => Some(safe.address),
+        Ok(None) => match reader.safe_info(SafeSelector::Deployer(me)).await {
+            Ok(Some(safe)) => Some(safe.address),
+            Ok(None) => None,
+            Err(error) => {
+                tracing::debug!(%error, "cannot read the safe the node deployed for metrics");
+                None
+            }
+        },
+        Err(error) => {
+            // A failed lookup must not switch to another safe: the gauges would then pair one
+            // safe's balance with the other's allowance.
+            tracing::debug!(%error, "cannot read the safe the node is registered with for metrics");
+            None
         }
     }
-    None
 }
 
 #[cfg(feature = "telemetry")]
@@ -368,14 +413,24 @@ where
         types::primitive::prelude::WxHOPR,
     };
 
-    match reader.balance::<WxHOPR, _>(safe).await {
-        Ok(balance) => record_safe_balance(base_units(balance.amount())),
-        Err(error) => tracing::debug!(%error, "cannot read the safe balance for metrics"),
-    }
-    match reader.safe_allowance::<WxHOPR, _>(safe).await {
-        Ok(allowance) => record_safe_allowance(base_units(allowance.amount())),
-        Err(error) => tracing::debug!(%error, "cannot read the safe allowance for metrics"),
-    }
+    let balance = match reader.balance::<WxHOPR, _>(safe).await {
+        Ok(balance) => base_units(balance.amount()),
+        Err(error) => {
+            tracing::debug!(%error, "cannot read the safe balance for metrics");
+            return;
+        }
+    };
+    let allowance = match reader.safe_allowance::<WxHOPR, _>(safe).await {
+        Ok(allowance) => base_units(allowance.amount()),
+        Err(error) => {
+            tracing::debug!(%error, "cannot read the safe allowance for metrics");
+            return;
+        }
+    };
+    // Both values come from the same Safe, so they are published together. Publishing one of them
+    // alone could pair a new Safe's balance with the previous Safe's allowance.
+    record_safe_balance(balance);
+    record_safe_allowance(allowance);
 }
 
 /// Backend reads per blocking batch while counting channels.
@@ -395,41 +450,59 @@ async fn collect_channel_gauges<B>(
         >,
     >,
     me: hopr_api::Address,
-) -> ChannelGauges
+) -> Option<ChannelGauges>
 where
     B: crate::Backend + Send + Sync + 'static,
 {
     let ids = {
         let backend = backend.clone();
         let graph = graph.clone();
-        hopr_utils::runtime::prelude::spawn_blocking(move || local_channel_ids(backend.as_ref(), &graph, me))
-            .await
-            .unwrap_or_default()
+        hopr_utils::runtime::prelude::spawn_blocking(move || local_channel_ids(backend.as_ref(), &graph, me)).await
+    };
+    let ids = match ids {
+        Ok(Ok(ids)) => ids,
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "cannot enumerate the local channels for metrics");
+            return None;
+        }
+        Err(error) => {
+            tracing::warn!(%error, "channel enumeration failed for metrics");
+            return None;
+        }
     };
 
     let mut gauges = ChannelGauges::default();
     for batch in ids.chunks(CHANNEL_READ_BATCH) {
         let batch = batch.to_vec();
         let backend = backend.clone();
-        let entries = hopr_utils::runtime::prelude::spawn_blocking(move || {
+        let entries = hopr_utils::runtime::prelude::spawn_blocking(move || -> Result<Vec<ChannelEntry>, String> {
             batch
                 .iter()
-                .filter_map(|id| match backend.get_channel_by_id(id) {
-                    Ok(channel) => channel,
-                    Err(error) => {
-                        tracing::debug!(%error, %id, "cannot read a local channel for metrics");
-                        None
-                    }
+                .map(|id| {
+                    backend
+                        .get_channel_by_id(id)
+                        .map_err(|error| format!("{id}: {error}"))?
+                        .ok_or_else(|| format!("{id}: missing"))
                 })
-                .collect::<Vec<_>>()
+                .collect()
         })
-        .await
-        .unwrap_or_default();
+        .await;
+        let entries = match entries {
+            Ok(Ok(entries)) => entries,
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "cannot read a local channel for metrics");
+                return None;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "local channel read failed for metrics");
+                return None;
+            }
+        };
         for entry in entries.iter() {
             gauges.record(entry, me);
         }
     }
-    gauges
+    Some(gauges)
 }
 
 /// Channel ids of both directions that involve the account at `me`.
@@ -444,15 +517,16 @@ fn local_channel_ids<B>(
         >,
     >,
     me: hopr_api::Address,
-) -> Vec<hopr_api::types::internal::prelude::ChannelId>
+) -> Result<Vec<hopr_api::types::internal::prelude::ChannelId>, String>
 where
     B: crate::Backend,
 {
-    let Ok(Some(account)) = backend.get_account_by_address(&me) else {
-        return Vec::new();
-    };
+    let account = backend
+        .get_account_by_address(&me)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "the local account is missing".to_string())?;
     let graph = graph.read();
-    graph
+    Ok(graph
         .edges(account.key_id)
         .chain(
             graph
@@ -460,7 +534,7 @@ where
                 .filter(|(src, ..)| *src != account.key_id),
         )
         .map(|(_, _, id)| *id)
-        .collect()
+        .collect())
 }
 
 #[cfg(test)]
@@ -495,20 +569,25 @@ mod tests {
 
     #[cfg(feature = "telemetry")]
     #[test]
-    fn info_age_stays_zero_while_chain_info_reads_and_grows_when_they_fail() {
+    fn info_age_is_measured_from_the_last_successful_read() {
         let freshness = InfoFreshness::default();
+        let now = Instant::now();
 
+        assert_eq!(None, freshness.age_at(now), "nothing was read yet");
+
+        freshness.success_at(now);
+        assert_eq!(Some(0.0), freshness.age_at(now), "a fresh read");
+
+        freshness.success_at(now - Duration::from_secs(5));
+        assert_eq!(Some(5.0), freshness.age_at(now), "an older read");
+
+        // A failed read leaves the last success in place, so the age keeps growing.
         freshness.failure();
-        assert_eq!(None, freshness.age(), "nothing was read yet");
-
-        freshness.success();
         assert!(
-            freshness.age().is_some_and(|age| age < 0.02),
-            "a fresh read reports a near-zero age"
+            freshness
+                .age_at(now + Duration::from_secs(5))
+                .is_some_and(|age| age >= 10.0)
         );
-        std::thread::sleep(Duration::from_millis(20));
-        freshness.failure();
-        assert!(freshness.age().is_some_and(|age| age >= 0.02));
     }
 
     #[cfg(feature = "telemetry")]
@@ -519,5 +598,10 @@ mod tests {
 
         assert_eq!(1.5e20, base_units(amount));
         assert_eq!(0.0, base_units(hopr_api::graph::traits::Balance::zero()));
+        assert_eq!(
+            2f64.powi(200),
+            base_units(hopr_api::graph::traits::Balance::from(1u8) << 200),
+            "an amount above 2^128 must not be reported as zero"
+        );
     }
 }

@@ -214,7 +214,11 @@ async fn chain_write_metrics_are_exported() -> anyhow::Result<()> {
 
 /// Whether the Prometheus text has a sample of `name` carrying every given label.
 fn has_sample(metrics: &str, name: &str, labels: &[&str]) -> bool {
+    let sample = |line: &str| {
+        line.strip_prefix(name)
+            .is_some_and(|rest| rest.starts_with('{') || rest.starts_with(' '))
+    };
     metrics
         .lines()
-        .any(|line| line.starts_with(name) && labels.iter().all(|label| line.contains(label)))
+        .any(|line| sample(line) && labels.iter().all(|label| line.contains(label)))
 }

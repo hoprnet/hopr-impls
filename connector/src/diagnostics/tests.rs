@@ -230,9 +230,9 @@ fn channel_gauges_count_open_apart_from_pending_to_close_and_only_reachable_peer
     );
     assert_eq!(2, gauges.count("outgoing", "open"));
     assert_eq!(
-        2,
+        1,
         gauges.usable_outgoing(),
-        "a drained open channel still counts towards usable peers"
+        "a drained open channel counts as open but path finding drops its edge"
     );
 
     Ok(())
