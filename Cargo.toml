@@ -106,5 +106,5 @@ validator = { version = "0.21.0", features = ["derive"] }
 
 # Temporary: unreleased blokli-client#87 (unmined diagnosis). Replace with the released version before merging.
 [patch.crates-io]
-blokli-client = { git = "https://github.com/hoprnet/blokli-client", branch = "agent/86-unmined-diagnosis" }
+blokli-client  = { git = "https://github.com/hoprnet/blokli-client", branch = "agent/86-unmined-diagnosis" }
 hopr-utilities = { git = "https://github.com/hoprnet/hopr-utilities", branch = "agent/blokli-client-0.38" }

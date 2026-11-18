@@ -255,15 +255,15 @@ async fn read_gas_estimation<C: BlokliQueryClient + Sync>(client: &C) -> errors:
 /// Signs and submits a transaction with `nonce` and `gas` through `attempt`, and corrects it once
 /// when Blokli's refusal says what was wrong with it.
 ///
-/// - `NONCE_TOO_HIGH`: the nonce was not consumed and the local nonce is ahead of what the chain
-///   expects. The chain's pending count is re-read through `read_pending` and adopted as the local
-///   nonce. The pending count never goes below `first_pending`, the one read at the start of the
-///   submission, and one that does not lie below the refused nonce is not worth a retry.
-/// - `NONCE_TOO_LOW`: the nonce was already used and the local nonce is behind. The pending count is
-///   re-read and adopted the same way, but only if it lies above the refused nonce.
-/// - `FEE_TOO_LOW`: the nonce was not consumed. The fees are read again through `read_gas`, and the
-///   transaction is signed at the same nonce only if they are higher than the ones just refused.
-///   Blokli caches its estimate for a block, so an unchanged estimate would be refused again.
+/// - `NONCE_TOO_HIGH`: the nonce was not consumed and the local nonce is ahead of what the chain expects. The chain's
+///   pending count is re-read through `read_pending` and adopted as the local nonce. The pending count never goes below
+///   `first_pending`, the one read at the start of the submission, and one that does not lie below the refused nonce is
+///   not worth a retry.
+/// - `NONCE_TOO_LOW`: the nonce was already used and the local nonce is behind. The pending count is re-read and
+///   adopted the same way, but only if it lies above the refused nonce.
+/// - `FEE_TOO_LOW`: the nonce was not consumed. The fees are read again through `read_gas`, and the transaction is
+///   signed at the same nonce only if they are higher than the ones just refused. Blokli caches its estimate for a
+///   block, so an unchanged estimate would be refused again.
 ///
 /// The correction happens at most once per submission, whatever the refusal: a second refusal is
 /// returned as is. Failing to read the corrected value returns the first refusal.
