@@ -531,7 +531,7 @@ mod tests {
     use super::*;
 
     fn failed(kind: ErrorKind) -> errors::Result<errors::Result<blokli_client::api::TxId>> {
-        Ok(Err(ConnectorError::ClientError(kind.into())))
+        Ok(Err(errors::test_support::client_error(kind)))
     }
 
     fn rpc_refusal(code: &str) -> errors::Result<errors::Result<blokli_client::api::TxId>> {
@@ -827,42 +827,15 @@ mod tests {
 
     #[tokio::test]
     async fn a_diagnosed_dropped_timeout_frees_the_nonce_and_a_plain_timeout_does_not() {
-        use blokli_client::{
-            BlokliTestClient, BlokliTestState, NopStateMutator,
-            api::types::{TransactionDiagnosis, TransactionStatus, UnminedReason},
-        };
+        use blokli_client::api::types::UnminedReason;
 
-        let client = BlokliTestClient::new(BlokliTestState::default(), NopStateMutator)
-            .with_tx_simulation_delay(Duration::from_millis(1));
-        let tx_id = client.submit_and_track_transaction(&[0x02]).await.unwrap();
-        let client = client.with_unmined_diagnosis(
-            tx_id.clone(),
-            TransactionDiagnosis {
-                reason: UnminedReason::Dropped,
-                signed_fees: None,
-                recommended_fees: None,
-                min_replacement_fees: None,
-                retry_after_seconds: 0,
-            },
-        );
-        client.hidden_state_update(|state| {
-            state.active_txs.get_mut(&tx_id).expect("tracked").status = TransactionStatus::Timeout;
-        });
-        let error = ConnectorError::from(
-            client
-                .track_transaction(tx_id, Duration::from_secs(1))
-                .await
-                .expect_err("the transaction timed out"),
-        );
+        let dropped = errors::test_support::timed_out_error(UnminedReason::Dropped, 0).await;
+        let underpriced = errors::test_support::timed_out_error(UnminedReason::Underpriced, 0).await;
+        let plain = errors::test_support::client_error(ErrorKind::TrackingError(TrackingErrorKind::Timeout));
 
-        assert!(nonce_is_free(&error));
-        assert!(!nonce_is_free(&failed_connector(ErrorKind::TrackingError(
-            TrackingErrorKind::Timeout
-        ))));
-    }
-
-    fn failed_connector(kind: ErrorKind) -> ConnectorError {
-        ConnectorError::ClientError(kind.into())
+        assert!(nonce_is_free(&dropped));
+        assert!(!nonce_is_free(&underpriced));
+        assert!(!nonce_is_free(&plain));
     }
 
     #[test]

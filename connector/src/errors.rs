@@ -177,15 +177,65 @@ impl ConnectorError {
 
 pub type Result<T> = std::result::Result<T, ConnectorError>;
 
+/// Builders of connector errors shared by the tests of this crate.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::time::Duration;
+
+    use blokli_client::{
+        BlokliTestClient, BlokliTestState, NopStateMutator,
+        api::{
+            BlokliTransactionClient,
+            types::{TransactionDiagnosis, TransactionStatus, UnminedReason},
+        },
+        errors::ErrorKind,
+    };
+
+    use super::ConnectorError;
+
+    /// A connector error wrapping a client error of `kind`.
+    pub(crate) fn client_error(kind: ErrorKind) -> ConnectorError {
+        ConnectorError::ClientError(kind.into())
+    }
+
+    /// The error of a tracked transaction that timed out with Blokli's diagnosis `reason` and hint.
+    pub(crate) async fn timed_out_error(reason: UnminedReason, retry_after_seconds: u32) -> ConnectorError {
+        let client = BlokliTestClient::new(BlokliTestState::default(), NopStateMutator)
+            .with_tx_simulation_delay(Duration::from_millis(1));
+        let tx_id = client.submit_and_track_transaction(&[0x02]).await.unwrap();
+        let client = client.with_unmined_diagnosis(
+            tx_id.clone(),
+            TransactionDiagnosis {
+                reason,
+                signed_fees: None,
+                recommended_fees: None,
+                min_replacement_fees: None,
+                retry_after_seconds,
+            },
+        );
+        client.hidden_state_update(|state| {
+            state.active_txs.get_mut(&tx_id).expect("tracked").status = TransactionStatus::Timeout;
+        });
+
+        ConnectorError::from(
+            client
+                .track_transaction(tx_id, Duration::from_secs(1))
+                .await
+                .expect_err("the transaction timed out"),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
-    use super::*;
+    use blokli_client::api::types::UnminedReason;
 
-    fn client_error(kind: ErrorKind) -> ConnectorError {
-        ConnectorError::ClientError(kind.into())
-    }
+    use super::{
+        test_support::{client_error, timed_out_error},
+        *,
+    };
 
     #[test]
     fn hopr_action_rejection_is_permanent_and_not_broadcast() {
@@ -278,43 +328,9 @@ mod tests {
         assert!(error.as_hopr_action_rejection().is_some());
     }
 
-    async fn timed_out_error(retry_after_seconds: u32) -> ConnectorError {
-        use blokli_client::{
-            BlokliTestClient, BlokliTestState, NopStateMutator,
-            api::{
-                BlokliTransactionClient,
-                types::{TransactionStatus, UnminedReason},
-            },
-        };
-
-        let client = BlokliTestClient::new(BlokliTestState::default(), NopStateMutator)
-            .with_tx_simulation_delay(Duration::from_millis(1));
-        let tx_id = client.submit_and_track_transaction(&[0x02]).await.unwrap();
-        let client = client.with_unmined_diagnosis(
-            tx_id.clone(),
-            TransactionDiagnosis {
-                reason: UnminedReason::Underpriced,
-                signed_fees: None,
-                recommended_fees: None,
-                min_replacement_fees: None,
-                retry_after_seconds,
-            },
-        );
-        client.hidden_state_update(|state| {
-            state.active_txs.get_mut(&tx_id).expect("tracked").status = TransactionStatus::Timeout;
-        });
-
-        ConnectorError::from(
-            client
-                .track_transaction(tx_id, Duration::from_secs(1))
-                .await
-                .expect_err("the transaction timed out"),
-        )
-    }
-
     #[tokio::test]
     async fn diagnosed_timeout_exposes_its_hint_but_is_not_a_refusal() {
-        let error = timed_out_error(30).await;
+        let error = timed_out_error(UnminedReason::Underpriced, 30).await;
 
         assert_eq!(Some(Duration::from_secs(30)), error.unmined_retry_after());
         assert!(error.unmined_diagnosis().is_some());
@@ -326,7 +342,9 @@ mod tests {
 
     #[tokio::test]
     async fn diagnosis_is_seen_through_cached_errors() {
-        let error = ConnectorError::CacheError(std::sync::Arc::new(timed_out_error(12).await));
+        let error = ConnectorError::CacheError(std::sync::Arc::new(
+            timed_out_error(UnminedReason::Underpriced, 12).await,
+        ));
 
         assert_eq!(Some(Duration::from_secs(12)), error.unmined_retry_after());
         assert!(!error.is_refused_before_broadcast());
@@ -334,7 +352,7 @@ mod tests {
 
     #[tokio::test]
     async fn zero_second_hint_means_no_back_off() {
-        let error = timed_out_error(0).await;
+        let error = timed_out_error(UnminedReason::Underpriced, 0).await;
 
         assert!(error.unmined_diagnosis().is_some());
         assert_eq!(None, error.unmined_retry_after());
