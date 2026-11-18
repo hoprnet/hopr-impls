@@ -289,7 +289,7 @@ where
         return first;
     };
 
-    match error.rpc_rejection_code() {
+    match error.refusal_code() {
         Some(code @ (RefusalCode::NonceTooHigh | RefusalCode::NonceTooLow)) => match read_pending().await {
             Ok(re_read) => {
                 let pending = re_read.max(first_pending);
@@ -444,7 +444,7 @@ fn nonce_consumed(
     if error.is_refused_before_broadcast() {
         return Some(false);
     }
-    match error.rpc_rejection_code() {
+    match error.refusal_code() {
         // a transaction already holds this nonce, mined or pending: it is consumed whatever the cache says
         Some(RefusalCode::ReplacementUnderpriced) => Some(true),
         Some(RefusalCode::FeeTooLow | RefusalCode::InsufficientFunds) => Some(false),

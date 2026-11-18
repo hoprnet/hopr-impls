@@ -152,7 +152,7 @@ where
         let rejection = error.as_transaction_rejection_error();
         if error.is_refused_before_broadcast()
             || matches!(
-                error.rpc_rejection_code(),
+                error.refusal_code(),
                 Some(RefusalCode::FeeTooLow | RefusalCode::InsufficientFunds)
             )
             || matches!(rejection, Some(TrackingErrorKind::ValidationFailed))

@@ -119,19 +119,12 @@ impl ConnectorError {
             )
     }
 
-    /// Returns Blokli's classification of the RPC node's refusal to broadcast, such as
-    /// [`RefusalCode::NonceTooLow`].
+    /// Returns Blokli's typed classification of a refusal, such as [`RefusalCode::NonceTooLow`] for the RPC
+    /// node's refusal to broadcast.
     ///
     /// A code this client version does not know is returned as [`RefusalCode::Unknown`].
-    pub fn rpc_rejection_code(&self) -> Option<RefusalCode> {
-        match self.client_error_kind()? {
-            ErrorKind::BlokliError {
-                kind: "rpc error",
-                code,
-                ..
-            } => Some(RefusalCode::from(code.as_str())),
-            _ => None,
-        }
+    pub fn refusal_code(&self) -> Option<RefusalCode> {
+        self.blokli_client_error()?.refusal_code()
     }
 
     /// Returns Blokli's explanation of why a timed out transaction was not mined, if it gave one.
@@ -257,7 +250,7 @@ mod tests {
             });
 
             assert!(error.is_refused_before_broadcast(), "{kind}");
-            assert_eq!(None, error.rpc_rejection_code(), "{kind}");
+            assert_eq!(None, error.refusal_code(), "{kind}");
         }
     }
 
@@ -269,9 +262,9 @@ mod tests {
             message: "nonce too high".into(),
         })));
 
-        assert_eq!(Some(RefusalCode::NonceTooHigh), error.rpc_rejection_code());
+        assert_eq!(Some(RefusalCode::NonceTooHigh), error.refusal_code());
         assert!(!error.is_refused_before_broadcast());
-        assert_eq!(None, client_error(ErrorKind::Timeout).rpc_rejection_code());
+        assert_eq!(None, client_error(ErrorKind::Timeout).refusal_code());
     }
 
     #[test]
