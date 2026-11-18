@@ -34,6 +34,9 @@ type TxRequest<T> = (
 pub struct TransactionSequencer<C, R> {
     sender: futures::channel::mpsc::Sender<TxRequest<R>>,
     client: std::sync::Arc<C>,
+    // Shared with the queue task, to drop the nonce of a signer whose transaction was found dropped
+    current_nonce: moka::sync::Cache<Address, std::sync::Arc<AtomicU64>>,
+    own_signer: Address,
 }
 
 const TX_QUEUE_CAPACITY: usize = 2048;
@@ -97,6 +100,7 @@ where
         tracing::debug!(signer = %signer.public().to_address(), "starting transaction sequencer");
 
         let client_clone = client.clone();
+        let signer_addr_own = signer.public().to_address();
         let (sender, receiver) = futures::channel::mpsc::channel::<TxRequest<R>>(TX_QUEUE_CAPACITY);
 
         // Nonce of our node signer never expires, all other signers expire after a few minutes
@@ -106,6 +110,8 @@ where
                 tti: OTHER_SIGNER_NONCE_EXPIRATION,
             })
             .build();
+
+        let current_nonce_handle = current_nonce.clone();
 
         // Tracking ids Blokli has already handed out to this sequencer.
         //
@@ -134,13 +140,7 @@ where
                     async move {
                         // Outer `Err`: the transaction never reached Blokli, inner: Blokli's outcome
                         let submission = async {
-                            let chain_info = client.query_chain_info().map_err(ConnectorError::from).await?;
-                            tracing::debug!(chain_id = chain_info.chain_id, "chain info retrieved for tx");
-
-                            let parsed_chain_info = model_to_chain_info(chain_info)?;
-                            let chain_id = parsed_chain_info.info.chain_id;
-                            let gas_estimation = GasEstimation::from(parsed_chain_info);
-                            tracing::debug!(?gas_estimation, "gas estimation used for tx");
+                            let (chain_id, gas_estimation) = read_gas_estimation(&*client).await?;
 
                             let pending = client
                                 .query_transaction_count(&signer_addr.into())
@@ -150,11 +150,12 @@ where
                             let nonce =
                                 sync_nonce(&local_nonce, &nonce_gaps, signer_addr, pending, nonce_gap_tolerance);
 
-                            submit_with_nonce_retry(
+                            submit_with_retry(
                                 nonce,
+                                gas_estimation,
                                 pending,
                                 &local_nonce,
-                                |nonce| {
+                                |nonce, gas_estimation| {
                                     tracing::Span::current().record("nonce", nonce);
                                     let tx = tx.clone();
                                     let client = &client;
@@ -176,6 +177,7 @@ where
                                         .map_err(ConnectorError::from)
                                         .await
                                 },
+                                || async { read_gas_estimation(&*client).await.map(|(_, gas)| gas) },
                             )
                             .await
                         }
@@ -227,62 +229,135 @@ where
                 .inspect(|_| tracing::warn!("transaction sequencer queue stopped")),
         );
 
-        Self { sender, client }
+        Self {
+            sender,
+            client,
+            current_nonce: current_nonce_handle,
+            own_signer: signer_addr_own,
+        }
     }
 }
 
 type Submission = errors::Result<errors::Result<blokli_client::api::TxId>>;
 
-/// Signs and submits a transaction with `nonce` through `attempt`.
+/// Reads the chain id and the fees to sign with from Blokli.
+async fn read_gas_estimation<C: BlokliQueryClient + Sync>(client: &C) -> errors::Result<(u64, GasEstimation)> {
+    let chain_info = client.query_chain_info().map_err(ConnectorError::from).await?;
+    tracing::debug!(chain_id = chain_info.chain_id, "chain info retrieved for tx");
+
+    let parsed_chain_info = model_to_chain_info(chain_info)?;
+    let chain_id = parsed_chain_info.info.chain_id;
+    let gas_estimation = GasEstimation::from(parsed_chain_info);
+    tracing::debug!(?gas_estimation, "gas estimation used for tx");
+    Ok((chain_id, gas_estimation))
+}
+
+/// Signs and submits a transaction with `nonce` and `gas` through `attempt`, and corrects it once
+/// when Blokli's refusal says what was wrong with it.
 ///
-/// When Blokli refuses it as `NONCE_TOO_HIGH`, the nonce is not consumed and the local nonce is
-/// ahead of what the chain expects. The chain's pending count is then re-read through
-/// `read_pending`, adopted as the local nonce, and the transaction is signed and submitted once
-/// more with it. The pending count never goes below `first_pending`, the one read at the start of
-/// the submission, and a count that does not lie below the refused nonce is not worth a retry.
-/// The retry happens at most once per submission: a second refusal is returned as is.
-async fn submit_with_nonce_retry<A, AFut, P, PFut>(
+/// - `NONCE_TOO_HIGH`: the nonce was not consumed and the local nonce is ahead of what the chain
+///   expects. The chain's pending count is re-read through `read_pending` and adopted as the local
+///   nonce. The pending count never goes below `first_pending`, the one read at the start of the
+///   submission, and one that does not lie below the refused nonce is not worth a retry.
+/// - `NONCE_TOO_LOW`: the nonce was already used and the local nonce is behind. The pending count is
+///   re-read and adopted the same way, but only if it lies above the refused nonce.
+/// - `FEE_TOO_LOW`: the nonce was not consumed. The fees are read again through `read_gas`, and the
+///   transaction is signed at the same nonce only if they are higher than the ones just refused.
+///   Blokli caches its estimate for a block, so an unchanged estimate would be refused again.
+///
+/// The correction happens at most once per submission, whatever the refusal: a second refusal is
+/// returned as is. Failing to read the corrected value returns the first refusal.
+async fn submit_with_retry<A, AFut, P, PFut, G, GFut>(
     nonce: u64,
+    gas: GasEstimation,
     first_pending: u64,
     local: &AtomicU64,
     mut attempt: A,
     read_pending: P,
+    read_gas: G,
 ) -> Submission
 where
-    A: FnMut(u64) -> AFut,
+    A: FnMut(u64, GasEstimation) -> AFut,
     AFut: Future<Output = Submission>,
     P: FnOnce() -> PFut,
     PFut: Future<Output = errors::Result<u64>>,
+    G: FnOnce() -> GFut,
+    GFut: Future<Output = errors::Result<GasEstimation>>,
 {
-    let first = attempt(nonce).await;
-    if !matches!(&first, Ok(Err(error)) if error.rpc_rejection_code() == Some("NONCE_TOO_HIGH")) {
+    let first = attempt(nonce, gas).await;
+    let Ok(Err(error)) = &first else {
         return first;
-    }
+    };
 
-    match read_pending().await {
-        Ok(re_read) => {
-            let pending = re_read.max(first_pending);
-            if pending >= nonce {
+    match error.rpc_rejection_code() {
+        Some(code @ ("NONCE_TOO_HIGH" | "NONCE_TOO_LOW")) => match read_pending().await {
+            Ok(re_read) => {
+                let pending = re_read.max(first_pending);
+                let usable = if code == "NONCE_TOO_HIGH" {
+                    pending < nonce
+                } else {
+                    pending > nonce
+                };
+                if !usable {
+                    tracing::warn!(nonce, pending, code, "pending count does not correct the refused nonce");
+                    return first;
+                }
                 tracing::warn!(
                     nonce,
                     pending,
-                    "nonce refused as too high, but not above the pending count"
+                    code,
+                    "nonce refused, retrying once with the chain's pending count"
                 );
-                return first;
+                local.store(pending, std::sync::atomic::Ordering::Relaxed);
+                attempt(pending, gas).await
             }
-            tracing::warn!(
-                nonce,
-                pending,
-                "nonce refused as too high, retrying once with the chain's pending count"
-            );
-            local.store(pending, std::sync::atomic::Ordering::Relaxed);
-            attempt(pending).await
-        }
-        Err(error) => {
-            tracing::warn!(%error, "failed to re-read the pending count after a too high nonce");
-            first
-        }
+            Err(error) => {
+                tracing::warn!(%error, code, "failed to re-read the pending count after a refused nonce");
+                first
+            }
+        },
+        Some("FEE_TOO_LOW") => match read_gas().await {
+            Ok(new_gas)
+                if new_gas.max_fee_per_gas > gas.max_fee_per_gas
+                    || new_gas.max_priority_fee_per_gas > gas.max_priority_fee_per_gas =>
+            {
+                tracing::warn!(
+                    nonce,
+                    old_max_fee = gas.max_fee_per_gas,
+                    new_max_fee = new_gas.max_fee_per_gas,
+                    "fees refused as too low, retrying once with Blokli's current estimate"
+                );
+                attempt(nonce, new_gas).await
+            }
+            Ok(_) => {
+                tracing::warn!(nonce, "fees refused as too low, but Blokli's estimate did not increase");
+                first
+            }
+            Err(error) => {
+                tracing::warn!(%error, "failed to re-read the fees after they were refused as too low");
+                first
+            }
+        },
+        _ => first,
     }
+}
+
+/// Whether Blokli found a timed out transaction to leave its nonce unused, so that the local nonce is ahead.
+///
+/// This is the case when the RPC node dropped the transaction, or an earlier nonce of the signer is missing
+/// altogether. Every later transaction of the signer then waits for a nonce that is never mined, until the
+/// local nonce is read from the chain again. A transaction that is merely underpriced or queued behind pending
+/// ones keeps its nonce, and a replaced one lost it to another transaction.
+fn nonce_is_free(error: &ConnectorError) -> bool {
+    error
+        .unmined_diagnosis()
+        .is_some_and(|diagnosis| reason_leaves_nonce_free(&diagnosis.reason))
+}
+
+fn reason_leaves_nonce_free(reason: &blokli_client::api::types::UnminedReason) -> bool {
+    use blokli_client::api::types::UnminedReason;
+
+    matches!(reason, UnminedReason::Dropped | UnminedReason::NonceGap)
 }
 
 /// Records a tracking id returned by Blokli.
@@ -365,9 +440,11 @@ fn nonce_consumed(
         return Some(false);
     }
     match error.rpc_rejection_code() {
-        Some("NONCE_TOO_LOW" | "REPLACEMENT_UNDERPRICED") => Some(true),
+        // a transaction already holds this nonce, mined or pending: it is consumed whatever the cache says
+        Some("REPLACEMENT_UNDERPRICED") => Some(true),
         Some("FEE_TOO_LOW" | "INSUFFICIENT_FUNDS") => Some(false),
-        // NONCE_TOO_HIGH refused twice, unverified ALREADY_KNOWN, unclassified RPC errors, transport failures
+        // NONCE_TOO_LOW or NONCE_TOO_HIGH refused again after their correction, unverified ALREADY_KNOWN,
+        // unclassified RPC errors, transport failures
         _ => None,
     }
 }
@@ -386,6 +463,10 @@ where
         custom_signer: Option<ChainKeypair>,
     ) -> errors::Result<impl Future<Output = errors::Result<blokli_client::api::types::Transaction>>> {
         let (notifier_tx, notifier_rx) = futures::channel::oneshot::channel();
+        let signer_addr = custom_signer
+            .as_ref()
+            .map_or(self.own_signer, |signer| signer.public().to_address());
+        let current_nonce = self.current_nonce.clone();
 
         self.sender
             .clone()
@@ -400,11 +481,21 @@ where
                     .map_err(|_| ConnectorError::InvalidState("transaction notifier dropped"))
                     .and_then(|tx_res| tx_res.map(|id| (id, timeout_until_finalized)))
             })
-            .and_then(|(tx_id, timeout)| {
+            .and_then(move |(tx_id, timeout)| {
                 self.client
                     .track_transaction(tx_id, timeout)
                     .map_err(ConnectorError::from)
                     .inspect(|res| tracing::debug!(?res, "transaction tracking done"))
+                    .inspect_err(move |error| {
+                        if nonce_is_free(error) {
+                            tracing::warn!(
+                                %signer_addr,
+                                diagnosis = ?error.unmined_diagnosis(),
+                                "transaction left unmined with its nonce unused, re-reading the nonce from the chain"
+                            );
+                            current_nonce.invalidate(&signer_addr);
+                        }
+                    })
                     .and_then(|outcome| async move {
                         match outcome {
                             TransactionTrackingOutcome::Confirmed(tx) => Ok(tx),
@@ -449,7 +540,6 @@ mod tests {
     #[test]
     fn nonce_is_consumed_by_a_broadcast_tx_or_a_competing_one() {
         assert_eq!(Some(true), nonce_consumed(&Ok(Ok("tx-1".into())), false));
-        assert_eq!(Some(true), nonce_consumed(&rpc_refusal("NONCE_TOO_LOW"), false));
         assert_eq!(
             Some(true),
             nonce_consumed(&rpc_refusal("REPLACEMENT_UNDERPRICED"), false)
@@ -480,119 +570,294 @@ mod tests {
 
     #[test]
     fn nonce_consumption_is_unknown_when_the_result_does_not_tell() {
-        // NONCE_TOO_HIGH reaches here only after its single retry was refused as well
-        for code in ["NONCE_TOO_HIGH", "ALREADY_KNOWN", "RPC_ERROR"] {
+        // the nonce codes reach here only after their single correction was refused as well
+        for code in ["NONCE_TOO_HIGH", "NONCE_TOO_LOW", "ALREADY_KNOWN", "RPC_ERROR"] {
             assert_eq!(None, nonce_consumed(&rpc_refusal(code), false), "{code}");
         }
         assert_eq!(None, nonce_consumed(&failed(ErrorKind::Timeout), false), "transport");
     }
 
-    /// Runs [`submit_with_nonce_retry`] with `outcomes` as the results of successive attempts.
-    ///
-    /// Returns the nonces the attempts were signed with, the final local nonce and the result.
-    async fn run_retry(first_nonce: u64, pending: u64, outcomes: Vec<Submission>) -> (Vec<u64>, u64, Submission) {
-        run_retry_from(first_nonce, pending, pending, outcomes).await
+    const LOW_FEE: u128 = 1_000;
+    const HIGH_FEE: u128 = 5_000;
+
+    fn gas(max_fee_per_gas: u128) -> GasEstimation {
+        GasEstimation {
+            max_fee_per_gas,
+            ..GasEstimation::default()
+        }
     }
 
-    /// Like [`run_retry`], with `first_pending` read at the start and `pending` re-read after the refusal.
-    async fn run_retry_from(
-        first_nonce: u64,
+    /// What a run of [`submit_with_retry`] did.
+    struct Run {
+        /// Nonce and max fee of every attempt, in order.
+        attempts: Vec<(u64, u128)>,
+        /// The local nonce after the run.
+        local: u64,
+        result: Submission,
+        pending_reads: usize,
+        gas_reads: usize,
+    }
+
+    /// Setup of a run: the nonce, the pending counts and the fees Blokli returns, and the attempt results.
+    struct Setup {
+        nonce: u64,
         first_pending: u64,
-        pending: u64,
+        pending: errors::Result<u64>,
+        new_gas: errors::Result<GasEstimation>,
         outcomes: Vec<Submission>,
-    ) -> (Vec<u64>, u64, Submission) {
-        let used = std::sync::Mutex::new(Vec::new());
-        let outcomes = std::sync::Mutex::new(outcomes.into_iter());
-        let local = AtomicU64::new(first_nonce);
-        let result = submit_with_nonce_retry(
-            first_nonce,
-            first_pending,
-            &local,
-            |nonce| {
-                used.lock().unwrap().push(nonce);
-                let outcome = outcomes.lock().unwrap().next().expect("unexpected extra attempt");
-                async move { outcome }
-            },
-            || async move { Ok(pending) },
-        )
-        .await;
-        let used = used.into_inner().unwrap();
-        (used, local.load(std::sync::atomic::Ordering::Relaxed), result)
+    }
+
+    impl Setup {
+        fn new(nonce: u64, pending: u64, outcomes: Vec<Submission>) -> Self {
+            Self {
+                nonce,
+                first_pending: pending,
+                pending: Ok(pending),
+                new_gas: Ok(gas(HIGH_FEE)),
+                outcomes,
+            }
+        }
+
+        async fn run(self) -> Run {
+            let attempts = std::sync::Mutex::new(Vec::new());
+            let outcomes = std::sync::Mutex::new(self.outcomes.into_iter());
+            let local = AtomicU64::new(self.nonce);
+            let reads = std::sync::Mutex::new((0usize, 0usize));
+            let result = submit_with_retry(
+                self.nonce,
+                gas(LOW_FEE),
+                self.first_pending,
+                &local,
+                |nonce, gas| {
+                    attempts.lock().unwrap().push((nonce, gas.max_fee_per_gas));
+                    let outcome = outcomes.lock().unwrap().next().expect("unexpected extra attempt");
+                    async move { outcome }
+                },
+                || {
+                    reads.lock().unwrap().0 += 1;
+                    async { self.pending }
+                },
+                || {
+                    reads.lock().unwrap().1 += 1;
+                    async { self.new_gas }
+                },
+            )
+            .await;
+            let (pending_reads, gas_reads) = reads.into_inner().unwrap();
+            Run {
+                attempts: attempts.into_inner().unwrap(),
+                local: local.load(std::sync::atomic::Ordering::Relaxed),
+                result,
+                pending_reads,
+                gas_reads,
+            }
+        }
+    }
+
+    fn ok() -> Submission {
+        Ok(Ok("tx-1".into()))
     }
 
     #[tokio::test]
     async fn too_high_nonce_is_resubmitted_once_with_the_pending_count() {
-        let (used, local, result) = run_retry(9, 5, vec![rpc_refusal("NONCE_TOO_HIGH"), Ok(Ok("tx-1".into()))]).await;
+        let run = Setup::new(9, 5, vec![rpc_refusal("NONCE_TOO_HIGH"), ok()]).run().await;
 
-        assert_eq!(vec![9, 5], used, "re-signed with the re-read nonce");
-        assert_eq!(5, local, "pending count adopted as the local nonce");
-        assert_eq!(Some(true), nonce_consumed(&result, false));
+        assert_eq!(
+            vec![(9, LOW_FEE), (5, LOW_FEE)],
+            run.attempts,
+            "re-signed with the re-read nonce"
+        );
+        assert_eq!(5, run.local, "pending count adopted as the local nonce");
+        assert_eq!(Some(true), nonce_consumed(&run.result, false));
+        assert_eq!(0, run.gas_reads, "the fees are not read for a nonce refusal");
     }
 
     #[tokio::test]
     async fn too_high_nonce_never_retries_below_the_first_pending_count() {
-        let (used, local, _) =
-            run_retry_from(9, 7, 5, vec![rpc_refusal("NONCE_TOO_HIGH"), Ok(Ok("tx-1".into()))]).await;
+        let mut setup = Setup::new(9, 7, vec![rpc_refusal("NONCE_TOO_HIGH"), ok()]);
+        setup.pending = Ok(5);
+        let run = setup.run().await;
 
-        assert_eq!(vec![9, 7], used, "re-signed with the larger pending count");
-        assert_eq!(7, local, "the lower re-read count is not adopted");
+        assert_eq!(vec![9, 7], run.attempts.iter().map(|a| a.0).collect::<Vec<_>>());
+        assert_eq!(7, run.local, "the lower re-read count is not adopted");
     }
 
     #[tokio::test]
     async fn too_high_nonce_is_not_resigned_when_pending_reaches_it() {
-        let (used, local, result) = run_retry_from(9, 9, 5, vec![rpc_refusal("NONCE_TOO_HIGH")]).await;
+        let mut setup = Setup::new(9, 9, vec![rpc_refusal("NONCE_TOO_HIGH")]);
+        setup.pending = Ok(5);
+        let run = setup.run().await;
 
-        assert_eq!(vec![9], used, "same nonce is not signed again");
-        assert_eq!(9, local);
-        assert_eq!(None, nonce_consumed(&result, false));
+        assert_eq!(1, run.attempts.len(), "same nonce is not signed again");
+        assert_eq!(9, run.local);
+        assert_eq!(None, nonce_consumed(&run.result, false));
     }
 
     #[tokio::test]
-    async fn too_high_nonce_is_not_retried_twice() {
-        let (used, local, result) =
-            run_retry(9, 5, vec![rpc_refusal("NONCE_TOO_HIGH"), rpc_refusal("NONCE_TOO_HIGH")]).await;
+    async fn too_low_nonce_is_resubmitted_once_with_the_pending_count() {
+        let mut setup = Setup::new(5, 5, vec![rpc_refusal("NONCE_TOO_LOW"), ok()]);
+        setup.pending = Ok(8);
+        let run = setup.run().await;
 
-        assert_eq!(vec![9, 5], used);
-        assert_eq!(5, local);
-        assert_eq!(None, nonce_consumed(&result, false), "left for a re-read");
+        assert_eq!(vec![(5, LOW_FEE), (8, LOW_FEE)], run.attempts);
+        assert_eq!(8, run.local, "pending count adopted as the local nonce");
+        assert_eq!(Some(true), nonce_consumed(&run.result, false));
+        assert_eq!(0, run.gas_reads);
+    }
+
+    #[tokio::test]
+    async fn too_low_nonce_is_not_resigned_when_pending_does_not_pass_it() {
+        let run = Setup::new(5, 5, vec![rpc_refusal("NONCE_TOO_LOW")]).run().await;
+
+        assert_eq!(1, run.attempts.len());
+        assert_eq!(5, run.local);
+        assert_eq!(None, nonce_consumed(&run.result, false), "left for a re-read");
+    }
+
+    #[tokio::test]
+    async fn nonce_refusals_are_not_retried_twice() {
+        for (code, pending) in [("NONCE_TOO_HIGH", 5), ("NONCE_TOO_LOW", 12)] {
+            let mut setup = Setup::new(9, 5, vec![rpc_refusal(code), rpc_refusal(code)]);
+            setup.pending = Ok(pending);
+            let run = setup.run().await;
+
+            assert_eq!(2, run.attempts.len(), "{code}");
+            assert_eq!(None, nonce_consumed(&run.result, false), "{code}: left for a re-read");
+        }
+    }
+
+    #[tokio::test]
+    async fn nonce_refusals_are_returned_when_the_pending_count_cannot_be_read() {
+        for code in ["NONCE_TOO_HIGH", "NONCE_TOO_LOW"] {
+            let mut setup = Setup::new(9, 5, vec![rpc_refusal(code)]);
+            setup.pending = Err(ConnectorError::ServerNotHealthy);
+            let run = setup.run().await;
+
+            assert_eq!(1, run.attempts.len(), "{code}");
+            assert_eq!(9, run.local, "{code}");
+            assert_eq!(None, nonce_consumed(&run.result, false), "{code}");
+        }
+    }
+
+    #[tokio::test]
+    async fn too_low_fees_are_resubmitted_once_at_the_same_nonce_with_the_current_estimate() {
+        let run = Setup::new(9, 5, vec![rpc_refusal("FEE_TOO_LOW"), ok()]).run().await;
+
+        assert_eq!(
+            vec![(9, LOW_FEE), (9, HIGH_FEE)],
+            run.attempts,
+            "same nonce, higher fees"
+        );
+        assert_eq!(9, run.local, "the nonce did not move");
+        assert_eq!(Some(true), nonce_consumed(&run.result, false));
+        assert_eq!(0, run.pending_reads, "the pending count is not read for a fee refusal");
+    }
+
+    #[tokio::test]
+    async fn too_low_fees_are_not_resigned_when_the_estimate_did_not_increase() {
+        for new_gas in [gas(LOW_FEE), gas(LOW_FEE - 1)] {
+            let mut setup = Setup::new(9, 5, vec![rpc_refusal("FEE_TOO_LOW")]);
+            setup.new_gas = Ok(new_gas);
+            let run = setup.run().await;
+
+            assert_eq!(1, run.attempts.len());
+            assert_eq!(Some(false), nonce_consumed(&run.result, false), "nonce stays free");
+        }
+    }
+
+    #[tokio::test]
+    async fn too_low_fees_are_returned_when_the_estimate_cannot_be_read() {
+        let mut setup = Setup::new(9, 5, vec![rpc_refusal("FEE_TOO_LOW")]);
+        setup.new_gas = Err(ConnectorError::ServerNotHealthy);
+        let run = setup.run().await;
+
+        assert_eq!(1, run.attempts.len());
+        assert_eq!(Some(false), nonce_consumed(&run.result, false));
+    }
+
+    #[tokio::test]
+    async fn too_low_fees_are_not_retried_twice() {
+        let run = Setup::new(9, 5, vec![rpc_refusal("FEE_TOO_LOW"), rpc_refusal("FEE_TOO_LOW")])
+            .run()
+            .await;
+
+        assert_eq!(2, run.attempts.len());
+        assert_eq!(1, run.gas_reads);
+        assert_eq!(Some(false), nonce_consumed(&run.result, false));
     }
 
     #[tokio::test]
     async fn other_refusals_and_successes_are_not_resubmitted() {
         for code in [
-            "NONCE_TOO_LOW",
             "REPLACEMENT_UNDERPRICED",
-            "FEE_TOO_LOW",
             "INSUFFICIENT_FUNDS",
             "ALREADY_KNOWN",
+            "RPC_ERROR",
         ] {
-            let (used, local, _) = run_retry(9, 5, vec![rpc_refusal(code)]).await;
-            assert_eq!(vec![9], used, "{code}");
-            assert_eq!(9, local, "{code}");
+            let run = Setup::new(9, 5, vec![rpc_refusal(code)]).run().await;
+            assert_eq!(vec![(9, LOW_FEE)], run.attempts, "{code}");
+            assert_eq!(9, run.local, "{code}");
+            assert_eq!((0, 0), (run.pending_reads, run.gas_reads), "{code}: nothing is read");
         }
-        let (used, local, _) = run_retry(9, 5, vec![Ok(Ok("tx-1".into()))]).await;
-        assert_eq!((vec![9], 9), (used, local));
+        let run = Setup::new(9, 5, vec![ok()]).run().await;
+        assert_eq!((vec![(9, LOW_FEE)], 9), (run.attempts, run.local));
+    }
+
+    #[test]
+    fn nonce_is_free_only_for_a_dropped_transaction_or_a_missing_earlier_nonce() {
+        use blokli_client::api::types::UnminedReason;
+
+        for (reason, free) in [
+            (UnminedReason::Dropped, true),
+            (UnminedReason::NonceGap, true),
+            (UnminedReason::Underpriced, false),
+            (UnminedReason::Queued, false),
+            (UnminedReason::Replaced, false),
+            (UnminedReason::Undetermined, false),
+            (UnminedReason::Unknown("FUTURE".into()), false),
+        ] {
+            assert_eq!(free, reason_leaves_nonce_free(&reason), "{reason:?}");
+        }
     }
 
     #[tokio::test]
-    async fn too_high_nonce_is_returned_when_the_pending_count_cannot_be_read() {
-        let used = std::sync::Mutex::new(Vec::new());
-        let local = AtomicU64::new(9);
-        let result = submit_with_nonce_retry(
-            9,
-            5,
-            &local,
-            |nonce| {
-                used.lock().unwrap().push(nonce);
-                async { rpc_refusal("NONCE_TOO_HIGH") }
-            },
-            || async { Err(ConnectorError::ServerNotHealthy) },
-        )
-        .await;
+    async fn a_diagnosed_dropped_timeout_frees_the_nonce_and_a_plain_timeout_does_not() {
+        use blokli_client::{
+            BlokliTestClient, BlokliTestState, NopStateMutator,
+            api::types::{TransactionDiagnosis, TransactionStatus, UnminedReason},
+        };
 
-        assert_eq!(vec![9], used.into_inner().unwrap());
-        assert_eq!(9, local.load(std::sync::atomic::Ordering::Relaxed));
-        assert_eq!(None, nonce_consumed(&result, false));
+        let client = BlokliTestClient::new(BlokliTestState::default(), NopStateMutator)
+            .with_tx_simulation_delay(Duration::from_millis(1));
+        let tx_id = client.submit_and_track_transaction(&[0x02]).await.unwrap();
+        let client = client.with_unmined_diagnosis(
+            tx_id.clone(),
+            TransactionDiagnosis {
+                reason: UnminedReason::Dropped,
+                signed_fees: None,
+                recommended_fees: None,
+                min_replacement_fees: None,
+                retry_after_seconds: 0,
+            },
+        );
+        client.hidden_state_update(|state| {
+            state.active_txs.get_mut(&tx_id).expect("tracked").status = TransactionStatus::Timeout;
+        });
+        let error = ConnectorError::from(
+            client
+                .track_transaction(tx_id, Duration::from_secs(1))
+                .await
+                .expect_err("the transaction timed out"),
+        );
+
+        assert!(nonce_is_free(&error));
+        assert!(!nonce_is_free(&failed_connector(ErrorKind::TrackingError(
+            TrackingErrorKind::Timeout
+        ))));
+    }
+
+    fn failed_connector(kind: ErrorKind) -> ConnectorError {
+        ConnectorError::ClientError(kind.into())
     }
 
     #[test]
