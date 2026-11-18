@@ -125,6 +125,8 @@ where
             .build();
 
         let nonce_gaps = moka::sync::Cache::new(1024);
+        // Alternate signers must not replace the node's nonce samples.
+        let node_address = signer.public().to_address();
         let queue_depth = std::sync::Arc::new(QueueDepth::default());
         let dequeued = queue_depth.clone();
 
@@ -159,8 +161,10 @@ where
                                 let nonce =
                                     sync_nonce(&local_nonce, &nonce_gaps, signer_addr, pending, nonce_gap_tolerance);
                                 tracing::Span::current().record("nonce", nonce);
-                                record_nonce("local", nonce);
-                                record_nonce("chain_pending", pending);
+                                if signer_addr == node_address {
+                                    record_nonce("local", nonce);
+                                    record_nonce("chain_pending", pending);
+                                }
 
                                 let tx = tx
                                     .sign_and_encode_to_eip2718(nonce, chain_id, gas_estimation.into(), &signer)
@@ -350,13 +354,20 @@ fn submit_outcome(
 /// Outcome of a chain write whose tracking failed.
 ///
 /// A tracking timeout is its own outcome: the transaction may still confirm, so reporting it as a
-/// failure hides writes that are alive and makes a caller's retry look like a chain fault.
-fn track_failure_outcome(error: &ConnectorError) -> &'static str {
+/// failure hides writes that are alive and makes a caller's retry look like a chain fault. The
+/// tracking deadline is this connector's own timer, so a client timeout that ran out the whole
+/// deadline is that outcome; a shorter one is a transport fault.
+fn track_failure_outcome(
+    error: &ConnectorError,
+    waited: std::time::Duration,
+    deadline: std::time::Duration,
+) -> &'static str {
     match error.tracking_error() {
         Some(blokli_client::errors::TrackingErrorKind::Timeout) => "tracking_timeout",
         Some(blokli_client::errors::TrackingErrorKind::Reverted) => "reverted",
         Some(blokli_client::errors::TrackingErrorKind::ValidationFailed) => "validation_failed",
         Some(blokli_client::errors::TrackingErrorKind::SubmissionFailed) => "submission_failed",
+        None if error.is_client_timeout() && waited >= deadline => "tracking_timeout",
         None => "transport_error",
     }
 }
@@ -422,10 +433,10 @@ where
                 ConnectorError::InvalidState("transaction queue dropped")
             })?;
 
+        // Created before the future exists, so dropping it unpolled still counts the abandonment.
+        // The write is alive on chain in that case: counting a failure would misreport it.
+        let abandoned = AbandonGuard::new(move || record_caller_abandoned(operation));
         Ok(async move {
-            // A dropped future, such as a caller-side timeout, leaves the write alive on chain: count
-            // the caller as abandoned rather than let the write disappear from the metrics.
-            let abandoned = AbandonGuard::new(move || record_caller_abandoned(operation));
             let result = async {
                 let tx_id = notifier_rx
                     .await
@@ -439,9 +450,14 @@ where
                     .await
                     .map_err(ConnectorError::from);
                 tracing::debug!(?tracked, "transaction tracking done");
+                let waited = tracking_started.elapsed();
                 // A confirmed transaction is classified where the Safe execution result is known.
                 if let Err(error) = &tracked {
-                    record_tx_outcome(operation, PHASE_TRACK, track_failure_outcome(error));
+                    record_tx_outcome(
+                        operation,
+                        PHASE_TRACK,
+                        track_failure_outcome(error, waited, timeout_until_finalized),
+                    );
                 }
                 record_tx_duration(
                     operation,
@@ -539,6 +555,29 @@ mod tests {
     }
 
     #[test]
+    fn an_unpolled_future_still_counts_the_caller_as_abandoned() {
+        let abandoned = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = {
+            let abandoned = abandoned.clone();
+            move || {
+                abandoned.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        };
+
+        let guard = AbandonGuard::new(count);
+        let future = async move {
+            guard.complete();
+        };
+        drop(future);
+
+        assert_eq!(
+            1,
+            abandoned.load(std::sync::atomic::Ordering::SeqCst),
+            "the guard is created before the future is built, so dropping it unpolled counts"
+        );
+    }
+
+    #[test]
     fn nonce_consumption_is_unknown_when_the_result_does_not_tell() {
         for code in ["NONCE_TOO_HIGH", "ALREADY_KNOWN", "RPC_ERROR"] {
             assert_eq!(None, nonce_consumed(&rpc_refusal(code), false), "{code}");
@@ -569,13 +608,23 @@ mod tests {
         assert_eq!("unknown", submit_outcome(&failed(ErrorKind::Timeout), false));
     }
 
+    fn deadline() -> std::time::Duration {
+        std::time::Duration::from_secs(60)
+    }
+
     #[test]
     fn a_tracking_timeout_is_its_own_outcome_and_never_a_revert() {
         let timeout = ConnectorError::ClientError(ErrorKind::TrackingError(TrackingErrorKind::Timeout).into());
 
-        assert_eq!("tracking_timeout", track_failure_outcome(&timeout));
-        assert_ne!("reverted", track_failure_outcome(&timeout));
-        assert_ne!("transport_error", track_failure_outcome(&timeout));
+        assert_eq!(
+            "tracking_timeout",
+            track_failure_outcome(&timeout, deadline(), deadline())
+        );
+        assert_ne!("reverted", track_failure_outcome(&timeout, deadline(), deadline()));
+        assert_ne!(
+            "transport_error",
+            track_failure_outcome(&timeout, deadline(), deadline())
+        );
     }
 
     #[test]
@@ -586,11 +635,28 @@ mod tests {
             (TrackingErrorKind::SubmissionFailed, "submission_failed"),
         ] {
             let error = ConnectorError::ClientError(ErrorKind::TrackingError(kind).into());
-            assert_eq!(outcome, track_failure_outcome(&error), "{kind:?}");
+            assert_eq!(
+                outcome,
+                track_failure_outcome(&error, deadline(), deadline()),
+                "{kind:?}"
+            );
         }
+    }
 
+    #[test]
+    fn only_a_client_timeout_that_ran_out_the_deadline_is_a_tracking_timeout() {
         let client_timeout = ConnectorError::ClientError(ErrorKind::Timeout.into());
-        assert_eq!("transport_error", track_failure_outcome(&client_timeout));
+
+        assert_eq!(
+            "tracking_timeout",
+            track_failure_outcome(&client_timeout, deadline(), deadline()),
+            "the tracking deadline is the connector's own timer"
+        );
+        assert_eq!(
+            "transport_error",
+            track_failure_outcome(&client_timeout, std::time::Duration::from_secs(3), deadline()),
+            "a request timeout inside the deadline is a transport fault"
+        );
     }
 
     #[test]

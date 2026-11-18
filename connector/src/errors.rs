@@ -116,6 +116,11 @@ impl ConnectorError {
             )
     }
 
+    /// Whether the client itself gave up waiting, rather than Blokli reporting an outcome.
+    pub(crate) fn is_client_timeout(&self) -> bool {
+        matches!(self.client_error_kind(), Some(ErrorKind::Timeout))
+    }
+
     /// Returns how the transaction tracking of this write failed, if it did.
     ///
     /// A tracking timeout is reported as such and is not a chain failure: Blokli stopped

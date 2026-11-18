@@ -317,39 +317,56 @@ static REFRESH_IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
 #[cfg(feature = "telemetry")]
 const GAUGE_REFRESH_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How a gauge refresh ended.
+#[cfg(feature = "telemetry")]
+#[derive(Debug, PartialEq, Eq)]
+enum RefreshOutcome {
+    /// Another refresh held the gate.
+    Skipped,
+    /// Every read answered.
+    Completed,
+    /// The budget ran out before the refresh finished.
+    TimedOut,
+}
+
 /// Runs one gauge refresh unless another is running, and gives up after `budget`.
 ///
-/// A stalled backend read is dropped together with the refresh, which releases the in-flight slot
-/// so the next tick can start. Returns `false` when a refresh was already running.
+/// A stalled backend read is dropped together with the refresh, which releases `gate` so the next
+/// tick can start. `gate` is a parameter so a test can drive it without sharing the production one.
 #[cfg(feature = "telemetry")]
-async fn refresh_within_budget<F>(refresh: F, budget: std::time::Duration) -> bool
+async fn refresh_within_budget<F>(
+    gate: &std::sync::atomic::AtomicBool,
+    refresh: F,
+    budget: std::time::Duration,
+) -> RefreshOutcome
 where
     F: std::future::Future<Output = ()>,
 {
     use futures_time::future::FutureExt;
 
-    if REFRESH_IN_FLIGHT.swap(true, std::sync::atomic::Ordering::AcqRel) {
-        return false;
+    if gate.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return RefreshOutcome::Skipped;
     }
-    let _in_flight = RefreshInFlight;
+    let _in_flight = RefreshInFlight(gate);
     if refresh
         .timeout(futures_time::time::Duration::from(budget))
         .await
         .is_err()
     {
         tracing::warn!(?budget, "chain gauge refresh timed out");
+        return RefreshOutcome::TimedOut;
     }
-    true
+    RefreshOutcome::Completed
 }
 
-/// Clears [`REFRESH_IN_FLIGHT`] however the refresh ends, including an abort.
+/// Clears a refresh gate however the refresh ends, including an abort.
 #[cfg(feature = "telemetry")]
-struct RefreshInFlight;
+struct RefreshInFlight<'a>(&'a std::sync::atomic::AtomicBool);
 
 #[cfg(feature = "telemetry")]
-impl Drop for RefreshInFlight {
+impl Drop for RefreshInFlight<'_> {
     fn drop(&mut self) {
-        REFRESH_IN_FLIGHT.store(false, std::sync::atomic::Ordering::Release);
+        self.0.store(false, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -377,13 +394,22 @@ pub(crate) async fn refresh_chain_gauges<C, B>(
     C: blokli_client::api::BlokliQueryClient + blokli_client::api::BlokliSubscriptionClient + Send + Sync + 'static,
     B: crate::Backend + Send + Sync + 'static,
 {
-    let ran = refresh_within_budget(
-        read_and_set_gauges(client, backend, graph, me, freshness),
+    let outcome = refresh_within_budget(
+        &REFRESH_IN_FLIGHT,
+        read_and_set_gauges(client, backend, graph, me, freshness.clone()),
         GAUGE_REFRESH_BUDGET,
     )
     .await;
-    if !ran {
-        tracing::debug!("skipping the chain gauge refresh, the previous one is still running");
+    match outcome {
+        RefreshOutcome::Skipped => {
+            tracing::debug!("skipping the chain gauge refresh, the previous one is still running")
+        }
+        RefreshOutcome::TimedOut => {
+            // The chain info query did not answer either, so the age grows like it does on a failed
+            // read.
+            freshness.failure();
+        }
+        RefreshOutcome::Completed => {}
     }
 }
 
@@ -648,21 +674,27 @@ mod tests {
     #[tokio::test]
     async fn a_stalled_refresh_releases_its_slot_for_the_next_one() {
         let budget = Duration::from_millis(50);
+        let gate = std::sync::atomic::AtomicBool::new(false);
 
         // A refresh that never finishes is dropped at its deadline.
-        assert!(
-            refresh_within_budget(std::future::pending(), budget).await,
-            "the first refresh runs"
+        assert_eq!(
+            RefreshOutcome::TimedOut,
+            refresh_within_budget(&gate, std::future::pending(), budget).await,
+            "the first refresh runs and times out"
         );
-        assert!(
-            refresh_within_budget(async {}, budget).await,
+        assert_eq!(
+            RefreshOutcome::Completed,
+            refresh_within_budget(&gate, async {}, budget).await,
             "a later refresh runs once the stalled one was dropped"
         );
 
         // While one refresh runs, the next tick is skipped.
-        let stalled = refresh_within_budget(std::future::pending(), budget);
-        let overlapping = refresh_within_budget(async {}, budget);
-        assert_eq!((true, false), futures::join!(stalled, overlapping));
+        let stalled = refresh_within_budget(&gate, std::future::pending(), budget);
+        let overlapping = refresh_within_budget(&gate, async {}, budget);
+        assert_eq!(
+            (RefreshOutcome::TimedOut, RefreshOutcome::Skipped),
+            futures::join!(stalled, overlapping)
+        );
     }
 
     #[cfg(feature = "telemetry")]

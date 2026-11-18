@@ -214,11 +214,18 @@ async fn chain_write_metrics_are_exported() -> anyhow::Result<()> {
 
 /// Whether the Prometheus text has a sample of `name` carrying every given label.
 fn has_sample(metrics: &str, name: &str, labels: &[&str]) -> bool {
-    let sample = |line: &str| {
-        line.strip_prefix(name)
-            .is_some_and(|rest| rest.starts_with('{') || rest.starts_with(' '))
-    };
-    metrics
-        .lines()
-        .any(|line| sample(line) && labels.iter().all(|label| line.contains(label)))
+    metrics.lines().any(|line| {
+        let Some(rest) = line.strip_prefix(name) else {
+            return false;
+        };
+        // The label block is `{key="value",…}`; compare whole pairs, so a different key that
+        // happens to carry the same value cannot satisfy the check.
+        let pairs = rest
+            .strip_prefix('{')
+            .and_then(|rest| rest.split('}').next())
+            .map(|block| block.split(',').map(str::trim).collect::<Vec<_>>())
+            .unwrap_or_default();
+        (rest.is_empty() || rest.starts_with('{') || rest.starts_with(' '))
+            && labels.iter().all(|label| pairs.contains(label))
+    })
 }
