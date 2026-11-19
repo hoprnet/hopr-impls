@@ -259,31 +259,128 @@ struct NeighborProbeState {
     connected: Option<bool>,
 }
 
+/// Per-peer state, and the order in which the peers are offered.
+///
+/// Peers that still need sampling are recorded as they are measured, so a count that has reached
+/// [`EgressConfig::stable_samples`] is what takes a peer out of the sample, and the sample
+/// deliberately does not outlive the pass through the graph that built it.
+#[derive(Debug, Default)]
+struct NeighborSamples {
+    states: HashMap<OffchainPublicKey, NeighborProbeState>,
+    /// Peers still to offer, fresh ones first and then the degraded ones, deepest deficit first.
+    sample: VecDeque<OffchainPublicKey>,
+    /// Measured peers, from which the random re-add draws.
+    measured: Vec<OffchainPublicKey>,
+}
+
+impl NeighborSamples {
+    /// What is recorded for `peer`.
+    fn get(&self, peer: &OffchainPublicKey) -> NeighborProbeState {
+        self.states.get(peer).copied().unwrap_or_default()
+    }
+
+    /// Mutable access to a peer's record.
+    fn entry(&mut self, peer: OffchainPublicKey) -> &mut NeighborProbeState {
+        self.states.entry(peer).or_default()
+    }
+
+    /// Counts one probe against a peer's sample.
+    fn count(&mut self, peer: OffchainPublicKey) {
+        let state = self.states.entry(peer).or_default();
+        state.samples = state.samples.saturating_add(1);
+    }
+
+    /// Takes the next peer of the current sample that still needs a probe.
+    fn take_next(&mut self, needs_probe: impl Fn(&OffchainPublicKey) -> bool) -> Option<OffchainPublicKey> {
+        while let Some(peer) = self.sample.pop_front() {
+            // A peer may have been measured out or disconnected since the sample was built.
+            if needs_probe(&peer) {
+                self.count(peer);
+                return Some(peer);
+            }
+        }
+        None
+    }
+
+    /// Draws a measured peer at random, with probability `probability`.
+    fn readd(&mut self, probability: f64) -> Option<OffchainPublicKey> {
+        if probability <= 0.0 || self.measured.is_empty() || random_float() >= probability {
+            return None;
+        }
+
+        let peer = self.measured[random_integer(0, Some(self.measured.len() as u64)) as usize];
+        self.count(peer);
+        Some(peer)
+    }
+
+    /// Replaces the sample for the next pass through the graph.
+    fn install(&mut self, sample: VecDeque<OffchainPublicKey>, measured: Vec<OffchainPublicKey>) {
+        self.sample = sample;
+        self.measured = measured;
+    }
+}
+
+/// One full pass over the loopback candidates, with the cursor that carries it across pulls.
+///
+/// The cursor is what makes a consumer that takes fewer probes per window than there are candidates
+/// continue where it stopped, instead of starting the set over each window.
+#[derive(Debug, Default)]
+struct LoopbackPass {
+    /// The candidates in the order they will be offered, already interleaved by the exploration share.
+    paths: Vec<LoopbackCandidate>,
+    /// How much of `paths` has been offered.
+    cursor: usize,
+    /// Edges with fresh SURB evidence seen while `paths` was built.
+    evidence: HashSet<(OffchainPublicKey, OffchainPublicKey)>,
+    /// Focus `paths` was built for, so a focus change rebuilds it.
+    focus: Option<HashSet<OffchainPublicKey>>,
+}
+
+impl LoopbackPass {
+    /// The next candidate, advancing the cursor.
+    fn next(&mut self) -> Option<LoopbackCandidate> {
+        let candidate = self.paths.get(self.cursor)?.clone();
+        self.cursor += 1;
+        Some(candidate)
+    }
+
+    /// Whether the pass must be rebuilt before the next candidate is offered.
+    fn is_spent(&self, focus: Option<&HashSet<OffchainPublicKey>>) -> bool {
+        self.paths.is_empty() || self.cursor >= self.paths.len() || self.focus.as_ref() != focus
+    }
+
+    /// Whether a pass ran to its end, i.e. covered its whole candidate set.
+    fn is_complete(&self) -> bool {
+        !self.paths.is_empty() && self.cursor >= self.paths.len()
+    }
+
+    /// Installs a pass built for `focus`, with the cursor back at its start.
+    fn install(
+        &mut self,
+        paths: Vec<LoopbackCandidate>,
+        evidence: HashSet<(OffchainPublicKey, OffchainPublicKey)>,
+        focus: Option<HashSet<OffchainPublicKey>>,
+    ) {
+        self.paths = paths;
+        self.cursor = 0;
+        self.evidence = evidence;
+        self.focus = focus;
+    }
+}
+
 /// The pull-driven probe generator.
 ///
 /// Holds no timer and reads no clock. Every pull produces at most one probe, and only while the
-/// dial is on; the consumer decides how often to pull. Two persistent cursors carry probing across
-/// pulls: one over the neighbor sample, one over the loopback path set, so a consumer that takes
-/// fewer probes per window than there are candidates continues where it stopped.
+/// dial is on; the consumer decides how often to pull. The two persistent cursors live with the
+/// state they walk: [`NeighborSamples`] and [`LoopbackPass`].
 struct ProbeGenerator<U> {
     me: OffchainPublicKey,
     cfg: EgressConfig,
     graph: U,
     control: watch::Receiver<ControlState>,
     coverage: Arc<CoverageCounters>,
-    neighbors: HashMap<OffchainPublicKey, NeighborProbeState>,
-    /// Neighbors still to offer in this sample, fresh peers first, then the degraded ones.
-    neighbor_sample: VecDeque<OffchainPublicKey>,
-    /// Measured peers, from which the random re-add draws.
-    measured: Vec<OffchainPublicKey>,
-    /// One full pass over the loopback candidates, already interleaved by the exploration share.
-    pass: Vec<LoopbackCandidate>,
-    /// How much of `pass` has been offered.
-    cursor: usize,
-    /// Edges with fresh SURB evidence seen while `pass` was built.
-    pass_evidence: HashSet<(OffchainPublicKey, OffchainPublicKey)>,
-    /// Focus `pass` was built for, so a focus change rebuilds it.
-    pass_focus: Option<HashSet<OffchainPublicKey>>,
+    neighbors: NeighborSamples,
+    pass: LoopbackPass,
     /// Whether the previous pull offered a neighbor, so the two kinds alternate.
     last_was_neighbor: bool,
 }
@@ -329,13 +426,19 @@ where
         let mut rebuilt = false;
 
         loop {
-            if let Some(peer) = self.take_from_sample() {
+            // Scoped so the shared borrow of the graph ends before the rebuild below needs `&mut self`.
+            let taken = {
+                let (graph, me, connected_only) = (&self.graph, self.me, self.cfg.probe_connected_only);
+                self.neighbors
+                    .take_next(|peer| neighbor_needs_probe(graph, me, connected_only, peer))
+            };
+            if let Some(peer) = taken {
                 return Some(peer);
             }
 
             // Every measured peer is left alone while it stays connected. Re-add one at random, so a
             // stale assumption about a static link cannot hold forever.
-            if let Some(peer) = self.readd_measured() {
+            if let Some(peer) = self.neighbors.readd(self.cfg.readd_probability) {
                 return Some(peer);
             }
 
@@ -347,37 +450,7 @@ where
         }
     }
 
-    /// Takes the next peer of the current sample that still needs a probe.
-    fn take_from_sample(&mut self) -> Option<OffchainPublicKey> {
-        while let Some(peer) = self.neighbor_sample.pop_front() {
-            // A peer may have been measured out or disconnected since the sample was built.
-            if self.neighbor_needs_probe(&peer) {
-                self.count_sample(&peer);
-                return Some(peer);
-            }
-        }
-        None
-    }
-
-    /// Draws a measured peer at random, with the configured probability.
-    fn readd_measured(&mut self) -> Option<OffchainPublicKey> {
-        if self.cfg.readd_probability <= 0.0 || self.measured.is_empty() || random_float() >= self.cfg.readd_probability
-        {
-            return None;
-        }
-
-        let peer = self.measured[random_integer(0, Some(self.measured.len() as u64)) as usize];
-        self.count_sample(&peer);
-        Some(peer)
-    }
-
-    /// Counts one probe against a peer's sample.
-    fn count_sample(&mut self, peer: &OffchainPublicKey) {
-        let samples = self.samples_of(peer).saturating_add(1);
-        self.neighbors.entry(*peer).or_default().samples = samples;
-    }
-
-    /// Rebuilds the neighbor sample, and records what the graph says about connectivity.
+    /// Rebuilds the neighbor sample from the graph, recording what it says about connectivity.
     async fn rebuild_neighbor_sample(&mut self) {
         let mut fresh = Vec::new();
         let mut degraded = Vec::new();
@@ -393,18 +466,19 @@ where
             let immediate = obs.as_ref().and_then(|obs| obs.immediate_qos());
             let connected = immediate.and_then(|imm| imm.is_connected());
 
-            let entry = self.neighbors.entry(peer).or_default();
+            let state = self.neighbors.entry(peer);
             // The link that was measured is gone, so the count that described it is too.
-            if connected == Some(false) && entry.connected != Some(false) {
-                entry.samples = 0;
+            if connected == Some(false) && state.connected != Some(false) {
+                state.samples = 0;
             }
-            entry.connected = connected;
+            state.connected = connected;
+            let samples = state.samples;
 
             if self.cfg.probe_connected_only && connected == Some(false) {
                 continue;
             }
 
-            if entry.samples < self.cfg.stable_samples {
+            if samples < self.cfg.stable_samples {
                 fresh.push(peer);
                 continue;
             }
@@ -430,52 +504,29 @@ where
         // deficit leads the sample.
         degraded.sort_by(|left, right| right.1.total_cmp(&left.1));
 
-        self.measured = measured;
-        self.neighbor_sample = uniform_shuffle(fresh)
+        let sample = uniform_shuffle(fresh)
             .into_iter()
             .chain(degraded.into_iter().map(|(peer, _)| peer))
             .collect();
-    }
-
-    /// Whether `peer` still needs a probe under the current configuration.
-    fn neighbor_needs_probe(&self, peer: &OffchainPublicKey) -> bool {
-        if peer == &self.me {
-            return false;
-        }
-        match self.graph.edge(&self.me, peer) {
-            Some(obs) if self.cfg.probe_connected_only => {
-                !(obs.immediate_qos().and_then(|imm| imm.is_connected()) == Some(false))
-            }
-            // A node the graph knows but has no edge from `me` to is still worth a ping: it is the
-            // only way the edge appears.
-            Some(_) | None => true,
-        }
-    }
-
-    fn samples_of(&self, peer: &OffchainPublicKey) -> u32 {
-        self.neighbors.get(peer).map_or(0, |state| state.samples)
+        self.neighbors.install(sample, measured);
     }
 
     /// The next loopback path, taken from the persistent cursor over the current pass.
     fn next_loopback(&mut self, control: &ControlState) -> Option<ProbeRouting> {
-        let exhausted = self.cursor >= self.pass.len();
-        let focus_changed = self.pass_focus.as_ref() != control.focus.as_deref();
-
-        if self.pass.is_empty() || exhausted || focus_changed {
+        if self.pass.is_spent(control.focus.as_deref()) {
             // A pass that ran to its end is a full cycle over the candidate set; report what it saw.
-            if !self.pass.is_empty() && exhausted {
+            if self.pass.is_complete() {
                 tracing::debug!(
-                    paths = self.pass.len(),
-                    edges_with_evidence = self.pass_evidence.len(),
+                    paths = self.pass.paths.len(),
+                    edges_with_evidence = self.pass.evidence.len(),
                     "loopback cycle completed"
                 );
-                self.coverage.record_cycle(self.pass_evidence.len());
+                self.coverage.record_cycle(self.pass.evidence.len());
             }
             self.rebuild_pass(control);
         }
 
-        let candidate = self.pass.get(self.cursor)?.clone();
-        self.cursor += 1;
+        let candidate = self.pass.next()?;
 
         let intermediates = strip_loopback_endpoints(candidate.path, &self.me);
         loopback_routing(self.me.into(), intermediates)
@@ -530,12 +581,10 @@ where
             .collect();
 
         let explore_share = 1.0 - self.cfg.best_path_share;
-        self.pass = interleave(best, explore, explore_share);
-        self.cursor = 0;
-        self.pass_evidence = evidence;
-        self.pass_focus = control.focus.as_deref().cloned();
+        let paths = interleave(best, explore, explore_share);
+        tracing::debug!(paths = paths.len(), explore_share, "rebuilt loopback probe pass");
 
-        tracing::debug!(paths = self.pass.len(), explore_share, "rebuilt loopback probe pass");
+        self.pass.install(paths, evidence, control.focus.as_deref().cloned());
     }
 
     /// Weighs a candidate, and skips it when any of its edges already carries fresh SURB evidence.
@@ -574,6 +623,27 @@ where
             path_id,
             weight,
         })
+    }
+}
+
+/// Whether `peer` still needs a probe under `probe_connected_only`.
+fn neighbor_needs_probe<U>(
+    graph: &U,
+    me: OffchainPublicKey,
+    probe_connected_only: bool,
+    peer: &OffchainPublicKey,
+) -> bool
+where
+    U: NetworkGraphView<NodeId = OffchainPublicKey, Observed = Observations>,
+{
+    if peer == &me {
+        return false;
+    }
+    match graph.edge(&me, peer) {
+        Some(obs) if probe_connected_only => !(obs.immediate_qos().and_then(|imm| imm.is_connected()) == Some(false)),
+        // A node the graph knows but has no edge from `me` to is still worth a ping: it is the only
+        // way the edge appears.
+        Some(_) | None => true,
     }
 }
 
@@ -656,13 +726,8 @@ where
             graph: self.graph.clone(),
             control: self.control.subscribe(),
             coverage: self.control.coverage_counters(),
-            neighbors: HashMap::new(),
-            neighbor_sample: VecDeque::new(),
-            measured: Vec::new(),
-            pass: Vec::new(),
-            cursor: 0,
-            pass_evidence: HashSet::new(),
-            pass_focus: None,
+            neighbors: NeighborSamples::default(),
+            pass: LoopbackPass::default(),
             last_was_neighbor: false,
         };
 
