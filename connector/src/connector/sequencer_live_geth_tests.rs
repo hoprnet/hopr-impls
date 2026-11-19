@@ -495,7 +495,9 @@ async fn run_burst_scenario() -> anyhow::Result<()> {
     }
 
     println!(
-        "[{label}] block: base fee / Blokli max fee, pooled approvals, stuck (max fee below the base fee), mined, pending          count, gap = pending - latest, ahead = highest pooled nonce + 1 - pending, nonces submitted more than once"
+        "[{label}] block: base fee / Blokli max fee, pooled approvals, stuck (max fee below the base fee), mined, \
+         pending          count, gap = pending - latest, ahead = highest pooled nonce + 1 - pending, nonces submitted \
+         more than once"
     );
     let mut watch = PoolWatch::default();
     let mut highest_next = first_nonce + SETTLE_APPROVALS as u64;
@@ -576,7 +578,8 @@ async fn run_burst_scenario() -> anyhow::Result<()> {
         refused.get()
     );
     println!(
-        "[{label}] peak stuck {peak_stuck}, peak gap {peak_gap}, peak ahead {peak_ahead}, final gap {final_gap}, final ahead {final_ahead},          nonces submitted more than once (peak) {max_resubmitted}, now {:?}",
+        "[{label}] peak stuck {peak_stuck}, peak gap {peak_gap}, peak ahead {peak_ahead}, final gap {final_gap}, \
+         final ahead {final_ahead},          nonces submitted more than once (peak) {max_resubmitted}, now {:?}",
         watch.resubmitted()
     );
     println!("[{label}] outcomes: {tally:?}");

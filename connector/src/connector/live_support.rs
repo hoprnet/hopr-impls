@@ -416,7 +416,8 @@ pub(super) async fn sample_gap(
         }
         {
             println!(
-                "[{label}]   t={second:>3}s base_fee={base_fee} blokli_max_fee={} pending={pending} highest_signed_next={highest_next} mined={mined} gap={gap} enqueued={} confirmed={}",
+                "[{label}]   t={second:>3}s base_fee={base_fee} blokli_max_fee={} pending={pending} \
+                 highest_signed_next={highest_next} mined={mined} gap={gap} enqueued={} confirmed={}",
                 fee_cap.map_or_else(|| "n/a".into(), |fee| fee.to_string()),
                 state.submitted.load(Ordering::SeqCst),
                 state.confirmed.load(Ordering::SeqCst)
@@ -450,13 +451,13 @@ impl RetryReport {
             config.channels, config.tick, config.tracking_timeout, config.window
         );
         println!(
-            "[{label}] peak gap: {} (Blokli count only: {}), final gap: {}, approvals enqueued: {}, confirmed channels: \
-             {}/{}",
+            "[{label}] peak gap: {} (Blokli count only: {}), final gap: {}, approvals enqueued: {}, confirmed \
+             channels: {}/{}",
             self.peak_gap, self.peak_blokli_gap, self.final_gap, self.submitted, self.confirmed, config.channels
         );
         println!(
-            "[{label}] base fee at start: {}, peak base fee reached: {}, Blokli max fee at start: {}, distinct transactions seen \
-             underpriced in the pool: {}",
+            "[{label}] base fee at start: {}, peak base fee reached: {}, Blokli max fee at start: {}, distinct \
+             transactions seen underpriced in the pool: {}",
             self.base_fee_at_start,
             self.peak_base_fee,
             self.fee_cap_at_start
