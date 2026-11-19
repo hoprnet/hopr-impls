@@ -3992,6 +3992,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-core",
+ "validator",
 ]
 
 [[package]]

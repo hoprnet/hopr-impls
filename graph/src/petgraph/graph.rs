@@ -4,6 +4,7 @@ use bimap::BiHashMap;
 use hopr_api::OffchainPublicKey;
 use parking_lot::RwLock;
 use petgraph::{graph::NodeIndex, stable_graph::StableDiGraph};
+use validator::{Validate, ValidationError, ValidationErrors};
 
 use crate::{Observations, StarvationParams, errors::ChannelGraphError};
 
@@ -110,11 +111,11 @@ pub const DEFAULT_MAX_PLAUSIBLE_LOOPBACK_RTT: std::time::Duration = std::time::D
     serde(default, deny_unknown_fields)
 )]
 pub struct ChannelGraphConfig {
-    /// Penalty multiplier for edges lacking probe-based quality observations.
+    /// Penalty multiplier for edges lacking probe-based quality observations. In `[0, 1]`.
     #[default(DEFAULT_EDGE_PENALTY)]
     pub edge_penalty: f64,
     /// Minimum acknowledgment rate for **data** path selection; deliberately not applied to loopback probe
-    /// generation.
+    /// generation. In `[0, 1]`.
     #[default(DEFAULT_MIN_ACK_RATE)]
     pub min_ack_rate: f64,
     /// Upper bound on a loopback probe RTT considered plausible; measurements above it are discarded during
@@ -138,13 +139,41 @@ pub struct ChannelGraphConfig {
     pub loopback_window: std::time::Duration,
 }
 
-impl ChannelGraphConfig {
-    /// Rejects a starvation policy or a loopback window that would silently break the graph.
+impl Validate for ChannelGraphConfig {
+    /// Rejects an edge parameter outside `[0, 1]`, a starvation policy or a loopback window that would silently
+    /// break the graph.
     ///
-    /// The edge scoring parameters are not checked, as they never were.
-    pub fn validate(&self) -> Result<(), String> {
-        self.starvation.validate()?;
-        crate::validate_loopback_window(self.loopback_window)
+    /// The probe RTT bound is not checked.
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        let mut errors = ValidationErrors::new();
+
+        // `contains` is false for NaN, which no comparison satisfies.
+        if !(0.0..=1.0).contains(&self.edge_penalty) {
+            errors.add(
+                "edge_penalty",
+                ValidationError::new("edge_penalty must be between 0.0 and 1.0"),
+            );
+        }
+        if !(0.0..=1.0).contains(&self.min_ack_rate) {
+            errors.add(
+                "min_ack_rate",
+                ValidationError::new("min_ack_rate must be between 0.0 and 1.0"),
+            );
+        }
+        if let Err(error) = self.starvation.validate() {
+            errors.add(
+                "starvation",
+                ValidationError::new("starvation").with_message(error.into()),
+            );
+        }
+        if let Err(error) = crate::validate_loopback_window(self.loopback_window) {
+            errors.add(
+                "loopback_window",
+                ValidationError::new("loopback_window").with_message(error.into()),
+            );
+        }
+
+        if errors.is_empty() { Ok(()) } else { Err(errors) }
     }
 }
 
@@ -183,7 +212,8 @@ impl ChannelGraph {
         min_ack_rate: f64,
         max_plausible_loopback_rtt: std::time::Duration,
     ) -> Self {
-        Self::with_config(
+        // Not validated, as never before: callers may pass values `with_config` rejects.
+        Self::from_config_unchecked(
             me,
             ChannelGraphConfig {
                 edge_penalty,
@@ -192,17 +222,20 @@ impl ChannelGraph {
                 ..ChannelGraphConfig::default()
             },
         )
-        .expect("the default starvation policy and loopback window are valid")
     }
 
     /// Creates a new channel graph with the given self identity and `config`.
     ///
     /// # Errors
     ///
-    /// Fails when `config` does not pass [`ChannelGraphConfig::validate`].
+    /// Fails when `config` does not pass [`Validate::validate`].
     pub fn with_config(me: OffchainPublicKey, config: ChannelGraphConfig) -> Result<Self, String> {
-        config.validate()?;
+        config.validate().map_err(|errors| errors.to_string())?;
+        Ok(Self::from_config_unchecked(me, config))
+    }
 
+    /// The one place a graph is created, so the config reaches it unchanged.
+    fn from_config_unchecked(me: OffchainPublicKey, config: ChannelGraphConfig) -> Self {
         let mut graph = StableDiGraph::new();
         let mut indices = BiHashMap::new();
 
@@ -214,7 +247,7 @@ impl ChannelGraph {
             .or_default()
             .push(idx);
 
-        Ok(Self {
+        Self {
             me,
             edge_penalty: config.edge_penalty,
             min_ack_rate: config.min_ack_rate,
@@ -226,7 +259,7 @@ impl ChannelGraph {
             searches: Arc::new(Default::default()),
             #[cfg(feature = "serde")]
             dump_previous_empty: Arc::new(Default::default()),
-        })
+        }
     }
 
     /// This graph with `starvation` deciding when the loops over an edge starve its relay. The defaults
@@ -904,6 +937,49 @@ mod tests {
         let back: ChannelGraphConfig = serde_json::from_str(&serde_json::to_string(&config)?)?;
         assert_eq!(back, config);
         Ok(())
+    }
+
+    #[test]
+    fn graph_should_reject_a_config_with_an_edge_parameter_outside_zero_to_one() {
+        let me = pubkey_from(&SECRET_0);
+        for value in [-0.1, 1.1, f64::NAN, f64::INFINITY] {
+            for config in [
+                ChannelGraphConfig {
+                    edge_penalty: value,
+                    ..ChannelGraphConfig::default()
+                },
+                ChannelGraphConfig {
+                    min_ack_rate: value,
+                    ..ChannelGraphConfig::default()
+                },
+            ] {
+                assert!(
+                    ChannelGraph::with_config(me, config).is_err(),
+                    "{value} must be rejected"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn graph_should_accept_the_edges_of_the_zero_to_one_range() -> anyhow::Result<()> {
+        let me = pubkey_from(&SECRET_0);
+        for value in [0.0, 1.0] {
+            let config = ChannelGraphConfig {
+                edge_penalty: value,
+                min_ack_rate: value,
+                ..ChannelGraphConfig::default()
+            };
+            ChannelGraph::with_config(me, config).map_err(anyhow::Error::msg)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn with_edge_params_should_keep_accepting_values_it_always_accepted() {
+        // Not checked, as never before: a caller that passes more than one must not start to fail.
+        let graph = ChannelGraph::with_edge_params(pubkey_from(&SECRET_0), 2.0, 3.0, std::time::Duration::ZERO);
+        assert_eq!(graph.edge_penalty(), 2.0);
     }
 
     #[test]
