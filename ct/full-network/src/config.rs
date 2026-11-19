@@ -38,14 +38,16 @@ pub struct EgressConfig {
 
     /// Probe success rate below which a measured peer is probed again.
     ///
-    /// The further below the threshold the rate sits, the earlier the peer is offered. In `(0.0, 1.0]`.
+    /// The further below the threshold the rate sits, the earlier the peer is offered. In
+    /// `[0.0, 1.0]`; `0.0` disables the trigger.
     #[cfg_attr(feature = "serde", serde(default = "default_min_success_rate"))]
     #[default(default_min_success_rate())]
     pub min_success_rate: f64,
 
     /// Acknowledgement rate below which a measured peer is probed again.
     ///
-    /// The further below the threshold the rate sits, the earlier the peer is offered. In `(0.0, 1.0]`.
+    /// The further below the threshold the rate sits, the earlier the peer is offered. In
+    /// `[0.0, 1.0]`; `0.0` disables the trigger.
     #[cfg_attr(feature = "serde", serde(default = "default_min_ack_rate"))]
     #[default(default_min_ack_rate())]
     pub min_ack_rate: f64,
@@ -135,11 +137,11 @@ impl EgressConfig {
             ("min_success_rate", self.min_success_rate),
             ("min_ack_rate", self.min_ack_rate),
         ] {
-            if !(rate > 0.0 && rate <= 1.0) {
+            if !(0.0..=1.0).contains(&rate) {
                 errors.add(
                     field,
                     ValidationError::new("rate_threshold_out_of_range")
-                        .with_message(format!("{field} must be in (0.0, 1.0], got {rate}").into()),
+                        .with_message(format!("{field} must be between 0.0 and 1.0, got {rate}").into()),
                 );
             }
         }
@@ -325,8 +327,8 @@ mod tests {
     }
 
     #[test]
-    fn a_rate_threshold_outside_zero_exclusive_to_one_should_be_invalid() {
-        for rate in [f64::NAN, 0.0, -0.1, 1.1, f64::INFINITY] {
+    fn a_rate_threshold_outside_zero_to_one_should_be_invalid() {
+        for rate in [f64::NAN, -0.1, 1.1, f64::INFINITY] {
             let success = EgressConfig {
                 min_success_rate: rate,
                 ..Default::default()
@@ -344,13 +346,15 @@ mod tests {
     }
 
     #[test]
-    fn rate_thresholds_of_one_are_valid() {
-        let cfg = EgressConfig {
-            min_success_rate: 1.0,
-            min_ack_rate: 1.0,
-            ..Default::default()
-        };
-        assert!(cfg.validate().is_ok());
+    fn a_rate_threshold_of_zero_or_one_is_valid() {
+        for rate in [0.0, 1.0] {
+            let cfg = EgressConfig {
+                min_success_rate: rate,
+                min_ack_rate: rate,
+                ..Default::default()
+            };
+            assert!(cfg.validate().is_ok(), "{rate}");
+        }
     }
 
     #[test]
