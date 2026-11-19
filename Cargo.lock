@@ -3928,7 +3928,7 @@ dependencies = [
 
 [[package]]
 name = "hopr-ct-full-network"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "anyhow",
  "cfg-if",
@@ -3966,7 +3966,7 @@ dependencies = [
 
 [[package]]
 name = "hopr-network-graph"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "anyhow",
  "assertables",
@@ -3977,6 +3977,7 @@ dependencies = [
  "hex-literal",
  "hopr-api",
  "hopr-utilities",
+ "humantime-serde",
  "indexmap 2.14.2",
  "insta",
  "lazy_static",
@@ -3986,10 +3987,12 @@ dependencies = [
  "serde",
  "serde_json",
  "smallvec",
+ "smart-default",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
  "tracing-core",
+ "validator",
 ]
 
 [[package]]

@@ -81,7 +81,17 @@ impl EgressConfig {
     /// Pinging more frequently than the probe timeout would cause probes to overlap;
     /// this check prevents that misconfiguration.
     pub fn validate_against_probe_timeout(&self, probe_timeout: std::time::Duration) -> anyhow::Result<()> {
-        self.validate()
+        self.validate_against_loopback_window(probe_timeout, hopr_network_graph::LOOPBACK_WINDOW)
+    }
+
+    /// Like [`validate_against_probe_timeout`](Self::validate_against_probe_timeout), with the interval
+    /// checked against the graph's configured loopback `window` instead of the default one.
+    pub fn validate_against_loopback_window(
+        &self,
+        probe_timeout: std::time::Duration,
+        window: std::time::Duration,
+    ) -> anyhow::Result<()> {
+        self.validate_for_window(window)
             .map_err(|e| anyhow::anyhow!("invalid EgressConfig: {e}"))?;
         anyhow::ensure!(
             self.interval >= probe_timeout,
@@ -91,10 +101,10 @@ impl EgressConfig {
         );
         Ok(())
     }
-}
 
-impl Validate for EgressConfig {
-    fn validate(&self) -> Result<(), ValidationErrors> {
+    /// The checks of [`Validate::validate`], with the interval held against `window` instead of the
+    /// default loopback window.
+    fn validate_for_window(&self, window: std::time::Duration) -> Result<(), ValidationErrors> {
         let mut errors = ValidationErrors::new();
 
         if !(0.0..=1.0).contains(&self.staleness_weight) {
@@ -118,10 +128,11 @@ impl Validate for EgressConfig {
 
         // The loopback evidence of one round must still be counted when the next one is sent, with room for
         // the probe timeout and a late round, or a failing relay reads as unprobed instead of starved.
-        if self.interval > hopr_network_graph::LOOPBACK_WINDOW / 2 {
+        if self.interval > window / 2 {
             errors.add(
                 "interval",
-                ValidationError::new("interval must fit twice in the 60 s loopback evidence window"),
+                ValidationError::new("interval_exceeds_loopback_window")
+                    .with_message(format!("interval must fit twice in the {window:?} loopback evidence window").into()),
             );
         }
 
@@ -141,6 +152,14 @@ impl Validate for EgressConfig {
         }
 
         if errors.is_empty() { Ok(()) } else { Err(errors) }
+    }
+}
+
+impl Validate for EgressConfig {
+    /// Holds the interval against the default [`hopr_network_graph::LOOPBACK_WINDOW`]; use
+    /// [`validate_against_loopback_window`](EgressConfig::validate_against_loopback_window) for a configured one.
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        self.validate_for_window(hopr_network_graph::LOOPBACK_WINDOW)
     }
 }
 
@@ -213,6 +232,30 @@ mod tests {
         };
         let err = huge.validate().unwrap_err();
         assert!(err.field_errors().contains_key("interval"), "{err}");
+    }
+
+    #[test]
+    fn an_interval_should_be_checked_against_the_configured_loopback_window() {
+        let timeout = std::time::Duration::from_secs(3);
+        let cfg = EgressConfig {
+            interval: std::time::Duration::from_secs(60),
+            ..EgressConfig::default()
+        };
+
+        assert!(
+            cfg.validate_against_probe_timeout(timeout).is_err(),
+            "60 s does not fit twice in the default 60 s window"
+        );
+        assert!(
+            cfg.validate_against_loopback_window(timeout, std::time::Duration::from_secs(120))
+                .is_ok(),
+            "exactly twice fits"
+        );
+        assert!(
+            cfg.validate_against_loopback_window(timeout, std::time::Duration::from_secs(119))
+                .is_err(),
+            "one second short of twice does not"
+        );
     }
 
     #[test]

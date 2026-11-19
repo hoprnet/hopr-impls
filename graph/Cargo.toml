@@ -17,35 +17,43 @@ name = "hopr-network-graph"
 readme = "README.md"
 repository.workspace = true
 rust-version.workspace = true
-version = "0.12.1"
+version = "0.12.2"
 
 [lib]
 crate-type = ["rlib"]
 
 [features]
 all-benchmarks = []
-default        = ["petgraph"]
-graph-api      = ["petgraph"]
-petgraph       = ["dep:indexmap", "dep:petgraph", "dep:rand"]
-serde          = ["dep:futures-time", "hopr-api/serde", "hopr-utils/runtime-tokio"]
-state-dump     = ["hopr-utils/runtime-tokio", "serde"]
-telemetry      = ["hopr-api/types-telemetry"]
+default = ["petgraph"]
+graph-api = ["petgraph"]
+petgraph = ["dep:indexmap", "dep:petgraph", "dep:rand"]
+serde = [
+  "dep:futures-time",
+  "dep:humantime-serde",
+  "hopr-api/serde",
+  "hopr-utils/runtime-tokio",
+]
+state-dump = ["hopr-utils/runtime-tokio", "serde"]
+telemetry = ["hopr-api/types-telemetry"]
 
 [dependencies]
-anyhow       = { workspace = true }
-bimap        = { workspace = true }
-futures      = { workspace = true }
-futures-time = { workspace = true, optional = true }
-indexmap     = { workspace = true, optional = true, features = ["rayon"] }
-lazy_static  = { workspace = true }
-parking_lot  = { workspace = true }
-petgraph     = { workspace = true, optional = true, features = ["rayon"] }
-rand         = { workspace = true, optional = true }
-serde        = { workspace = true }
-serde_json   = { workspace = true }
-smallvec     = { workspace = true }
-thiserror    = { workspace = true }
-tracing      = { workspace = true }
+anyhow          = { workspace = true }
+bimap           = { workspace = true }
+futures         = { workspace = true }
+futures-time    = { workspace = true, optional = true }
+humantime-serde = { workspace = true, optional = true }
+indexmap        = { workspace = true, optional = true, features = ["rayon"] }
+lazy_static     = { workspace = true }
+parking_lot     = { workspace = true }
+petgraph        = { workspace = true, optional = true, features = ["rayon"] }
+rand            = { workspace = true, optional = true }
+serde           = { workspace = true }
+serde_json      = { workspace = true }
+smallvec        = { workspace = true }
+smart-default   = { workspace = true }
+thiserror       = { workspace = true }
+tracing         = { workspace = true }
+validator       = { workspace = true }
 
 hopr-api = { workspace = true, features = [
   "component",
@@ -76,3 +84,6 @@ name    = "traverse_bench"
 harness           = false
 name              = "dump_contention"
 required-features = ["serde"]
+
+[package.metadata.cargo-shear]
+ignored = ["humantime-serde"]

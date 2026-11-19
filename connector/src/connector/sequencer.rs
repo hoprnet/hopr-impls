@@ -19,12 +19,18 @@ use tracing::Instrument;
 
 use crate::{
     errors::{self, ConnectorError},
+    metrics::{
+        PHASE_SUBMIT, PHASE_TRACK, QueueDepth, elapsed_seconds, record_caller_abandoned, record_nonce,
+        record_tx_duration, record_tx_outcome,
+    },
     utils::model_to_chain_info,
 };
 
+/// A queued chain write: the request, an optional signer, its operation label and the result notifier.
 type TxRequest<T> = (
     T,
     Option<ChainKeypair>,
+    &'static str,
     futures::channel::oneshot::Sender<errors::Result<blokli_client::api::TxId>>,
 );
 
@@ -37,6 +43,7 @@ pub struct TransactionSequencer<C, R> {
     // Shared with the queue task, to drop the nonce of a signer whose transaction was found dropped
     current_nonce: moka::sync::Cache<Address, std::sync::Arc<AtomicU64>>,
     own_signer: Address,
+    queue_depth: std::sync::Arc<QueueDepth>,
 }
 
 const TX_QUEUE_CAPACITY: usize = 2048;
@@ -127,105 +134,131 @@ where
             .build();
 
         let nonce_gaps = moka::sync::Cache::new(1024);
+        // Alternate signers must not replace the node's nonce samples.
+        let node_address = signer.public().to_address();
+        let queue_depth = std::sync::Arc::new(QueueDepth::default());
+        let dequeued = queue_depth.clone();
 
         hopr_utils::runtime::prelude::spawn(
             receiver
-                .for_each(move |(tx, tx_signer, notifier): (R, Option<ChainKeypair>, _)| {
-                    let client = client_clone.clone();
-                    let signer = tx_signer.unwrap_or_else(|| signer.clone());
-                    let signer_addr = signer.public().to_address();
-                    let current_nonce = current_nonce.clone();
-                    let nonce_gaps = nonce_gaps.clone();
-                    let issued_tx_ids = issued_tx_ids.clone();
-                    async move {
-                        // Outer `Err`: the transaction never reached Blokli, inner: Blokli's outcome
-                        let submission = async {
-                            let (chain_id, gas_estimation) = read_gas_estimation(&*client).await?;
+                .for_each(
+                    move |(tx, tx_signer, operation, notifier): (R, Option<ChainKeypair>, &'static str, _)| {
+                        dequeued.dequeued();
+                        let submit_started = Instant::now();
+                        let client = client_clone.clone();
+                        let signer = tx_signer.unwrap_or_else(|| signer.clone());
+                        let signer_addr = signer.public().to_address();
+                        let current_nonce = current_nonce.clone();
+                        let nonce_gaps = nonce_gaps.clone();
+                        let issued_tx_ids = issued_tx_ids.clone();
+                        async move {
+                            // Outer `Err`: the transaction never reached Blokli, inner: Blokli's outcome
+                            let submission = async {
+                                let (chain_id, gas_estimation) = read_gas_estimation(&*client).await?;
 
-                            let pending = client
-                                .query_transaction_count(&signer_addr.into())
-                                .map_err(ConnectorError::from)
-                                .await?;
-                            let local_nonce = current_nonce.entry(signer_addr).or_default().into_value();
-                            let nonce =
-                                sync_nonce(&local_nonce, &nonce_gaps, signer_addr, pending, nonce_gap_tolerance);
+                                let pending = client
+                                    .query_transaction_count(&signer_addr.into())
+                                    .map_err(ConnectorError::from)
+                                    .await?;
+                                let local_nonce = current_nonce.entry(signer_addr).or_default().into_value();
+                                let nonce =
+                                    sync_nonce(&local_nonce, &nonce_gaps, signer_addr, pending, nonce_gap_tolerance);
+                                if signer_addr == node_address {
+                                    record_nonce("local", nonce);
+                                    record_nonce("chain_pending", pending);
+                                }
 
-                            submit_with_retry(
-                                nonce,
-                                gas_estimation,
-                                pending,
-                                &local_nonce,
-                                |nonce, gas_estimation| {
-                                    tracing::Span::current().record("nonce", nonce);
-                                    let tx = tx.clone();
-                                    let client = &client;
-                                    let signer = &signer;
-                                    async move {
-                                        let tx = tx
-                                            .sign_and_encode_to_eip2718(nonce, chain_id, gas_estimation.into(), signer)
-                                            .await?;
-                                        tracing::debug!("submitting transaction");
-                                        Ok(client
-                                            .submit_and_track_transaction(&tx)
+                                submit_with_retry(
+                                    nonce,
+                                    gas_estimation,
+                                    pending,
+                                    &local_nonce,
+                                    |nonce, gas_estimation| {
+                                        tracing::Span::current().record("nonce", nonce);
+                                        let tx = tx.clone();
+                                        let client = &client;
+                                        let signer = &signer;
+                                        async move {
+                                            let tx = tx
+                                                .sign_and_encode_to_eip2718(
+                                                    nonce,
+                                                    chain_id,
+                                                    gas_estimation.into(),
+                                                    signer,
+                                                )
+                                                .await?;
+                                            tracing::debug!("submitting transaction");
+                                            Ok(client
+                                                .submit_and_track_transaction(&tx)
+                                                .map_err(ConnectorError::from)
+                                                .await)
+                                        }
+                                    },
+                                    || async {
+                                        client
+                                            .query_transaction_count(&signer_addr.into())
                                             .map_err(ConnectorError::from)
-                                            .await)
-                                    }
-                                },
-                                || async {
-                                    client
-                                        .query_transaction_count(&signer_addr.into())
-                                        .map_err(ConnectorError::from)
-                                        .await
-                                },
-                                || async { read_gas_estimation(&*client).await.map(|(_, gas)| gas) },
-                            )
-                            .await
-                        }
-                        .await;
-
-                        let deduplicated = matches!(
-                            &submission,
-                            Ok(Ok(tx_id)) if !record_issued_tx_id(&issued_tx_ids, tx_id)
-                        );
-                        match nonce_consumed(&submission, deduplicated) {
-                            Some(true) => {
-                                let prev_nonce = current_nonce
-                                    .entry(signer_addr)
-                                    .or_default()
-                                    .value()
-                                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-
-                                tracing::debug!(
-                                    prev_nonce,
-                                    ?submission,
-                                    "nonce incremented due to tx success or rejection"
-                                );
+                                            .await
+                                    },
+                                    || async { read_gas_estimation(&*client).await.map(|(_, gas)| gas) },
+                                )
+                                .await
                             }
-                            Some(false) => tracing::debug!(deduplicated, ?submission, "nonce not consumed"),
-                            None => {
-                                current_nonce.invalidate(&signer_addr);
-                                tracing::warn!(
-                                    ?submission,
-                                    "unknown whether the nonce was consumed, re-reading it from the chain"
-                                );
-                            }
-                        }
-                        submission.and_then(|res| res)
-                    }
-                    .instrument(tracing::debug_span!(
-                        "sequence_transaction",
-                        signer = %signer_addr,
-                        nonce = tracing::field::Empty
-                    ))
-                    .map(move |res| {
-                        if notifier.send(res).is_err() {
-                            tracing::debug!(
-                                "failed to notify transaction result - the caller may not want to await the result \
-                                 anymore."
+                            .await;
+
+                            let deduplicated = matches!(
+                                &submission,
+                                Ok(Ok(tx_id)) if !record_issued_tx_id(&issued_tx_ids, tx_id)
                             );
+                            match nonce_consumed(&submission, deduplicated) {
+                                Some(true) => {
+                                    let prev_nonce = current_nonce
+                                        .entry(signer_addr)
+                                        .or_default()
+                                        .value()
+                                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+                                    tracing::debug!(
+                                        prev_nonce,
+                                        ?submission,
+                                        "nonce incremented due to tx success or rejection"
+                                    );
+                                }
+                                Some(false) => tracing::debug!(deduplicated, ?submission, "nonce not consumed"),
+                                None => {
+                                    current_nonce.invalidate(&signer_addr);
+                                    tracing::warn!(
+                                        ?submission,
+                                        "unknown whether the nonce was consumed, re-reading it from the chain"
+                                    );
+                                }
+                            }
+
+                            let outcome = submit_outcome(&submission, deduplicated);
+                            // Only a submission that reached Blokli has a submit duration worth reporting.
+                            let submitted_in = matches!(submission, Ok(Ok(_)))
+                                .then(|| elapsed_seconds(submit_started, Instant::now()));
+                            (submission.and_then(|res| res), outcome, submitted_in)
                         }
-                    })
-                })
+                        .instrument(tracing::debug_span!(
+                            "sequence_transaction",
+                            signer = %signer_addr,
+                            nonce = tracing::field::Empty
+                        ))
+                        .map(move |(res, outcome, submitted_in)| {
+                            if notifier.send(res).is_err() {
+                                tracing::debug!(
+                                    "failed to notify transaction result - the caller may not want to await the \
+                                     result anymore."
+                                );
+                            }
+                            record_tx_outcome(operation, PHASE_SUBMIT, outcome);
+                            if let Some(seconds) = submitted_in {
+                                record_tx_duration(operation, PHASE_SUBMIT, seconds);
+                            }
+                        })
+                    },
+                )
                 .inspect(|_| tracing::warn!("transaction sequencer queue stopped")),
         );
 
@@ -234,6 +267,7 @@ where
             client,
             current_nonce: current_nonce_handle,
             own_signer: signer_addr_own,
+            queue_depth,
         }
     }
 }
@@ -430,6 +464,84 @@ fn nonce_gap_age(
     }
 }
 
+/// Records a chain write as abandoned when it is dropped before it produced a result.
+///
+/// The caller of a chain write can stop waiting after the transaction was submitted, which leaves
+/// the write in flight. Counting that as an abandoned caller keeps it visible; the transaction then
+/// records no phase outcome, because it has none yet.
+struct AbandonGuard<F: FnOnce()> {
+    on_abandon: Option<F>,
+}
+
+impl<F: FnOnce()> AbandonGuard<F> {
+    fn new(on_abandon: F) -> Self {
+        Self {
+            on_abandon: Some(on_abandon),
+        }
+    }
+
+    /// Disarms the guard. Call this once the result reached the caller.
+    fn complete(mut self) {
+        self.on_abandon = None;
+    }
+}
+
+impl<F: FnOnce()> Drop for AbandonGuard<F> {
+    fn drop(&mut self) {
+        if let Some(on_abandon) = self.on_abandon.take() {
+            on_abandon();
+        }
+    }
+}
+
+/// Outcome of the submit phase of a chain write.
+fn submit_outcome(
+    submission: &errors::Result<errors::Result<blokli_client::api::TxId>>,
+    deduplicated: bool,
+) -> &'static str {
+    match submission {
+        Err(_) => "transport_error",
+        Ok(Ok(_)) if deduplicated => "deduplicated",
+        Ok(Ok(_)) => "accepted",
+        Ok(Err(error)) if error.is_refused_before_broadcast() => "refused_before_broadcast",
+        Ok(Err(error)) if error.refusal_code().is_some() => "rpc_rejected",
+        Ok(Err(_)) => "unknown",
+    }
+}
+
+/// Outcome of a chain write whose tracking failed.
+///
+/// A tracking timeout is its own outcome: the transaction may still confirm, so reporting it as a
+/// failure hides writes that are alive and makes a caller's retry look like a chain fault. The
+/// tracking deadline is this connector's own timer, so a client timeout that ran out the whole
+/// deadline is that outcome; a shorter one is a transport fault.
+fn track_failure_outcome(
+    error: &ConnectorError,
+    waited: std::time::Duration,
+    deadline: std::time::Duration,
+) -> &'static str {
+    match error.tracking_error() {
+        Some(blokli_client::errors::TrackingErrorKind::Timeout) => "tracking_timeout",
+        Some(blokli_client::errors::TrackingErrorKind::Reverted) => "reverted",
+        Some(blokli_client::errors::TrackingErrorKind::ValidationFailed) => "validation_failed",
+        Some(blokli_client::errors::TrackingErrorKind::SubmissionFailed) => "submission_failed",
+        None if error.is_client_timeout() && waited >= deadline => "tracking_timeout",
+        None => "transport_error",
+    }
+}
+
+/// Outcome of a chain write that confirmed.
+///
+/// A Safe-wrapped transaction can confirm while the action inside it reverted, which the caller
+/// receives as `InnerTxFailed`. Reporting that as `confirmed` would count a failed write as a
+/// success.
+pub(crate) fn confirmed_outcome(safe_execution_succeeded: Option<bool>) -> &'static str {
+    match safe_execution_succeeded {
+        Some(false) => "inner_failed",
+        _ => "confirmed",
+    }
+}
+
 /// Whether the nonce the transaction was signed with is now used up, by it or by another
 /// transaction. `None` when the result does not tell.
 fn nonce_consumed(
@@ -461,11 +573,13 @@ where
     /// Adds the transaction to the [`TransactionSequencer`] queue.
     ///
     /// The `timeout_until_finalized` is a total time until the TX is submitted and either confirmed or rejected.
+    /// The `operation` is the metric label of the write, such as `open_channel`.
     pub async fn enqueue_transaction(
         &self,
         transaction: R,
         timeout_until_finalized: std::time::Duration,
         custom_signer: Option<ChainKeypair>,
+        operation: &'static str,
     ) -> errors::Result<impl Future<Output = errors::Result<blokli_client::api::types::Transaction>>> {
         let (notifier_tx, notifier_rx) = futures::channel::oneshot::channel();
         let signer_addr = custom_signer
@@ -473,47 +587,71 @@ where
             .map_or(self.own_signer, |signer| signer.public().to_address());
         let current_nonce = self.current_nonce.clone();
 
+        self.queue_depth.enqueued();
         self.sender
             .clone()
-            .send((transaction, custom_signer, notifier_tx))
+            .send((transaction, custom_signer, operation, notifier_tx))
             .await
-            .map_err(|_| ConnectorError::InvalidState("transaction queue dropped"))?;
+            .map_err(|_| {
+                self.queue_depth.dequeued();
+                ConnectorError::InvalidState("transaction queue dropped")
+            })?;
 
-        Ok(notifier_rx
-            .inspect_ok(|res| tracing::debug!(?res, "transaction tracking id received"))
-            .map(move |result| {
-                result
-                    .map_err(|_| ConnectorError::InvalidState("transaction notifier dropped"))
-                    .and_then(|tx_res| tx_res.map(|id| (id, timeout_until_finalized)))
-            })
-            .and_then(move |(tx_id, timeout)| {
-                self.client
-                    .track_transaction(tx_id, timeout)
+        // Created before the future exists, so dropping it unpolled still counts the abandonment.
+        // The write is alive on chain in that case: counting a failure would misreport it.
+        let abandoned = AbandonGuard::new(move || record_caller_abandoned(operation));
+        Ok(async move {
+            let result = async {
+                let tx_id = notifier_rx
+                    .await
+                    .map_err(|_| ConnectorError::InvalidState("transaction notifier dropped"))??;
+                tracing::debug!(?tx_id, "transaction tracking id received");
+
+                let tracking_started = Instant::now();
+                let tracked = self
+                    .client
+                    .track_transaction(tx_id, timeout_until_finalized)
+                    .await
                     .map_err(ConnectorError::from)
-                    .inspect(|res| tracing::debug!(?res, "transaction tracking done"))
-                    .inspect_err(move |error| {
-                        if nonce_is_free(error) {
-                            tracing::warn!(
-                                %signer_addr,
-                                diagnosis = ?error.unmined_diagnosis(),
-                                "transaction left unmined with its nonce unused, re-reading the nonce from the chain"
-                            );
-                            current_nonce.invalidate(&signer_addr);
+                    .and_then(|outcome| match outcome {
+                        TransactionTrackingOutcome::Confirmed(tx) => Ok(tx),
+                        // The client deadline elapsed without a terminal status. This was reported as a
+                        // timeout before the client distinguished the two, and is kept that way here.
+                        TransactionTrackingOutcome::StatusUnknown { .. } => {
+                            Err(ConnectorError::from(blokli_client::errors::BlokliClientError::from(
+                                blokli_client::errors::ErrorKind::TrackingError(TrackingErrorKind::Timeout),
+                            )))
                         }
-                    })
-                    .and_then(|outcome| async move {
-                        match outcome {
-                            TransactionTrackingOutcome::Confirmed(tx) => Ok(tx),
-                            // The client deadline elapsed without a terminal status. This was reported as a
-                            // timeout before the client distinguished the two, and is kept that way here.
-                            TransactionTrackingOutcome::StatusUnknown { .. } => {
-                                Err(ConnectorError::from(blokli_client::errors::BlokliClientError::from(
-                                    blokli_client::errors::ErrorKind::TrackingError(TrackingErrorKind::Timeout),
-                                )))
-                            }
-                        }
-                    })
-            }))
+                    });
+                tracing::debug!(?tracked, "transaction tracking done");
+                let waited = tracking_started.elapsed();
+                // A confirmed transaction is classified where the Safe execution result is known.
+                if let Err(error) = &tracked {
+                    if nonce_is_free(error) {
+                        tracing::warn!(
+                            %signer_addr,
+                            diagnosis = ?error.unmined_diagnosis(),
+                            "transaction left unmined with its nonce unused, re-reading the nonce from the chain"
+                        );
+                        current_nonce.invalidate(&signer_addr);
+                    }
+                    record_tx_outcome(
+                        operation,
+                        PHASE_TRACK,
+                        track_failure_outcome(error, waited, timeout_until_finalized),
+                    );
+                }
+                record_tx_duration(
+                    operation,
+                    PHASE_TRACK,
+                    elapsed_seconds(tracking_started, Instant::now()),
+                );
+                tracked
+            }
+            .await;
+            abandoned.complete();
+            result
+        })
     }
 }
 
@@ -526,7 +664,7 @@ impl<C, R> Drop for TransactionSequencer<C, R> {
 
 #[cfg(test)]
 mod tests {
-    use blokli_client::errors::ErrorKind;
+    use blokli_client::errors::{ErrorKind, TrackingErrorKind};
 
     use super::*;
 
@@ -571,6 +709,53 @@ mod tests {
             message: "too many tracked transactions".into(),
         });
         assert_eq!(Some(false), nonce_consumed(&overloaded, false));
+    }
+
+    #[test]
+    fn a_dropped_future_counts_as_an_abandoned_caller() {
+        let abandoned = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = {
+            let abandoned = abandoned.clone();
+            move || {
+                abandoned.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        };
+
+        {
+            let _guard = AbandonGuard::new(count.clone());
+        }
+        assert_eq!(1, abandoned.load(std::sync::atomic::Ordering::SeqCst));
+
+        let completed = AbandonGuard::new(count);
+        completed.complete();
+        assert_eq!(
+            1,
+            abandoned.load(std::sync::atomic::Ordering::SeqCst),
+            "a caller that received the result is not abandoned"
+        );
+    }
+
+    #[test]
+    fn an_unpolled_future_still_counts_the_caller_as_abandoned() {
+        let abandoned = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = {
+            let abandoned = abandoned.clone();
+            move || {
+                abandoned.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        };
+
+        let guard = AbandonGuard::new(count);
+        let future = async move {
+            guard.complete();
+        };
+        drop(future);
+
+        assert_eq!(
+            1,
+            abandoned.load(std::sync::atomic::Ordering::SeqCst),
+            "the guard is created before the future is built, so dropping it unpolled counts"
+        );
     }
 
     #[test]
@@ -836,6 +1021,87 @@ mod tests {
         assert!(nonce_is_free(&dropped));
         assert!(!nonce_is_free(&underpriced));
         assert!(!nonce_is_free(&plain));
+    }
+
+    #[test]
+    fn submit_outcomes_are_distinct_per_submission_result() {
+        assert_eq!("accepted", submit_outcome(&Ok(Ok("tx-1".into())), false));
+        assert_eq!("deduplicated", submit_outcome(&Ok(Ok("tx-1".into())), true));
+        assert_eq!(
+            "refused_before_broadcast",
+            submit_outcome(
+                &failed(ErrorKind::HoprActionRejected {
+                    operation: "finalize_channel_closure".into(),
+                    reason: "closure_time_not_elapsed".into(),
+                    message: "too early".into(),
+                }),
+                false
+            )
+        );
+        assert_eq!("rpc_rejected", submit_outcome(&rpc_refusal("NONCE_TOO_LOW"), false));
+        assert_eq!(
+            "transport_error",
+            submit_outcome(&Err(ConnectorError::ServerNotHealthy), false)
+        );
+        assert_eq!("unknown", submit_outcome(&failed(ErrorKind::Timeout), false));
+    }
+
+    fn deadline() -> std::time::Duration {
+        std::time::Duration::from_secs(60)
+    }
+
+    #[test]
+    fn a_tracking_timeout_is_its_own_outcome_and_never_a_revert() {
+        let timeout = ConnectorError::ClientError(ErrorKind::TrackingError(TrackingErrorKind::Timeout).into());
+
+        assert_eq!(
+            "tracking_timeout",
+            track_failure_outcome(&timeout, deadline(), deadline())
+        );
+        assert_ne!("reverted", track_failure_outcome(&timeout, deadline(), deadline()));
+        assert_ne!(
+            "transport_error",
+            track_failure_outcome(&timeout, deadline(), deadline())
+        );
+    }
+
+    #[test]
+    fn track_outcomes_follow_the_tracking_failure_kind() {
+        for (kind, outcome) in [
+            (TrackingErrorKind::Reverted, "reverted"),
+            (TrackingErrorKind::ValidationFailed, "validation_failed"),
+            (TrackingErrorKind::SubmissionFailed, "submission_failed"),
+        ] {
+            let error = ConnectorError::ClientError(ErrorKind::TrackingError(kind).into());
+            assert_eq!(
+                outcome,
+                track_failure_outcome(&error, deadline(), deadline()),
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_client_timeout_that_ran_out_the_deadline_is_a_tracking_timeout() {
+        let client_timeout = ConnectorError::ClientError(ErrorKind::Timeout.into());
+
+        assert_eq!(
+            "tracking_timeout",
+            track_failure_outcome(&client_timeout, deadline(), deadline()),
+            "the tracking deadline is the connector's own timer"
+        );
+        assert_eq!(
+            "transport_error",
+            track_failure_outcome(&client_timeout, std::time::Duration::from_secs(3), deadline()),
+            "a request timeout inside the deadline is a transport fault"
+        );
+    }
+
+    #[test]
+    fn a_confirmed_transaction_with_a_reverted_safe_execution_is_a_failure() {
+        assert_eq!("confirmed", confirmed_outcome(None), "no Safe execution");
+        assert_eq!("confirmed", confirmed_outcome(Some(true)));
+        assert_eq!("inner_failed", confirmed_outcome(Some(false)));
     }
 
     #[test]

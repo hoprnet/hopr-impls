@@ -4,6 +4,7 @@ mod connector;
 #[cfg(feature = "serde")]
 mod diagnostics;
 pub mod errors;
+mod metrics;
 mod reader;
 #[cfg(any(test, feature = "testing"))]
 pub use hopr_utils::testing::blokli as testing;

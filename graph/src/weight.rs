@@ -90,22 +90,29 @@ pub struct Observations {
     health: Option<f64>,
     /// How the loops over this edge judge its relay, handed to its intermediate stream.
     starvation: StarvationParams,
+    /// How long the loops over this edge are counted; [`LOOPBACK_WINDOW`] when `None`.
+    loopback_window: Option<std::time::Duration>,
 }
 
 impl Observations {
-    /// An edge whose loops are judged by `starvation` instead of the defaults.
-    pub(crate) fn with_starvation(starvation: StarvationParams) -> Self {
+    /// An edge whose loops are judged by `starvation` and counted for `window`.
+    pub(crate) fn with_loopback_params(starvation: StarvationParams, window: std::time::Duration) -> Self {
         Self {
             starvation,
+            loopback_window: Some(window),
             ..Self::default()
         }
     }
 
+    pub(crate) fn loopback_window(&self) -> std::time::Duration {
+        self.loopback_window.unwrap_or(LOOPBACK_WINDOW)
+    }
+
     /// The intermediate stream, created on first use with this edge's starvation parameters.
     fn intermediate_mut(&mut self) -> &mut TransportIntermediates {
-        let starvation = self.starvation;
+        let (starvation, window) = (self.starvation, self.loopback_window());
         self.intermediate_probe
-            .get_or_insert_with(|| TransportIntermediates::with_starvation(starvation))
+            .get_or_insert_with(|| TransportIntermediates::with_params(starvation, window))
     }
 
     pub(crate) fn set_health(&mut self, health: Option<f64>) {
@@ -132,11 +139,12 @@ impl Observations {
     /// The neighbour ping reads the verdict of the edge's loopback stream; see `relay_starved_at`.
     fn restamp_starved(&mut self) {
         let now = std::time::Instant::now();
+        let window = self.loopback_window();
         if let Some(immediate) = self.immediate_probe.as_mut() {
-            immediate.relay_starved_at = self
+            immediate.relay_starved_until = self
                 .intermediate_probe
                 .is_some_and(|i| i.relay_starved_at(now))
-                .then_some(now);
+                .then(|| now + window);
         }
     }
 }
@@ -198,13 +206,15 @@ pub struct TransportImmediates {
     ///
     /// The neighbour answers pings whatever it does with relayed packets, so this stream's latency says
     /// nothing about a relay that is starved. The stream cannot see the other one, so the edge stamps
-    /// the verdict here on every record, and it lapses with the window it was read from.
-    relay_starved_at: Option<std::time::Instant>,
+    /// the verdict here on every record, and it lapses with the window it was read from: this is the
+    /// instant that window ends.
+    relay_starved_until: Option<std::time::Instant>,
 }
 
 impl TransportImmediates {
     fn relay_starved(&self) -> bool {
-        self.relay_starved_at.is_some_and(|at| at.elapsed() < LOOPBACK_WINDOW)
+        self.relay_starved_until
+            .is_some_and(|until| std::time::Instant::now() < until)
     }
 }
 
@@ -308,7 +318,7 @@ struct SurbPeak {
 
 /// Width of one loopback bucket.
 const LOOPBACK_BUCKET_WIDTH: std::time::Duration = std::time::Duration::from_secs(5);
-/// Buckets in the loopback window: 60 s of evidence.
+/// Buckets in the loopback window: 60 s of evidence by default.
 ///
 /// Loops are sent once per probing round, 30 s by default, and a lost one is recorded after the 3 s
 /// probe timeout. The window has to span more than one round, or the evidence is gone for most of
@@ -317,13 +327,31 @@ const LOOPBACK_BUCKET_WIDTH: std::time::Duration = std::time::Duration::from_sec
 /// good loop stays counted until it expires.
 const LOOPBACK_BUCKETS: usize = 12;
 
-/// How far back loopback outcomes over an edge are still counted.
+/// How far back loopback outcomes over an edge are still counted, unless the graph is built with another
+/// [`ChannelGraphConfig::loopback_window`](crate::ChannelGraphConfig::loopback_window).
 ///
 /// The probing interval must stay well inside it: a loop is sent once per round, so with a longer
 /// interval the evidence expires between rounds and a failing relay reads as unprobed instead of
 /// dead. The loopback generator's own configuration is checked against it.
 pub const LOOPBACK_WINDOW: std::time::Duration =
     std::time::Duration::from_secs(LOOPBACK_BUCKET_WIDTH.as_secs() * LOOPBACK_BUCKETS as u64);
+
+/// Shortest configurable loopback window: twelve buckets of one second.
+pub const MIN_LOOPBACK_WINDOW: std::time::Duration = std::time::Duration::from_secs(LOOPBACK_BUCKETS as u64);
+
+/// Longest configurable loopback window. A longer one only delays noticing a dead relay by that much.
+pub const MAX_LOOPBACK_WINDOW: std::time::Duration = std::time::Duration::from_hours(1);
+
+/// Rejects a loopback window outside [`MIN_LOOPBACK_WINDOW`]..=[`MAX_LOOPBACK_WINDOW`].
+pub fn validate_loopback_window(window: std::time::Duration) -> Result<(), String> {
+    if (MIN_LOOPBACK_WINDOW..=MAX_LOOPBACK_WINDOW).contains(&window) {
+        Ok(())
+    } else {
+        Err(format!(
+            "loopback window must be between {MIN_LOOPBACK_WINDOW:?} and {MAX_LOOPBACK_WINDOW:?}, got {window:?}"
+        ))
+    }
+}
 
 /// Loops over an edge from which the return rate, not a single returned loop, judges its relay. Three, not
 /// more: a sparse network sees few loops per edge, and a dropping relay should not stay usable for want of
@@ -348,6 +376,11 @@ const LOST_RUN_SIGNIFICANCE: f64 = 0.05;
 /// How the loops over an edge judge its relay. Built from the path planner's configuration by whoever
 /// constructs the graph, see [`ChannelGraph::with_starvation`](crate::ChannelGraph::with_starvation).
 #[derive(Debug, Copy, Clone, PartialEq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(default, deny_unknown_fields)
+)]
 pub struct StarvationParams {
     /// Loops in the window from which the return rate judges the relay. Below it, a single returned loop
     /// keeps the relay and none starves it.
@@ -389,7 +422,7 @@ struct LoopbackBucket {
     returned: u32,
 }
 
-/// Loopbacks over an edge that returned, against all of them, over the last 60 s.
+/// Loopbacks over an edge that returned, against all of them, over the last window (60 s by default).
 ///
 /// Every loop that crosses the edge counts once, returned or failed, so the rate is returned over returned
 /// plus failed. A window rather than a moving average: a relay none of whose loops returned reads exactly
@@ -399,6 +432,8 @@ struct LoopbackBucket {
 #[derive(Debug, Copy, Clone, PartialEq)]
 struct LoopbackWindow {
     epoch: std::time::Instant,
+    /// Span of one bucket: the window over [`LOOPBACK_BUCKETS`].
+    bucket_width: std::time::Duration,
     buckets: [LoopbackBucket; LOOPBACK_BUCKETS],
     /// Loops lost in a row since the latest one that came back.
     lost_run: u32,
@@ -406,8 +441,16 @@ struct LoopbackWindow {
 
 impl LoopbackWindow {
     fn new(epoch: std::time::Instant) -> Self {
+        Self::with_window(epoch, LOOPBACK_WINDOW)
+    }
+
+    /// A window that counts outcomes for `window` instead of [`LOOPBACK_WINDOW`].
+    ///
+    /// `window` must pass [`validate_loopback_window`], or the bucket width is zero.
+    fn with_window(epoch: std::time::Instant, window: std::time::Duration) -> Self {
         Self {
             epoch,
+            bucket_width: window / LOOPBACK_BUCKETS as u32,
             buckets: [LoopbackBucket::default(); LOOPBACK_BUCKETS],
             lost_run: 0,
         }
@@ -431,7 +474,8 @@ impl LoopbackWindow {
     }
 
     fn slot_of(&self, now: std::time::Instant) -> u64 {
-        now.saturating_duration_since(self.epoch).as_secs() / LOOPBACK_BUCKET_WIDTH.as_secs()
+        let slot = now.saturating_duration_since(self.epoch).as_nanos() / self.bucket_width.as_nanos();
+        u64::try_from(slot).unwrap_or(u64::MAX)
     }
 
     fn record_at(&mut self, returned: bool, now: std::time::Instant) {
@@ -504,10 +548,11 @@ impl Default for TransportIntermediates {
 }
 
 impl TransportIntermediates {
-    /// An edge stream that judges its relay by `starvation`.
-    pub(crate) fn with_starvation(starvation: StarvationParams) -> Self {
+    /// An edge stream that judges its relay by `starvation`, from loops counted for `window`.
+    pub(crate) fn with_params(starvation: StarvationParams, window: std::time::Duration) -> Self {
         Self {
             starvation,
+            loopback: LoopbackWindow::with_window(std::time::Instant::now(), window),
             ..Self::default()
         }
     }
@@ -1802,6 +1847,62 @@ mod loopback_window_tests {
     }
 
     #[test]
+    fn a_longer_window_should_keep_outcomes_until_it_has_elapsed() {
+        let epoch = Instant::now();
+        let window_len = Duration::from_secs(120);
+        let mut window = LoopbackWindow::with_window(epoch, window_len);
+        record(&mut window, epoch, 0, 5);
+
+        assert_eq!(
+            window.rate_at(epoch + Duration::from_secs(90)),
+            Some(0.0),
+            "90 s in, the failures are inside a 120 s window"
+        );
+        assert_eq!(
+            window.rate_at(epoch + window_len),
+            None,
+            "a full window on, the failures are out of it"
+        );
+    }
+
+    #[test]
+    fn a_window_outside_the_bounds_should_be_rejected() {
+        for window in [
+            Duration::ZERO,
+            MIN_LOOPBACK_WINDOW - Duration::from_millis(1),
+            MAX_LOOPBACK_WINDOW + Duration::from_millis(1),
+        ] {
+            assert!(validate_loopback_window(window).is_err(), "{window:?} must be rejected");
+        }
+        for window in [MIN_LOOPBACK_WINDOW, LOOPBACK_WINDOW, MAX_LOOPBACK_WINDOW] {
+            assert!(validate_loopback_window(window).is_ok(), "{window:?} must be accepted");
+        }
+    }
+
+    #[test]
+    fn an_edge_should_count_loops_for_the_window_it_was_built_with() {
+        let window = Duration::from_secs(120);
+        let mut observations = Observations::with_loopback_params(StarvationParams::default(), window);
+        observations.record(EdgeWeightType::Intermediate(Err(())));
+
+        let intermediate = observations.intermediate_mut();
+        assert_eq!(intermediate.loopback.bucket_width, window / LOOPBACK_BUCKETS as u32);
+        assert_eq!(observations.loopback_window(), window);
+        assert_eq!(Observations::default().loopback_window(), LOOPBACK_WINDOW);
+    }
+
+    #[test]
+    fn a_shorter_window_should_forget_outcomes_sooner() {
+        let epoch = Instant::now();
+        let window_len = Duration::from_secs(24);
+        let mut window = LoopbackWindow::with_window(epoch, window_len);
+        record(&mut window, epoch, 0, 5);
+
+        assert_eq!(window.rate_at(epoch + Duration::from_secs(20)), Some(0.0));
+        assert_eq!(window.rate_at(epoch + window_len), None);
+    }
+
+    #[test]
     fn a_relay_should_recover_once_its_loopbacks_return() {
         let epoch = Instant::now();
         let mut window = LoopbackWindow::new(epoch);
@@ -2261,7 +2362,7 @@ mod starvation_params_tests {
 
     /// An edge that saw `returned` loops come back and `lost` time out.
     fn edge_with(params: StarvationParams, returned: u32, lost: u32) -> Observations {
-        let mut observations = Observations::with_starvation(params);
+        let mut observations = Observations::with_loopback_params(params, LOOPBACK_WINDOW);
         for _ in 0..returned {
             observations.record(EdgeWeightType::Intermediate(Ok(std::time::Duration::from_millis(40))));
         }
