@@ -31,7 +31,6 @@
 //! ```
 
 use std::{
-    pin::Pin,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -39,17 +38,14 @@ use std::{
 use blokli_client::{BlokliClient, BlokliClientConfig, api::BlokliQueryClient, exports::Url};
 use futures::{StreamExt, stream::FuturesUnordered};
 use hopr_api::types::{
-    chain::prelude::{BasicPayloadGenerator, GasEstimation, PayloadGenerator, TransactionRequest},
+    chain::prelude::{BasicPayloadGenerator, GasEstimation},
     crypto::prelude::*,
     primitive::prelude::*,
 };
-use serde_json::{Value, json};
+use serde_json::json;
 
+use super::live_support::{ANVIL_ACCOUNT_1_KEY, Enqueuer, Outcome, Rpc, Seq, wait_for_chain_info};
 use crate::{connector::sequencer::TransactionSequencer, utils::model_to_chain_info};
-
-/// Secret key of the well-known, public Anvil development account #1. It holds no real funds.
-const ANVIL_ACCOUNT_1_KEY: [u8; 32] =
-    hex_literal::hex!("59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d");
 
 /// Default base fee the scenario starts from, in wei. `NONCE_GAP_BASELINE_BASE_FEE` overrides it.
 const DEFAULT_BASELINE_BASE_FEE: u128 = 100_000_000;
@@ -66,8 +62,6 @@ const BEFORE_SPIKE: usize = 3;
 const SEND_INTERVAL: Duration = Duration::from_secs(2);
 /// The sequencer's nonce gap tolerance, as in the default connector configuration.
 const NONCE_GAP_TOLERANCE: Duration = Duration::from_mins(5);
-/// Tracking timeout of every approval: longer than Blokli's unmined timeout set by `chain.sh`.
-const TRACKING_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Base fees of the blocks to mine: up by 12.5% per block until `peak`, held for `HOLD_BLOCKS`, then down by 12.5% per
 /// block until `baseline`. Returns the fees, the index of the first decay block and the number of ramp blocks.
@@ -88,52 +82,7 @@ fn ramp_schedule(baseline: u128, peak: u128) -> (Vec<u128>, usize, usize) {
     (fees, drop_after, ramp_blocks)
 }
 
-struct Anvil {
-    http: reqwest::Client,
-    url: String,
-}
-
-impl Anvil {
-    async fn call(&self, method: &str, params: Value) -> anyhow::Result<Value> {
-        let body = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
-        let response: Value = serde_json::from_slice(
-            &self
-                .http
-                .post(&self.url)
-                .header("content-type", "application/json")
-                .body(body.to_string())
-                .send()
-                .await?
-                .bytes()
-                .await?,
-        )?;
-        match response.get("error") {
-            Some(error) => anyhow::bail!("{method} failed: {error}"),
-            None => Ok(response["result"].clone()),
-        }
-    }
-
-    async fn quantity(&self, method: &str, params: Value) -> anyhow::Result<u128> {
-        let result = self.call(method, params).await?;
-        let hex = result
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("{method} returned no quantity"))?;
-        Ok(u128::from_str_radix(hex.trim_start_matches("0x"), 16)?)
-    }
-
-    /// Mined transaction count of `account`.
-    async fn nonce(&self, account: &str) -> anyhow::Result<u64> {
-        Ok(self
-            .quantity("eth_getTransactionCount", json!([account, "latest"]))
-            .await? as u64)
-    }
-
-    async fn base_fee(&self) -> anyhow::Result<u128> {
-        let block = self.call("eth_getBlockByNumber", json!(["latest", false])).await?;
-        let hex = block["baseFeePerGas"].as_str().unwrap_or("0x0");
-        Ok(u128::from_str_radix(hex.trim_start_matches("0x"), 16)?)
-    }
-
+impl Rpc {
     async fn set_next_base_fee(&self, fee: u128) -> anyhow::Result<()> {
         self.call("anvil_setNextBlockBaseFeePerGas", json!([format!("{fee:#x}")]))
             .await
@@ -152,57 +101,7 @@ impl Anvil {
     async fn mine_every_second(&self) -> anyhow::Result<()> {
         self.call("anvil_setIntervalMining", json!([1])).await.map(drop)
     }
-
-    /// Transactions of `account` held in the pool, as `(nonce, hash)`.
-    async fn pooled(&self, account: &str) -> anyhow::Result<Vec<(u64, String)>> {
-        let content = self.call("txpool_content", json!([])).await?;
-        let mut found = Vec::new();
-        for section in ["pending", "queued"] {
-            let Some(senders) = content[section].as_object() else {
-                continue;
-            };
-            for (sender, by_nonce) in senders {
-                if !sender.eq_ignore_ascii_case(account) {
-                    continue;
-                }
-                for (nonce, tx) in by_nonce.as_object().into_iter().flatten() {
-                    if let (Ok(nonce), Some(hash)) = (nonce.parse(), tx["hash"].as_str()) {
-                        found.push((nonce, hash.to_owned()));
-                    }
-                }
-            }
-        }
-        Ok(found)
-    }
 }
-
-type Seq = TransactionSequencer<BlokliClient, TransactionRequest>;
-
-struct Enqueuer<'a> {
-    sequencer: &'a Seq,
-    payloads: &'a BasicPayloadGenerator,
-    spender: Address,
-    started: Instant,
-}
-
-impl<'a> Enqueuer<'a> {
-    async fn enqueue(&self, index: usize, outcomes: &FuturesUnordered<Outcome<'a>>) -> anyhow::Result<()> {
-        // A distinct amount per approval, so that none is mistaken for a retry of another.
-        let tx = self.payloads.approve(self.spender, HoprBalance::from(index as u64))?;
-        let tracked = self.sequencer.enqueue_transaction(tx, TRACKING_TIMEOUT, None).await?;
-        let started = self.started;
-        outcomes.push(Box::pin(async move {
-            let result = match tracked.await {
-                Ok(tx) => format!("confirmed ({:?})", tx.status),
-                Err(error) => format!("{error}; diagnosis {:?}", error.unmined_diagnosis().map(|d| &d.reason)),
-            };
-            (index, started.elapsed(), result)
-        }));
-        Ok(())
-    }
-}
-
-type Outcome<'a> = Pin<Box<dyn Future<Output = (usize, Duration, String)> + 'a>>;
 
 async fn run_scenario(spike_factor: u128, default_window_secs: u64) -> anyhow::Result<()> {
     let blokli_url: Url = std::env::var("BLOKLI_URL")?.parse()?;
@@ -213,10 +112,7 @@ async fn run_scenario(spike_factor: u128, default_window_secs: u64) -> anyhow::R
             .and_then(|v| v.parse().ok())
             .unwrap_or(default_window_secs),
     );
-    let anvil = Anvil {
-        http: reqwest::Client::new(),
-        url: std::env::var("ANVIL_URL")?,
-    };
+    let anvil = Rpc::new(std::env::var("ANVIL_URL")?);
 
     let signer = ChainKeypair::from_secret(&ANVIL_ACCOUNT_1_KEY)?;
     let account = signer.public().to_address().to_string();
@@ -240,18 +136,7 @@ async fn run_scenario(spike_factor: u128, default_window_secs: u64) -> anyhow::R
     tokio::time::sleep(Duration::from_secs(2)).await;
     let base_fee = anvil.base_fee().await?;
 
-    // Blokli refuses queries while its indexer lags behind the blocks mined above.
-    let deadline = Instant::now() + Duration::from_secs(60);
-    let chain_info = loop {
-        match client.query_chain_info().await {
-            Ok(info) => break model_to_chain_info(info)?,
-            Err(error) if Instant::now() < deadline => {
-                println!("[{label}] waiting for Blokli's indexer: {error}");
-                tokio::time::sleep(Duration::from_secs(2)).await;
-            }
-            Err(error) => return Err(error.into()),
-        }
-    };
+    let chain_info = wait_for_chain_info(&client, &label).await?;
     let gas = GasEstimation::from(chain_info.clone());
     let spike_fee = base_fee * spike_factor;
     let payloads = BasicPayloadGenerator::new(signer.public().to_address(), chain_info.info.contract_addresses);

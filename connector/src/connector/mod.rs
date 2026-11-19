@@ -37,6 +37,8 @@ mod accounts;
 mod channels;
 mod events;
 mod keys;
+#[cfg(test)]
+mod live_support;
 mod safe;
 mod sequencer;
 #[cfg(test)]
