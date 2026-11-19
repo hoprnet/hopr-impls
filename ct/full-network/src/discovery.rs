@@ -924,6 +924,7 @@ mod tests {
 
     fn fast_cfg() -> EgressConfig {
         EgressConfig {
+            #[cfg(feature = "noise")]
             interval: Duration::from_millis(1),
             probe_connected_only: false,
             // Keep the re-add out of the way of the ordering assertions.
@@ -1144,6 +1145,7 @@ mod tests {
             probe_connected_only: false,
             ..Default::default()
         };
+        #[cfg(feature = "noise")]
         assert_eq!(cfg.interval, Duration::from_secs(30));
 
         let prober = FullNetworkDiscovery::new(me, cfg, graph);

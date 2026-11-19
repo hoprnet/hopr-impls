@@ -15,10 +15,13 @@ use validator::{Validate, ValidationError, ValidationErrors};
 pub struct EgressConfig {
     /// The delay between individual cover-traffic rounds.
     ///
-    /// Cover traffic only, and only with the `noise` feature: probe generation is pull driven and
-    /// never reads this value, the consumer decides how often to pull. Validation rejects an interval
-    /// above half of the loopback evidence window, because a failing relay's evidence would expire
-    /// between cover-traffic rounds.
+    /// The delay between individual cover-traffic rounds.
+    ///
+    /// Cover traffic only, which is why this exists only with the `noise` feature: probe generation
+    /// is pull driven and never reads a clock. Validation rejects an interval above half of the
+    /// loopback evidence window, because a failing relay's evidence would expire between
+    /// cover-traffic rounds.
+    #[cfg(feature = "noise")]
     #[default(default_probing_interval())]
     pub interval: std::time::Duration,
 
@@ -72,16 +75,20 @@ pub struct EgressConfig {
 }
 
 impl EgressConfig {
-    /// Validates the config, additionally ensuring `self.interval >= probe_timeout`.
+    /// Validates the config, additionally ensuring the cover-traffic interval is at least
+    /// `probe_timeout`.
     ///
-    /// Pinging more frequently than the probe timeout would cause probes to overlap;
-    /// this check prevents that misconfiguration.
+    /// Rounds closer together than the probe timeout would overlap; this check prevents that
+    /// misconfiguration. Only exists with the `noise` feature, which is the only thing that paces on
+    /// the interval.
+    #[cfg(feature = "noise")]
     pub fn validate_against_probe_timeout(&self, probe_timeout: std::time::Duration) -> anyhow::Result<()> {
         self.validate_against_loopback_window(probe_timeout, hopr_network_graph::LOOPBACK_WINDOW)
     }
 
     /// Like [`validate_against_probe_timeout`](Self::validate_against_probe_timeout), with the interval
     /// checked against the graph's configured loopback `window` instead of the default one.
+    #[cfg(feature = "noise")]
     pub fn validate_against_loopback_window(
         &self,
         probe_timeout: std::time::Duration,
@@ -100,6 +107,9 @@ impl EgressConfig {
 
     /// The checks of [`Validate::validate`], with the interval held against `window` instead of the
     /// default loopback window.
+    ///
+    /// `window` only matters for the interval, which exists only with the `noise` feature.
+    #[cfg_attr(not(feature = "noise"), allow(unused_variables))]
     fn validate_for_window(&self, window: std::time::Duration) -> Result<(), ValidationErrors> {
         let mut errors = ValidationErrors::new();
 
@@ -121,6 +131,7 @@ impl EgressConfig {
         // The loopback evidence of one cover-traffic round must still be counted when the next one is
         // sent, with room for the probe timeout and a late round, or a failing relay reads as unprobed
         // instead of starved.
+        #[cfg(feature = "noise")]
         if self.interval > window / 2 {
             errors.add(
                 "interval",
@@ -187,6 +198,7 @@ impl Validate for EgressConfig {
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EgressConfigFields {
+    #[cfg(feature = "noise")]
     #[serde(default = "default_probing_interval", with = "humantime_serde")]
     interval: std::time::Duration,
     #[serde(default = "just_true")]
@@ -212,6 +224,7 @@ impl TryFrom<EgressConfigFields> for EgressConfig {
 
     fn try_from(fields: EgressConfigFields) -> Result<Self, Self::Error> {
         let cfg = EgressConfig {
+            #[cfg(feature = "noise")]
             interval: fields.interval,
             probe_connected_only: fields.probe_connected_only,
             stable_samples: fields.stable_samples,
@@ -257,6 +270,7 @@ const fn default_best_set_size() -> usize {
     100
 }
 
+#[cfg(feature = "noise")]
 #[inline]
 const fn default_probing_interval() -> std::time::Duration {
     std::time::Duration::from_secs(30)
@@ -271,11 +285,13 @@ const fn just_true() -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "noise")]
     #[test]
     fn the_default_probing_interval_should_pass_validation() {
         assert!(EgressConfig::default().validate().is_ok());
     }
 
+    #[cfg(feature = "noise")]
     #[test]
     fn an_interval_that_does_not_fit_twice_in_the_loopback_window_should_be_invalid() {
         let half = hopr_network_graph::LOOPBACK_WINDOW / 2;
@@ -293,6 +309,7 @@ mod tests {
         assert!(err.field_errors().contains_key("interval"), "{err}");
     }
 
+    #[cfg(feature = "noise")]
     #[test]
     fn an_interval_too_large_to_double_should_be_invalid_instead_of_panicking() {
         let huge = EgressConfig {
@@ -303,6 +320,7 @@ mod tests {
         assert!(err.field_errors().contains_key("interval"), "{err}");
     }
 
+    #[cfg(feature = "noise")]
     #[test]
     fn an_interval_should_be_checked_against_the_configured_loopback_window() {
         let timeout = std::time::Duration::from_secs(3);
@@ -327,6 +345,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "noise")]
     #[test]
     fn interval_less_than_probe_timeout_is_invalid() {
         let cfg = EgressConfig::default(); // interval = 30s
@@ -334,6 +353,7 @@ mod tests {
         assert!(cfg.validate_against_probe_timeout(timeout).is_err());
     }
 
+    #[cfg(feature = "noise")]
     #[test]
     fn interval_equal_to_probe_timeout_is_valid() {
         let cfg = EgressConfig::default(); // interval = 30s
