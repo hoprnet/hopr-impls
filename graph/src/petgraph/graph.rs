@@ -183,9 +183,13 @@ impl ChannelGraph {
     /// # Errors
     ///
     /// Fails when `window` does not pass [`validate_loopback_window`](crate::validate_loopback_window), or
-    /// when the graph already has an edge: an edge keeps the window it was created with.
+    /// when the graph is already shared or has an edge: an edge keeps the window it was created with.
     pub fn with_loopback_window(mut self, window: std::time::Duration) -> Result<Self, String> {
         crate::validate_loopback_window(window)?;
+        // Clones share the edges but each keeps its own window, so only an unshared graph can change it.
+        if Arc::strong_count(&self.inner) > 1 {
+            return Err("the loopback window must be set before the graph is shared".into());
+        }
         if self.inner.read().graph.edge_count() > 0 {
             return Err("the loopback window must be set before any edge is added".into());
         }
@@ -771,8 +775,36 @@ mod tests {
         graph.add_edge(&me, &peer)?;
 
         // The existing edge keeps its own window, so accepting this would leave the graph mixed.
-        assert!(graph.with_loopback_window(std::time::Duration::from_secs(120)).is_err());
+        let error = graph
+            .with_loopback_window(std::time::Duration::from_secs(120))
+            .expect_err("a graph with an edge must refuse a new window");
+        assert!(error.contains("before any edge"), "{error}");
         Ok(())
+    }
+
+    #[test]
+    fn graph_should_accept_a_loopback_window_while_it_only_has_nodes() -> anyhow::Result<()> {
+        let (me, peer) = (pubkey_from(&SECRET_0), pubkey_from(&SECRET_1));
+        let graph = ChannelGraph::new(me);
+        graph.add_node(peer);
+
+        graph
+            .with_loopback_window(std::time::Duration::from_secs(120))
+            .map_err(anyhow::Error::msg)?;
+        Ok(())
+    }
+
+    #[test]
+    fn graph_should_reject_a_loopback_window_once_it_is_shared() {
+        let graph = ChannelGraph::new(pubkey_from(&SECRET_0));
+        let other_handle = graph.clone();
+
+        // Handles share the edges but not the window, so a clone could create edges with the old one.
+        let error = graph
+            .with_loopback_window(std::time::Duration::from_secs(120))
+            .expect_err("a shared graph must refuse a new window");
+        assert!(error.contains("shared"), "{error}");
+        drop(other_handle);
     }
 
     #[test]
