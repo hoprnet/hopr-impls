@@ -704,8 +704,8 @@ async fn wait_for_dial(control: &mut watch::Receiver<ControlState>) -> Option<()
 /// Nothing is polled until the consumer pulls, and no timer runs between pulls. While the dial is
 /// off, or while every peer is measured, it waits on the control handle rather than spinning.
 fn neighbor_probes<U>(
-    mut prober: NeighborProber<U>,
-    mut control: watch::Receiver<ControlState>,
+    prober: NeighborProber<U>,
+    control: watch::Receiver<ControlState>,
 ) -> impl futures::Stream<Item = ProbeRouting>
 where
     U: NetworkGraphView<NodeId = OffchainPublicKey, Observed = Observations> + Send + Sync + 'static,
@@ -735,8 +735,8 @@ where
 /// Nothing is polled until the consumer pulls, and no timer runs between pulls. While the dial is
 /// off, or while there is no candidate path, it waits on the control handle rather than spinning.
 fn loopback_probes<U>(
-    mut prober: LoopbackProber<U>,
-    mut control: watch::Receiver<ControlState>,
+    prober: LoopbackProber<U>,
+    control: watch::Receiver<ControlState>,
 ) -> impl futures::Stream<Item = ProbeRouting>
 where
     U: NetworkGraphView<NodeId = OffchainPublicKey, Observed = Observations>
