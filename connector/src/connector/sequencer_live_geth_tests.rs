@@ -72,6 +72,9 @@ const DEFAULT_RELIEF_SECS: u64 = 120;
 /// Approvals sent and mined before the congestion.
 const SETTLE_APPROVALS: usize = 3;
 const SEND_INTERVAL: Duration = Duration::from_secs(2);
+/// Approvals enqueued at once by the burst scenario, and the time between two bursts.
+const BURST_SIZE: usize = 5;
+const BURST_INTERVAL: Duration = Duration::from_secs(10);
 /// The sequencer's nonce gap tolerance, as in the default connector configuration.
 const NONCE_GAP_TOLERANCE: Duration = Duration::from_mins(5);
 
@@ -381,4 +384,191 @@ async fn run_scenario() -> anyhow::Result<()> {
 #[ignore = "requires a running Blokli and geth"]
 async fn nonce_gap_under_congestion() -> anyhow::Result<()> {
     run_scenario().await
+}
+
+/// Submissions of one signer per nonce, as seen in the node's pool: the distinct transaction hashes per nonce.
+#[derive(Default)]
+struct PoolWatch {
+    hashes: BTreeMap<u64, std::collections::BTreeSet<String>>,
+}
+
+impl PoolWatch {
+    fn observe(&mut self, pooled: &[super::live_support::PoolTx]) {
+        for tx in pooled {
+            self.hashes.entry(tx.nonce).or_default().insert(tx.hash.clone());
+        }
+    }
+
+    /// Nonces seen with more than one transaction hash: the sequencer submitted that nonce again at other fees.
+    fn resubmitted(&self) -> Vec<(u64, usize)> {
+        self.hashes
+            .iter()
+            .filter(|(_, hashes)| hashes.len() > 1)
+            .map(|(nonce, hashes)| (*nonce, hashes.len()))
+            .collect()
+    }
+}
+
+/// Bursts of `BURST_SIZE` approvals enqueued at once while the filler raises the base fee above the max fee Blokli
+/// hands out, so that part of them wait in the pool underpriced. A row per block gives the distinct submissions per
+/// nonce seen in the pool, the gap between the pending and the mined count (`pending - latest`), and how far the
+/// highest nonce seen in the pool is ahead of the pending count (`ahead`: a nonce the chain does not know yet).
+async fn run_burst_scenario() -> anyhow::Result<()> {
+    let blokli_url: Url = std::env::var("BLOKLI_URL")?.parse()?;
+    let label = std::env::var("BLOKLI_LABEL").unwrap_or_else(|_| "unlabeled".into());
+    let peak_base_fee: u128 = env_or("GETH_PEAK_BASE_FEE", DEFAULT_PEAK_BASE_FEE);
+    let max_fill_blocks: u64 = env_or("GETH_MAX_FILL_BLOCKS", DEFAULT_MAX_FILL_BLOCKS);
+    let relief_window = Duration::from_secs(env_or("GETH_RELIEF_SECS", DEFAULT_RELIEF_SECS));
+    let rpc = Rpc::new(std::env::var("GETH_URL")?);
+
+    let signer = ChainKeypair::from_secret(&ANVIL_ACCOUNT_1_KEY)?;
+    let account = signer.public().to_address().to_string();
+    let client = Arc::new(BlokliClient::new(blokli_url, BlokliClientConfig::default()));
+    let chain_id = rpc.quantity("eth_chainId", json!([])).await? as u64;
+    let mut filler = Filler::deploy_burner(&rpc, chain_id).await?;
+    let chain_info = wait_for_chain_info(&client, &label).await?;
+    let payloads = BasicPayloadGenerator::new(signer.public().to_address(), chain_info.info.contract_addresses);
+    let spender = Address::try_from(chain_info.info.contract_addresses.channels.as_slice())?;
+    let sequencer: Seq = TransactionSequencer::new(signer.clone(), client.clone(), NONCE_GAP_TOLERANCE);
+    let ctx = Enqueuer {
+        sequencer: &sequencer,
+        payloads: &payloads,
+        spender,
+        started: Instant::now(),
+    };
+    let mut outcomes: FuturesUnordered<Outcome<'_>> = FuturesUnordered::new();
+    let mut tally: BTreeMap<String, usize> = BTreeMap::new();
+    let refused = std::cell::Cell::new(0usize);
+    let mut record = |index: usize, at: Duration, result: String| {
+        println!("[{label}] t={:.1}s approval #{index}: {result}", at.as_secs_f64());
+        if result.starts_with("remote blokli error") {
+            refused.set(refused.get() + 1);
+        }
+        let (error, diagnosis) = result.split_once("; diagnosis ").unwrap_or(("confirmed", ""));
+        let error: String = error.chars().take(70).collect();
+        *tally
+            .entry(format!("{error} {diagnosis}").trim().to_owned())
+            .or_default() += 1;
+    };
+
+    let first_nonce = rpc.nonce(&account).await?;
+    let mut sent = 0usize;
+    for _ in 0..SETTLE_APPROVALS {
+        sent += 1;
+        ctx.enqueue(sent, &outcomes).await?;
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while rpc.nonce(&account).await? < first_nonce + SETTLE_APPROVALS as u64 {
+        anyhow::ensure!(Instant::now() < deadline, "the settle approvals were not mined");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    println!(
+        "[{label}] block: base fee / Blokli max fee, pooled approvals, stuck (max fee below the base fee), mined, pending          count, gap = pending - latest, ahead = highest pooled nonce + 1 - pending, nonces submitted more than once"
+    );
+    let mut watch = PoolWatch::default();
+    let mut highest_next = first_nonce + SETTLE_APPROVALS as u64;
+    let (mut peak_gap, mut peak_ahead, mut peak_stuck, mut max_resubmitted) = (0u64, 0u64, 0usize, 0usize);
+    let mut last_block = 0u64;
+    let mut first_block: Option<u64> = None;
+    let mut relief_start: Option<Instant> = None;
+    let mut closed_after: Option<Duration> = None;
+    let mut next_burst = Instant::now();
+    let mut ticker = tokio::time::interval(Duration::from_millis(250));
+    let mut final_mined: u64;
+    let (mut final_gap, mut final_ahead);
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                let (block, base_fee, _) = latest_block(&rpc).await?;
+                let first = *first_block.get_or_insert(block);
+                if relief_start.is_none() {
+                    if base_fee >= peak_base_fee || block - first >= max_fill_blocks {
+                        relief_start = Some(Instant::now());
+                        println!("[{label}] relief starts at block {}, base fee {base_fee}", block - first);
+                    } else {
+                        filler.top_up().await?;
+                        if Instant::now() >= next_burst {
+                            for _ in 0..BURST_SIZE {
+                                sent += 1;
+                                ctx.enqueue(sent, &outcomes).await?;
+                            }
+                            next_burst += BURST_INTERVAL;
+                        }
+                    }
+                }
+                let latest = rpc.nonce(&account).await?;
+                let pending = rpc.quantity("eth_getTransactionCount", json!([account, "pending"])).await? as u64;
+                let pooled = rpc.pool_entries(&account).await?;
+                watch.observe(&pooled);
+                for tx in &pooled {
+                    highest_next = highest_next.max(tx.nonce + 1);
+                }
+                let stuck = pooled.iter().filter(|tx| tx.max_fee < base_fee).count();
+                let gap = pending.saturating_sub(latest);
+                let ahead = highest_next.saturating_sub(pending);
+                (final_gap, final_ahead) = (gap, ahead);
+                final_mined = latest - first_nonce;
+                if block != last_block {
+                    last_block = block;
+                    let resubmitted = watch.resubmitted();
+                    peak_gap = peak_gap.max(gap);
+                    peak_ahead = peak_ahead.max(ahead);
+                    peak_stuck = peak_stuck.max(stuck);
+                    max_resubmitted = max_resubmitted.max(resubmitted.len());
+                    println!(
+                        "[{label}]   block {:>3} {base_fee}/{} pooled={} stuck={stuck} mined={final_mined} pending={pending} gap={gap} ahead={ahead} resubmitted={resubmitted:?}",
+                        block - first,
+                        show(blokli_max_fee(&client).await),
+                        pooled.len(),
+                    );
+                }
+                if let Some(start) = relief_start {
+                    if pooled.is_empty() && latest - first_nonce + refused.get() as u64 >= sent as u64 {
+                        closed_after.get_or_insert(start.elapsed());
+                        break;
+                    }
+                    if start.elapsed() > relief_window {
+                        break;
+                    }
+                }
+            }
+            Some((index, at, result)) = outcomes.next() => record(index, at, result),
+        }
+    }
+    while let Ok(Some((index, at, result))) = tokio::time::timeout(Duration::from_secs(1), outcomes.next()).await {
+        record(index, at, result);
+    }
+
+    println!(
+        "[{label}] bursts of {BURST_SIZE}: {sent} approvals sent, {final_mined} mined, {} refused by Blokli",
+        refused.get()
+    );
+    println!(
+        "[{label}] peak stuck {peak_stuck}, peak gap {peak_gap}, peak ahead {peak_ahead}, final gap {final_gap}, final ahead {final_ahead},          nonces submitted more than once (peak) {max_resubmitted}, now {:?}",
+        watch.resubmitted()
+    );
+    println!("[{label}] outcomes: {tally:?}");
+    match closed_after {
+        Some(after) => println!(
+            "[{label}] the pool emptied {:.1}s after the filler stopped",
+            after.as_secs_f64()
+        ),
+        None => println!("[{label}] the pool did not empty within the relief window"),
+    }
+    anyhow::ensure!(
+        closed_after.is_some(),
+        "the pool is expected to empty after relief: {final_mined} of {sent} approvals mined"
+    );
+    anyhow::ensure!(
+        final_mined + refused.get() as u64 == sent as u64,
+        "every approval Blokli accepted is expected to be mined"
+    );
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+#[ignore = "requires a running Blokli and geth"]
+async fn burst_under_rising_base_fee() -> anyhow::Result<()> {
+    run_burst_scenario().await
 }
