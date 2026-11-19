@@ -187,7 +187,9 @@ impl ChannelGraph {
     /// Production code should prefer [`with_config`](Self::with_config) to
     /// receive values from its configuration.
     pub fn new(me: OffchainPublicKey) -> Self {
-        Self::with_config(me, ChannelGraphConfig::default()).expect("the default config is valid")
+        Self::with_config(me, ChannelGraphConfig::default())
+            // Held by the test `default_config_should_be_valid`.
+            .expect("the default config is valid")
     }
 
     /// Creates a new channel graph with custom edge scoring parameters and the default starvation policy
@@ -854,6 +856,12 @@ mod tests {
             assert_eq!(obs.loopback_window(), window);
         }
         Ok(())
+    }
+
+    #[test]
+    fn default_config_should_be_valid() {
+        // `ChannelGraph::new` builds from it and cannot fail.
+        assert!(ChannelGraphConfig::default().validate().is_ok());
     }
 
     #[test]
