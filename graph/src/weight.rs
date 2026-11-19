@@ -327,8 +327,8 @@ const LOOPBACK_BUCKET_WIDTH: std::time::Duration = std::time::Duration::from_sec
 /// good loop stays counted until it expires.
 const LOOPBACK_BUCKETS: usize = 12;
 
-/// How far back loopback outcomes over an edge are still counted, unless the graph is built with
-/// [`ChannelGraph::with_loopback_window`](crate::ChannelGraph::with_loopback_window).
+/// How far back loopback outcomes over an edge are still counted, unless the graph is built with another
+/// [`ChannelGraphConfig::loopback_window`](crate::ChannelGraphConfig::loopback_window).
 ///
 /// The probing interval must stay well inside it: a loop is sent once per round, so with a longer
 /// interval the evidence expires between rounds and a failing relay reads as unprobed instead of
@@ -336,7 +336,7 @@ const LOOPBACK_BUCKETS: usize = 12;
 pub const LOOPBACK_WINDOW: std::time::Duration =
     std::time::Duration::from_secs(LOOPBACK_BUCKET_WIDTH.as_secs() * LOOPBACK_BUCKETS as u64);
 
-/// Shortest configurable loopback window: [`LOOPBACK_BUCKETS`] buckets of one second.
+/// Shortest configurable loopback window: twelve buckets of one second.
 pub const MIN_LOOPBACK_WINDOW: std::time::Duration = std::time::Duration::from_secs(LOOPBACK_BUCKETS as u64);
 
 /// Longest configurable loopback window. A longer one only delays noticing a dead relay by that much.
@@ -376,6 +376,11 @@ const LOST_RUN_SIGNIFICANCE: f64 = 0.05;
 /// How the loops over an edge judge its relay. Built from the path planner's configuration by whoever
 /// constructs the graph, see [`ChannelGraph::with_starvation`](crate::ChannelGraph::with_starvation).
 #[derive(Debug, Copy, Clone, PartialEq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(default, deny_unknown_fields)
+)]
 pub struct StarvationParams {
     /// Loops in the window from which the return rate judges the relay. Below it, a single returned loop
     /// keeps the relay and none starves it.

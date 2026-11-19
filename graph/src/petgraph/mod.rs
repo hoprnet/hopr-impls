@@ -5,7 +5,9 @@ mod search_diagnostics;
 pub mod traverse;
 pub mod update;
 
-pub use graph::{ChannelGraph, DEFAULT_EDGE_PENALTY, DEFAULT_MAX_PLAUSIBLE_LOOPBACK_RTT, DEFAULT_MIN_ACK_RATE};
+pub use graph::{
+    ChannelGraph, ChannelGraphConfig, DEFAULT_EDGE_PENALTY, DEFAULT_MAX_PLAUSIBLE_LOOPBACK_RTT, DEFAULT_MIN_ACK_RATE,
+};
 
 /// Encoding of nodes into [`PathId`](hopr_api::types::internal::routing::PathId) slots.
 ///

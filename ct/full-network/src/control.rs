@@ -7,8 +7,8 @@ use tokio::sync::watch;
 
 /// Pace of probing traffic, relative to the configured [`EgressConfig::interval`](crate::EgressConfig).
 ///
-/// The graph counts the outcome of a loopback for `hopr_network_graph::LOOPBACK_WINDOW` (60 s by default). A level whose
-/// period exceeds half of it (`Low`, and `Medium` at the 30 s default interval) can let the evidence of a failing
+/// The graph counts the outcome of a loopback for `hopr_network_graph::LOOPBACK_WINDOW` (60 s by default). A level
+/// whose period exceeds half of it (`Low`, and `Medium` at the 30 s default interval) can let the evidence of a failing
 /// relay expire between rounds, so it reads as unprobed again and may be routed until the next loop fails. The
 /// level and the window are independent on purpose, and this is accepted: a slow pace trades slower detection
 /// for less traffic.
