@@ -59,7 +59,11 @@ const MIN_CONNECTION_TIMEOUT: Duration = Duration::from_millis(100);
 /// never be able to spend the budget the channel graph needs to sync.
 const REGISTRY_READ_BUDGET_DIVISOR: u32 = 4;
 const MIN_TX_CONFIRM_TIMEOUT: Duration = Duration::from_secs(1);
-const TX_TIMEOUT_MULTIPLIER: u32 = 2;
+/// With Gnosis Chain (5 s blocks, finality 3) this waits 60 s, longer than Blokli's unmined timeout (45 s), so the
+/// connector sees Blokli's diagnosis instead of giving up first.
+const TX_TIMEOUT_MULTIPLIER: u32 = 4;
+/// Must exceed Blokli's unmined transaction timeout (45 s by default) with margin.
+const NONCE_GAP_TOLERANCE: Duration = Duration::from_mins(2);
 const DEFAULT_SYNC_TOLERANCE_PCT: usize = 90;
 const CHANNEL_CUSTOM_TIMEMOUT_MULTIPLIER: u32 = 4;
 const TICKET_CUSTOM_TIMEOUT_MULTIPLIER: u32 = 4;
@@ -348,14 +352,15 @@ pub struct BlockchainConnectorConfig {
     /// Transaction waits for confirmation by multiplying chain's blocktime, finality, and this multiplier.
     /// Set it to higher values if transactions are failing due to timeout at the client.
     ///
-    /// Default is 2, minimum is 1.
+    /// Default is 4 (60 s on Gnosis Chain), minimum is 1. It should keep the wait longer than
+    /// Blokli's unmined transaction timeout, otherwise Blokli's diagnosis never reaches the connector.
     #[default(TX_TIMEOUT_MULTIPLIER)]
     pub tx_timeout_multiplier: u32,
     /// How long the local nonce may stay ahead of an unchanging on-chain pending count before
     /// it is resynced, so a lost transaction does not block the signer for good.
     ///
-    /// Default is 5 minutes, matching Blokli's transaction tracking timeout.
-    #[default(Duration::from_mins(5))]
+    /// Default is 2 minutes. It must exceed Blokli's unmined transaction timeout (45 s by default).
+    #[default(NONCE_GAP_TOLERANCE)]
     pub nonce_gap_tolerance: Duration,
 }
 
@@ -1160,6 +1165,17 @@ pub(crate) mod tests {
     pub const PRIVATE_KEY_1: [u8; 32] = hex!("c14b8faa0a9b8a5fa4453664996f23a7e7de606d42297d723fc4a794f375e260");
     pub const PRIVATE_KEY_2: [u8; 32] = hex!("492057cf93e99b31d2a85bc5e98a9c3aa0021feec52c227cc8170e8f7d047775");
     pub const MODULE_ADDR: [u8; 20] = hex!("1111111111111111111111111111111111111111");
+
+    #[test]
+    fn default_config_should_fit_gnosis_chain_timeouts() {
+        let cfg = BlockchainConnectorConfig::default();
+        // Gnosis Chain: 5 s blocks, finality 3. Blokli's unmined timeout is 45 s by default.
+        let blokli_unmined_timeout = Duration::from_secs(45);
+        assert_eq!(4, cfg.tx_timeout_multiplier);
+        assert!(Duration::from_secs(5 * 3) * cfg.tx_timeout_multiplier > blokli_unmined_timeout);
+        assert_eq!(Duration::from_mins(2), cfg.nonce_gap_tolerance);
+        assert!(cfg.nonce_gap_tolerance > blokli_unmined_timeout);
+    }
 
     pub type TestConnector<C> = HoprBlockchainConnector<
         C,
