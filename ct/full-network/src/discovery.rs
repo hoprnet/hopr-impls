@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
+    time::Duration,
 };
 
 use futures::{
@@ -253,9 +254,10 @@ type WeightedRoute = (ProbeRouting, f64);
 #[derive(Debug, Clone, Copy, Default)]
 struct NeighborProbeState {
     outcomes: u32,
-    /// The graph's lifetime counter when `outcomes` was last brought up to date.
+    /// The graph's lifetime probe counter when `outcomes` was last brought up to date.
     observed: u64,
-    connected: Option<bool>,
+    /// The graph's disconnect count when `outcomes` was last reset to zero.
+    disconnects: u64,
 }
 
 /// Per-peer state, and the order in which the peers are offered.
@@ -417,12 +419,15 @@ where
             let connected = immediate.and_then(|imm| imm.is_connected());
 
             let observed = immediate.map_or(0, |imm| imm.probe_samples());
+            let disconnects = immediate.map_or(0, |imm| imm.disconnects());
 
             let state = self.samples.entry(peer);
-            // The link that was measured is gone, so the count that described it is too. The graph's
-            // lifetime counter keeps running, so it becomes the new baseline instead of zero.
-            if connected == Some(false) && state.connected != Some(false) {
-                (state.outcomes, state.observed) = (0, observed);
+            // The link that was measured is gone, so the count that described it is too. A disconnect
+            // and reconnect that both happened between two rebuilds leaves the state reading
+            // connected, so the count of disconnects is what carries it. The graph's lifetime probe
+            // counter keeps running, so it becomes the new baseline instead of zero.
+            if disconnects > state.disconnects {
+                (state.outcomes, state.observed, state.disconnects) = (0, observed, disconnects);
             }
             if observed > state.observed {
                 state.outcomes = state
@@ -430,7 +435,6 @@ where
                     .saturating_add(u32::try_from(observed - state.observed).unwrap_or(u32::MAX));
                 state.observed = observed;
             }
-            state.connected = connected;
             let outcomes = state.outcomes;
 
             if self.cfg.probe_connected_only && connected == Some(false) {
@@ -748,16 +752,37 @@ async fn wait_for_dial(control: &mut watch::Receiver<ControlState>) -> Option<()
     }
 }
 
-/// Resolves once either the control or an explicit wake says to look again.
+/// Resolves once the control, an explicit wake, or the idle re-read says to look again.
 ///
-/// The graph offers no change notification and the generator reads no clock, so a disconnect or a
-/// dropped rate is invisible to an idle stream until something calls
-/// [`EgressControl::wake_probing`](crate::EgressControl::wake_probing). `false` means the control
-/// handle is gone and nothing can steer probing any more.
-async fn wait_for_wake(control: &mut watch::Receiver<ControlState>, wake: &Notify) -> bool {
-    match futures::future::select(std::pin::pin!(control.changed()), std::pin::pin!(wake.notified())).await {
-        Either::Left((Ok(()), _)) | Either::Right(((), _)) => true,
+/// The graph offers no change notification, so a disconnect or a dropped rate is otherwise
+/// invisible to an idle stream. [`EgressControl::wake_probing`](crate::EgressControl::wake_probing)
+/// makes it immediate for a consumer that knows it just wrote, and `recheck` bounds how stale an
+/// idle stream can get for one that does not. `false` means the control handle is gone and nothing
+/// can steer probing any more.
+async fn wait_for_wake(control: &mut watch::Receiver<ControlState>, wake: &Notify, recheck: Duration) -> bool {
+    let woken = wake.notified();
+    let rechecked = futures_time::task::sleep(recheck.into());
+    let mut changed = std::pin::pin!(control.changed());
+    let mut woken = std::pin::pin!(woken);
+    let mut rechecked = std::pin::pin!(rechecked);
+
+    match futures::future::select(
+        std::future::poll_fn(|cx| changed.as_mut().poll(cx)),
+        std::future::poll_fn(|cx| {
+            if woken.as_mut().poll(cx).is_ready() {
+                return std::task::Poll::Ready(true);
+            }
+            match rechecked.as_mut().poll(cx) {
+                std::task::Poll::Ready(_) => std::task::Poll::Ready(true),
+                std::task::Poll::Pending => std::task::Poll::Pending,
+            }
+        }),
+    )
+    .await
+    {
+        Either::Left((Ok(()), _)) => true,
         Either::Left((Err(_), _)) => false,
+        Either::Right(_) => true,
     }
 }
 
@@ -769,6 +794,7 @@ fn neighbor_probes<U>(
     prober: NeighborProber<U>,
     control: watch::Receiver<ControlState>,
     wake: Arc<Notify>,
+    recheck: Duration,
 ) -> impl futures::Stream<Item = ProbeRouting>
 where
     U: NetworkGraphView<NodeId = OffchainPublicKey, Observed = Observations> + Send + Sync + 'static,
@@ -789,7 +815,7 @@ where
                 }
 
                 // Nothing to offer until the peer set or the wake says to look again.
-                if !wait_for_wake(&mut control, &wake).await {
+                if !wait_for_wake(&mut control, &wake, recheck).await {
                     return futures::future::pending().await;
                 }
             }
@@ -805,6 +831,7 @@ fn loopback_probes<U>(
     prober: LoopbackProber<U>,
     control: watch::Receiver<ControlState>,
     wake: Arc<Notify>,
+    recheck: Duration,
 ) -> impl futures::Stream<Item = ProbeRouting>
 where
     U: NetworkGraphView<NodeId = OffchainPublicKey, Observed = Observations>
@@ -831,7 +858,7 @@ where
                 }
 
                 // Nothing to offer until the graph or the wake says to look again.
-                if !wait_for_wake(&mut control, &wake).await {
+                if !wait_for_wake(&mut control, &wake, recheck).await {
                     return futures::future::pending().await;
                 }
             }
@@ -861,6 +888,7 @@ where
             },
             self.control.subscribe(),
             self.control.wake_handle(),
+            self.cfg.recheck_interval,
         );
 
         let loopbacks = loopback_probes(
@@ -874,6 +902,7 @@ where
             },
             self.control.subscribe(),
             self.control.wake_handle(),
+            self.cfg.recheck_interval,
         );
 
         // Alternate which stream is polled first, so a peer that stays below its thresholds cannot
@@ -1270,6 +1299,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_idle_stream_should_re_read_the_graph_without_a_wake() -> anyhow::Result<()> {
+        let me = random_key();
+        let peer = random_key();
+        let graph = Arc::new(ChannelGraph::new(me));
+        graph.record_node(peer);
+        mark_edge_ready(&graph, &me, &peer);
+
+        let outcomes = fast_cfg().stable_samples;
+        record_probes(&graph, &me, &peer, outcomes, 0);
+
+        let cfg = EgressConfig {
+            // A short recheck keeps the test quick; `futures-time` has its own reactor, so a paused
+            // tokio clock cannot drive it.
+            recheck_interval: Duration::from_millis(5),
+            ..fast_cfg()
+        };
+        let prober = FullNetworkDiscovery::new(me, cfg, graph.clone());
+        let stream = ProbingTrafficGeneration::build(&prober);
+        pin_mut!(stream);
+
+        assert!(
+            timeout(TINY_TIMEOUT, stream.next()).await.is_err(),
+            "the peer starts measured, so the stream parks"
+        );
+
+        // A disconnect and reconnect written to the graph, with no control change and no wake.
+        {
+            use hopr_api::graph::traits::{EdgeObservableWrite, EdgeWeightType};
+            graph.upsert_edge(&me, &peer, |obs| obs.record(EdgeWeightType::Connected(false)));
+            graph.upsert_edge(&me, &peer, |obs| obs.record(EdgeWeightType::Connected(true)));
+        }
+
+        let offered: Vec<NodeId> = timeout(
+            TINY_TIMEOUT * 200,
+            neighbor_destinations(stream.by_ref())
+                .take(outcomes as usize)
+                .collect::<Vec<_>>(),
+        )
+        .await?;
+        assert_eq!(
+            offered,
+            vec![NodeId::from(peer); outcomes as usize],
+            "the reconnected peer must be sampled again, with no wake"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn a_reconnect_should_restart_the_sample_count() -> anyhow::Result<()> {
         let me = random_key();
         let peer = random_key();
@@ -1356,7 +1433,7 @@ mod tests {
 
         let cfg = EgressConfig {
             // Measured peers with a rate below this are probed again.
-            min_success_rate: 0.5,
+            min_success_rate: 0.8,
             ..fast_cfg()
         };
         let outcomes = cfg.stable_samples;
@@ -1365,11 +1442,11 @@ mod tests {
         for peer in [deeper, shallower, at_threshold] {
             record_probes(&graph, &me, &peer, outcomes, 0);
         }
-        // Then two drop below the threshold, one of them further, and one sits exactly on it.
-        // The success rate is an EMA over five samples, so each failure moves it part way down.
-        record_probes(&graph, &me, &deeper, 0, 6);
-        record_probes(&graph, &me, &shallower, 0, 4);
-        record_probes(&graph, &me, &at_threshold, 1, 1);
+        // The rate is an EMA over five samples, so from 1.0 each failure moves it to 0.8, 0.64,
+        // 0.512 and 0.4096: two drop below the threshold, one of them further, and one lands on it.
+        record_probes(&graph, &me, &deeper, 0, 4);
+        record_probes(&graph, &me, &shallower, 0, 2);
+        record_probes(&graph, &me, &at_threshold, 0, 1);
 
         let prober = FullNetworkDiscovery::new(me, cfg, graph);
         let stream = ProbingTrafficGeneration::build(&prober);
@@ -1380,7 +1457,7 @@ mod tests {
         let first = timeout(TINY_TIMEOUT * 200, neighbor_destinations(stream.by_ref()).next())
             .await?
             .context("a degraded peer must be offered again")?;
-        let second = timeout(TINY_TIMEOUT * 200, neighbor_destinations(stream).next())
+        let second = timeout(TINY_TIMEOUT * 200, neighbor_destinations(stream.by_ref()).next())
             .await?
             .context("both degraded peers must be offered again")?;
 
@@ -1390,6 +1467,16 @@ mod tests {
             "the peer further below its threshold must lead the pull order"
         );
         assert_eq!(second, NodeId::from(shallower), "then the shallower one");
+
+        let later: Vec<NodeId> = timeout(
+            TINY_TIMEOUT * 200,
+            neighbor_destinations(stream.by_ref()).take(4).collect::<Vec<_>>(),
+        )
+        .await?;
+        assert!(
+            later.iter().all(|peer| peer != &NodeId::from(at_threshold)),
+            "a peer exactly at the threshold is never offered again"
+        );
         Ok(())
     }
 

@@ -184,7 +184,11 @@ impl EdgeObservableWrite for Observations {
             EdgeWeightType::Intermediate(result) => self.intermediate_mut().record(result),
             EdgeWeightType::Balance(balance) => self.intermediate_mut().balance = balance,
             EdgeWeightType::Connected(is_connected) => {
-                self.immediate_probe.get_or_insert_default().is_connected = Some(is_connected)
+                let immediate = self.immediate_probe.get_or_insert_default();
+                immediate.is_connected = Some(is_connected);
+                if !is_connected {
+                    immediate.disconnects = immediate.disconnects.saturating_add(1);
+                }
             }
             EdgeWeightType::SurbRoundTrips { expected, observed } => {
                 self.intermediate_mut().record_surb_round_trips(expected, observed);
@@ -225,6 +229,13 @@ pub struct TransportImmediates {
     messages_sent: f64,
     /// Exponentially decayed count of acknowledgements received from this peer.
     acks_received: f64,
+    /// How often this edge was recorded as disconnected.
+    ///
+    /// The state alone cannot say this: a link that dropped and came back before anyone read it looks
+    /// connected both before and after, so a caller that has to reset a measurement on a reconnect
+    /// counts these instead. Interim, like `probe_samples`: hopr-impls#120 removes it once the
+    /// interface carries the count.
+    disconnects: u64,
     /// When the edge's intermediate stream last showed that the relay at its end delivers nothing.
     ///
     /// The neighbour answers pings whatever it does with relayed packets, so this stream's latency says
@@ -252,6 +263,11 @@ impl TransportImmediates {
     /// [`TransportLinkMeasurement::probe_samples`].
     pub fn probe_samples(&self) -> u64 {
         self.link.probe_samples()
+    }
+
+    /// How often this edge was recorded as disconnected; see [`Self::disconnects`].
+    pub fn disconnects(&self) -> u64 {
+        self.disconnects
     }
 }
 

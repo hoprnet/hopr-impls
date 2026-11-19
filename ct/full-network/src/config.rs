@@ -25,6 +25,16 @@ pub struct EgressConfig {
     #[default(default_probing_interval())]
     pub interval: std::time::Duration,
 
+    /// How long an idle probe stream waits before re-reading the graph on its own.
+    ///
+    /// A stream with nothing to offer cannot see a disconnect, a dropped rate or a new channel: the
+    /// graph has no change notification and the generator reads no clock. Re-reading after this long
+    /// bounds how stale an idle stream can be, and
+    /// [`EgressControl::wake_probing`](crate::EgressControl::wake_probing) makes it immediate for a
+    /// consumer that knows it just wrote. Must be greater than zero.
+    #[default(default_recheck_interval())]
+    pub recheck_interval: std::time::Duration,
+
     /// When `true`, neighbor probes are only sent to peers that are not observed to be down.
     ///
     /// A peer whose connectivity was never observed is still probed: skipping it would suppress the
@@ -140,6 +150,14 @@ impl EgressConfig {
             );
         }
 
+        if self.recheck_interval.is_zero() {
+            errors.add(
+                "recheck_interval",
+                ValidationError::new("zero_recheck_interval")
+                    .with_message("recheck_interval must be greater than zero".into()),
+            );
+        }
+
         // Also rejects NaN, which no comparison satisfies.
         for (field, rate) in [
             ("min_success_rate", self.min_success_rate),
@@ -201,6 +219,8 @@ struct EgressConfigFields {
     #[cfg(feature = "noise")]
     #[serde(default = "default_probing_interval", with = "humantime_serde")]
     interval: std::time::Duration,
+    #[serde(default = "default_recheck_interval", with = "humantime_serde")]
+    recheck_interval: std::time::Duration,
     #[serde(default = "just_true")]
     probe_connected_only: bool,
     #[serde(default = "default_stable_samples")]
@@ -226,6 +246,7 @@ impl TryFrom<EgressConfigFields> for EgressConfig {
         let cfg = EgressConfig {
             #[cfg(feature = "noise")]
             interval: fields.interval,
+            recheck_interval: fields.recheck_interval,
             probe_connected_only: fields.probe_connected_only,
             stable_samples: fields.stable_samples,
             min_success_rate: fields.min_success_rate,
@@ -268,6 +289,11 @@ const fn default_best_path_share() -> f64 {
 #[inline]
 const fn default_best_set_size() -> usize {
     100
+}
+
+#[inline]
+const fn default_recheck_interval() -> std::time::Duration {
+    std::time::Duration::from_secs(30)
 }
 
 #[cfg(feature = "noise")]
