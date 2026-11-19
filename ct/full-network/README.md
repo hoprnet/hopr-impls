@@ -11,9 +11,11 @@ streams that are already running.
 
 - **Probing is pull driven.** The probe stream yields one probe per pull and holds no timer. The consumer owns the pacing, the per-window
   budget and the clock; this crate only decides what to probe next.
-- `set_level(Some(Low | Medium | High | Ultra))` sets the dial: 0.1, 0.5, 1.0 or 2.0 of the base pull rate. `set_level(None)` stops probing
-  and leaves the stream pending. Default `Some(High)`.
-- `set_budget(Some(probes))` bounds the best set to what one window can re-measure. `None` is unbounded.
+- `set_dial(Some(dial))` sets the dial, any positive multiplier (`Dial::LOW`, `MEDIUM`, `HIGH`, `ULTRA` are 0.1, 0.5, 1.0 and 2.0).
+  `set_dial(None)` stops probing and leaves the stream pending. Default `Dial::HIGH`.
+- `set_best_set_cap(Some(paths))` caps the best set to what one window can re-measure. `None` leaves only `EgressConfig::best_set_size`.
+- `wake_probing()` tells an idle stream to re-examine the graph. The graph has no change notification and the generator reads no clock, so
+  whoever records a disconnect or a probe outcome should call it; otherwise a stream with nothing to offer stays parked.
 - `set_path_weights(PathWeights)` hands in the path planner's own evaluation, so probing follows the distribution routing uses. Without it
   every path weighs the same.
 - `set_focus(exits)` / `clear_focus()` draw the best set from the loops around the exits, forward loops first. The rest of the network is
@@ -24,10 +26,15 @@ streams that are already running.
 
 ### What the generator probes
 
-A neighbor is probed until it has `EgressConfig::stable_samples` samples, and left alone while it stays connected, apart from a small random
-re-add (`EgressConfig::readd_probability`). A connection drop restarts the count, and a success or acknowledgement rate below its threshold
-brings the peer back, the furthest below first. Loopbacks skip any path whose edges already carry fresh SURB evidence, and reserve the
-exploration share for paths outside the best set.
+A neighbor is probed until it has `EgressConfig::stable_samples` recorded outcomes, and left alone while it stays connected, apart from a
+small random re-add (`EgressConfig::readd_probability`). An offer the consumer drops is not a sample. A connection drop restarts the count,
+and a success or acknowledgement rate below its threshold brings the peer back, the furthest below first.
+
+Loopbacks skip a path only when every one of its edges already carries fresh SURB evidence, and prefer paths with more unmeasured edges. The
+best set is the paths the planner values most, and the exploration share spends the rest of the cycle outside it. Successive cycles start
+further into the enumeration, so a candidate set larger than one window is still covered.
+
+`EgressConfig::interval` paces cover traffic only; probe generation reads no clock.
 
 ## Specification
 

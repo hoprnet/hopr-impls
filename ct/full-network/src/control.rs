@@ -9,35 +9,51 @@ use std::{
 use hopr_api::types::{crypto::types::OffchainPublicKey, internal::routing::PathId};
 // Only the `sync` primitives of tokio are used. They need no tokio runtime, so the handle works
 // under any async executor.
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 
 /// Dial that scales the rate at which the consumer pulls probes.
 ///
-/// Probe generation no longer has an interval of its own: it yields one probe per pull and the
-/// consumer decides how often to pull. The dial tells that consumer how hard to pull. `None` is off.
-/// [`EgressControl::set_level`] sets it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ProbingLevel {
-    /// One tenth of the base rate.
-    Low,
-    /// Half of the base rate.
-    Medium,
+/// Probe generation has no interval of its own: it yields one probe per pull and the consumer
+/// decides how often to pull. The dial tells that consumer how hard to pull, and carries any
+/// positive multiplier, not only the presets. `None` is off; see [`EgressControl::set_dial`].
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+pub struct Dial(f64);
+
+impl Dial {
     /// The base rate.
-    #[default]
-    High,
+    pub const HIGH: Self = Self(1.0);
+    /// One tenth of the base rate.
+    pub const LOW: Self = Self(0.1);
+    /// Half of the base rate.
+    pub const MEDIUM: Self = Self(0.5);
     /// Twice the base rate. Overcharge for a short burst, such as a new session that needs path evidence fast.
-    Ultra,
+    pub const ULTRA: Self = Self(2.0);
+
+    /// A dial at `multiplier`, or `None` when it is not a positive finite number.
+    ///
+    /// Rejects zero and negatives rather than clamping them: a dial of zero would stop probing
+    /// through the value that is meant to keep it running, which is what `None` is for.
+    pub fn new(multiplier: f64) -> Option<Self> {
+        (multiplier.is_finite() && multiplier > 0.0).then_some(Self(multiplier))
+    }
+
+    /// The multiplier this dial carries.
+    pub const fn multiplier(self) -> f64 {
+        self.0
+    }
 }
 
-impl ProbingLevel {
-    /// Dial multiplier, always positive.
-    pub const fn multiplier(self) -> f64 {
-        match self {
-            Self::Low => 0.1,
-            Self::Medium => 0.5,
-            Self::High => 1.0,
-            Self::Ultra => 2.0,
-        }
+impl Default for Dial {
+    fn default() -> Self {
+        Self::HIGH
+    }
+}
+
+impl TryFrom<f64> for Dial {
+    type Error = &'static str;
+
+    fn try_from(multiplier: f64) -> Result<Self, Self::Error> {
+        Self::new(multiplier).ok_or("dial multiplier must be a positive finite number")
     }
 }
 
@@ -121,10 +137,10 @@ impl CoverageCounters {
 /// State shared between a [`EgressControl`] and the streams it steers.
 #[derive(Debug, Clone)]
 pub(crate) struct ControlState {
-    /// `None` switches probing off.
-    pub(crate) level: Option<ProbingLevel>,
-    /// Cap on the loopback best set, `None` when only `best_set_size` applies.
-    pub(crate) budget: Option<usize>,
+    /// `None` switches probing off. The multiplier is the consumer's business: it owns pacing.
+    pub(crate) dial: Option<Dial>,
+    /// Cap on the loopback best set, `None` when only `EgressConfig::best_set_size` applies.
+    pub(crate) best_set_cap: Option<usize>,
     pub(crate) noise: bool,
     pub(crate) focus: Option<Arc<HashSet<OffchainPublicKey>>>,
     /// How the path owner values a loopback path.
@@ -134,8 +150,8 @@ pub(crate) struct ControlState {
 impl Default for ControlState {
     fn default() -> Self {
         Self {
-            level: Some(ProbingLevel::default()),
-            budget: None,
+            dial: Some(Dial::default()),
+            best_set_cap: None,
             noise: false,
             focus: None,
             weights: PathWeights::default(),
@@ -151,6 +167,7 @@ impl Default for ControlState {
 pub struct EgressControl {
     state: Arc<watch::Sender<ControlState>>,
     coverage: Arc<CoverageCounters>,
+    wake: Arc<Notify>,
 }
 
 impl Default for EgressControl {
@@ -158,6 +175,7 @@ impl Default for EgressControl {
         Self {
             state: Arc::new(watch::channel(ControlState::default()).0),
             coverage: Arc::new(CoverageCounters::default()),
+            wake: Arc::new(Notify::new()),
         }
     }
 }
@@ -171,35 +189,47 @@ impl EgressControl {
         self.coverage.clone()
     }
 
+    pub(crate) fn wake_handle(&self) -> Arc<Notify> {
+        self.wake.clone()
+    }
+
+    /// Tells an idle probe stream to re-examine the graph.
+    ///
+    /// The graph is read through `NetworkGraphView`, which has no change notification and gives
+    /// the generator no clock, so an idle stream cannot notice on its own that a neighbour
+    /// disconnected or that a recorded outcome dropped its rate. Whoever records those
+    /// observations calls this after writing them, and the next pull sees the new state.
+    pub fn wake_probing(&self) {
+        self.wake.notify_one();
+    }
+
     /// Sets the dial. `None` stops all probing traffic.
     ///
     /// The generator emits one probe per pull while the dial is on; the multiplier tells the
     /// consumer how hard to pull. Does not affect cover traffic, see [`Self::set_noise`].
-    pub fn set_level(&self, level: Option<ProbingLevel>) {
+    pub fn set_dial(&self, dial: Option<Dial>) {
         self.state
-            .send_if_modified(|s| std::mem::replace(&mut s.level, level) != level);
+            .send_if_modified(|s| std::mem::replace(&mut s.dial, dial) != dial);
     }
 
     /// Current dial, `None` when probing is off.
-    pub fn level(&self) -> Option<ProbingLevel> {
-        self.state.borrow().level
+    pub fn dial(&self) -> Option<Dial> {
+        self.state.borrow().dial
     }
 
-    /// Caps the loopback best set to `budget` paths, `None` to keep the plain `best_set_size` cap.
+    /// Caps the loopback best set to `cap` paths, `None` to keep the plain `best_set_size` cap.
     ///
-    /// The budget is what one consumer window can re-measure, so the best set never exceeds it and
-    /// one window of pulls can re-measure every best path. The exploration share of a pass is not
-    /// bounded by it, and a window that stops mid-pass continues where the cursor left off.
-    /// `Some(0)` is treated as `None`.
-    pub fn set_budget(&self, budget: Option<usize>) {
-        let budget = budget.filter(|budget| *budget > 0);
+    /// The cap is what one consumer window can re-measure, so the best set never exceeds it and one
+    /// window of pulls can re-measure every best path. `Some(0)` is treated as `None`.
+    pub fn set_best_set_cap(&self, cap: Option<usize>) {
+        let cap = cap.filter(|cap| *cap > 0);
         self.state
-            .send_if_modified(|s| std::mem::replace(&mut s.budget, budget) != budget);
+            .send_if_modified(|s| std::mem::replace(&mut s.best_set_cap, cap) != cap);
     }
 
     /// Cap on the loopback best set, `None` when only `best_set_size` applies.
-    pub fn budget(&self) -> Option<usize> {
-        self.state.borrow().budget
+    pub fn best_set_cap(&self) -> Option<usize> {
+        self.state.borrow().best_set_cap
     }
 
     /// Sets how the path owner values a loopback path. Probing then follows the routing distribution.
@@ -261,14 +291,31 @@ mod handle {
     }
 
     #[test]
-    fn the_dial_should_multiply_the_base_pull_rate() {
-        for (level, expected) in [
-            (ProbingLevel::Low, 0.1),
-            (ProbingLevel::Medium, 0.5),
-            (ProbingLevel::High, 1.0),
-            (ProbingLevel::Ultra, 2.0),
+    fn the_dial_presets_should_carry_their_multipliers() {
+        for (preset, expected) in [
+            (Dial::LOW, 0.1),
+            (Dial::MEDIUM, 0.5),
+            (Dial::HIGH, 1.0),
+            (Dial::ULTRA, 2.0),
         ] {
-            assert_eq!(level.multiplier(), expected, "{level:?}");
+            assert_eq!(preset.multiplier(), expected, "{preset:?}");
+        }
+        assert_eq!(Dial::default(), Dial::HIGH);
+    }
+
+    #[test]
+    fn the_dial_should_carry_a_multiplier_that_is_not_a_preset() {
+        let dial = Dial::new(0.25).expect("0.25 is a positive multiplier");
+
+        assert_eq!(dial.multiplier(), 0.25);
+        assert_eq!(Dial::try_from(0.25).map(Dial::multiplier), Ok(0.25));
+    }
+
+    #[test]
+    fn a_dial_that_is_not_positive_and_finite_should_be_rejected() {
+        for multiplier in [0.0, -0.1, f64::NAN, f64::INFINITY] {
+            assert!(Dial::new(multiplier).is_none(), "{multiplier}");
+            assert!(Dial::try_from(multiplier).is_err(), "{multiplier}");
         }
     }
 
@@ -276,10 +323,10 @@ mod handle {
     fn control_should_start_at_full_pace_with_noise_off_and_no_focus() {
         let control = EgressControl::default();
 
-        assert_eq!(control.level(), Some(ProbingLevel::High));
+        assert_eq!(control.dial(), Some(Dial::HIGH));
         assert!(!control.noise());
         assert!(control.focus().is_none());
-        assert!(control.budget().is_none());
+        assert!(control.best_set_cap().is_none());
         assert!(control.coverage().is_none());
     }
 
@@ -288,25 +335,22 @@ mod handle {
         let control = EgressControl::default();
         let clone = control.clone();
 
-        clone.set_level(Some(ProbingLevel::Low));
+        clone.set_dial(Some(Dial::LOW));
         clone.set_noise(true);
-        clone.set_budget(Some(7));
+        clone.set_best_set_cap(Some(7));
 
-        assert_eq!(control.level(), Some(ProbingLevel::Low));
+        assert_eq!(control.dial(), Some(Dial::LOW));
         assert!(control.noise());
-        assert_eq!(control.budget(), Some(7));
+        assert_eq!(control.best_set_cap(), Some(7));
     }
 
     #[test]
-    fn a_zero_budget_should_read_as_unbounded() {
+    fn a_zero_best_set_cap_should_read_as_unset() {
         let control = EgressControl::default();
 
-        control.set_budget(Some(0));
+        control.set_best_set_cap(Some(0));
 
-        assert!(
-            control.budget().is_none(),
-            "a cycle that may spend nothing never completes"
-        );
+        assert!(control.best_set_cap().is_none(), "a best set of zero paths is no cap");
     }
 
     #[test]
@@ -380,10 +424,10 @@ mod handle {
         let mut rx = control.subscribe();
         rx.mark_unchanged();
 
-        control.set_level(Some(ProbingLevel::High));
+        control.set_dial(Some(Dial::HIGH));
         control.set_noise(false);
         control.clear_focus();
-        control.set_budget(None);
+        control.set_best_set_cap(None);
 
         assert!(!rx.has_changed().unwrap_or(true), "no-op setters must not wake streams");
     }

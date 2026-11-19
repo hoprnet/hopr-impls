@@ -36,6 +36,18 @@ impl TransportLinkMeasurement {
     }
 }
 
+impl TransportLinkMeasurement {
+    /// Probe outcomes recorded for this link, successful or not.
+    ///
+    /// Unlike [`EdgeLinkObservable::average_probe_rate`] this tells "measured and failing" from
+    /// "never measured", which is what a caller needs to decide whether a peer has been sampled
+    /// enough to be left alone. It is a lifetime total: a caller that needs a count since some
+    /// earlier point must take the difference.
+    pub fn probe_samples(&self) -> u64 {
+        self.samples
+    }
+}
+
 impl EdgeLinkObservable for TransportLinkMeasurement {
     fn record(&mut self, measurement: EdgeTransportMeasurement) {
         self.samples = self.samples.saturating_add(1);
@@ -229,6 +241,14 @@ impl TransportImmediates {
 impl EdgeNetworkObservableRead for TransportImmediates {
     fn is_connected(&self) -> Option<bool> {
         self.is_connected
+    }
+}
+
+impl TransportImmediates {
+    /// Probe outcomes recorded for this link, successful or not; see
+    /// [`TransportLinkMeasurement::probe_samples`].
+    pub fn probe_samples(&self) -> u64 {
+        self.link.probe_samples()
     }
 }
 

@@ -15,9 +15,10 @@ use validator::{Validate, ValidationError, ValidationErrors};
 pub struct EgressConfig {
     /// The delay between individual cover-traffic rounds.
     ///
-    /// Cover traffic only. Probe generation is pull driven and never reads this value; the consumer
-    /// decides how often to pull. Validation rejects an interval above half of the loopback evidence
-    /// window, because a failing relay's evidence would expire between cover-traffic rounds.
+    /// Cover traffic only, and only with the `noise` feature: probe generation is pull driven and
+    /// never reads this value, the consumer decides how often to pull. Validation rejects an interval
+    /// above half of the loopback evidence window, because a failing relay's evidence would expire
+    /// between cover-traffic rounds.
     #[default(default_probing_interval())]
     pub interval: std::time::Duration,
 

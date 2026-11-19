@@ -46,7 +46,7 @@ hopr-utils = { workspace = true, features = [
 ] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["test-util", "time"] }
 
 [package.metadata.cargo-machete]
 ignored = ["humantime-serde"]
