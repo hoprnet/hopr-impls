@@ -7,14 +7,27 @@ use hopr_api::graph::{
 };
 use hopr_utils::statistics::{ExponentialMovingAverage, WindowedRatio};
 
+/// Samples the latency of a link averages over.
+const LATENCY_AVERAGE_SAMPLES: usize = 3;
+
+/// Samples the probe success rate of a link averages over.
+const SUCCESS_RATE_AVERAGE_SAMPLES: usize = 5;
+
+/// The fewest probe samples an edge needs before its measurements count as settled.
+///
+/// This is the wider of the two averaging windows an edge keeps: see [`LATENCY_AVERAGE_SAMPLES`] and
+/// [`SUCCESS_RATE_AVERAGE_SAMPLES`]. A prober that stops sampling before it reaches this count reads
+/// a window that still holds initial values, so it must sample at least this often.
+pub const MIN_STABLE_SAMPLES: usize = SUCCESS_RATE_AVERAGE_SAMPLES;
+
 /// A representation of a individual neighbor link measurement
 #[derive(Debug, Copy, Clone, Default, PartialEq)]
 pub struct TransportLinkMeasurement {
     /// `None` until a probe has succeeded. The average cannot express "no samples yet" on its own —
     /// an untouched EMA reads `0.0`, which is also a legitimate measured latency — so absence is
     /// carried by the `Option` rather than by a parallel counter that could disagree with it.
-    latency_average: Option<ExponentialMovingAverage<3>>,
-    probe_success_rate: ExponentialMovingAverage<5>,
+    latency_average: Option<ExponentialMovingAverage<LATENCY_AVERAGE_SAMPLES>>,
+    probe_success_rate: ExponentialMovingAverage<SUCCESS_RATE_AVERAGE_SAMPLES>,
     /// Recorded probe outcomes, successful or not. The EMA cannot express "no samples yet":
     /// an all-failed stream holds exactly `0.0`, the same as its initial value.
     samples: u64,

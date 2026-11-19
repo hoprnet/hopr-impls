@@ -11,21 +11,21 @@ name                   = "hopr-ct-full-network"
 readme                 = "README.md"
 repository.workspace   = true
 rust-version.workspace = true
-version                = "0.11.1"
+version                = "0.12.0"
 
 [lib]
 crate-type = ["rlib"]
 
 [features]
 default = ["noise"]
-noise   = []
+noise   = ["dep:futures-time"]
 serde   = ["dep:humantime-serde", "dep:serde", "hopr-api/serde"]
 
 [dependencies]
 anyhow          = { workspace = true }
 cfg-if          = { workspace = true }
 futures         = { workspace = true }
-futures-time    = { workspace = true }
+futures-time    = { workspace = true, optional = true }
 humantime-serde = { workspace = true, optional = true }
 serde           = { workspace = true, optional = true, features = ["derive"] }
 smart-default   = { workspace = true }
@@ -44,10 +44,11 @@ hopr-utils = { workspace = true, features = [
   "statistics-types",
   "statistics-types-weighted",
 ] }
+rand.workspace = true
 
 [dev-dependencies]
 lazy_static = { workspace = true }
-tokio       = { workspace = true, features = ["time"] }
+tokio       = { workspace = true, features = ["time", "test-util"] }
 
 [package.metadata.cargo-machete]
 ignored = ["humantime-serde"]
