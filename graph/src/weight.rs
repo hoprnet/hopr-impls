@@ -413,6 +413,11 @@ impl LoopbackWindow {
         }
     }
 
+    /// A window that counts outcomes for `window` instead of [`LOOPBACK_WINDOW`].
+    fn with_window(epoch: std::time::Instant, _window: std::time::Duration) -> Self {
+        Self::new(epoch)
+    }
+
     /// Whether the loops lost in a row since the latest one that came back are more than the edge's return
     /// rate explains, at [`LOST_RUN_SIGNIFICANCE`].
     ///
@@ -1799,6 +1804,36 @@ mod loopback_window_tests {
             None,
             "a full window on, the failures are out of it"
         );
+    }
+
+    #[test]
+    fn a_longer_window_should_keep_outcomes_until_it_has_elapsed() {
+        let epoch = Instant::now();
+        let window_len = Duration::from_secs(120);
+        let mut window = LoopbackWindow::with_window(epoch, window_len);
+        record(&mut window, epoch, 0, 5);
+
+        assert_eq!(
+            window.rate_at(epoch + Duration::from_secs(90)),
+            Some(0.0),
+            "90 s in, the failures are inside a 120 s window"
+        );
+        assert_eq!(
+            window.rate_at(epoch + window_len),
+            None,
+            "a full window on, the failures are out of it"
+        );
+    }
+
+    #[test]
+    fn a_shorter_window_should_forget_outcomes_sooner() {
+        let epoch = Instant::now();
+        let window_len = Duration::from_secs(24);
+        let mut window = LoopbackWindow::with_window(epoch, window_len);
+        record(&mut window, epoch, 0, 5);
+
+        assert_eq!(window.rate_at(epoch + Duration::from_secs(20)), Some(0.0));
+        assert_eq!(window.rate_at(epoch + window_len), None);
     }
 
     #[test]

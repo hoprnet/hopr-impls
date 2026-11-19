@@ -91,6 +91,16 @@ impl EgressConfig {
         );
         Ok(())
     }
+
+    /// Like [`validate_against_probe_timeout`](Self::validate_against_probe_timeout), with the interval
+    /// checked against the graph's configured loopback `window` instead of the default one.
+    pub fn validate_against_loopback_window(
+        &self,
+        probe_timeout: std::time::Duration,
+        _window: std::time::Duration,
+    ) -> anyhow::Result<()> {
+        self.validate_against_probe_timeout(probe_timeout)
+    }
 }
 
 impl Validate for EgressConfig {
@@ -213,6 +223,30 @@ mod tests {
         };
         let err = huge.validate().unwrap_err();
         assert!(err.field_errors().contains_key("interval"), "{err}");
+    }
+
+    #[test]
+    fn an_interval_should_be_checked_against_the_configured_loopback_window() {
+        let timeout = std::time::Duration::from_secs(3);
+        let cfg = EgressConfig {
+            interval: std::time::Duration::from_secs(60),
+            ..EgressConfig::default()
+        };
+
+        assert!(
+            cfg.validate_against_probe_timeout(timeout).is_err(),
+            "60 s does not fit twice in the default 60 s window"
+        );
+        assert!(
+            cfg.validate_against_loopback_window(timeout, std::time::Duration::from_secs(120))
+                .is_ok(),
+            "exactly twice fits"
+        );
+        assert!(
+            cfg.validate_against_loopback_window(timeout, std::time::Duration::from_secs(119))
+                .is_err(),
+            "one second short of twice does not"
+        );
     }
 
     #[test]
