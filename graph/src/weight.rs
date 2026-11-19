@@ -43,6 +43,9 @@ impl TransportLinkMeasurement {
     /// "never measured", which is what a caller needs to decide whether a peer has been sampled
     /// enough to be left alone. It is a lifetime total: a caller that needs a count since some
     /// earlier point must take the difference.
+    ///
+    /// Interim: the count belongs in the interface rather than here, see hopr-api#178, and this
+    /// accessor goes when it lands (hopr-impls#120).
     pub fn probe_samples(&self) -> u64 {
         self.samples
     }
