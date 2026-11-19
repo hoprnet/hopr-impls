@@ -54,8 +54,8 @@ fn resolve_loopback_edges(
     }
 
     let mut path_id: hopr_api::ct::PathId = Default::default();
-    for (i, chunk) in path_bytes.chunks_exact(8).enumerate() {
-        path_id[i] = u64::from_le_bytes(chunk.try_into().expect("chunk is 8 bytes"));
+    for (i, chunk) in path_bytes.as_chunks::<8>().0.iter().enumerate() {
+        path_id[i] = u64::from_le_bytes(*chunk);
     }
 
     let me_val = crate::petgraph::path_id::encode(me);
