@@ -7,6 +7,14 @@ use hopr_api::graph::{
 };
 use hopr_utils::statistics::{ExponentialMovingAverage, WindowedRatio};
 
+/// Probes an edge needs before its success rate is more than its most recent outcome.
+///
+/// This is the averaging window of `TransportLinkMeasurement`'s probe success rate, the longest
+/// average an edge keeps. Probing that stops re-probing a connected neighbour before this many
+/// samples would stop on noise rather than on a measurement, so a caller that decides how many
+/// stable samples it waits for must not go below this value.
+pub const PROBE_SUCCESS_AVERAGING_WINDOW: usize = 5;
+
 /// A representation of a individual neighbor link measurement
 #[derive(Debug, Copy, Clone, Default, PartialEq)]
 pub struct TransportLinkMeasurement {
@@ -14,7 +22,7 @@ pub struct TransportLinkMeasurement {
     /// an untouched EMA reads `0.0`, which is also a legitimate measured latency — so absence is
     /// carried by the `Option` rather than by a parallel counter that could disagree with it.
     latency_average: Option<ExponentialMovingAverage<3>>,
-    probe_success_rate: ExponentialMovingAverage<5>,
+    probe_success_rate: ExponentialMovingAverage<{ PROBE_SUCCESS_AVERAGING_WINDOW }>,
     /// Recorded probe outcomes, successful or not. The EMA cannot express "no samples yet":
     /// an all-failed stream holds exactly `0.0`, the same as its initial value.
     samples: u64,
