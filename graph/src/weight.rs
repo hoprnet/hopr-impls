@@ -376,6 +376,11 @@ const LOST_RUN_SIGNIFICANCE: f64 = 0.05;
 /// How the loops over an edge judge its relay. Built from the path planner's configuration by whoever
 /// constructs the graph, see [`ChannelGraph::with_starvation`](crate::ChannelGraph::with_starvation).
 #[derive(Debug, Copy, Clone, PartialEq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(default, deny_unknown_fields)
+)]
 pub struct StarvationParams {
     /// Loops in the window from which the return rate judges the relay. Below it, a single returned loop
     /// keeps the relay and none starves it.

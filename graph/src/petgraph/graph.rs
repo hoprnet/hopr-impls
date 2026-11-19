@@ -103,18 +103,27 @@ pub const DEFAULT_MAX_PLAUSIBLE_LOOPBACK_RTT: std::time::Duration = std::time::D
 ///
 /// Every field is fixed for the life of the graph. The defaults are the `DEFAULT_*` constants of this module,
 /// [`StarvationParams::default`] and [`LOOPBACK_WINDOW`](crate::LOOPBACK_WINDOW).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, smart_default::SmartDefault)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(default, deny_unknown_fields)
+)]
 pub struct ChannelGraphConfig {
     /// Penalty multiplier for edges lacking probe-based quality observations.
+    #[default(DEFAULT_EDGE_PENALTY)]
     pub edge_penalty: f64,
     /// Minimum acknowledgment rate for **data** path selection; deliberately not applied to loopback probe
     /// generation.
+    #[default(DEFAULT_MIN_ACK_RATE)]
     pub min_ack_rate: f64,
     /// Upper bound on a loopback probe RTT considered plausible; measurements above it are discarded during
     /// attribution.
     ///
     /// The bound also takes into account that some SURBs are retained in a buffer and may not come back soon
     /// enough.
+    #[default(DEFAULT_MAX_PLAUSIBLE_LOOPBACK_RTT)]
+    #[cfg_attr(feature = "serde", serde(with = "humantime_serde"))]
     pub max_plausible_loopback_rtt: std::time::Duration,
     /// How the loops over an edge judge its relay.
     pub starvation: StarvationParams,
@@ -124,19 +133,9 @@ pub struct ChannelGraphConfig {
     /// `EgressConfig::validate_against_loopback_window` in `hopr-ct-full-network`. A longer window delays
     /// noticing that a relay stopped returning loops by up to the added span. Outcomes expire by whole buckets
     /// (a twelfth of the window), so it is an approximate retention period.
+    #[default(crate::LOOPBACK_WINDOW)]
+    #[cfg_attr(feature = "serde", serde(with = "humantime_serde"))]
     pub loopback_window: std::time::Duration,
-}
-
-impl Default for ChannelGraphConfig {
-    fn default() -> Self {
-        Self {
-            edge_penalty: DEFAULT_EDGE_PENALTY,
-            min_ack_rate: DEFAULT_MIN_ACK_RATE,
-            max_plausible_loopback_rtt: DEFAULT_MAX_PLAUSIBLE_LOOPBACK_RTT,
-            starvation: StarvationParams::default(),
-            loopback_window: crate::LOOPBACK_WINDOW,
-        }
-    }
 }
 
 impl ChannelGraphConfig {
@@ -794,13 +793,6 @@ mod tests {
         assert!(graph.edge(&unknown, &me).is_none());
     }
 
-    fn config_with_window(loopback_window: std::time::Duration) -> ChannelGraphConfig {
-        ChannelGraphConfig {
-            loopback_window,
-            ..ChannelGraphConfig::default()
-        }
-    }
-
     #[test]
     fn graph_should_hand_its_loopback_window_to_every_edge_it_creates() -> anyhow::Result<()> {
         let (me, peer, other, third) = (
@@ -810,7 +802,11 @@ mod tests {
             pubkey_from(&SECRET_3),
         );
         let window = std::time::Duration::from_secs(120);
-        let graph = ChannelGraph::with_config(me, config_with_window(window)).map_err(anyhow::Error::msg)?;
+        let config = ChannelGraphConfig {
+            loopback_window: window,
+            ..ChannelGraphConfig::default()
+        };
+        let graph = ChannelGraph::with_config(me, config).map_err(anyhow::Error::msg)?;
         graph.add_node(peer);
         graph.add_node(other);
 
@@ -866,10 +862,48 @@ mod tests {
             crate::MAX_LOOPBACK_WINDOW * 2,
         ] {
             assert!(
-                ChannelGraph::with_config(me, config_with_window(window)).is_err(),
+                ChannelGraph::with_config(
+                    me,
+                    ChannelGraphConfig {
+                        loopback_window: window,
+                        ..ChannelGraphConfig::default()
+                    }
+                )
+                .is_err(),
                 "{window:?} must be rejected"
             );
         }
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn config_should_deserialize_with_the_defaults_for_what_it_omits() -> anyhow::Result<()> {
+        let config: ChannelGraphConfig = serde_json::from_str(r#"{"loopback_window": "2m"}"#)?;
+
+        assert_eq!(config.loopback_window, std::time::Duration::from_secs(120));
+        assert_eq!(
+            config,
+            ChannelGraphConfig {
+                loopback_window: std::time::Duration::from_secs(120),
+                ..ChannelGraphConfig::default()
+            }
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn config_should_refuse_an_unknown_field() {
+        assert!(serde_json::from_str::<ChannelGraphConfig>(r#"{"loopback_windows": "2m"}"#).is_err());
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn config_should_survive_a_serialization_round_trip() -> anyhow::Result<()> {
+        let config = ChannelGraphConfig::default();
+        let back: ChannelGraphConfig = serde_json::from_str(&serde_json::to_string(&config)?)?;
+        assert_eq!(back, config);
+        Ok(())
     }
 
     #[test]
