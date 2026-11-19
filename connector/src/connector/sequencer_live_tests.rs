@@ -340,26 +340,49 @@ async fn nonce_gap_after_a_large_fee_spike() -> anyhow::Result<()> {
     run_scenario(100, 150).await
 }
 
-/// Models the redemption strategy on top of the ramp of `run_scenario` (spike of 100x): `REDEMPTION_CHANNELS` channels
-/// (20 by default) each enqueue one approval, and enqueue it again `REDEMPTION_TICK_SECS` (5) after every failure,
-/// with a tracking timeout of `REDEMPTION_TRACKING_SECS` (12). The gap, Blokli's transaction count of the signer minus
-/// the mined count, is sampled every second for `REDEMPTION_WINDOW_SECS` (480, so that the 5 minute nonce gap tolerance
-/// can show). The relief starts with the decay of the base fee.
+/// Base fees of the blocks of the production-like profile: up by 12.5% per block from `baseline` to `peak`, `hold`
+/// blocks at the peak, then a decay that halves the fee every 24 blocks until it is below `floor`. Returns the fees,
+/// the index of the first block of the hold phase's end (the relief) and the number of ramp blocks.
+fn incident_schedule(baseline: u128, peak: u128, hold: u64, floor: u128) -> (Vec<u128>, usize, usize) {
+    let mut fees = Vec::new();
+    let mut fee = baseline;
+    while fee < peak {
+        fee = (fee * 1125 / 1000 + 1).min(peak);
+        fees.push(fee);
+    }
+    let ramp_blocks = fees.len();
+    fees.extend(std::iter::repeat_n(peak, hold as usize));
+    let relief = fees.len();
+    while fee > floor {
+        // 0.5^(1/24)
+        fee = fee * 97153 / 100_000;
+        fees.push(fee);
+    }
+    (fees, relief, ramp_blocks)
+}
+
+/// Models the redemption strategy under a fee spike like the production incident: the base fee starts at
+/// `REDEMPTION_BASELINE_BASE_FEE` (15 wei), ramps up by 12.5% per block to `REDEMPTION_PEAK_BASE_FEE` (100 Mwei), is
+/// held for `REDEMPTION_HOLD_BLOCKS` (30) blocks, then halves every 24 blocks until it is below 1 Mwei, after which
+/// Anvil mines on its own. `REDEMPTION_CHANNELS` channels (12 by default) each enqueue one approval, from the moment
+/// the base fee passes `REDEMPTION_START_BASE_FEE` (2 Mwei), `REDEMPTION_STAGGER_SECS` (2) apart, and enqueue it again
+/// `REDEMPTION_TICK_SECS` (5) after every failure, with a tracking timeout of `REDEMPTION_TRACKING_SECS` (12). The gap,
+/// Blokli's transaction count of the signer minus the mined count, is sampled every second until it has closed after
+/// the relief and every channel is confirmed, or `REDEMPTION_WINDOW_SECS` (900) have passed.
 async fn run_redemption_loop() -> anyhow::Result<()> {
     let blokli_url: Url = std::env::var("BLOKLI_URL")?.parse()?;
     let label = std::env::var("BLOKLI_LABEL").unwrap_or_else(|_| "unlabeled".into());
-    let config = RetryConfig::from_env(480, false);
+    let config = RetryConfig::from_env(900, true);
     let anvil = Rpc::new(std::env::var("ANVIL_URL")?);
     let signer = ChainKeypair::from_secret(&ANVIL_ACCOUNT_1_KEY)?;
-    let account = signer.public().to_address().to_string();
     let client = Arc::new(BlokliClient::new(blokli_url, BlokliClientConfig::default()));
 
     anvil.stop_mining().await?;
     anvil.call("anvil_dropAllTransactions", json!([])).await?;
-    let baseline = std::env::var("NONCE_GAP_BASELINE_BASE_FEE")
+    let baseline: u128 = std::env::var("REDEMPTION_BASELINE_BASE_FEE")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_BASELINE_BASE_FEE);
+        .unwrap_or(15);
     for _ in 0..SETTLE_BLOCKS {
         anvil.set_next_base_fee(baseline).await?;
         anvil.mine().await?;
@@ -368,7 +391,12 @@ async fn run_redemption_loop() -> anyhow::Result<()> {
     tokio::time::sleep(Duration::from_secs(2)).await;
     let base_fee = anvil.base_fee().await?;
     let chain_info = wait_for_chain_info(&client, &label).await?;
-    let spike_fee = base_fee * 100;
+    println!(
+        "[{label}] start base fee {base_fee} wei, Blokli max fee {}",
+        super::live_support::blokli_fee_cap(&client)
+            .await
+            .map_or_else(|| "n/a".into(), |fee| fee.to_string())
+    );
     let payloads = BasicPayloadGenerator::new(signer.public().to_address(), chain_info.info.contract_addresses);
     let spender = Address::try_from(chain_info.info.contract_addresses.channels.as_slice())?;
     let sequencer: Seq = TransactionSequencer::new(signer.clone(), client.clone(), NONCE_GAP_TOLERANCE);
@@ -379,9 +407,12 @@ async fn run_redemption_loop() -> anyhow::Result<()> {
         spender,
         started: state.started,
     };
-    let (schedule, drop_after, ramp_blocks) = ramp_schedule(base_fee, spike_fee);
+    let (schedule, relief, ramp_blocks) =
+        incident_schedule(base_fee, config.peak_base_fee, config.hold_blocks, 1_000_000);
     println!(
-        "[{label}] base fee {base_fee} wei, ramp of {ramp_blocks} blocks to {spike_fee} wei, {} blocks in total",
+        "[{label}] base fee {base_fee} wei, ramp of {ramp_blocks} blocks to {} wei, hold {} blocks, {} blocks in total",
+        config.peak_base_fee,
+        config.hold_blocks,
         schedule.len()
     );
 
@@ -390,21 +421,25 @@ async fn run_redemption_loop() -> anyhow::Result<()> {
             if state.stopped() {
                 return anyhow::Ok(());
             }
-            if blocks_mined == drop_after {
+            if blocks_mined == relief {
                 state.start_relief();
-                // The RPC node forgets the transactions it lists although they cannot pay the base fee.
-                let base_fee_now = anvil.base_fee().await?;
-                for tx in anvil.pool_entries(&account).await? {
-                    if tx.max_fee < base_fee_now {
-                        anvil.call("anvil_dropTransaction", json!([tx.hash])).await?;
-                    }
-                }
+                println!(
+                    "[{label}] relief starts at t={}s, block {blocks_mined}",
+                    state.started.elapsed().as_secs()
+                );
+            }
+            if *fee >= config.start_base_fee && !state.go.load(std::sync::atomic::Ordering::SeqCst) {
+                println!(
+                    "[{label}] channels start at t={}s, block {blocks_mined}, base fee {fee}",
+                    state.started.elapsed().as_secs()
+                );
+                state.begin();
             }
             anvil.set_next_base_fee(*fee).await?;
             anvil.mine().await?;
+            state.observe_base_fee(*fee);
             tokio::time::sleep(BLOCK_INTERVAL).await;
         }
-        anvil.set_next_base_fee(base_fee).await?;
         anvil.mine_every_second().await?;
         Ok(())
     };

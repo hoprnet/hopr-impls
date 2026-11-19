@@ -14,6 +14,7 @@
 # Optional:
 #   GETH_PORT (default 18545), BLOKLI_PORT (default 18080)
 #   BLOCK_TIME (default 1): seconds between blocks
+#   GENESIS_BASE_FEE (default 15): base fee of the genesis block, in wei (geth dev mode floors it at 7 when idle)
 #   GETH_EXTRA_ARGS: extra geth flags, for example a small pool so that pool pressure evicts underpriced
 #     transactions: "--txpool.globalslots 64 --txpool.globalqueue 64"
 #   UNMINED_TIMEOUT (default 15s): bloklid's unmined transaction timeout, set through
@@ -52,7 +53,7 @@ cat >"${DATA_DIR}/genesis.json" <<JSON
 "constantinopleBlock":0,"petersburgBlock":0,"istanbulBlock":0,"berlinBlock":0,"londonBlock":0,"shanghaiTime":0,
 "cancunTime":0,"terminalTotalDifficulty":0,
 "blobSchedule":{"cancun":{"target":3,"max":6,"baseFeeUpdateFraction":3338477}}},
-"difficulty":"0","gasLimit":"15000000","baseFeePerGas":"1000","alloc":{
+"difficulty":"0","gasLimit":"15000000","baseFeePerGas":"${GENESIS_BASE_FEE:-15}","alloc":{
 "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266":{"balance":"0x21e19e0c9bab2400000"},
 "0x70997970C51812dc3A010C7d01b50e0d17dc79C8":{"balance":"0x21e19e0c9bab2400000"}}}
 JSON

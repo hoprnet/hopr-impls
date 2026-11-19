@@ -65,6 +65,16 @@ const FILLER_GAS_LIMIT: u64 = 14_980_000;
 const FILLER_MAX_FEE: u128 = 20_000_000_000;
 const FILLER_TIP: u128 = 5_000_000_000;
 const FILLER_TIP_STEP: u128 = 10_000_000;
+/// Tips of the filler in the redemption scenario: small, as the tips of the production traffic are, so that Blokli's
+/// estimate (twice the base fee plus the recent tip) stays close to its 5 Mwei floor until the base fee grows.
+const RETRY_FILLER_TIP: u128 = 1_000;
+const RETRY_FILLER_TIP_STEP: u128 = 10;
+/// Gas burnt by the single filler transaction per block during the decay of the redemption scenario: 77.2% of the
+/// gas target (half the block gas limit), which lowers the base fee by 2.85% per block, so that it halves every 24
+/// blocks as it did during the production incident. Empty blocks would lower it by 12.5% per block.
+const RETRY_DECAY_GAS: u64 = 5_790_000;
+/// The decay ends, and the filler stops, below this base fee, far under the fee cap of every approval.
+const RETRY_DECAY_END_BASE_FEE: u128 = 1_000_000;
 /// Filler transactions kept in the pool ahead of the chain.
 const FILLER_AHEAD: u64 = 3;
 const DEFAULT_PEAK_BASE_FEE: u128 = 4_000_000_000;
@@ -95,6 +105,11 @@ struct Filler<'a> {
     next_nonce: u64,
     /// Nonce of the first filler transaction, which sets its tip.
     first_nonce: u64,
+    /// Tip of the first filler transaction, and the increase with every following one.
+    tip: u128,
+    tip_step: u128,
+    /// Gas limit, and so the gas burnt, by every filler transaction.
+    gas_limit: u64,
 }
 
 impl Filler<'_> {
@@ -110,6 +125,11 @@ impl Filler<'_> {
 
     /// Deploys the burner contract and returns its address.
     async fn deploy_burner(rpc: &Rpc, chain_id: u64) -> anyhow::Result<Filler<'_>> {
+        Self::deploy_burner_with_tip(rpc, chain_id, FILLER_TIP, FILLER_TIP_STEP).await
+    }
+
+    /// Deploys the burner contract; the filler's transactions carry `tip`, plus `tip_step` per transaction.
+    async fn deploy_burner_with_tip(rpc: &Rpc, chain_id: u64, tip: u128, tip_step: u128) -> anyhow::Result<Filler<'_>> {
         let keypair = ChainKeypair::from_secret(&ANVIL_ACCOUNT_0_KEY)?;
         let address = keypair.public().to_address().to_string();
         let nonce = rpc
@@ -123,6 +143,9 @@ impl Filler<'_> {
             burner: [0; 20],
             next_nonce: nonce + 1,
             first_nonce: nonce + 1,
+            tip,
+            tip_step,
+            gas_limit: FILLER_GAS_LIMIT,
         };
         let deploy = TransactionRequest {
             to: Some(TxKind::Create),
@@ -132,7 +155,7 @@ impl Filler<'_> {
         let gas = GasEstimation {
             gas_limit: 200_000,
             max_fee_per_gas: FILLER_MAX_FEE,
-            max_priority_fee_per_gas: FILLER_TIP,
+            max_priority_fee_per_gas: tip,
         };
         let hash = filler.send_raw(deploy, nonce, gas).await?;
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -152,16 +175,21 @@ impl Filler<'_> {
 
     /// Keeps `FILLER_AHEAD` filler transactions ahead of the chain.
     async fn top_up(&mut self) -> anyhow::Result<()> {
+        self.top_up_to(FILLER_AHEAD).await
+    }
+
+    /// Keeps `ahead` filler transactions ahead of the chain.
+    async fn top_up_to(&mut self, ahead: u64) -> anyhow::Result<()> {
         let mined = self.rpc.nonce(&self.address).await?;
-        while self.next_nonce < mined + FILLER_AHEAD {
+        while self.next_nonce < mined + ahead {
             let tx = TransactionRequest {
                 to: Some(TxKind::Call(self.burner.into())),
                 ..Default::default()
             };
             let gas = GasEstimation {
-                gas_limit: FILLER_GAS_LIMIT,
+                gas_limit: self.gas_limit,
                 max_fee_per_gas: FILLER_MAX_FEE,
-                max_priority_fee_per_gas: FILLER_TIP + (self.next_nonce - self.first_nonce) as u128 * FILLER_TIP_STEP,
+                max_priority_fee_per_gas: self.tip + (self.next_nonce - self.first_nonce) as u128 * self.tip_step,
             };
             self.send_raw(tx, self.next_nonce, gas).await?;
             self.next_nonce += 1;
@@ -576,23 +604,30 @@ async fn burst_under_rising_base_fee() -> anyhow::Result<()> {
     run_burst_scenario().await
 }
 
-/// Models the redemption strategy under the congestion of `run_scenario`: `REDEMPTION_CHANNELS` channels (20 by
-/// default) each enqueue one approval, and enqueue it again `REDEMPTION_TICK_SECS` (5) after every failure, with a
-/// tracking timeout of `REDEMPTION_TRACKING_SECS` (12). The gap, Blokli's transaction count of the signer minus the
-/// mined count, is sampled every second until it has closed after the relief or `REDEMPTION_WINDOW_SECS` (480) have
-/// passed. Set `REDEMPTION_STOP_ON_CLOSE=0` to observe the whole window.
+/// Models the redemption strategy under a fee spike like the production incident: the base fee starts at a few wei,
+/// is ramped up by full filler blocks (12.5% per block) to `REDEMPTION_PEAK_BASE_FEE` (100 Mwei), held near it for
+/// `REDEMPTION_HOLD_BLOCKS` (30) blocks by filling only while it is below the peak, then decays by 2.85% per block
+/// (halving every 24 blocks, as in the incident) with one partly filled block at a time, until it is below 1 Mwei.
+/// `REDEMPTION_CHANNELS` channels (12 by default) each enqueue one approval, from the moment the base fee passes
+/// `REDEMPTION_START_BASE_FEE` (2 Mwei), `REDEMPTION_STAGGER_SECS` (2) apart, and enqueue it again
+/// `REDEMPTION_TICK_SECS` (5) after every failure, with a tracking timeout of `REDEMPTION_TRACKING_SECS` (12). The gap,
+/// Blokli's transaction count of the signer minus the mined count, is sampled every second until it has closed after
+/// the relief and every channel is confirmed, or `REDEMPTION_WINDOW_SECS` (900) have passed.
 async fn run_redemption_loop() -> anyhow::Result<()> {
     let blokli_url: Url = std::env::var("BLOKLI_URL")?.parse()?;
     let label = std::env::var("BLOKLI_LABEL").unwrap_or_else(|_| "unlabeled".into());
-    let config = RetryConfig::from_env(480, true);
-    let peak_base_fee: u128 = env_or("GETH_PEAK_BASE_FEE", DEFAULT_PEAK_BASE_FEE);
-    let max_fill_blocks: u64 = env_or("GETH_MAX_FILL_BLOCKS", DEFAULT_MAX_FILL_BLOCKS);
+    let config = RetryConfig::from_env(900, true);
+    anyhow::ensure!(
+        config.peak_base_fee < FILLER_MAX_FEE,
+        "the peak must stay below the filler's max fee"
+    );
+    let max_fill_blocks: u64 = env_or("GETH_MAX_FILL_BLOCKS", 400);
     let rpc = Rpc::new(std::env::var("GETH_URL")?);
 
     let signer = ChainKeypair::from_secret(&ANVIL_ACCOUNT_1_KEY)?;
     let client = Arc::new(BlokliClient::new(blokli_url, BlokliClientConfig::default()));
     let chain_id = rpc.quantity("eth_chainId", json!([])).await? as u64;
-    let mut filler = Filler::deploy_burner(&rpc, chain_id).await?;
+    let mut filler = Filler::deploy_burner_with_tip(&rpc, chain_id, RETRY_FILLER_TIP, RETRY_FILLER_TIP_STEP).await?;
     let chain_info = wait_for_chain_info(&client, &label).await?;
     let payloads = BasicPayloadGenerator::new(signer.public().to_address(), chain_info.info.contract_addresses);
     let spender = Address::try_from(chain_info.info.contract_addresses.channels.as_slice())?;
@@ -604,9 +639,16 @@ async fn run_redemption_loop() -> anyhow::Result<()> {
         spender,
         started: state.started,
     };
+    println!(
+        "[{label}] start base fee {} wei, Blokli max fee {}",
+        rpc.base_fee().await?,
+        show(blokli_max_fee(&client).await)
+    );
 
     let drive = async {
         let mut first_block: Option<u64> = None;
+        let mut peak_block: Option<u64> = None;
+        let mut relief = false;
         let mut ticker = tokio::time::interval(Duration::from_millis(250));
         loop {
             ticker.tick().await;
@@ -614,17 +656,54 @@ async fn run_redemption_loop() -> anyhow::Result<()> {
                 return anyhow::Ok(());
             }
             let (block, base_fee, _) = latest_block(&rpc).await?;
+            state.observe_base_fee(base_fee);
             let first = *first_block.get_or_insert(block);
-            if base_fee >= peak_base_fee || block - first >= max_fill_blocks {
+            if base_fee >= config.start_base_fee && !state.go.load(std::sync::atomic::Ordering::SeqCst) {
+                println!(
+                    "[{label}] channels start at t={}s, block {}, base fee {base_fee}",
+                    state.started.elapsed().as_secs(),
+                    block - first
+                );
+                state.begin();
+            }
+            if base_fee >= config.peak_base_fee && peak_block.is_none() {
+                peak_block = Some(block);
+                println!(
+                    "[{label}] peak reached at t={}s, block {}, base fee {base_fee}",
+                    state.started.elapsed().as_secs(),
+                    block - first
+                );
+            }
+            let hold_over = peak_block.is_some_and(|peak| block - peak >= config.hold_blocks);
+            if (hold_over || block - first >= max_fill_blocks) && !relief {
+                relief = true;
                 state.start_relief();
                 println!(
                     "[{label}] relief starts at t={}s, block {}, base fee {base_fee}",
                     state.started.elapsed().as_secs(),
                     block - first
                 );
-                return Ok(());
             }
-            filler.top_up().await?;
+            if relief {
+                // One partly filled block at a time makes the base fee decay slowly, as it did in production.
+                if base_fee < RETRY_DECAY_END_BASE_FEE {
+                    return Ok(());
+                }
+                filler.gas_limit = RETRY_DECAY_GAS;
+                filler.top_up_to(1).await?;
+                continue;
+            }
+            // Near the peak a single pooled filler transaction per block, and none while the base fee is at the peak,
+            // keeps the base fee oscillating just below it.
+            if base_fee < config.peak_base_fee {
+                filler
+                    .top_up_to(if base_fee * 2 >= config.peak_base_fee {
+                        1
+                    } else {
+                        FILLER_AHEAD
+                    })
+                    .await?;
+            }
         }
     };
     let (_, report, driven) = tokio::join!(
