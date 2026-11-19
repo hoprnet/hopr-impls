@@ -236,13 +236,12 @@ where
     }
 }
 
-/// A path the generator may probe, at the weight the path owner gives it.
-#[derive(Debug, Clone)]
-struct LoopbackCandidate {
-    path: Vec<OffchainPublicKey>,
-    path_id: PathId,
-    weight: f64,
-}
+/// A loopback route, and the weight the path owner gives it.
+///
+/// The route is the interface's own [`ProbeRouting`], built as soon as the path is weighed, so the
+/// pass holds exactly the objects the stream hands out. The weight rides alongside because
+/// [`ProbeRouting`] carries no valuation and the pass is ordered by it.
+type WeightedRoute = (ProbeRouting, f64);
 
 /// What was last seen of a neighbor, and how many outcomes it has recorded since its last
 /// disconnect.
@@ -313,7 +312,7 @@ impl NeighborSamples {
 #[derive(Debug, Default)]
 struct LoopbackPass {
     /// The candidates in the order they will be offered, already interleaved by the exploration share.
-    paths: Vec<LoopbackCandidate>,
+    paths: Vec<WeightedRoute>,
     /// How much of `paths` has been offered.
     cursor: usize,
     /// Edges with fresh SURB evidence seen while `paths` was built.
@@ -324,10 +323,10 @@ struct LoopbackPass {
 
 impl LoopbackPass {
     /// The next candidate, advancing the cursor.
-    fn next(&mut self) -> Option<LoopbackCandidate> {
-        let candidate = self.paths.get(self.cursor)?.clone();
+    fn next(&mut self) -> Option<ProbeRouting> {
+        let (route, _) = self.paths.get(self.cursor)?.clone();
         self.cursor += 1;
-        Some(candidate)
+        Some(route)
     }
 
     /// Whether the pass must be rebuilt before the next candidate is offered.
@@ -343,7 +342,7 @@ impl LoopbackPass {
     /// Installs a pass built for `focus`, with the cursor back at its start.
     fn install(
         &mut self,
-        paths: Vec<LoopbackCandidate>,
+        paths: Vec<WeightedRoute>,
         evidence: HashSet<(OffchainPublicKey, OffchainPublicKey)>,
         focus: Option<HashSet<OffchainPublicKey>>,
     ) {
@@ -515,11 +514,7 @@ where
             self.rebuild_pass(control);
         }
 
-        let candidate = self.pass.next()?;
-
-        let intermediates = strip_loopback_endpoints(candidate.path, &self.me);
-        loopback_routing(self.me.into(), intermediates)
-            .map(|routing| ProbeRouting::Looping((routing, candidate.path_id)))
+        self.pass.next()
     }
 
     /// Builds one full pass over the loopback candidates: the best paths first, the exploration
@@ -563,8 +558,8 @@ where
         // The best set is the selection, not a weighted draw from it: it is what the path owner
         // values most. With a focus it also stays around the exits, forward loops ahead of return
         // ones, so the paths routing will take there are the ones kept measured.
-        let by_weight = |mut paths: Vec<LoopbackCandidate>| {
-            paths.sort_by(|left, right| right.weight.total_cmp(&left.weight));
+        let by_weight = |mut paths: Vec<WeightedRoute>| {
+            paths.sort_by(|left, right| right.1.total_cmp(&left.1));
             paths
         };
         let ranked = if control.focus.is_some() {
@@ -599,7 +594,7 @@ where
         path_id: PathId,
         weights: &PathWeights,
         evidence: &mut HashSet<(OffchainPublicKey, OffchainPublicKey)>,
-    ) -> Option<LoopbackCandidate> {
+    ) -> Option<WeightedRoute> {
         let intermediates = strip_loopback_endpoints(path, &self.me);
         let edges: Vec<_> = loopback_edge_pairs(self.me, &intermediates).collect();
         let mut evidenced = Vec::new();
@@ -626,12 +621,9 @@ where
         }
 
         let weight = weights.weight_of(&intermediates, path_id).unwrap_or(0.0) * unmeasured as f64;
+        let route = ProbeRouting::Looping((loopback_routing(self.me.into(), intermediates)?, path_id));
 
-        Some(LoopbackCandidate {
-            path: intermediates,
-            path_id,
-            weight,
-        })
+        Some((route, weight))
     }
 }
 
@@ -670,17 +662,25 @@ fn uniform_shuffle<T>(items: Vec<T>) -> Vec<T> {
 }
 
 /// A random permutation in which heavier items come earlier more often.
-fn weighted_shuffle(items: Vec<LoopbackCandidate>) -> Vec<LoopbackCandidate> {
+fn weighted_shuffle(items: Vec<WeightedRoute>) -> Vec<WeightedRoute> {
     WeightedCollection::new(
         items
             .into_iter()
             .map(|item| {
-                let weight = item.weight;
+                let weight = item.1;
                 (item, weight)
             })
             .collect(),
     )
     .into_shuffled()
+}
+
+/// The path a loopback route was selected for, `None` for a route that is not a loopback.
+fn route_path_id(route: &ProbeRouting) -> Option<PathId> {
+    match route {
+        ProbeRouting::Looping((_, path_id)) => Some(*path_id),
+        ProbeRouting::Neighbor(_) => None,
+    }
 }
 
 /// Splits the candidates into the best set and the exploration set, then interleaves them.
@@ -689,16 +689,16 @@ fn weighted_shuffle(items: Vec<LoopbackCandidate>) -> Vec<LoopbackCandidate> {
 /// what makes membership follow the owner's valuation rather than a draw). The order within each
 /// set is still random, so cycles do not replay the same sequence.
 fn split_pass(
-    ranked: Vec<LoopbackCandidate>,
-    all: Vec<LoopbackCandidate>,
+    ranked: Vec<WeightedRoute>,
+    all: Vec<WeightedRoute>,
     best_cap: usize,
     explore_share: f64,
-) -> Vec<LoopbackCandidate> {
+) -> Vec<WeightedRoute> {
     let best = weighted_shuffle(ranked.into_iter().take(best_cap).collect());
-    let best_paths: HashSet<Vec<OffchainPublicKey>> = best.iter().map(|candidate| candidate.path.clone()).collect();
+    let best_paths: HashSet<PathId> = best.iter().filter_map(|(route, _)| route_path_id(route)).collect();
     let explore = weighted_shuffle(
         all.into_iter()
-            .filter(|candidate| !best_paths.contains(&candidate.path))
+            .filter(|(route, _)| route_path_id(route).is_none_or(|id| !best_paths.contains(&id)))
             .collect(),
     );
 
@@ -710,11 +710,7 @@ fn split_pass(
 /// The generator cannot see the consumer's windows, so the share is carried by the order itself:
 /// at every position the exploration set takes its turn as soon as it is behind by more than
 /// `explore_share`, whatever the window boundaries turn out to be.
-fn interleave(
-    best: Vec<LoopbackCandidate>,
-    explore: Vec<LoopbackCandidate>,
-    explore_share: f64,
-) -> Vec<LoopbackCandidate> {
+fn interleave(best: Vec<WeightedRoute>, explore: Vec<WeightedRoute>, explore_share: f64) -> Vec<WeightedRoute> {
     let mut best = VecDeque::from(best);
     let mut explore = VecDeque::from(explore);
     let mut pass = Vec::with_capacity(best.len() + explore.len());
@@ -1527,10 +1523,14 @@ mod tests {
     #[test]
     fn the_exploration_share_should_hold_within_a_window() {
         // Tags at or above 1_000 identify the exploration candidates.
-        let candidate = |tag: usize, weight: f64| LoopbackCandidate {
-            path: vec![random_key()],
-            path_id: [tag as u64; 5],
-            weight,
+        let candidate = |tag: usize, weight: f64| {
+            let routing = DestinationRouting::Forward {
+                destination: Box::new(NodeId::Offchain(random_key())),
+                pseudonym: None,
+                forward_options: RoutingOptions::Hops(0u8.try_into().expect("0 is a valid u8")),
+                return_options: None,
+            };
+            (ProbeRouting::Looping((routing, [tag as u64; 5])), weight)
         };
         let best: Vec<_> = (0..900).map(|tag| candidate(tag, 1.0)).collect();
         let explore: Vec<_> = (1_000..1_100).map(|tag| candidate(tag, 1.0)).collect();
@@ -1539,7 +1539,10 @@ mod tests {
 
         assert_eq!(pass.len(), 1_000);
         for window in pass.chunks(20) {
-            let explored = window.iter().filter(|candidate| candidate.path_id[0] >= 1_000).count();
+            let explored = window
+                .iter()
+                .filter(|(route, _)| route_path_id(route).is_some_and(|id| id[0] >= 1_000))
+                .count();
             assert!(
                 (1..=3).contains(&explored),
                 "a twenty-pull window held {explored} explorations"
@@ -1547,17 +1550,24 @@ mod tests {
         }
 
         // Over the whole pass the share is exact, give or take one.
-        let explored = pass.iter().filter(|candidate| candidate.path_id[0] >= 1_000).count();
+        let explored = pass
+            .iter()
+            .filter(|(route, _)| route_path_id(route).is_some_and(|id| id[0] >= 1_000))
+            .count();
         assert!((99..=101).contains(&explored), "the cycle held {explored}");
     }
 
     #[test]
     fn the_best_set_should_follow_the_weights() {
         // Ten paths the owner values, and a hundred and ninety it barely does.
-        let candidate = |tag: usize, weight: f64| LoopbackCandidate {
-            path: vec![random_key()],
-            path_id: [tag as u64; 5],
-            weight,
+        let candidate = |tag: usize, weight: f64| {
+            let routing = DestinationRouting::Forward {
+                destination: Box::new(NodeId::Offchain(random_key())),
+                pseudonym: None,
+                forward_options: RoutingOptions::Hops(0u8.try_into().expect("0 is a valid u8")),
+                return_options: None,
+            };
+            (ProbeRouting::Looping((routing, [tag as u64; 5])), weight)
         };
         let heavy: Vec<_> = (0..10).map(|tag| candidate(tag, 1.0)).collect();
         let light: Vec<_> = (10..200).map(|tag| candidate(tag, 0.01)).collect();
@@ -1568,13 +1578,13 @@ mod tests {
         for _ in 0..20 {
             let mut all = heavy.clone();
             all.extend(light.clone());
-            all.sort_by(|left, right| right.weight.total_cmp(&left.weight));
+            all.sort_by(|left, right| right.1.total_cmp(&left.1));
 
             let pass = split_pass(all.clone(), all, 10, 0.0);
 
             for candidate in pass.iter().take(10) {
                 best_slots += 1;
-                if candidate.weight == 1.0 {
+                if candidate.1 == 1.0 {
                     heavy_slots += 1;
                 }
             }
