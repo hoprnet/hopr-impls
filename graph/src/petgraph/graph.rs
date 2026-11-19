@@ -112,6 +112,9 @@ pub struct ChannelGraphConfig {
     pub min_ack_rate: f64,
     /// Upper bound on a loopback probe RTT considered plausible; measurements above it are discarded during
     /// attribution.
+    ///
+    /// The bound also takes into account that some SURBs are retained in a buffer and may not come back soon
+    /// enough.
     pub max_plausible_loopback_rtt: std::time::Duration,
     /// How the loops over an edge judge its relay.
     pub starvation: StarvationParams,
