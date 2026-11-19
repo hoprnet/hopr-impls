@@ -67,6 +67,13 @@ The private reporter applies a 5-second deadline and a 32 KiB record budget, emi
 and `analysis_required`. Graph observations are not atomic with any other component. `HOPR_STATE_DUMP_INTERVAL` defaults to 60 seconds,
 accepts 5 through 86400, and disables reads at zero.
 
+## Loopback window
+
+The graph counts the outcome of a loopback over an edge for `LOOPBACK_WINDOW`, 60 seconds by default. `ChannelGraph::with_loopback_window`
+sets another window between 12 seconds and 1 hour; call it before the graph is shared. The loopback generator's interval must fit twice
+in the window: check it with `EgressConfig::validate_against_loopback_window` in `hopr-ct-full-network`. A longer window delays noticing
+that a relay stopped returning loops by up to the added span.
+
 ## License
 
 GPL-3.0-only
