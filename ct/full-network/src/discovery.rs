@@ -5,7 +5,10 @@ use std::{
 
 #[cfg(feature = "noise")]
 use futures::future::Either;
-use futures::{StreamExt, stream::BoxStream};
+use futures::{
+    StreamExt,
+    stream::{BoxStream, PollNext},
+};
 use hopr_api::{
     ct::{CoverTrafficGeneration, ProbeRouting, ProbingTrafficGeneration},
     graph::{
@@ -234,13 +237,6 @@ where
     }
 }
 
-/// What the generator offers: a direct neighbor, or a loopback over a path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProbeKind {
-    Neighbor,
-    Loopback,
-}
-
 /// A path the generator may probe, at the weight the path owner gives it.
 #[derive(Debug, Clone)]
 struct LoopbackCandidate {
@@ -274,11 +270,6 @@ struct NeighborSamples {
 }
 
 impl NeighborSamples {
-    /// What is recorded for `peer`.
-    fn get(&self, peer: &OffchainPublicKey) -> NeighborProbeState {
-        self.states.get(peer).copied().unwrap_or_default()
-    }
-
     /// Mutable access to a peer's record.
     fn entry(&mut self, peer: OffchainPublicKey) -> &mut NeighborProbeState {
         self.states.entry(peer).or_default()
@@ -368,68 +359,33 @@ impl LoopbackPass {
     }
 }
 
-/// The pull-driven probe generator.
+/// Neighbor probing on its own: which direct peer needs a ping next.
 ///
-/// Holds no timer and reads no clock. Every pull produces at most one probe, and only while the
-/// dial is on; the consumer decides how often to pull. The two persistent cursors live with the
-/// state they walk: [`NeighborSamples`] and [`LoopbackPass`].
-struct ProbeGenerator<U> {
+/// Knows nothing about loopbacks, and shares no state with them. It owns its sample count, because
+/// the graph's `samples` counter is a lifetime total that never resets.
+struct NeighborProber<U> {
     me: OffchainPublicKey,
     cfg: EgressConfig,
     graph: U,
-    control: watch::Receiver<ControlState>,
-    coverage: Arc<CoverageCounters>,
-    neighbors: NeighborSamples,
-    pass: LoopbackPass,
-    /// Whether the previous pull offered a neighbor, so the two kinds alternate.
-    last_was_neighbor: bool,
+    samples: NeighborSamples,
 }
 
-impl<U> ProbeGenerator<U>
+impl<U> NeighborProber<U>
 where
-    U: NetworkGraphView<NodeId = OffchainPublicKey, Observed = Observations>
-        + NetworkGraphTraverse<NodeId = OffchainPublicKey>
-        + FocusedLoopback
-        + Send
-        + Sync
-        + 'static,
+    U: NetworkGraphView<NodeId = OffchainPublicKey, Observed = Observations> + Send + Sync + 'static,
 {
-    /// The next probe to offer, `None` when neither kind has anything to offer right now.
-    ///
-    /// Neighbor and loopback probes alternate while both are available, so a peer that stays below
-    /// its rate thresholds cannot hold the pull order and stop loopbacks from being measured.
-    async fn next_probe(&mut self, control: &ControlState) -> Option<ProbeRouting> {
-        let kinds = if self.last_was_neighbor {
-            [ProbeKind::Loopback, ProbeKind::Neighbor]
-        } else {
-            [ProbeKind::Neighbor, ProbeKind::Loopback]
-        };
-
-        for kind in kinds {
-            let routing = match kind {
-                ProbeKind::Neighbor => self.next_neighbor().await.map(neighbor_routing),
-                ProbeKind::Loopback => self.next_loopback(control),
-            };
-            if let Some(routing) = routing {
-                self.last_was_neighbor = kind == ProbeKind::Neighbor;
-                return Some(routing);
-            }
-        }
-        None
-    }
-
-    /// Offers the next neighbor that needs a probe, advancing its sample count.
+    /// The next peer to ping, `None` when every known peer is measured and the re-add did not fire.
     ///
     /// Re-examines the graph at most once per call, so a graph with nothing left to probe cannot
     /// make the search spin.
-    async fn next_neighbor(&mut self) -> Option<OffchainPublicKey> {
+    async fn next(&mut self) -> Option<OffchainPublicKey> {
         let mut rebuilt = false;
 
         loop {
             // Scoped so the shared borrow of the graph ends before the rebuild below needs `&mut self`.
             let taken = {
                 let (graph, me, connected_only) = (&self.graph, self.me, self.cfg.probe_connected_only);
-                self.neighbors
+                self.samples
                     .take_next(|peer| neighbor_needs_probe(graph, me, connected_only, peer))
             };
             if let Some(peer) = taken {
@@ -438,20 +394,20 @@ where
 
             // Every measured peer is left alone while it stays connected. Re-add one at random, so a
             // stale assumption about a static link cannot hold forever.
-            if let Some(peer) = self.neighbors.readd(self.cfg.readd_probability) {
+            if let Some(peer) = self.samples.readd(self.cfg.readd_probability) {
                 return Some(peer);
             }
 
             if rebuilt {
                 return None;
             }
-            self.rebuild_neighbor_sample().await;
+            self.rebuild_sample().await;
             rebuilt = true;
         }
     }
 
-    /// Rebuilds the neighbor sample from the graph, recording what it says about connectivity.
-    async fn rebuild_neighbor_sample(&mut self) {
+    /// Rebuilds the sample from the graph, recording what it says about connectivity.
+    async fn rebuild_sample(&mut self) {
         let mut fresh = Vec::new();
         let mut degraded = Vec::new();
         let mut measured = Vec::new();
@@ -466,7 +422,7 @@ where
             let immediate = obs.as_ref().and_then(|obs| obs.immediate_qos());
             let connected = immediate.and_then(|imm| imm.is_connected());
 
-            let state = self.neighbors.entry(peer);
+            let state = self.samples.entry(peer);
             // The link that was measured is gone, so the count that described it is too.
             if connected == Some(false) && state.connected != Some(false) {
                 state.samples = 0;
@@ -508,11 +464,33 @@ where
             .into_iter()
             .chain(degraded.into_iter().map(|(peer, _)| peer))
             .collect();
-        self.neighbors.install(sample, measured);
+        self.samples.install(sample, measured);
     }
+}
 
+/// Loopback probing on its own: which path to measure next.
+///
+/// Knows nothing about neighbors, and shares no state with them. It keeps the persistent cursor
+/// over its candidate set and publishes what each completed pass saw.
+struct LoopbackProber<U> {
+    me: OffchainPublicKey,
+    cfg: EgressConfig,
+    graph: U,
+    pass: LoopbackPass,
+    coverage: Arc<CoverageCounters>,
+}
+
+impl<U> LoopbackProber<U>
+where
+    U: NetworkGraphView<NodeId = OffchainPublicKey, Observed = Observations>
+        + NetworkGraphTraverse<NodeId = OffchainPublicKey>
+        + FocusedLoopback
+        + Send
+        + Sync
+        + 'static,
+{
     /// The next loopback path, taken from the persistent cursor over the current pass.
-    fn next_loopback(&mut self, control: &ControlState) -> Option<ProbeRouting> {
+    fn next(&mut self, control: &ControlState) -> Option<ProbeRouting> {
         if self.pass.is_spent(control.focus.as_deref()) {
             // A pass that ran to its end is a full cycle over the candidate set; report what it saw.
             if self.pass.is_complete() {
@@ -709,6 +687,86 @@ fn interleave(
     pass
 }
 
+/// Waits until the dial is on. `None` once the control handle is gone.
+async fn wait_for_dial(control: &mut watch::Receiver<ControlState>) -> Option<()> {
+    loop {
+        if control.borrow_and_update().level.is_some() {
+            return Some(());
+        }
+        if control.changed().await.is_err() {
+            return None;
+        }
+    }
+}
+
+/// Stream of neighbor probes, one per pull, driven only by its own state.
+///
+/// Nothing is polled until the consumer pulls, and no timer runs between pulls. While the dial is
+/// off, or while every peer is measured, it waits on the control handle rather than spinning.
+fn neighbor_probes<U>(
+    mut prober: NeighborProber<U>,
+    mut control: watch::Receiver<ControlState>,
+) -> impl futures::Stream<Item = ProbeRouting>
+where
+    U: NetworkGraphView<NodeId = OffchainPublicKey, Observed = Observations> + Send + Sync + 'static,
+{
+    futures::stream::unfold((prober, control), |(mut prober, mut control)| async move {
+        loop {
+            // Without a control handle nobody can steer probing, so the stream stays pending
+            // rather than ending: probe generation is never meant to run out.
+            if wait_for_dial(&mut control).await.is_none() {
+                return futures::future::pending().await;
+            }
+
+            if let Some(peer) = prober.next().await {
+                return Some((neighbor_routing(peer), (prober, control)));
+            }
+
+            // Nothing to offer until the peer set or the control changes.
+            if control.changed().await.is_err() {
+                return futures::future::pending().await;
+            }
+        }
+    })
+}
+
+/// Stream of loopback probes, one per pull, driven only by its own state.
+///
+/// Nothing is polled until the consumer pulls, and no timer runs between pulls. While the dial is
+/// off, or while there is no candidate path, it waits on the control handle rather than spinning.
+fn loopback_probes<U>(
+    mut prober: LoopbackProber<U>,
+    mut control: watch::Receiver<ControlState>,
+) -> impl futures::Stream<Item = ProbeRouting>
+where
+    U: NetworkGraphView<NodeId = OffchainPublicKey, Observed = Observations>
+        + NetworkGraphTraverse<NodeId = OffchainPublicKey>
+        + FocusedLoopback
+        + Send
+        + Sync
+        + 'static,
+{
+    futures::stream::unfold((prober, control), |(mut prober, mut control)| async move {
+        loop {
+            // Without a control handle nobody can steer probing, so the stream stays pending
+            // rather than ending: probe generation is never meant to run out.
+            if wait_for_dial(&mut control).await.is_none() {
+                return futures::future::pending().await;
+            }
+
+            let state = control.borrow_and_update().clone();
+            if let Some(probe) = prober.next(&state) {
+                return Some((probe, (prober, control)));
+            }
+
+            // Nothing to offer until the graph or the control changes.
+            if control.changed().await.is_err() {
+                return futures::future::pending().await;
+            }
+        }
+    })
+}
+
 impl<U> ProbingTrafficGeneration for FullNetworkDiscovery<U>
 where
     U: NetworkGraphView<NodeId = OffchainPublicKey, Observed = Observations>
@@ -719,57 +777,34 @@ where
         + Sync
         + 'static,
 {
+    /// Neighbor and loopback probing are separate streams with no shared state, merged fairly so
+    /// neither can starve the other.
     fn build(&self) -> BoxStream<'static, ProbeRouting> {
-        let generator = ProbeGenerator {
-            me: self.me,
-            cfg: self.cfg,
-            graph: self.graph.clone(),
-            control: self.control.subscribe(),
-            coverage: self.control.coverage_counters(),
-            neighbors: NeighborSamples::default(),
-            pass: LoopbackPass::default(),
-            last_was_neighbor: false,
-        };
+        let neighbors = neighbor_probes(
+            NeighborProber {
+                me: self.me,
+                cfg: self.cfg,
+                graph: self.graph.clone(),
+                samples: NeighborSamples::default(),
+            },
+            self.control.subscribe(),
+        );
 
-        probing_stream(generator).boxed()
+        let loopbacks = loopback_probes(
+            LoopbackProber {
+                me: self.me,
+                cfg: self.cfg,
+                graph: self.graph.clone(),
+                pass: LoopbackPass::default(),
+                coverage: self.control.coverage_counters(),
+            },
+            self.control.subscribe(),
+        );
+
+        // Alternate which stream is polled first, so a peer that stays below its thresholds cannot
+        // hold the pull order and stop loopbacks from being measured.
+        futures::stream::select_with_strategy(neighbors, loopbacks, |next: &mut PollNext| next.toggle()).boxed()
     }
-}
-
-/// The lazy stream over a [`ProbeGenerator`].
-///
-/// Nothing is polled until the consumer pulls, and no timer runs between pulls. While the dial is
-/// off, or while nothing is left to offer, the stream waits on the control handle rather than
-/// spinning; it emits nothing and holds no timer either way.
-fn probing_stream<U>(generator: ProbeGenerator<U>) -> impl futures::Stream<Item = ProbeRouting>
-where
-    U: NetworkGraphView<NodeId = OffchainPublicKey, Observed = Observations>
-        + NetworkGraphTraverse<NodeId = OffchainPublicKey>
-        + FocusedLoopback
-        + Send
-        + Sync
-        + 'static,
-{
-    futures::stream::unfold(generator, |mut generator| async move {
-        loop {
-            if generator.control.borrow_and_update().level.is_none() {
-                if generator.control.changed().await.is_err() {
-                    return futures::future::pending().await;
-                }
-                continue;
-            }
-
-            let control = generator.control.borrow_and_update().clone();
-
-            if let Some(probe) = generator.next_probe(&control).await {
-                return Some((probe, generator));
-            }
-
-            // Nothing to offer until something changes: a focus, a budget, a dial, or a peer.
-            if generator.control.changed().await.is_err() {
-                return futures::future::pending().await;
-            }
-        }
-    })
 }
 
 #[cfg(test)]
@@ -1103,6 +1138,28 @@ mod tests {
                 .is_err(),
             "probing stops again once the sample count is back"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn loopbacks_should_be_offered_while_a_peer_keeps_needing_probes() -> anyhow::Result<()> {
+        // A peer whose probe rate stays below its threshold never leaves the neighbor sample, so the
+        // neighbor stream is always ready. Merging without a fair strategy would let it hold every
+        // pull, and an edge nothing else measures would stay unmeasured.
+        let (me, head, _, _, graph) = two_loops()?;
+        record_probes(&graph, &me, &head, 0, 6);
+
+        let cfg = EgressConfig {
+            min_success_rate: 0.9,
+            ..fast_cfg()
+        };
+        let prober = FullNetworkDiscovery::new(me, cfg, graph);
+        let stream = ProbingTrafficGeneration::build(&prober);
+        pin_mut!(stream);
+
+        let offered = loopbacks(&mut stream, 2).await?;
+
+        assert_eq!(offered.len(), 2, "loopbacks must still be offered");
         Ok(())
     }
 
