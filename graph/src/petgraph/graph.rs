@@ -172,17 +172,23 @@ impl ChannelGraph {
     }
 
     /// This graph with the loops over an edge counted for `window` instead of
-    /// [`LOOPBACK_WINDOW`](crate::LOOPBACK_WINDOW). Call before the graph is shared.
+    /// [`LOOPBACK_WINDOW`](crate::LOOPBACK_WINDOW). Call before the graph is shared and before any edge is
+    /// added.
     ///
     /// The loopback generator's interval must fit twice in `window`; check it with
     /// `EgressConfig::validate_against_loopback_window` in `hopr-ct-full-network`. A longer window delays
-    /// noticing that a relay stopped returning loops by up to the added span.
+    /// noticing that a relay stopped returning loops by up to the added span. Outcomes expire by whole buckets
+    /// (a twelfth of `window`), so `window` is an approximate retention period.
     ///
     /// # Errors
     ///
-    /// Fails when `window` does not pass [`validate_loopback_window`](crate::validate_loopback_window).
+    /// Fails when `window` does not pass [`validate_loopback_window`](crate::validate_loopback_window), or
+    /// when the graph already has an edge: an edge keeps the window it was created with.
     pub fn with_loopback_window(mut self, window: std::time::Duration) -> Result<Self, String> {
         crate::validate_loopback_window(window)?;
+        if self.inner.read().graph.edge_count() > 0 {
+            return Err("the loopback window must be set before any edge is added".into());
+        }
         self.loopback_window = window;
         Ok(self)
     }
@@ -754,6 +760,18 @@ mod tests {
             let obs = graph.edge(&me, &dest).expect("edge should exist");
             assert_eq!(obs.loopback_window(), window);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn graph_should_reject_a_loopback_window_once_it_has_edges() -> anyhow::Result<()> {
+        let (me, peer) = (pubkey_from(&SECRET_0), pubkey_from(&SECRET_1));
+        let graph = ChannelGraph::new(me);
+        graph.add_node(peer);
+        graph.add_edge(&me, &peer)?;
+
+        // The existing edge keeps its own window, so accepting this would leave the graph mixed.
+        assert!(graph.with_loopback_window(std::time::Duration::from_secs(120)).is_err());
         Ok(())
     }
 
