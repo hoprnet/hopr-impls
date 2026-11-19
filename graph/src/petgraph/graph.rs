@@ -77,6 +77,8 @@ pub struct ChannelGraph {
     pub(crate) max_plausible_loopback_rtt: std::time::Duration,
     /// How the loops over an edge judge its relay; handed to every edge this graph creates.
     pub(crate) starvation: StarvationParams,
+    /// How long the loops over an edge are counted; handed to every edge this graph creates.
+    pub(crate) loopback_window: std::time::Duration,
     /// Current single-hop ticket face value, pushed in whenever the price or winning probability
     /// changes. Held once for the whole graph so a change costs one write, not an edge sweep.
     pub(crate) ticket_face_value: Arc<RwLock<Option<hopr_api::graph::traits::Balance>>>,
@@ -146,6 +148,7 @@ impl ChannelGraph {
             min_ack_rate,
             max_plausible_loopback_rtt,
             starvation: StarvationParams::default(),
+            loopback_window: crate::LOOPBACK_WINDOW,
             ticket_face_value: Arc::new(RwLock::new(None)),
             inner: Arc::new(RwLock::new(InnerGraph { graph, indices, slots })),
             searches: Arc::new(Default::default()),
@@ -165,6 +168,22 @@ impl ChannelGraph {
     pub fn with_starvation(mut self, starvation: StarvationParams) -> Result<Self, String> {
         starvation.validate()?;
         self.starvation = starvation;
+        Ok(self)
+    }
+
+    /// This graph with the loops over an edge counted for `window` instead of
+    /// [`LOOPBACK_WINDOW`](crate::LOOPBACK_WINDOW). Call before the graph is shared.
+    ///
+    /// The loopback generator's interval must fit twice in `window`; check it with
+    /// `EgressConfig::validate_against_loopback_window` in `hopr-ct-full-network`. A longer window delays
+    /// noticing that a relay stopped returning loops by up to the added span.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `window` does not pass [`validate_loopback_window`](crate::validate_loopback_window).
+    pub fn with_loopback_window(mut self, window: std::time::Duration) -> Result<Self, String> {
+        crate::validate_loopback_window(window)?;
+        self.loopback_window = window;
         Ok(self)
     }
 
@@ -310,9 +329,11 @@ impl hopr_api::graph::NetworkGraphWrite for ChannelGraph {
             .ok_or(ChannelGraphError::PublicKeyNodeNotFound(*dest))?;
 
         if inner.graph.find_edge(src_idx, dest_idx).is_none() {
-            inner
-                .graph
-                .add_edge(src_idx, dest_idx, Observations::with_starvation(self.starvation));
+            inner.graph.add_edge(
+                src_idx,
+                dest_idx,
+                Observations::with_loopback_params(self.starvation, self.loopback_window),
+            );
         }
 
         Ok(())
@@ -362,9 +383,11 @@ impl hopr_api::graph::NetworkGraphWrite for ChannelGraph {
         };
 
         let edge_idx = inner.graph.find_edge(src_idx, dest_idx).unwrap_or_else(|| {
-            inner
-                .graph
-                .add_edge(src_idx, dest_idx, Observations::with_starvation(self.starvation))
+            inner.graph.add_edge(
+                src_idx,
+                dest_idx,
+                Observations::with_loopback_params(self.starvation, self.loopback_window),
+            )
         });
 
         if let Some(weight) = inner.graph.edge_weight_mut(edge_idx) {
@@ -712,6 +735,34 @@ mod tests {
         let unknown = pubkey_from(&SECRET_7);
         assert!(graph.edge(&me, &unknown).is_none());
         assert!(graph.edge(&unknown, &me).is_none());
+    }
+
+    #[test]
+    fn graph_should_hand_its_loopback_window_to_every_edge_it_creates() -> anyhow::Result<()> {
+        let (me, peer, other) = (pubkey_from(&SECRET_0), pubkey_from(&SECRET_1), pubkey_from(&SECRET_2));
+        let window = std::time::Duration::from_secs(120);
+        let graph = ChannelGraph::new(me)
+            .with_loopback_window(window)
+            .map_err(anyhow::Error::msg)?;
+        graph.add_node(peer);
+        graph.add_node(other);
+
+        graph.add_edge(&me, &peer)?;
+        graph.upsert_edge(&me, &other, |_| {});
+
+        for dest in [peer, other] {
+            let obs = graph.edge(&me, &dest).expect("edge should exist");
+            assert_eq!(obs.loopback_window(), window);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn graph_should_reject_a_loopback_window_outside_the_bounds() {
+        let me = pubkey_from(&SECRET_0);
+        for window in [std::time::Duration::ZERO, crate::MAX_LOOPBACK_WINDOW * 2] {
+            assert!(ChannelGraph::new(me).with_loopback_window(window).is_err());
+        }
     }
 
     #[test]

@@ -38,7 +38,8 @@ pub use petgraph::traverse::{FocusRelevance, FocusedLoopback, MAX_LOOPBACK_HOPS,
 #[cfg(feature = "petgraph")]
 pub use petgraph::*;
 pub use weight::{
-    DEFAULT_MIN_LOOPBACK_RETURN_RATE, DEFAULT_MIN_LOOPBACKS_FOR_RATE, LOOPBACK_WINDOW, Observations, StarvationParams,
+    DEFAULT_MIN_LOOPBACK_RETURN_RATE, DEFAULT_MIN_LOOPBACKS_FOR_RATE, LOOPBACK_WINDOW, MAX_LOOPBACK_WINDOW,
+    MIN_LOOPBACK_WINDOW, Observations, StarvationParams, validate_loopback_window,
 };
 
 /// A thread-safe, shareable handle to a [`ChannelGraph`].
