@@ -328,7 +328,7 @@ const LOOPBACK_BUCKET_WIDTH: std::time::Duration = std::time::Duration::from_sec
 const LOOPBACK_BUCKETS: usize = 12;
 
 /// How far back loopback outcomes over an edge are still counted, unless the graph is built with
-/// [`ChannelGraph::with_loopback_window`](crate::ChannelGraph::with_loopback_window).
+/// [`ChannelGraph::with_edge_params_and_window`](crate::ChannelGraph::with_edge_params_and_window).
 ///
 /// The probing interval must stay well inside it: a loop is sent once per round, so with a longer
 /// interval the evidence expires between rounds and a failing relay reads as unprobed instead of

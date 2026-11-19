@@ -131,6 +131,23 @@ impl ChannelGraph {
         min_ack_rate: f64,
         max_plausible_loopback_rtt: std::time::Duration,
     ) -> Self {
+        Self::build(
+            me,
+            edge_penalty,
+            min_ack_rate,
+            max_plausible_loopback_rtt,
+            crate::LOOPBACK_WINDOW,
+        )
+    }
+
+    /// The one place a graph is made, so the window is set here and nowhere else.
+    fn build(
+        me: OffchainPublicKey,
+        edge_penalty: f64,
+        min_ack_rate: f64,
+        max_plausible_loopback_rtt: std::time::Duration,
+        loopback_window: std::time::Duration,
+    ) -> Self {
         let mut graph = StableDiGraph::new();
         let mut indices = BiHashMap::new();
 
@@ -148,7 +165,7 @@ impl ChannelGraph {
             min_ack_rate,
             max_plausible_loopback_rtt,
             starvation: StarvationParams::default(),
-            loopback_window: crate::LOOPBACK_WINDOW,
+            loopback_window,
             ticket_face_value: Arc::new(RwLock::new(None)),
             inner: Arc::new(RwLock::new(InnerGraph { graph, indices, slots })),
             searches: Arc::new(Default::default()),
@@ -171,30 +188,33 @@ impl ChannelGraph {
         Ok(self)
     }
 
-    /// This graph with the loops over an edge counted for `window` instead of
-    /// [`LOOPBACK_WINDOW`](crate::LOOPBACK_WINDOW). Call before the graph is shared and before any edge is
-    /// added.
+    /// Like [`with_edge_params`](Self::with_edge_params), with the loops over an edge counted for
+    /// `loopback_window` instead of [`LOOPBACK_WINDOW`](crate::LOOPBACK_WINDOW).
     ///
-    /// The loopback generator's interval must fit twice in `window`; check it with
-    /// `EgressConfig::validate_against_loopback_window` in `hopr-ct-full-network`. A longer window delays
-    /// noticing that a relay stopped returning loops by up to the added span. Outcomes expire by whole buckets
-    /// (a twelfth of `window`), so `window` is an approximate retention period.
+    /// The window is fixed for the life of the graph and every edge gets it. The loopback generator's interval
+    /// must fit twice in it; check it with `EgressConfig::validate_against_loopback_window` in
+    /// `hopr-ct-full-network`. A longer window delays noticing that a relay stopped returning loops by up to the
+    /// added span. Outcomes expire by whole buckets (a twelfth of the window), so it is an approximate retention
+    /// period.
     ///
     /// # Errors
     ///
-    /// Fails when `window` does not pass [`validate_loopback_window`](crate::validate_loopback_window), or
-    /// when the graph is already shared or has an edge: an edge keeps the window it was created with.
-    pub fn with_loopback_window(mut self, window: std::time::Duration) -> Result<Self, String> {
-        crate::validate_loopback_window(window)?;
-        // Clones share the edges but each keeps its own window, so only an unshared graph can change it.
-        if Arc::strong_count(&self.inner) > 1 {
-            return Err("the loopback window must be set before the graph is shared".into());
-        }
-        if self.inner.read().graph.edge_count() > 0 {
-            return Err("the loopback window must be set before any edge is added".into());
-        }
-        self.loopback_window = window;
-        Ok(self)
+    /// Fails when `loopback_window` does not pass [`validate_loopback_window`](crate::validate_loopback_window).
+    pub fn with_edge_params_and_window(
+        me: OffchainPublicKey,
+        edge_penalty: f64,
+        min_ack_rate: f64,
+        max_plausible_loopback_rtt: std::time::Duration,
+        loopback_window: std::time::Duration,
+    ) -> Result<Self, String> {
+        crate::validate_loopback_window(loopback_window)?;
+        Ok(Self::build(
+            me,
+            edge_penalty,
+            min_ack_rate,
+            max_plausible_loopback_rtt,
+            loopback_window,
+        ))
     }
 
     /// Returns the self-identity key of this graph.
@@ -751,16 +771,26 @@ mod tests {
     fn graph_should_hand_its_loopback_window_to_every_edge_it_creates() -> anyhow::Result<()> {
         let (me, peer, other) = (pubkey_from(&SECRET_0), pubkey_from(&SECRET_1), pubkey_from(&SECRET_2));
         let window = std::time::Duration::from_secs(120);
-        let graph = ChannelGraph::new(me)
-            .with_loopback_window(window)
-            .map_err(anyhow::Error::msg)?;
+        let graph = ChannelGraph::with_edge_params_and_window(
+            me,
+            DEFAULT_EDGE_PENALTY,
+            DEFAULT_MIN_ACK_RATE,
+            DEFAULT_MAX_PLAUSIBLE_LOOPBACK_RTT,
+            window,
+        )
+        .map_err(anyhow::Error::msg)?;
         graph.add_node(peer);
         graph.add_node(other);
 
         graph.add_edge(&me, &peer)?;
         graph.upsert_edge(&me, &other, |_| {});
 
-        for dest in [peer, other] {
+        // A clone is the same graph, so its edges get the window too.
+        let clone = graph.clone();
+        clone.add_node(pubkey_from(&SECRET_3));
+        clone.add_edge(&me, &pubkey_from(&SECRET_3))?;
+
+        for dest in [peer, other, pubkey_from(&SECRET_3)] {
             let obs = graph.edge(&me, &dest).expect("edge should exist");
             assert_eq!(obs.loopback_window(), window);
         }
@@ -768,50 +798,36 @@ mod tests {
     }
 
     #[test]
-    fn graph_should_reject_a_loopback_window_once_it_has_edges() -> anyhow::Result<()> {
+    fn graph_should_keep_the_default_loopback_window_when_built_with_edge_params() -> anyhow::Result<()> {
         let (me, peer) = (pubkey_from(&SECRET_0), pubkey_from(&SECRET_1));
         let graph = ChannelGraph::new(me);
         graph.add_node(peer);
         graph.add_edge(&me, &peer)?;
 
-        // The existing edge keeps its own window, so accepting this would leave the graph mixed.
-        let error = graph
-            .with_loopback_window(std::time::Duration::from_secs(120))
-            .expect_err("a graph with an edge must refuse a new window");
-        assert!(error.contains("before any edge"), "{error}");
+        let obs = graph.edge(&me, &peer).expect("edge should exist");
+        assert_eq!(obs.loopback_window(), crate::LOOPBACK_WINDOW);
         Ok(())
-    }
-
-    #[test]
-    fn graph_should_accept_a_loopback_window_while_it_only_has_nodes() -> anyhow::Result<()> {
-        let (me, peer) = (pubkey_from(&SECRET_0), pubkey_from(&SECRET_1));
-        let graph = ChannelGraph::new(me);
-        graph.add_node(peer);
-
-        graph
-            .with_loopback_window(std::time::Duration::from_secs(120))
-            .map_err(anyhow::Error::msg)?;
-        Ok(())
-    }
-
-    #[test]
-    fn graph_should_reject_a_loopback_window_once_it_is_shared() {
-        let graph = ChannelGraph::new(pubkey_from(&SECRET_0));
-        let other_handle = graph.clone();
-
-        // Handles share the edges but not the window, so a clone could create edges with the old one.
-        let error = graph
-            .with_loopback_window(std::time::Duration::from_secs(120))
-            .expect_err("a shared graph must refuse a new window");
-        assert!(error.contains("shared"), "{error}");
-        drop(other_handle);
     }
 
     #[test]
     fn graph_should_reject_a_loopback_window_outside_the_bounds() {
         let me = pubkey_from(&SECRET_0);
-        for window in [std::time::Duration::ZERO, crate::MAX_LOOPBACK_WINDOW * 2] {
-            assert!(ChannelGraph::new(me).with_loopback_window(window).is_err());
+        for window in [
+            std::time::Duration::ZERO,
+            crate::MIN_LOOPBACK_WINDOW - std::time::Duration::from_millis(1),
+            crate::MAX_LOOPBACK_WINDOW * 2,
+        ] {
+            assert!(
+                ChannelGraph::with_edge_params_and_window(
+                    me,
+                    DEFAULT_EDGE_PENALTY,
+                    DEFAULT_MIN_ACK_RATE,
+                    DEFAULT_MAX_PLAUSIBLE_LOOPBACK_RTT,
+                    window,
+                )
+                .is_err(),
+                "{window:?} must be rejected"
+            );
         }
     }
 

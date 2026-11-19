@@ -69,14 +69,15 @@ accepts 5 through 86400, and disables reads at zero.
 
 ## Loopback window
 
-The graph counts the outcome of a loopback over an edge for `LOOPBACK_WINDOW`, 60 seconds by default. `ChannelGraph::with_loopback_window`
-sets another window between 12 seconds and 1 hour. It returns an error once the graph is shared or has an edge, because an existing edge
-keeps the window it was created with. Outcomes expire by whole buckets (one twelfth of the window), so the window is an approximate
-retention period: an outcome can expire up to one bucket early. The loopback generator's interval must fit twice in the window: check it
-with `EgressConfig::validate_against_loopback_window` in `hopr-ct-full-network`. The graph does not call it: the caller that sets the window
-must also run that check, because `validate_against_probe_timeout` and `Validate::validate` only know the default window. The check uses the
-configured interval, so a slower `ProbingLevel` (`Low`, and `Medium` at a long interval) can still let evidence expire between rounds. A
-longer window delays noticing that a relay stopped returning loops by up to the added span.
+The graph counts the outcome of a loopback over an edge for `LOOPBACK_WINDOW`, 60 seconds by default.
+`ChannelGraph::with_edge_params_and_window` builds a graph with another window between 12 seconds and 1 hour. The window is fixed when the
+graph is built, and every edge gets it; `ChannelGraph::new` and `with_edge_params` keep the default. Outcomes expire by whole buckets (one
+twelfth of the window), so the window is an approximate retention period: an outcome can expire up to one bucket early. The loopback
+generator's interval must fit twice in the window: check it with `EgressConfig::validate_against_loopback_window` in `hopr-ct-full-network`.
+The graph does not call it: the caller that builds the graph must also run that check, because `validate_against_probe_timeout` and
+`Validate::validate` only know the default window. The check uses the configured interval, so a slower `ProbingLevel` (`Low`, and `Medium`
+at a long interval) can still let evidence expire between rounds. A longer window delays noticing that a relay stopped returning loops by up
+to the added span.
 
 ## License
 
