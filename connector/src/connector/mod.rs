@@ -42,6 +42,8 @@ mod live_support;
 mod safe;
 mod sequencer;
 #[cfg(test)]
+mod sequencer_live_geth_tests;
+#[cfg(test)]
 mod sequencer_live_tests;
 #[cfg(test)]
 pub(crate) mod service_fixtures;
