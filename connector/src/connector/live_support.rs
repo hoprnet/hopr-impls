@@ -2,7 +2,12 @@
 //! against geth): a minimal JSON-RPC client, the sequencer enqueuing and the wait for Blokli's indexer.
 
 use std::{
+    collections::BTreeMap,
     pin::Pin,
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -154,6 +159,25 @@ impl<'a> Enqueuer<'a> {
     }
 }
 
+impl Enqueuer<'_> {
+    /// Enqueues one approval with the given tracking timeout and waits for its outcome.
+    pub async fn attempt(&self, index: usize, timeout: Duration) -> Result<String, String> {
+        let tx = self
+            .payloads
+            .approve(self.spender, HoprBalance::from(index as u64))
+            .map_err(|error| error.to_string())?;
+        let tracked = self
+            .sequencer
+            .enqueue_transaction(tx, timeout, None, "live_test")
+            .await
+            .map_err(|error| error.to_string())?;
+        match tracked.await {
+            Ok(tx) => Ok(format!("{:?}", tx.status)),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+}
+
 pub(super) type Outcome<'a> = Pin<Box<dyn Future<Output = (usize, Duration, String)> + 'a>>;
 
 /// Blokli refuses queries while its indexer lags behind the blocks mined so far: waits until it answers.
@@ -168,5 +192,196 @@ pub(super) async fn wait_for_chain_info(client: &BlokliClient, label: &str) -> a
             }
             Err(error) => return Err(error.into()),
         }
+    }
+}
+
+/// Parameters of the `redemption_retry_loop` scenario.
+pub(super) struct RetryConfig {
+    /// Simulated channels, each redeeming one ticket.
+    pub channels: usize,
+    /// Wait between a failed attempt and the next one, as the strategy tick.
+    pub tick: Duration,
+    /// Tracking timeout of every attempt.
+    pub tracking_timeout: Duration,
+    /// Total wall time of the observation.
+    pub window: Duration,
+    /// Stops the observation as soon as the gap has closed after the relief.
+    pub stop_on_close: bool,
+}
+
+impl RetryConfig {
+    pub fn from_env(default_window_secs: u64, stop_on_close: bool) -> Self {
+        fn var<T: std::str::FromStr>(name: &str, default: T) -> T {
+            std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+        }
+        Self {
+            channels: var("REDEMPTION_CHANNELS", 20),
+            tick: Duration::from_secs(var("REDEMPTION_TICK_SECS", 5)),
+            tracking_timeout: Duration::from_secs(var("REDEMPTION_TRACKING_SECS", 12)),
+            window: Duration::from_secs(var("REDEMPTION_WINDOW_SECS", default_window_secs)),
+            stop_on_close: stop_on_close && var("REDEMPTION_STOP_ON_CLOSE", 1u8) == 1,
+        }
+    }
+}
+
+/// State shared by the channels, the sampler and the chain driver of the scenario.
+pub(super) struct RetryState {
+    /// Approvals enqueued so far, retries included.
+    pub submitted: AtomicUsize,
+    /// Channels whose approval was confirmed.
+    pub confirmed: AtomicUsize,
+    /// Second (since the start) at which the congestion relief starts, `u64::MAX` before.
+    pub relief_at: AtomicU64,
+    pub stop: AtomicBool,
+    pub errors: Mutex<BTreeMap<String, usize>>,
+    pub started: Instant,
+}
+
+impl RetryState {
+    pub fn new() -> Self {
+        Self {
+            submitted: AtomicUsize::new(0),
+            confirmed: AtomicUsize::new(0),
+            relief_at: AtomicU64::new(u64::MAX),
+            stop: AtomicBool::new(false),
+            errors: Mutex::new(BTreeMap::new()),
+            started: Instant::now(),
+        }
+    }
+
+    /// Called by the chain driver when the fee pressure ends.
+    pub fn start_relief(&self) {
+        self.relief_at.store(self.started.elapsed().as_secs(), Ordering::SeqCst);
+    }
+
+    pub fn stopped(&self) -> bool {
+        self.stop.load(Ordering::SeqCst)
+    }
+}
+
+/// Models the redemption strategy: every channel enqueues one approval and waits for the outcome. On an error it waits
+/// one tick and enqueues the approval again, as the next strategy tick starts a new redemption of the ticket at the
+/// head of the queue. A confirmed approval ends the channel.
+pub(super) async fn run_channels(ctx: &Enqueuer<'_>, state: &RetryState, config: &RetryConfig) {
+    let channel = |id: usize| async move {
+        loop {
+            if state.stopped() {
+                return;
+            }
+            // A distinct amount per attempt, across channels too.
+            let index = state.submitted.fetch_add(1, Ordering::SeqCst) + 1;
+            match ctx.attempt(index, config.tracking_timeout).await {
+                Ok(_) => {
+                    state.confirmed.fetch_add(1, Ordering::SeqCst);
+                    return;
+                }
+                Err(error) => {
+                    println!(
+                        "t={:.1}s channel {id} approval #{index} failed: {}",
+                        state.started.elapsed().as_secs_f64(),
+                        error.chars().take(100).collect::<String>()
+                    );
+                    *state
+                        .errors
+                        .lock()
+                        .expect("error tally lock")
+                        .entry(error.chars().take(70).collect())
+                        .or_default() += 1;
+                    tokio::time::sleep(config.tick).await;
+                }
+            }
+        }
+    };
+    futures::future::join_all((0..config.channels).map(channel)).await;
+}
+
+/// Result of the observation of the Blokli pending count against the mined count.
+pub(super) struct RetryReport {
+    pub peak_gap: u64,
+    pub final_gap: u64,
+    /// Seconds since the start at which the gap was first zero for 3 seconds after the relief started.
+    pub closed_at: Option<u64>,
+    pub relief_at: Option<u64>,
+    pub submitted: usize,
+    pub confirmed: usize,
+}
+
+/// Samples every second the gap between Blokli's transaction count of the signer and the mined count, until the
+/// window ends, or the gap has closed when `stop_on_close` is set. Sets `state.stop` at the end.
+pub(super) async fn sample_gap(
+    client: &BlokliClient,
+    rpc: &Rpc,
+    signer: Address,
+    config: &RetryConfig,
+    state: &RetryState,
+    label: &str,
+) -> anyhow::Result<RetryReport> {
+    let account = signer.to_string();
+    let mut ticker = tokio::time::interval(Duration::from_secs(1));
+    let (mut peak_gap, mut final_gap) = (0u64, 0u64);
+    let mut zero_run = 0u32;
+    let mut closed_at: Option<u64> = None;
+    println!(
+        "[{label}] seconds since the start: Blokli pending count, mined count, gap, approvals enqueued, confirmed"
+    );
+    while state.started.elapsed() < config.window {
+        ticker.tick().await;
+        let second = state.started.elapsed().as_secs();
+        let pending = match client.query_transaction_count(&signer.into()).await {
+            Ok(pending) => pending,
+            Err(error) => {
+                println!("[{label}] t={second}s pending count unavailable: {error}");
+                continue;
+            }
+        };
+        let mined = rpc.nonce(&account).await?;
+        let gap = pending.saturating_sub(mined);
+        (peak_gap, final_gap) = (peak_gap.max(gap), gap);
+        let relief = state.relief_at.load(Ordering::SeqCst);
+        zero_run = if gap == 0 { zero_run + 1 } else { 0 };
+        if zero_run >= 3 && second >= relief && closed_at.is_none() {
+            closed_at = Some(second);
+            println!("[{label}] t={second}s the gap is closed");
+        }
+        if second % 10 == 0 {
+            println!(
+                "[{label}]   t={second:>3}s pending={pending} mined={mined} gap={gap} enqueued={} confirmed={}",
+                state.submitted.load(Ordering::SeqCst),
+                state.confirmed.load(Ordering::SeqCst)
+            );
+        }
+        if config.stop_on_close && closed_at.is_some() {
+            break;
+        }
+    }
+    state.stop.store(true, Ordering::SeqCst);
+    Ok(RetryReport {
+        peak_gap,
+        final_gap,
+        closed_at,
+        relief_at: Some(state.relief_at.load(Ordering::SeqCst)).filter(|at| *at != u64::MAX),
+        submitted: state.submitted.load(Ordering::SeqCst),
+        confirmed: state.confirmed.load(Ordering::SeqCst),
+    })
+}
+
+impl RetryReport {
+    pub fn print(&self, label: &str, config: &RetryConfig, state: &RetryState) {
+        println!(
+            "[{label}] redemption retry loop: {} channels, tick {:?}, tracking timeout {:?}, window {:?}",
+            config.channels, config.tick, config.tracking_timeout, config.window
+        );
+        println!(
+            "[{label}] peak gap: {}, final gap: {}, approvals enqueued: {}, confirmed channels: {}/{}",
+            self.peak_gap, self.final_gap, self.submitted, self.confirmed, config.channels
+        );
+        match (self.closed_at, self.relief_at) {
+            (Some(closed), Some(relief)) => println!(
+                "[{label}] the gap closed at t={closed}s, {}s after the relief started (t={relief}s)",
+                closed.saturating_sub(relief)
+            ),
+            _ => println!("[{label}] the gap never closed"),
+        }
+        println!("[{label}] errors: {:?}", state.errors.lock().expect("error tally lock"));
     }
 }

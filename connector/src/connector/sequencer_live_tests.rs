@@ -44,7 +44,10 @@ use hopr_api::types::{
 };
 use serde_json::json;
 
-use super::live_support::{ANVIL_ACCOUNT_1_KEY, Enqueuer, Outcome, Rpc, Seq, wait_for_chain_info};
+use super::live_support::{
+    ANVIL_ACCOUNT_1_KEY, Enqueuer, Outcome, RetryConfig, RetryState, Rpc, Seq, run_channels, sample_gap,
+    wait_for_chain_info,
+};
 use crate::{connector::sequencer::TransactionSequencer, utils::model_to_chain_info};
 
 /// Default base fee the scenario starts from, in wei. `NONCE_GAP_BASELINE_BASE_FEE` overrides it.
@@ -335,4 +338,89 @@ async fn nonce_gap_after_a_moderate_fee_spike() -> anyhow::Result<()> {
 #[ignore = "requires a running Blokli and Anvil"]
 async fn nonce_gap_after_a_large_fee_spike() -> anyhow::Result<()> {
     run_scenario(100, 150).await
+}
+
+/// Models the redemption strategy on top of the ramp of `run_scenario` (spike of 100x): `REDEMPTION_CHANNELS` channels
+/// (20 by default) each enqueue one approval, and enqueue it again `REDEMPTION_TICK_SECS` (5) after every failure,
+/// with a tracking timeout of `REDEMPTION_TRACKING_SECS` (12). The gap, Blokli's transaction count of the signer minus
+/// the mined count, is sampled every second for `REDEMPTION_WINDOW_SECS` (480, so that the 5 minute nonce gap tolerance
+/// can show). The relief starts with the decay of the base fee.
+async fn run_redemption_loop() -> anyhow::Result<()> {
+    let blokli_url: Url = std::env::var("BLOKLI_URL")?.parse()?;
+    let label = std::env::var("BLOKLI_LABEL").unwrap_or_else(|_| "unlabeled".into());
+    let config = RetryConfig::from_env(480, false);
+    let anvil = Rpc::new(std::env::var("ANVIL_URL")?);
+    let signer = ChainKeypair::from_secret(&ANVIL_ACCOUNT_1_KEY)?;
+    let account = signer.public().to_address().to_string();
+    let client = Arc::new(BlokliClient::new(blokli_url, BlokliClientConfig::default()));
+
+    anvil.stop_mining().await?;
+    anvil.call("anvil_dropAllTransactions", json!([])).await?;
+    let baseline = std::env::var("NONCE_GAP_BASELINE_BASE_FEE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_BASELINE_BASE_FEE);
+    for _ in 0..SETTLE_BLOCKS {
+        anvil.set_next_base_fee(baseline).await?;
+        anvil.mine().await?;
+        tokio::time::sleep(BLOCK_INTERVAL).await;
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let base_fee = anvil.base_fee().await?;
+    let chain_info = wait_for_chain_info(&client, &label).await?;
+    let spike_fee = base_fee * 100;
+    let payloads = BasicPayloadGenerator::new(signer.public().to_address(), chain_info.info.contract_addresses);
+    let spender = Address::try_from(chain_info.info.contract_addresses.channels.as_slice())?;
+    let sequencer: Seq = TransactionSequencer::new(signer.clone(), client.clone(), NONCE_GAP_TOLERANCE);
+    let state = RetryState::new();
+    let ctx = Enqueuer {
+        sequencer: &sequencer,
+        payloads: &payloads,
+        spender,
+        started: state.started,
+    };
+    let (schedule, drop_after, ramp_blocks) = ramp_schedule(base_fee, spike_fee);
+    println!(
+        "[{label}] base fee {base_fee} wei, ramp of {ramp_blocks} blocks to {spike_fee} wei, {} blocks in total",
+        schedule.len()
+    );
+
+    let drive = async {
+        for (blocks_mined, fee) in schedule.iter().enumerate() {
+            if state.stopped() {
+                return anyhow::Ok(());
+            }
+            if blocks_mined == drop_after {
+                state.start_relief();
+                // The RPC node forgets the transactions it lists although they cannot pay the base fee.
+                let base_fee_now = anvil.base_fee().await?;
+                for tx in anvil.pool_entries(&account).await? {
+                    if tx.max_fee < base_fee_now {
+                        anvil.call("anvil_dropTransaction", json!([tx.hash])).await?;
+                    }
+                }
+            }
+            anvil.set_next_base_fee(*fee).await?;
+            anvil.mine().await?;
+            tokio::time::sleep(BLOCK_INTERVAL).await;
+        }
+        anvil.set_next_base_fee(base_fee).await?;
+        anvil.mine_every_second().await?;
+        Ok(())
+    };
+    let (_, report, driven) = tokio::join!(
+        run_channels(&ctx, &state, &config),
+        sample_gap(&client, &anvil, signer.public().to_address(), &config, &state, &label),
+        drive
+    );
+    driven?;
+    let report = report?;
+    report.print(&label, &config, &state);
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+#[ignore = "requires a running Blokli and Anvil"]
+async fn redemption_retry_loop() -> anyhow::Result<()> {
+    run_redemption_loop().await
 }

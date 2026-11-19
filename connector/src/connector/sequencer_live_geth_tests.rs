@@ -44,7 +44,10 @@ use hopr_api::types::{
 };
 use serde_json::{Value, json};
 
-use super::live_support::{ANVIL_ACCOUNT_1_KEY, Enqueuer, Outcome, Rpc, Seq, parse_quantity, wait_for_chain_info};
+use super::live_support::{
+    ANVIL_ACCOUNT_1_KEY, Enqueuer, Outcome, RetryConfig, RetryState, Rpc, Seq, parse_quantity, run_channels,
+    sample_gap, wait_for_chain_info,
+};
 use crate::{connector::sequencer::TransactionSequencer, utils::model_to_chain_info};
 
 /// Secret key of the well-known, public Anvil development account #0 (the filler). It holds no real funds.
@@ -571,4 +574,72 @@ async fn run_burst_scenario() -> anyhow::Result<()> {
 #[ignore = "requires a running Blokli and geth"]
 async fn burst_under_rising_base_fee() -> anyhow::Result<()> {
     run_burst_scenario().await
+}
+
+/// Models the redemption strategy under the congestion of `run_scenario`: `REDEMPTION_CHANNELS` channels (20 by
+/// default) each enqueue one approval, and enqueue it again `REDEMPTION_TICK_SECS` (5) after every failure, with a
+/// tracking timeout of `REDEMPTION_TRACKING_SECS` (12). The gap, Blokli's transaction count of the signer minus the
+/// mined count, is sampled every second until it has closed after the relief or `REDEMPTION_WINDOW_SECS` (480) have
+/// passed. Set `REDEMPTION_STOP_ON_CLOSE=0` to observe the whole window.
+async fn run_redemption_loop() -> anyhow::Result<()> {
+    let blokli_url: Url = std::env::var("BLOKLI_URL")?.parse()?;
+    let label = std::env::var("BLOKLI_LABEL").unwrap_or_else(|_| "unlabeled".into());
+    let config = RetryConfig::from_env(480, true);
+    let peak_base_fee: u128 = env_or("GETH_PEAK_BASE_FEE", DEFAULT_PEAK_BASE_FEE);
+    let max_fill_blocks: u64 = env_or("GETH_MAX_FILL_BLOCKS", DEFAULT_MAX_FILL_BLOCKS);
+    let rpc = Rpc::new(std::env::var("GETH_URL")?);
+
+    let signer = ChainKeypair::from_secret(&ANVIL_ACCOUNT_1_KEY)?;
+    let client = Arc::new(BlokliClient::new(blokli_url, BlokliClientConfig::default()));
+    let chain_id = rpc.quantity("eth_chainId", json!([])).await? as u64;
+    let mut filler = Filler::deploy_burner(&rpc, chain_id).await?;
+    let chain_info = wait_for_chain_info(&client, &label).await?;
+    let payloads = BasicPayloadGenerator::new(signer.public().to_address(), chain_info.info.contract_addresses);
+    let spender = Address::try_from(chain_info.info.contract_addresses.channels.as_slice())?;
+    let sequencer: Seq = TransactionSequencer::new(signer.clone(), client.clone(), NONCE_GAP_TOLERANCE);
+    let state = RetryState::new();
+    let ctx = Enqueuer {
+        sequencer: &sequencer,
+        payloads: &payloads,
+        spender,
+        started: state.started,
+    };
+
+    let drive = async {
+        let mut first_block: Option<u64> = None;
+        let mut ticker = tokio::time::interval(Duration::from_millis(250));
+        loop {
+            ticker.tick().await;
+            if state.stopped() {
+                return anyhow::Ok(());
+            }
+            let (block, base_fee, _) = latest_block(&rpc).await?;
+            let first = *first_block.get_or_insert(block);
+            if base_fee >= peak_base_fee || block - first >= max_fill_blocks {
+                state.start_relief();
+                println!(
+                    "[{label}] relief starts at t={}s, block {}, base fee {base_fee}",
+                    state.started.elapsed().as_secs(),
+                    block - first
+                );
+                return Ok(());
+            }
+            filler.top_up().await?;
+        }
+    };
+    let (_, report, driven) = tokio::join!(
+        run_channels(&ctx, &state, &config),
+        sample_gap(&client, &rpc, signer.public().to_address(), &config, &state, &label),
+        drive
+    );
+    driven?;
+    let report = report?;
+    report.print(&label, &config, &state);
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+#[ignore = "requires a running Blokli and geth"]
+async fn redemption_retry_loop() -> anyhow::Result<()> {
+    run_redemption_loop().await
 }

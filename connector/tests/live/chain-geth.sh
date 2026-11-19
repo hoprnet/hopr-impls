@@ -14,6 +14,8 @@
 # Optional:
 #   GETH_PORT (default 18545), BLOKLI_PORT (default 18080)
 #   BLOCK_TIME (default 1): seconds between blocks
+#   GETH_EXTRA_ARGS: extra geth flags, for example a small pool so that pool pressure evicts underpriced
+#     transactions: "--txpool.globalslots 64 --txpool.globalqueue 64"
 #   UNMINED_TIMEOUT (default 15s): bloklid's unmined transaction timeout, set through
 #     BLOKLI_API_TRANSACTIONS_UNMINED_TIMEOUT. Builds that do not know the key ignore it.
 set -euo pipefail
@@ -59,7 +61,7 @@ geth_dir="${DATA_DIR}/g"
 "${GETH_BIN}" --datadir "${geth_dir}" --dev --dev.period "${BLOCK_TIME:-1}" --miner.gaslimit 15000000 \
   --ipcdisable --nodiscover --port "$((geth_port + 1))" --authrpc.port "$((geth_port + 2))" \
   --http --http.addr 127.0.0.1 --http.port "${geth_port}" --http.api eth,net,web3,txpool,debug \
-  --rpc.allow-unprotected-txs --rpc.txfeecap 0 >"${DATA_DIR}/geth.log" 2>&1 &
+  --rpc.allow-unprotected-txs --rpc.txfeecap 0 ${GETH_EXTRA_ARGS:-} >"${DATA_DIR}/geth.log" 2>&1 &
 geth_pid=$!
 
 for _ in $(seq 1 60); do
