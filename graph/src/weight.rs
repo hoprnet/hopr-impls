@@ -336,7 +336,7 @@ const LOOPBACK_BUCKETS: usize = 12;
 pub const LOOPBACK_WINDOW: std::time::Duration =
     std::time::Duration::from_secs(LOOPBACK_BUCKET_WIDTH.as_secs() * LOOPBACK_BUCKETS as u64);
 
-/// Shortest configurable loopback window: [`LOOPBACK_BUCKETS`] buckets of one second.
+/// Shortest configurable loopback window: twelve buckets of one second.
 pub const MIN_LOOPBACK_WINDOW: std::time::Duration = std::time::Duration::from_secs(LOOPBACK_BUCKETS as u64);
 
 /// Longest configurable loopback window. A longer one only delays noticing a dead relay by that much.

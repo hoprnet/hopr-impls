@@ -70,9 +70,11 @@ accepts 5 through 86400, and disables reads at zero.
 ## Loopback window
 
 The graph counts the outcome of a loopback over an edge for `LOOPBACK_WINDOW`, 60 seconds by default. `ChannelGraph::with_loopback_window`
-sets another window between 12 seconds and 1 hour; call it before the graph is shared. The loopback generator's interval must fit twice
-in the window: check it with `EgressConfig::validate_against_loopback_window` in `hopr-ct-full-network`. A longer window delays noticing
-that a relay stopped returning loops by up to the added span.
+sets another window between 12 seconds and 1 hour; call it before the graph is shared and before any edge is added, because an existing edge
+keeps the window it was created with. Outcomes expire by whole buckets (one twelfth of the window), so the window is an approximate
+retention period: an outcome can expire up to one bucket early. The loopback generator's interval must fit twice in the window: check it
+with `EgressConfig::validate_against_loopback_window` in `hopr-ct-full-network`. A longer window delays noticing that a relay stopped
+returning loops by up to the added span.
 
 ## License
 
