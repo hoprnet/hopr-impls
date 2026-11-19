@@ -3,18 +3,21 @@ use serde::{Deserialize, Serialize};
 use validator::{Validate, ValidationError, ValidationErrors};
 
 /// Configuration for the probing mechanism
+///
+/// Deserialization runs [`Validate::validate`], so a config taken from a file cannot hold a value
+/// the probing code would have to defend against.
 #[derive(Debug, Clone, Copy, PartialEq, smart_default::SmartDefault)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(deny_unknown_fields))]
+#[cfg_attr(
+    feature = "serde",
+    derive(Serialize, Deserialize),
+    serde(try_from = "EgressConfigFields")
+)]
 pub struct EgressConfig {
     /// The delay between individual cover-traffic rounds.
     ///
     /// Cover traffic only. Probe generation is pull driven and never reads this value; the consumer
     /// decides how often to pull. Validation rejects an interval above half of the loopback evidence
     /// window, because a failing relay's evidence would expire between cover-traffic rounds.
-    #[cfg_attr(
-        feature = "serde",
-        serde(default = "default_probing_interval", with = "humantime_serde")
-    )]
     #[default(default_probing_interval())]
     pub interval: std::time::Duration,
 
@@ -22,7 +25,6 @@ pub struct EgressConfig {
     ///
     /// A peer whose connectivity was never observed is still probed: skipping it would suppress the
     /// probe that establishes whether it is reachable.
-    #[cfg_attr(feature = "serde", serde(default = "just_true"))]
     #[default(just_true())]
     pub probe_connected_only: bool,
 
@@ -32,7 +34,6 @@ pub struct EgressConfig {
     /// alone while it stays connected. Must be at least
     /// [`hopr_network_graph::PROBE_SUCCESS_AVERAGING_WINDOW`]: below the success-rate averaging window
     /// the count says nothing about the rate it is meant to measure.
-    #[cfg_attr(feature = "serde", serde(default = "default_stable_samples"))]
     #[default(default_stable_samples())]
     pub stable_samples: u32,
 
@@ -40,7 +41,6 @@ pub struct EgressConfig {
     ///
     /// The further below the threshold the rate sits, the earlier the peer is offered. In
     /// `[0.0, 1.0]`; `0.0` disables the trigger.
-    #[cfg_attr(feature = "serde", serde(default = "default_min_success_rate"))]
     #[default(default_min_success_rate())]
     pub min_success_rate: f64,
 
@@ -48,7 +48,6 @@ pub struct EgressConfig {
     ///
     /// The further below the threshold the rate sits, the earlier the peer is offered. In
     /// `[0.0, 1.0]`; `0.0` disables the trigger.
-    #[cfg_attr(feature = "serde", serde(default = "default_min_ack_rate"))]
     #[default(default_min_ack_rate())]
     pub min_ack_rate: f64,
 
@@ -56,7 +55,6 @@ pub struct EgressConfig {
     ///
     /// Keeps a stale assumption about a static link from holding forever, at a small steady cost. In
     /// `[0.0, 1.0]`; `0.0` stops the re-add.
-    #[cfg_attr(feature = "serde", serde(default = "default_readd_probability"))]
     #[default(default_readd_probability())]
     pub readd_probability: f64,
 
@@ -64,12 +62,10 @@ pub struct EgressConfig {
     ///
     /// The best set is the focused loops while a focus is set, and the paths the planner values most
     /// otherwise. In `[0.0, 1.0]`; `0.9` sends a tenth of the loopbacks to the rest of the network.
-    #[cfg_attr(feature = "serde", serde(default = "default_best_path_share"))]
     #[default(default_best_path_share())]
     pub best_path_share: f64,
 
     /// Most paths the best set holds. At least 1.
-    #[cfg_attr(feature = "serde", serde(default = "default_best_set_size"))]
     #[default(default_best_set_size())]
     pub best_set_size: usize,
 }
@@ -178,6 +174,54 @@ impl Validate for EgressConfig {
     /// [`validate_against_loopback_window`](EgressConfig::validate_against_loopback_window) for a configured one.
     fn validate(&self) -> Result<(), ValidationErrors> {
         self.validate_for_window(hopr_network_graph::LOOPBACK_WINDOW)
+    }
+}
+
+/// The wire form of [`EgressConfig`].
+///
+/// Split out so deserialization can run [`Validate::validate`] before an `EgressConfig` exists: a
+/// config file is the one path that could otherwise hand probing a value outside its bounds. Every
+/// field repeats [`EgressConfig`]'s default, so an omitted field deserializes to the same value.
+#[cfg(feature = "serde")]
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EgressConfigFields {
+    #[serde(default = "default_probing_interval", with = "humantime_serde")]
+    interval: std::time::Duration,
+    #[serde(default = "just_true")]
+    probe_connected_only: bool,
+    #[serde(default = "default_stable_samples")]
+    stable_samples: u32,
+    #[serde(default = "default_min_success_rate")]
+    min_success_rate: f64,
+    #[serde(default = "default_min_ack_rate")]
+    min_ack_rate: f64,
+    #[serde(default = "default_readd_probability")]
+    readd_probability: f64,
+    #[serde(default = "default_best_path_share")]
+    best_path_share: f64,
+    #[serde(default = "default_best_set_size")]
+    best_set_size: usize,
+}
+
+#[cfg(feature = "serde")]
+impl TryFrom<EgressConfigFields> for EgressConfig {
+    /// The validation failures, joined, so serde reports why the config was rejected.
+    type Error = String;
+
+    fn try_from(fields: EgressConfigFields) -> Result<Self, Self::Error> {
+        let cfg = EgressConfig {
+            interval: fields.interval,
+            probe_connected_only: fields.probe_connected_only,
+            stable_samples: fields.stable_samples,
+            min_success_rate: fields.min_success_rate,
+            min_ack_rate: fields.min_ack_rate,
+            readd_probability: fields.readd_probability,
+            best_path_share: fields.best_path_share,
+            best_set_size: fields.best_set_size,
+        };
+
+        cfg.validate().map(|()| cfg).map_err(|errors| errors.to_string())
     }
 }
 
@@ -389,6 +433,48 @@ mod tests {
         };
         let err = cfg.validate().unwrap_err();
         assert!(err.field_errors().contains_key("best_set_size"), "{err}");
+    }
+
+    #[cfg(feature = "serde")]
+    fn deserialize_floats(entries: impl IntoIterator<Item = (&'static str, f64)>) -> Result<EgressConfig, String> {
+        use serde::de::value::{Error as ValueError, F64Deserializer, MapDeserializer};
+
+        let map: Vec<(&'static str, F64Deserializer<ValueError>)> = entries
+            .into_iter()
+            .map(|(key, value)| (key, F64Deserializer::<ValueError>::new(value)))
+            .collect();
+
+        EgressConfig::deserialize(MapDeserializer::<_, ValueError>::new(map.into_iter()))
+            .map_err(|error| error.to_string())
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn deserializing_a_rate_threshold_above_one_should_fail() {
+        let error = deserialize_floats([("min_success_rate", 1.5)]).unwrap_err();
+        assert!(error.contains("min_success_rate"), "{error}");
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn deserializing_a_negative_probability_should_fail() {
+        let error = deserialize_floats([("readd_probability", -0.5)]).unwrap_err();
+        assert!(error.contains("readd_probability"), "{error}");
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn deserializing_a_valid_field_should_keep_every_other_default() -> anyhow::Result<()> {
+        let cfg = deserialize_floats([("best_path_share", 0.5)]).map_err(anyhow::Error::msg)?;
+
+        assert_eq!(
+            cfg,
+            EgressConfig {
+                best_path_share: 0.5,
+                ..Default::default()
+            }
+        );
+        Ok(())
     }
 
     #[test]
