@@ -40,6 +40,8 @@ mod keys;
 mod safe;
 mod sequencer;
 #[cfg(test)]
+mod sequencer_test_client;
+#[cfg(test)]
 pub(crate) mod service_fixtures;
 mod services;
 #[cfg(feature = "serde")]

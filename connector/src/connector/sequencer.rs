@@ -894,4 +894,180 @@ mod tests {
         assert_eq!(None, nonce_gap_age(&gaps, signer, 8, 8), "caught up");
         assert!(gaps.get(&signer).is_none());
     }
+
+    mod burst {
+        use futures::future::join_all;
+
+        use super::*;
+        use crate::connector::sequencer_test_client::{FakeTx, ScriptedClient, Step};
+
+        const BURST: usize = 5;
+
+        /// Enqueues [`BURST`] transactions at once and waits for all their results.
+        async fn burst(
+            client: ScriptedClient,
+        ) -> (
+            std::sync::Arc<ScriptedClient>,
+            TransactionSequencer<ScriptedClient, FakeTx>,
+            Vec<errors::Result<blokli_client::api::types::Transaction>>,
+        ) {
+            let client = std::sync::Arc::new(client);
+            let sequencer = TransactionSequencer::new(ChainKeypair::random(), client.clone(), Duration::from_mins(5));
+            let mut pending = Vec::new();
+            for _ in 0..BURST {
+                pending.push(
+                    sequencer
+                        .enqueue_transaction(FakeTx, Duration::from_secs(5), None)
+                        .await
+                        .expect("enqueued"),
+                );
+            }
+            let results = join_all(pending).await;
+            (client, sequencer, results)
+        }
+
+        /// Nonces of the attempts, in order, and the nonces that were accepted.
+        fn nonces(client: &ScriptedClient) -> (Vec<u64>, Vec<u64>) {
+            let attempts = client.attempts();
+            (
+                attempts.iter().map(|a| a.nonce).collect(),
+                attempts.iter().filter(|a| a.accepted).map(|a| a.nonce).collect(),
+            )
+        }
+
+        /// The local nonce must end at the chain's pending count: not ahead of it, not behind.
+        fn assert_local_nonce_at_pending(
+            client: &ScriptedClient,
+            sequencer: &TransactionSequencer<ScriptedClient, FakeTx>,
+        ) {
+            let local = sequencer
+                .current_nonce
+                .get(&sequencer.own_signer)
+                .map_or(0, |n| n.load(std::sync::atomic::Ordering::Relaxed));
+            assert_eq!(
+                client.pending(),
+                local,
+                "the local nonce must end at the chain's pending count"
+            );
+        }
+
+        /// No accepted submission is ahead of the chain's pending count, and none reuses a nonce.
+        fn assert_no_gap(client: &ScriptedClient) {
+            let attempts = client.attempts();
+            for attempt in attempts.iter().filter(|a| a.accepted) {
+                assert_eq!(
+                    attempt.nonce, attempt.pending_before,
+                    "nonce signed ahead of the chain's pending count: {attempts:?}"
+                );
+            }
+            let (_, mut accepted) = nonces(client);
+            let n = accepted.len();
+            accepted.dedup();
+            assert_eq!(n, accepted.len(), "a nonce was accepted twice");
+        }
+
+        #[tokio::test]
+        async fn fee_refused_first_tx_leaves_its_nonce_for_the_next_ones() {
+            // The estimate does not rise, so the refused transaction is not resigned
+            let (client, s, results) = burst(ScriptedClient::new(7, vec![Step::refuse("FEE_TOO_LOW")])).await;
+
+            assert!(results[0].is_err());
+            assert!(results[1..].iter().all(Result::is_ok));
+            let (all, accepted) = nonces(&client);
+            assert_eq!(vec![7, 7, 8, 9, 10], all, "the second tx reuses the unconsumed nonce");
+            assert_eq!(vec![7, 8, 9, 10], accepted);
+            assert_eq!(11, client.pending());
+            assert_no_gap(&client);
+            assert_local_nonce_at_pending(&client, &s);
+        }
+
+        #[tokio::test]
+        async fn fee_refused_first_tx_resigned_once_at_the_same_nonce_when_fees_rise() {
+            let (client, s, results) =
+                burst(ScriptedClient::new(7, vec![Step::refuse("FEE_TOO_LOW")]).with_rising_fees(1)).await;
+
+            assert!(results.iter().all(Result::is_ok));
+            let (all, accepted) = nonces(&client);
+            assert_eq!(
+                vec![7, 7, 8, 9, 10, 11],
+                all,
+                "only the refused nonce is submitted twice"
+            );
+            assert_eq!(vec![7, 8, 9, 10, 11], accepted);
+            assert_no_gap(&client);
+            assert_local_nonce_at_pending(&client, &s);
+        }
+
+        #[tokio::test]
+        async fn nonce_too_high_first_tx_does_not_make_the_next_ones_skip_a_nonce() {
+            // The chain still expects 7: nothing changed the pending count, so there is nothing to correct
+            let (client, s, results) = burst(ScriptedClient::new(7, vec![Step::refuse("NONCE_TOO_HIGH")])).await;
+
+            assert!(results[0].is_err());
+            assert!(results[1..].iter().all(Result::is_ok));
+            let (all, accepted) = nonces(&client);
+            assert_eq!(vec![7, 7, 8, 9, 10], all);
+            assert_eq!(vec![7, 8, 9, 10], accepted);
+            assert_no_gap(&client);
+            assert_local_nonce_at_pending(&client, &s);
+        }
+
+        #[tokio::test]
+        async fn nonce_too_high_after_the_pending_count_dropped_is_not_resigned_below_the_first_read() {
+            // A mempool eviction brings the pending count from 9 to 7 after the refusal. The correction never
+            // goes below the pending count read at the start, so the refused tx fails and the next ones start
+            // from the lowered count, re-read from the chain.
+            let step = Step {
+                refusal: Some("NONCE_TOO_HIGH"),
+                pending_after: Some(7),
+            };
+            let (client, s, results) = burst(ScriptedClient::new(9, vec![step])).await;
+
+            assert!(results[0].is_err());
+            assert!(results[1..].iter().all(Result::is_ok));
+            let (all, accepted) = nonces(&client);
+            assert_eq!(vec![9, 7, 8, 9, 10], all);
+            assert_eq!(vec![7, 8, 9, 10], accepted);
+            assert_no_gap(&client);
+            assert_local_nonce_at_pending(&client, &s);
+        }
+
+        #[tokio::test]
+        async fn underpriced_first_tx_keeps_its_nonce_and_the_next_ones_follow() {
+            // The first transaction sits in the mempool underpriced and times out while tracked
+            let (client, s, results) = burst(ScriptedClient::new(7, vec![]).with_underpriced_timeout(7)).await;
+
+            assert!(results[0].is_err());
+            assert!(results[1..].iter().all(Result::is_ok));
+            let (all, accepted) = nonces(&client);
+            assert_eq!(vec![7, 8, 9, 10, 11], all);
+            assert_eq!(all, accepted);
+            assert_no_gap(&client);
+            assert_local_nonce_at_pending(&client, &s);
+        }
+
+        #[tokio::test]
+        async fn underpriced_txs_missing_from_the_pending_count_are_signed_ahead_of_it() {
+            // A node that does not count its underpriced transactions in the pending count: the cached
+            // nonce runs ahead of what the chain knows and stays there until the gap tolerance elapses
+            let (client, sequencer, _results) = burst(
+                ScriptedClient::new(7, vec![])
+                    .without_mempool_count()
+                    .with_underpriced_timeout(7),
+            )
+            .await;
+
+            let (all, _) = nonces(&client);
+            assert_eq!(vec![7, 8, 9, 10, 11], all);
+            assert_eq!(7, client.pending());
+            assert_eq!(
+                12,
+                sequencer
+                    .current_nonce
+                    .get(&sequencer.own_signer)
+                    .expect("cached")
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            );
+        }
+    }
 }
