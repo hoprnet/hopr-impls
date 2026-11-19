@@ -187,12 +187,7 @@ impl ChannelGraph {
     /// Production code should prefer [`with_config`](Self::with_config) to
     /// receive values from its configuration.
     pub fn new(me: OffchainPublicKey) -> Self {
-        Self::with_edge_params(
-            me,
-            DEFAULT_EDGE_PENALTY,
-            DEFAULT_MIN_ACK_RATE,
-            DEFAULT_MAX_PLAUSIBLE_LOOPBACK_RTT,
-        )
+        Self::with_config(me, ChannelGraphConfig::default()).expect("the default config is valid")
     }
 
     /// Creates a new channel graph with custom edge scoring parameters and the default starvation policy
@@ -205,15 +200,21 @@ impl ChannelGraph {
     /// * `max_plausible_loopback_rtt` – upper bound on a loopback probe RTT considered plausible; measurements above it
     ///   are discarded during attribution.
     ///
-    /// Use [`with_config`](Self::with_config) to set more.
+    /// # Panics
+    ///
+    /// Panics when `edge_penalty` or `min_ack_rate` is outside `[0, 1]`, as [`with_config`](Self::with_config)
+    /// rejects it.
+    #[deprecated(
+        since = "0.12.2",
+        note = "use `ChannelGraph::with_config`, which returns an error instead of panicking"
+    )]
     pub fn with_edge_params(
         me: OffchainPublicKey,
         edge_penalty: f64,
         min_ack_rate: f64,
         max_plausible_loopback_rtt: std::time::Duration,
     ) -> Self {
-        // Not validated, as never before: callers may pass values `with_config` rejects.
-        Self::from_config_unchecked(
+        Self::with_config(
             me,
             ChannelGraphConfig {
                 edge_penalty,
@@ -222,6 +223,7 @@ impl ChannelGraph {
                 ..ChannelGraphConfig::default()
             },
         )
+        .unwrap_or_else(|error| panic!("invalid edge parameters: {error}"))
     }
 
     /// Creates a new channel graph with the given self identity and `config`.
@@ -231,11 +233,7 @@ impl ChannelGraph {
     /// Fails when `config` does not pass [`Validate::validate`].
     pub fn with_config(me: OffchainPublicKey, config: ChannelGraphConfig) -> Result<Self, String> {
         config.validate().map_err(|errors| errors.to_string())?;
-        Ok(Self::from_config_unchecked(me, config))
-    }
 
-    /// The one place a graph is created, so the config reaches it unchanged.
-    fn from_config_unchecked(me: OffchainPublicKey, config: ChannelGraphConfig) -> Self {
         let mut graph = StableDiGraph::new();
         let mut indices = BiHashMap::new();
 
@@ -247,7 +245,7 @@ impl ChannelGraph {
             .or_default()
             .push(idx);
 
-        Self {
+        Ok(Self {
             me,
             edge_penalty: config.edge_penalty,
             min_ack_rate: config.min_ack_rate,
@@ -259,7 +257,7 @@ impl ChannelGraph {
             searches: Arc::new(Default::default()),
             #[cfg(feature = "serde")]
             dump_previous_empty: Arc::new(Default::default()),
-        }
+        })
     }
 
     /// This graph with `starvation` deciding when the loops over an edge starve its relay. The defaults
@@ -878,6 +876,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn with_edge_params_should_keep_the_edge_parameters_it_is_given() {
         let graph =
             ChannelGraph::with_edge_params(pubkey_from(&SECRET_0), 0.25, 0.2, std::time::Duration::from_secs(10));
@@ -976,10 +975,10 @@ mod tests {
     }
 
     #[test]
-    fn with_edge_params_should_keep_accepting_values_it_always_accepted() {
-        // Not checked, as never before: a caller that passes more than one must not start to fail.
-        let graph = ChannelGraph::with_edge_params(pubkey_from(&SECRET_0), 2.0, 3.0, std::time::Duration::ZERO);
-        assert_eq!(graph.edge_penalty(), 2.0);
+    #[allow(deprecated)]
+    #[should_panic(expected = "edge_penalty")]
+    fn with_edge_params_should_panic_when_an_edge_parameter_is_outside_zero_to_one() {
+        let _ = ChannelGraph::with_edge_params(pubkey_from(&SECRET_0), 2.0, 0.1, std::time::Duration::ZERO);
     }
 
     #[test]
