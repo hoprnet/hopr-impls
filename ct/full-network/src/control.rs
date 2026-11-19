@@ -123,7 +123,7 @@ impl CoverageCounters {
 pub(crate) struct ControlState {
     /// `None` switches probing off.
     pub(crate) level: Option<ProbingLevel>,
-    /// Probes one cycle may spend, `None` for the whole candidate set.
+    /// Cap on the loopback best set, `None` when only `best_set_size` applies.
     pub(crate) budget: Option<usize>,
     pub(crate) noise: bool,
     pub(crate) focus: Option<Arc<HashSet<OffchainPublicKey>>>,
@@ -185,19 +185,19 @@ impl EgressControl {
         self.state.borrow().level
     }
 
-    /// Bounds the probes one loopback cycle spends to `budget`, `None` for the whole candidate set.
+    /// Caps the loopback best set to `budget` paths, `None` to keep the plain `best_set_size` cap.
     ///
-    /// A cycle is what the generator offers between two rebuilds of its candidate set, roughly one
-    /// consumer window. With a budget below the candidate count a cycle covers only part of the
-    /// network and the next one continues where it stopped, so consecutive windows reach different
-    /// edges. `Some(0)` is treated as `None`: a cycle that may spend nothing can never complete.
+    /// The budget is what one consumer window can re-measure, so the best set never exceeds it and
+    /// one window of pulls can re-measure every best path. The exploration share of a pass is not
+    /// bounded by it, and a window that stops mid-pass continues where the cursor left off.
+    /// `Some(0)` is treated as `None`.
     pub fn set_budget(&self, budget: Option<usize>) {
         let budget = budget.filter(|budget| *budget > 0);
         self.state
             .send_if_modified(|s| std::mem::replace(&mut s.budget, budget) != budget);
     }
 
-    /// Probes one cycle may spend, `None` when unbounded.
+    /// Cap on the loopback best set, `None` when only `best_set_size` applies.
     pub fn budget(&self) -> Option<usize> {
         self.state.borrow().budget
     }

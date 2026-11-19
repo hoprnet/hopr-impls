@@ -24,9 +24,10 @@ streams that are already running.
 
 ### What the generator probes
 
-A neighbor is probed until it has `EgressConfig::stable_samples` samples, and left alone while it stays connected. A connection drop
-restarts the count, and a success or acknowledgement rate below its threshold brings the peer back, the furthest below first. Loopbacks skip
-any path whose edges already carry fresh SURB evidence, and reserve the exploration share for paths outside the best set.
+A neighbor is probed until it has `EgressConfig::stable_samples` samples, and left alone while it stays connected, apart from a small random
+re-add (`EgressConfig::readd_probability`). A connection drop restarts the count, and a success or acknowledgement rate below its threshold
+brings the peer back, the furthest below first. Loopbacks skip any path whose edges already carry fresh SURB evidence, and reserve the
+exploration share for paths outside the best set.
 
 ## Specification
 
