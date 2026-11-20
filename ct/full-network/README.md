@@ -10,9 +10,8 @@ Part of the [HOPR](https://hoprnet.org/) protocol implementation.
 streams that are already running.
 
 - **Probing is pull driven.** The probe stream yields one probe per pull and holds no timer. The consumer owns the pacing, the per-window
-  budget and the clock; this crate only decides what to probe next.
-- `set_dial(Some(dial))` sets the dial, any positive multiplier (`Dial::LOW`, `MEDIUM`, `HIGH`, `ULTRA` are 0.1, 0.5, 1.0 and 2.0).
-  `set_dial(None)` stops probing and leaves the stream pending. Default `Dial::HIGH`.
+  budget and the clock; this crate only decides what to probe next. The consumer also owns the on/off switch (in hoprnet that is
+  `ProbeControl::set_dial`).
 - `set_best_set_cap(Some(paths))` caps the best set to what one window can re-measure. `None` leaves only `EgressConfig::best_set_size`.
 - `wake_probing()` tells an idle stream to re-examine the graph. The graph has no change notification and the generator reads no clock, so
   whoever records a disconnect or a probe outcome should call it; otherwise a stream with nothing to offer stays parked.
@@ -20,8 +19,7 @@ streams that are already running.
   every path weighs the same.
 - `set_focus(exits)` / `clear_focus()` draw the best set from the loops around the exits, forward loops first. The rest of the network is
   still explored at the configured share, so a focus is not a hard restriction. An exit needs no channel and no edge back to this node.
-- `set_noise(bool)` switches cover traffic (`noise` feature, on by default). Default off. Cover traffic keeps its own interval and is
-  independent of the dial.
+- `set_noise(bool)` switches cover traffic (`noise` feature, on by default). Default off. Cover traffic keeps its own interval.
 - `coverage()` reports the edges the last completed loopback cycle saw fresh SURB evidence for.
 
 ### What the generator probes
