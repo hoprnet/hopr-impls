@@ -7,6 +7,14 @@ use hopr_api::graph::{
 };
 use hopr_utils::statistics::{ExponentialMovingAverage, WindowedRatio};
 
+/// Probes an edge needs before its success rate is more than its most recent outcome.
+///
+/// This is the averaging window of `TransportLinkMeasurement`'s probe success rate, the longest
+/// average an edge keeps. Probing that stops re-probing a connected neighbour before this many
+/// samples would stop on noise rather than on a measurement, so a caller that decides how many
+/// stable samples it waits for must not go below this value.
+pub const PROBE_SUCCESS_AVERAGING_WINDOW: usize = 5;
+
 /// A representation of a individual neighbor link measurement
 #[derive(Debug, Copy, Clone, Default, PartialEq)]
 pub struct TransportLinkMeasurement {
@@ -14,7 +22,7 @@ pub struct TransportLinkMeasurement {
     /// an untouched EMA reads `0.0`, which is also a legitimate measured latency — so absence is
     /// carried by the `Option` rather than by a parallel counter that could disagree with it.
     latency_average: Option<ExponentialMovingAverage<3>>,
-    probe_success_rate: ExponentialMovingAverage<5>,
+    probe_success_rate: ExponentialMovingAverage<{ PROBE_SUCCESS_AVERAGING_WINDOW }>,
     /// Recorded probe outcomes, successful or not. The EMA cannot express "no samples yet":
     /// an all-failed stream holds exactly `0.0`, the same as its initial value.
     samples: u64,
@@ -25,6 +33,21 @@ impl TransportLinkMeasurement {
     fn credit(&mut self) {
         self.samples = self.samples.saturating_add(1);
         self.probe_success_rate.update(1.0);
+    }
+}
+
+impl TransportLinkMeasurement {
+    /// Probe outcomes recorded for this link, successful or not.
+    ///
+    /// Unlike [`EdgeLinkObservable::average_probe_rate`] this tells "measured and failing" from
+    /// "never measured", which is what a caller needs to decide whether a peer has been sampled
+    /// enough to be left alone. It is a lifetime total: a caller that needs a count since some
+    /// earlier point must take the difference.
+    ///
+    /// Interim: the count belongs in the interface rather than here, see hopr-api#178, and this
+    /// accessor goes when it lands (hopr-impls#120).
+    pub fn probe_samples(&self) -> u64 {
+        self.samples
     }
 }
 
@@ -161,7 +184,11 @@ impl EdgeObservableWrite for Observations {
             EdgeWeightType::Intermediate(result) => self.intermediate_mut().record(result),
             EdgeWeightType::Balance(balance) => self.intermediate_mut().balance = balance,
             EdgeWeightType::Connected(is_connected) => {
-                self.immediate_probe.get_or_insert_default().is_connected = Some(is_connected)
+                let immediate = self.immediate_probe.get_or_insert_default();
+                immediate.is_connected = Some(is_connected);
+                if !is_connected {
+                    immediate.disconnects = immediate.disconnects.saturating_add(1);
+                }
             }
             EdgeWeightType::SurbRoundTrips { expected, observed } => {
                 self.intermediate_mut().record_surb_round_trips(expected, observed);
@@ -202,6 +229,13 @@ pub struct TransportImmediates {
     messages_sent: f64,
     /// Exponentially decayed count of acknowledgements received from this peer.
     acks_received: f64,
+    /// How often this edge was recorded as disconnected.
+    ///
+    /// The state alone cannot say this: a link that dropped and came back before anyone read it looks
+    /// connected both before and after, so a caller that has to reset a measurement on a reconnect
+    /// counts these instead. Interim, like `probe_samples`: hopr-impls#120 removes it once the
+    /// interface carries the count.
+    disconnects: u64,
     /// When the edge's intermediate stream last showed that the relay at its end delivers nothing.
     ///
     /// The neighbour answers pings whatever it does with relayed packets, so this stream's latency says
@@ -221,6 +255,19 @@ impl TransportImmediates {
 impl EdgeNetworkObservableRead for TransportImmediates {
     fn is_connected(&self) -> Option<bool> {
         self.is_connected
+    }
+}
+
+impl TransportImmediates {
+    /// Probe outcomes recorded for this link, successful or not; see
+    /// [`TransportLinkMeasurement::probe_samples`].
+    pub fn probe_samples(&self) -> u64 {
+        self.link.probe_samples()
+    }
+
+    /// How often this edge was recorded as disconnected; see [`Self::disconnects`].
+    pub fn disconnects(&self) -> u64 {
+        self.disconnects
     }
 }
 
