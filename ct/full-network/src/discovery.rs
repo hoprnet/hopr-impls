@@ -220,7 +220,7 @@ where
                 let interval = self.cfg.interval;
                 let graph = self.graph.clone();
 
-                // Cover traffic follows the noise switch only, never the probing dial.
+                // Cover traffic follows the noise switch only.
                 let ticks = paced_ticks(self.control.subscribe(), move |s| s.noise.then_some(interval));
                 let candidates = move |hops| default_candidates(&graph, hops, 1.0);
 
@@ -740,18 +740,6 @@ fn interleave(best: Vec<WeightedRoute>, explore: Vec<WeightedRoute>, explore_sha
     pass
 }
 
-/// Waits until the dial is on. `None` once the control handle is gone.
-async fn wait_for_dial(control: &mut watch::Receiver<ControlState>) -> Option<()> {
-    loop {
-        if control.borrow_and_update().dial.is_some() {
-            return Some(());
-        }
-        if control.changed().await.is_err() {
-            return None;
-        }
-    }
-}
-
 /// Resolves once the control, an explicit wake, or the idle re-read says to look again.
 ///
 /// The graph offers no change notification, so a disconnect or a dropped rate is otherwise
@@ -788,8 +776,8 @@ async fn wait_for_wake(control: &mut watch::Receiver<ControlState>, wake: &Notif
 
 /// Stream of neighbor probes, one per pull, driven only by its own state.
 ///
-/// Nothing is polled until the consumer pulls, and no timer runs between pulls. While the dial is
-/// off, or while every peer is measured, it waits on the control handle rather than spinning.
+/// Nothing is polled until the consumer pulls, and no timer runs between pulls. While every peer is
+/// measured, it waits on the control handle rather than spinning.
 fn neighbor_probes<U>(
     prober: NeighborProber<U>,
     control: watch::Receiver<ControlState>,
@@ -804,12 +792,6 @@ where
 
         async move {
             loop {
-                // Without a control handle nobody can steer probing, so the stream stays pending
-                // rather than ending: probe generation is never meant to run out.
-                if wait_for_dial(&mut control).await.is_none() {
-                    return futures::future::pending().await;
-                }
-
                 if let Some(peer) = prober.next().await {
                     return Some((neighbor_routing(peer), (prober, control)));
                 }
@@ -825,8 +807,8 @@ where
 
 /// Stream of loopback probes, one per pull, driven only by its own state.
 ///
-/// Nothing is polled until the consumer pulls, and no timer runs between pulls. While the dial is
-/// off, or while there is no candidate path, it waits on the control handle rather than spinning.
+/// Nothing is polled until the consumer pulls, and no timer runs between pulls. While there is no
+/// candidate path, it waits on the control handle rather than spinning.
 fn loopback_probes<U>(
     prober: LoopbackProber<U>,
     control: watch::Receiver<ControlState>,
@@ -846,12 +828,6 @@ where
 
         async move {
             loop {
-                // Without a control handle nobody can steer probing, so the stream stays pending
-                // rather than ending: probe generation is never meant to run out.
-                if wait_for_dial(&mut control).await.is_none() {
-                    return futures::future::pending().await;
-                }
-
                 let state = control.borrow_and_update().clone();
                 if let Some(probe) = prober.next(&state) {
                     return Some((probe, (prober, control)));
@@ -927,7 +903,7 @@ mod tests {
     use tokio::time::timeout;
 
     use super::*;
-    use crate::{Dial, EgressConfig};
+    use crate::EgressConfig;
 
     const TINY_TIMEOUT: Duration = Duration::from_millis(20);
 
@@ -1192,7 +1168,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_stream_should_be_lazy_and_follow_the_dial() -> anyhow::Result<()> {
+    async fn the_stream_should_be_lazy() -> anyhow::Result<()> {
         let me = random_key();
         let graph = Arc::new(ChannelGraph::new(me));
         for _ in 0..3 {
@@ -1205,33 +1181,9 @@ mod tests {
 
         tokio::time::pause();
 
-        // An hour with the dial off, and no pull, produces nothing.
-        prober.control().set_dial(None);
-        tokio::time::advance(Duration::from_hours(1)).await;
-        assert!(
-            timeout(TINY_TIMEOUT, stream.next()).await.is_err(),
-            "no probe comes out of a dial that is off"
-        );
-
-        // Turning it on is what makes the next pull produce exactly one probe.
-        prober.control().set_dial(Some(Dial::HIGH));
+        // One pull yields one probe, and no timer produces more while nobody pulls.
         assert!(timeout(TINY_TIMEOUT * 20, stream.next()).await?.is_some());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn a_dial_that_is_not_a_preset_should_still_run_probing() -> anyhow::Result<()> {
-        let me = random_key();
-        let graph = Arc::new(ChannelGraph::new(me));
-        graph.record_node(random_key());
-
-        let prober = FullNetworkDiscovery::new(me, fast_cfg(), graph);
-        prober
-            .control()
-            .set_dial(Some(Dial::new(0.25).expect("0.25 is a valid dial")));
-        let stream = ProbingTrafficGeneration::build(&prober);
-        pin_mut!(stream);
-
+        tokio::time::advance(Duration::from_hours(1)).await;
         assert!(timeout(TINY_TIMEOUT * 20, stream.next()).await?.is_some());
         Ok(())
     }
@@ -1873,44 +1825,6 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn probing_should_stay_pending_when_the_dial_is_off_and_resume_when_raised() -> anyhow::Result<()> {
-        let (me, _, _, _, graph) = two_loops()?;
-        let prober = FullNetworkDiscovery::new(me, fast_cfg(), graph);
-        let control = prober.control();
-        control.set_dial(None);
-        let stream = ProbingTrafficGeneration::build(&prober);
-        pin_mut!(stream);
-
-        assert!(
-            timeout(TINY_TIMEOUT * 5, stream.next()).await.is_err(),
-            "no probe may be emitted while the dial is off"
-        );
-
-        control.set_dial(Some(Dial::HIGH));
-
-        assert!(
-            timeout(TINY_TIMEOUT * 50, stream.next()).await?.is_some(),
-            "the running stream must resume without being rebuilt"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn probing_should_stop_when_the_dial_is_turned_off_on_a_running_stream() -> anyhow::Result<()> {
-        let (me, _, _, _, graph) = two_loops()?;
-        let prober = FullNetworkDiscovery::new(me, fast_cfg(), graph);
-        let control = prober.control();
-        let stream = ProbingTrafficGeneration::build(&prober);
-        pin_mut!(stream);
-        assert!(timeout(TINY_TIMEOUT * 50, stream.next()).await?.is_some());
-
-        control.set_dial(None);
-
-        assert!(timeout(TINY_TIMEOUT * 5, stream.next()).await.is_err());
-        Ok(())
-    }
-
     #[cfg(feature = "noise")]
     #[tokio::test]
     async fn cover_traffic_should_stay_pending_until_noise_is_switched_on() -> anyhow::Result<()> {
@@ -1925,21 +1839,6 @@ mod tests {
         );
 
         prober.control().set_noise(true);
-
-        assert!(timeout(TINY_TIMEOUT * 50, stream.next()).await?.is_some());
-        Ok(())
-    }
-
-    #[cfg(feature = "noise")]
-    #[tokio::test]
-    async fn cover_traffic_should_ignore_the_probing_dial() -> anyhow::Result<()> {
-        let (me, _, _, _, graph) = two_loops()?;
-        let prober = FullNetworkDiscovery::new(me, fast_cfg(), graph);
-        let control = prober.control();
-        control.set_noise(true);
-        control.set_dial(None);
-        let stream = CoverTrafficGeneration::build(&prober);
-        pin_mut!(stream);
 
         assert!(timeout(TINY_TIMEOUT * 50, stream.next()).await?.is_some());
         Ok(())
