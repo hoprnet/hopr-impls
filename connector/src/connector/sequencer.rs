@@ -154,7 +154,7 @@ where
                         async move {
                             // Outer `Err`: the transaction never reached Blokli, inner: Blokli's outcome
                             let submission = async {
-                                let (chain_id, gas_estimation) = read_gas_estimation(&*client).await?;
+                                let (chain_id, gas_estimation) = read_gas_estimation(client.as_ref()).await?;
 
                                 let pending = client
                                     .query_transaction_count(&signer_addr.into())
