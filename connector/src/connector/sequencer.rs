@@ -152,6 +152,8 @@ where
                         let nonce_gaps = nonce_gaps.clone();
                         let issued_tx_ids = issued_tx_ids.clone();
                         async move {
+                            // The nonce counter the submission selected its nonce from, set once it is read
+                            let mut selected_nonce = None;
                             // Outer `Err`: the transaction never reached Blokli, inner: Blokli's outcome
                             let submission = async {
                                 let (chain_id, gas_estimation) = read_gas_estimation(client.as_ref()).await?;
@@ -160,9 +162,10 @@ where
                                     .query_transaction_count(&signer_addr.into())
                                     .map_err(ConnectorError::from)
                                     .await?;
-                                let local_nonce = current_nonce.entry(signer_addr).or_default().into_value();
+                                let local_nonce =
+                                    selected_nonce.insert(current_nonce.entry(signer_addr).or_default().into_value());
                                 let nonce =
-                                    sync_nonce(&local_nonce, &nonce_gaps, signer_addr, pending, nonce_gap_tolerance);
+                                    sync_nonce(local_nonce, &nonce_gaps, signer_addr, pending, nonce_gap_tolerance);
                                 if signer_addr == node_address {
                                     record_nonce("local", nonce);
                                     record_nonce("chain_pending", pending);
@@ -172,7 +175,7 @@ where
                                     nonce,
                                     gas_estimation,
                                     pending,
-                                    &local_nonce,
+                                    local_nonce,
                                     |nonce, gas_estimation| {
                                         tracing::Span::current().record("nonce", nonce);
                                         let tx = tx.clone();
@@ -212,11 +215,14 @@ where
                             );
                             match nonce_consumed(&submission, deduplicated) {
                                 Some(true) => {
-                                    let prev_nonce = current_nonce
-                                        .entry(signer_addr)
-                                        .or_default()
-                                        .value()
-                                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                    // Counted on the counter the submission selected its nonce from, not on a fresh
+                                    // lookup: tracking may have invalidated the entry meanwhile, and a new entry would
+                                    // be advanced past the pending count of the chain, which reuses the nonce of
+                                    // another transaction. The orphaned counter takes the increment instead, and the
+                                    // next submission re-reads the pending count into the new entry.
+                                    let prev_nonce = selected_nonce
+                                        .as_deref()
+                                        .map_or(0, |nonce| nonce.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
 
                                     tracing::debug!(
                                         prev_nonce,
@@ -1159,5 +1165,103 @@ mod tests {
         );
         assert_eq!(None, nonce_gap_age(&gaps, signer, 8, 8), "caught up");
         assert!(gaps.get(&signer).is_none());
+    }
+
+    /// A transaction whose "signed" bytes are the nonce it was signed with.
+    #[derive(Clone)]
+    struct NonceTx;
+
+    #[async_trait::async_trait]
+    impl SignableTransaction for NonceTx {
+        async fn sign_and_encode_to_eip2718(
+            self,
+            nonce: u64,
+            _chain_id: u64,
+            _max_gas: Option<GasEstimation>,
+            _chain_keypair: &ChainKeypair,
+        ) -> hopr_api::types::chain::errors::Result<Box<[u8]>> {
+            Ok(Box::from(nonce.to_be_bytes()))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn nonce_is_counted_on_the_counter_that_selected_it_when_tracking_invalidates_the_entry() {
+        use std::sync::{Arc, Mutex, mpsc};
+
+        let signer = ChainKeypair::random();
+        let signer_addr = signer.public().to_address();
+
+        // The nonces the chain was asked to include, and the hold on the first submission signed with nonce 1.
+        let submitted = Arc::new(Mutex::new(Vec::<u64>::new()));
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let entered_tx = Mutex::new(entered_tx);
+        let release_rx = Mutex::new(release_rx);
+        let mutator = {
+            let submitted = submitted.clone();
+            let held = std::sync::atomic::AtomicBool::new(false);
+            move |signed_tx: &[u8], _: &mut blokli_client::BlokliTestState| {
+                let nonce = u64::from_be_bytes(signed_tx.try_into().expect("nonce bytes"));
+                submitted.lock().unwrap().push(nonce);
+                if nonce == 1 && !held.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    entered_tx.lock().unwrap().send(()).unwrap();
+                    release_rx.lock().unwrap().recv().unwrap();
+                }
+                Ok(())
+            }
+        };
+        // The chain's pending count of the signer stays 0 throughout.
+        let client = Arc::new(
+            blokli_client::BlokliTestClient::new(blokli_client::BlokliTestState::default(), mutator)
+                .with_tx_simulation_delay(Duration::ZERO),
+        );
+        let sequencer = TransactionSequencer::<_, NonceTx>::new(signer.clone(), client, Duration::from_hours(1));
+        let wait = Duration::from_secs(10);
+        let submitted_count = |count: usize| {
+            let submitted = submitted.clone();
+            async move {
+                tokio::time::timeout(wait, async {
+                    while submitted.lock().unwrap().len() < count {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("submissions did not arrive");
+            }
+        };
+
+        // A takes nonce 0
+        let _a = sequencer
+            .enqueue_transaction(NonceTx, wait, None, "test")
+            .await
+            .unwrap();
+        submitted_count(1).await;
+
+        // B takes nonce 1 and stays in flight
+        let _b = sequencer
+            .enqueue_transaction(NonceTx, wait, None, "test")
+            .await
+            .unwrap();
+        tokio::task::spawn_blocking(move || entered_rx.recv_timeout(wait))
+            .await
+            .unwrap()
+            .expect("B reached the chain");
+
+        // Tracking of A finds it dropped and invalidates the nonce of the signer, as the tracking future does
+        sequencer.current_nonce.invalidate(&signer_addr);
+
+        // C waits behind B, and B then succeeds
+        let _c = sequencer
+            .enqueue_transaction(NonceTx, wait, None, "test")
+            .await
+            .unwrap();
+        release_tx.send(()).unwrap();
+        submitted_count(3).await;
+
+        assert_eq!(
+            vec![0, 1, 0],
+            *submitted.lock().unwrap(),
+            "C is signed with the nonce of the chain's pending count, not with the one B used"
+        );
     }
 }
