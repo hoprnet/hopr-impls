@@ -213,28 +213,57 @@ impl Validate for EgressConfig {
 /// config file is the one path that could otherwise hand probing a value outside its bounds. Every
 /// field repeats [`EgressConfig`]'s default, so an omitted field deserializes to the same value.
 #[cfg(feature = "serde")]
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, Validate)]
 #[serde(deny_unknown_fields)]
 struct EgressConfigFields {
     #[cfg(feature = "noise")]
     #[serde(default = "default_probing_interval", with = "humantime_serde")]
     interval: std::time::Duration,
     #[serde(default = "default_recheck_interval", with = "humantime_serde")]
+    #[validate(custom(function = "positive_duration"))]
     recheck_interval: std::time::Duration,
     #[serde(default = "just_true")]
     probe_connected_only: bool,
     #[serde(default = "default_stable_samples")]
     stable_samples: u32,
     #[serde(default = "default_min_success_rate")]
+    #[validate(custom(function = "unit_interval"))]
     min_success_rate: f64,
     #[serde(default = "default_min_ack_rate")]
+    #[validate(custom(function = "unit_interval"))]
     min_ack_rate: f64,
     #[serde(default = "default_readd_probability")]
+    #[validate(custom(function = "unit_interval"))]
     readd_probability: f64,
     #[serde(default = "default_best_path_share")]
+    #[validate(custom(function = "unit_interval"))]
     best_path_share: f64,
     #[serde(default = "default_best_set_size")]
     best_set_size: usize,
+}
+
+/// Rejects anything outside `[0, 1]`.
+///
+/// Custom rather than `#[validate(range(..))]` because `range` lets `NaN` through: both of its
+/// comparisons are false for it, and a threshold of `NaN` would silently never trigger.
+#[cfg(feature = "serde")]
+fn unit_interval(value: f64) -> Result<(), ValidationError> {
+    if (0.0..=1.0).contains(&value) {
+        Ok(())
+    } else {
+        Err(ValidationError::new("unit_interval")
+            .with_message(format!("must be between 0.0 and 1.0, got {value}").into()))
+    }
+}
+
+/// Rejects a zero duration, which would make an idle stream spin.
+#[cfg(feature = "serde")]
+fn positive_duration(value: &std::time::Duration) -> Result<(), ValidationError> {
+    if value.is_zero() {
+        Err(ValidationError::new("positive_duration").with_message("must be greater than zero".into()))
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(feature = "serde")]
@@ -243,6 +272,10 @@ impl TryFrom<EgressConfigFields> for EgressConfig {
     type Error = String;
 
     fn try_from(fields: EgressConfigFields) -> Result<Self, Self::Error> {
+        // The wire form carries its own field bounds, so a value outside them is rejected here,
+        // named by the field it belongs to, before the config exists.
+        fields.validate().map_err(|errors| errors.to_string())?;
+
         let cfg = EgressConfig {
             #[cfg(feature = "noise")]
             interval: fields.interval,
