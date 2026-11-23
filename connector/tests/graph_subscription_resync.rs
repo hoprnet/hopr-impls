@@ -336,6 +336,12 @@ impl Harness {
     /// Builds a connector over a chain that holds both channels, but whose graph subscription only delivers what
     /// the test sends. The sync tolerance is lowered so that a single delivered channel is enough to connect.
     async fn new() -> Self {
+        Self::with_node_key(ChainKeypair::random()).await
+    }
+
+    /// Like [`Harness::new`], with the connector running as the given node. Channels with that node as an endpoint
+    /// are its own channels, which the connector also reconciles against blokli.
+    async fn with_node_key(node_key: ChainKeypair) -> Self {
         let state_client = BlokliTestStateBuilder::default()
             .with_hopr_network_chain_info("anvil-localhost")
             .with_accounts(
@@ -369,14 +375,10 @@ impl Harness {
             sync_tolerance: 50,
             ..Default::default()
         };
-        let connector = create_trustful_hopr_blokli_connector(
-            &ChainKeypair::random(),
-            cfg,
-            client,
-            Address::new(&[2u8; Address::SIZE]),
-        )
-        .await
-        .unwrap();
+        let connector =
+            create_trustful_hopr_blokli_connector(&node_key, cfg, client, Address::new(&[2u8; Address::SIZE]))
+                .await
+                .unwrap();
 
         Self {
             connector,
@@ -481,7 +483,8 @@ async fn an_entry_with_an_unknown_status_is_recovered() {
 
 #[tokio::test]
 async fn a_channel_missing_from_the_graph_subscription_is_backfilled_from_blokli() {
-    let mut harness = Harness::new().await;
+    // The missing channel is one of the node's own channels, the ones the connector reconciles against blokli.
+    let mut harness = Harness::with_node_key(CHAIN_KEYS[0].clone()).await;
     let [missing, delivered] = channels();
 
     harness.send(harness.entries[1].clone());
