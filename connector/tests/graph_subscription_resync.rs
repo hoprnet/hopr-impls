@@ -15,7 +15,7 @@ use std::{
 use blokli_client::{
     AccountSelector, BlokliClientError, BlokliQueryClient, BlokliSubscriptionClient, BlokliTransactionClient,
     ChainAddress, ChannelFilter, ChannelSelector, ModulePredictionInput, RedeemedStatsSelector, SafeSelector,
-    ServiceSelector, ServiceTypeId, TicketSelector, TxId, TxReceipt,
+    ServiceSelector, ServiceTypeId, TicketSelector, TransactionTrackingOutcome, TxId, TxReceipt,
     types::{self, ChannelStatus as ModelChannelStatus, OpenedChannelsGraphEntry},
 };
 use futures::{StreamExt, stream::BoxStream};
@@ -190,7 +190,7 @@ impl<T: BlokliTransactionClient + Send + Sync> BlokliTransactionClient for Scrip
         &self,
         tx_id: TxId,
         client_timeout: Duration,
-    ) -> Result<types::Transaction, BlokliClientError> {
+    ) -> Result<TransactionTrackingOutcome, BlokliClientError> {
         self.inner.track_transaction(tx_id, client_timeout).await
     }
 }
