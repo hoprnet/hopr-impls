@@ -35,6 +35,9 @@ use crate::{
 };
 
 mod accounts;
+mod cache;
+#[cfg(test)]
+mod channel_cache_race_tests;
 mod channels;
 mod events;
 mod keys;
@@ -663,15 +666,15 @@ where
                     let chain_to_packet = chain_to_packet.clone();
                     let packet_to_chain = packet_to_chain.clone();
                     hopr_utils::runtime::prelude::spawn_blocking(move || {
-                        mapper.key_to_id.insert(account.public_key, Some(account.key_id));
-                        mapper.id_to_key.insert(account.key_id, Some(account.public_key));
-                        chain_to_packet.insert(account.chain_addr, Some(account.public_key));
-                        packet_to_chain.insert(account.public_key, Some(account.chain_addr));
                         graph.write().add_node(account.key_id);
-                        let old = mapper
-                            .backend
-                            .insert_account(account.clone())
-                            .map_err(ConnectorError::backend)?;
+                        let stored = mapper.backend.insert_account(account.clone());
+                        // Caches are written after the backend, serialized per key with the lookups. They are
+                        // filled even when the backend write failed, so the mapping is not lost.
+                        cache::put(&mapper.key_to_id, &account.public_key, account.key_id);
+                        cache::put(&mapper.id_to_key, &account.key_id, account.public_key);
+                        cache::put(&chain_to_packet, &account.chain_addr, account.public_key);
+                        cache::put(&packet_to_chain, &account.public_key, account.chain_addr);
+                        let old = stored.map_err(ConnectorError::backend)?;
                         accounts::update_announced(&announced, &account, old.as_ref(), &me);
                         if let Some(old_account) = &old {
                             if old_account.chain_addr != account.chain_addr {
@@ -704,19 +707,15 @@ where
                     let channel_by_parties = channel_by_parties.clone();
                     hopr_utils::runtime::prelude::spawn_blocking(move || {
                         graph.write().add_edge(src.key_id, dst.key_id, *channel.get_id());
-                        backend
-                            .insert_channel(channel)
-                            .map(|old| (channel, old.map(|old| old.diff(&channel))))
+                        let old = backend.insert_channel(channel)?;
+                        // Rather update the cached entries than invalidating them. The backend is written first
+                        // and the cache writes are serialized per key with the lookups.
+                        cache::put(&channel_by_id, channel.get_id(), channel);
+                        cache::put(&channel_by_parties, &ChannelParties::from(&channel), channel);
+                        Ok::<_, B::Error>((channel, old.map(|old| old.diff(&channel))))
                     })
                     .map_err(ConnectorError::backend)
-                    .and_then(move |res| {
-                        let channel_by_id = channel_by_id.clone();
-                        let channel_by_parties = channel_by_parties.clone();
-                        if let Ok((upserted_channel, _)) = &res {
-                            // Rather update the cached entry than invalidating it
-                            channel_by_id.insert(*upserted_channel.get_id(), Some(*upserted_channel));
-                            channel_by_parties.insert(ChannelParties::from(upserted_channel), Some(*upserted_channel));
-                        }
+                    .and_then(|res| {
                         futures::future::ready(res.map(SubscribedEventType::Channel).map_err(ConnectorError::backend))
                     })
                 })
