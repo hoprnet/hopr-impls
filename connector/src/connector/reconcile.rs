@@ -46,18 +46,15 @@ fn status_rank(status: &ChannelStatus) -> u8 {
     }
 }
 
-/// Whether `new` may replace `old` without moving the channel backwards.
+/// Whether `new` is strictly newer than `old`, and so may replace it when it comes from a query.
 ///
-/// Used for data read from a query, which can be older than what the subscription has delivered since: the epoch
-/// never decreases, and within an epoch neither the status (a reopen needs a higher epoch) nor the ticket index does.
-fn is_not_older(old: &ChannelEntry, new: &ChannelEntry) -> bool {
-    match new.channel_epoch.cmp(&old.channel_epoch) {
-        std::cmp::Ordering::Greater => true,
-        std::cmp::Ordering::Less => false,
-        std::cmp::Ordering::Equal => {
-            status_rank(&new.status) >= status_rank(&old.status) && new.ticket_index >= old.ticket_index
-        }
-    }
+/// A query can be older than what the subscription has delivered since. The epoch decides first, then the status
+/// (a reopen needs a higher epoch), then the ticket index. When those are all equal there is no way to tell which
+/// value is newer, so the row is not newer and the subscription stays authoritative. This leaves one known gap: a
+/// channel that went from PendingToClose back to Open within the same epoch is not healed by a query.
+fn is_newer(old: &ChannelEntry, new: &ChannelEntry) -> bool {
+    (new.channel_epoch, status_rank(&new.status), new.ticket_index)
+        > (old.channel_epoch, status_rank(&old.status), old.ticket_index)
 }
 
 /// Outcome of [`upsert_channel`].
@@ -72,7 +69,7 @@ pub(crate) enum Upsert {
 ///
 /// The graph write lock is held for the whole operation, and every writer of channels goes through this function,
 /// so a writer never observes or overwrites another one halfway. With `only_if_not_older`, an update that would move
-/// the channel backwards, or that changes nothing, is skipped.
+/// the channel backwards, or that is not strictly newer, is skipped.
 pub(crate) fn upsert_channel<B: Backend>(
     backend: &B,
     graph: &Graph,
@@ -85,7 +82,7 @@ pub(crate) fn upsert_channel<B: Backend>(
     let mut graph = graph.write();
     if only_if_not_older {
         match backend.get_channel_by_id(channel.get_id())? {
-            Some(old) if old == channel || !is_not_older(&old, &channel) => return Ok(Upsert::Skipped),
+            Some(old) if !is_newer(&old, &channel) => return Ok(Upsert::Skipped),
             _ => {}
         }
     }
@@ -112,6 +109,8 @@ pub(crate) struct ReconcileStats {
     pub(crate) healed: usize,
     /// Rows that could not be converted or stored.
     pub(crate) failed: usize,
+    /// Direction queries that failed, so the pass did not see every channel.
+    pub(crate) incomplete: usize,
 }
 
 pub(crate) struct OwnChannelReconciler<C, B> {
@@ -156,7 +155,9 @@ where
         hopr_utils::runtime::prelude::spawn(async move {
             let _guard = InFlightGuard(&this.in_flight);
             match this.reconcile().await {
-                Ok(stats) if stats.failed > 0 => tracing::warn!(?stats, "own channels reconciled with failures"),
+                Ok(stats) if stats.failed > 0 || stats.incomplete > 0 => {
+                    tracing::warn!(?stats, "own channels reconciled incompletely")
+                }
                 Ok(stats) => tracing::debug!(?stats, "own channels reconciled"),
                 Err(error) => tracing::warn!(%error, "own channel reconciliation failed"),
             }
@@ -223,14 +224,15 @@ where
     ///
     /// A failing query or a row that cannot be converted is logged and skipped, so one bad item never hides the
     /// rest. Returns the rows, the number of failed rows and the last query error.
-    async fn fetch(&self) -> Result<(Vec<Fetched>, usize, Option<ConnectorError>), ConnectorError> {
+    async fn fetch(&self) -> Result<(Vec<Fetched>, usize, usize, Option<ConnectorError>), ConnectorError> {
         let Some(own_key_id) = self.own_key_id().await? else {
             tracing::debug!("own account is not bound on chain yet, skipping the channel reconciliation");
-            return Ok((vec![], 0, None));
+            return Ok((vec![], 0, 0, None));
         };
 
         let mut fetched = Vec::new();
         let mut failed = 0;
+        let mut incomplete = 0;
         let mut last_error = None;
         let mut resolved = HashMap::new();
         let mut seen_ids = std::collections::HashSet::new();
@@ -250,6 +252,7 @@ where
                 Ok(list) => list.channels,
                 Err(error) => {
                     tracing::warn!(%error, "failed to query own channels for reconciliation");
+                    incomplete += 1;
                     last_error = Some(ConnectorError::from(error));
                     continue;
                 }
@@ -269,7 +272,7 @@ where
                 }
             }
         }
-        Ok((fetched, failed, last_error))
+        Ok((fetched, failed, incomplete, last_error))
     }
 
     async fn convert(
@@ -289,7 +292,7 @@ where
     ///
     /// Only reading from Blokli is subject to the timeout; applying the rows is not cancellable by it.
     pub(crate) async fn reconcile(&self) -> Result<ReconcileStats, ConnectorError> {
-        let (rows, mut failed, last_error) = self
+        let (rows, mut failed, incomplete, last_error) = self
             .fetch()
             .timeout(futures_time::time::Duration::from(RECONCILE_FETCH_TIMEOUT))
             .await
@@ -297,6 +300,7 @@ where
 
         let mut stats = ReconcileStats {
             seen: rows.len() + failed,
+            incomplete,
             ..Default::default()
         };
         for row in rows {
@@ -597,7 +601,8 @@ mod tests {
             ReconcileStats {
                 seen: 2,
                 healed: 2,
-                failed: 0
+                failed: 0,
+                incomplete: 0
             },
             stats
         );
@@ -744,7 +749,8 @@ mod tests {
             ReconcileStats {
                 seen: 2,
                 healed: 1,
-                failed: 1
+                failed: 1,
+                incomplete: 0
             },
             stats
         );
@@ -774,7 +780,8 @@ mod tests {
             ReconcileStats {
                 seen: 1,
                 healed: 1,
-                failed: 0
+                failed: 0,
+                incomplete: 1
             },
             stats
         );
@@ -802,6 +809,43 @@ mod tests {
             Some(Some(open)),
             f.reconciler.channel_by_parties.get(&ChannelParties::from(&open))
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reconciliation_should_not_overwrite_a_newer_balance_at_the_same_epoch() -> anyhow::Result<()> {
+        let mut f = fixture(|me, peer, _| vec![channel(me, peer, ChannelStatus::Open)], true);
+        let stream_value = ChannelEntry::builder()
+            .between(&f.me, &f.peer)
+            .amount(99)
+            .ticket_index(0)
+            .status(ChannelStatus::Open)
+            .epoch(1)
+            .build()?;
+        seed(&f, stream_value);
+
+        assert_eq!(0, f.reconciler.reconcile().await?.healed);
+        assert_eq!(
+            Some(stream_value),
+            f.reconciler.backend.get_channel_by_id(stream_value.get_id())?
+        );
+        assert!(f.events.try_recv().is_err());
+        Ok(())
+    }
+
+    /// Pins a known gap: a query cannot heal a channel that is PendingToClose locally but Open in Blokli within the
+    /// same epoch, because the status would move backwards. Only the subscription can do that.
+    #[tokio::test]
+    async fn reconciliation_should_leave_pending_to_close_alone_for_an_open_row_of_the_same_epoch() -> anyhow::Result<()>
+    {
+        let closure = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1000);
+        let mut f = fixture(|me, peer, _| vec![channel(me, peer, ChannelStatus::Open)], true);
+        let local = channel(&f.me, &f.peer, ChannelStatus::PendingToClose(closure));
+        seed(&f, local);
+
+        assert_eq!(0, f.reconciler.reconcile().await?.healed);
+        assert_eq!(Some(local), f.reconciler.backend.get_channel_by_id(local.get_id())?);
+        assert!(f.events.try_recv().is_err());
         Ok(())
     }
 

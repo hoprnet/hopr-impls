@@ -120,7 +120,10 @@ pub(crate) fn model_to_channel_entry(
             // never happens, still a case to cover
             _ => return Err(ConnectorError::TypeConversion("invalid channel status".into())),
         })
-        .epoch(model.epoch as u32)
+        .epoch(
+            u32::try_from(model.epoch)
+                .map_err(|_| ConnectorError::TypeConversion(format!("invalid channel epoch {}", model.epoch)))?,
+        )
         .build()?)
 }
 
@@ -560,6 +563,27 @@ mod tests {
             Some(ChainEvent::ChannelClosureInitiated(_))
         ));
         assert!(event_for_first_seen_channel(channel(ChannelStatus::Closed, 1)).is_none());
+    }
+
+    #[test]
+    fn channel_model_with_a_negative_epoch_should_be_rejected() {
+        let model = |epoch: i32| blokli_client::api::types::Channel {
+            balance: blokli_client::api::types::TokenValueString(HoprBalance::from(10_u32).to_string()),
+            closure_time: None,
+            concrete_channel_id: String::new(),
+            destination: 2,
+            epoch,
+            source: 1,
+            status: blokli_client::api::types::ChannelStatus::Open,
+            ticket_index: blokli_client::api::types::Uint64("0".into()),
+        };
+        let (src, dst) = (Address::new(&[1u8; Address::SIZE]), Address::new(&[2u8; Address::SIZE]));
+
+        assert!(matches!(
+            model_to_channel_entry(&model(-1), src, dst),
+            Err(ConnectorError::TypeConversion(_))
+        ));
+        assert_eq!(3, model_to_channel_entry(&model(3), src, dst).unwrap().channel_epoch);
     }
 
     #[test]
