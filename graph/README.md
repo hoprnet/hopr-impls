@@ -73,11 +73,14 @@ The graph counts the outcome of a loopback over an edge for `LOOPBACK_WINDOW`, 6
 `ChannelGraph::with_config` takes a `ChannelGraphConfig` whose `loopback_window` sets another one between 12 seconds and 1 hour; it is
 validated once and fixed for the life of the graph, and every edge gets it. `ChannelGraph::new` keeps the default. `with_edge_params` is
 deprecated in favour of `with_config`. Outcomes expire by whole buckets (one twelfth of the window), so the window is an approximate
-retention period: an outcome can expire up to one bucket early. The loopback generator's interval must fit twice in the window: check it
-with `EgressConfig::validate_against_loopback_window` in `hopr-ct-full-network`. The graph does not call it: the caller that builds the
-graph must also run that check, because `validate_against_probe_timeout` and `Validate::validate` only know the default window. The check
-uses the configured interval, so a slower `ProbingLevel` (`Low`, and `Medium` at a long interval) can still let evidence expire between
-rounds. A longer window delays noticing that a relay stopped returning loops by up to the added span.
+retention period: an outcome can expire up to one bucket early. The cover-traffic interval of `hopr-ct-full-network` must fit twice in the
+window: check it with `EgressConfig::validate_against_loopback_window`. The graph does not call it: the caller that builds the graph must
+also run that check, because `validate_against_probe_timeout` and `Validate::validate` only know the default window. Probe generation is
+pull driven and has no interval of its own, so only cover traffic is bounded here. A longer window delays noticing that a relay stopped
+returning loops by up to the added span.
+
+`PROBE_SUCCESS_AVERAGING_WINDOW` is the averaging window of an edge's probe success rate, five samples. Probing that stops re-probing a
+connected neighbour waits at least that many samples, so the decision rests on a measured rate instead of on noise.
 
 ## License
 

@@ -1,15 +1,23 @@
-use std::collections::HashSet;
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    sync::Arc,
+    time::Duration,
+};
 
-use futures::{StreamExt, future::Either, stream::BoxStream};
+use futures::{
+    StreamExt,
+    future::Either,
+    stream::{BoxStream, PollNext},
+};
 use hopr_api::{
     ct::{CoverTrafficGeneration, ProbeRouting, ProbingTrafficGeneration},
     graph::{
         NetworkGraphTraverse, NetworkGraphView,
-        traits::{EdgeNetworkObservableRead, EdgeObservableRead},
+        traits::{EdgeImmediateProtocolObservable, EdgeLinkObservable, EdgeNetworkObservableRead, EdgeObservableRead},
     },
     types::{
         crypto::types::OffchainPublicKey,
-        crypto_random::Randomizable,
+        crypto_random::{Randomizable, random_float, random_integer},
         internal::{
             NodeId,
             protocol::HoprPseudonym,
@@ -17,14 +25,13 @@ use hopr_api::{
         },
     },
 };
-use hopr_network_graph::{FocusRelevance, FocusedLoopback, MAX_LOOPBACK_HOPS, MIN_LOOPBACK_HOPS};
+use hopr_network_graph::{FocusRelevance, FocusedLoopback, MAX_LOOPBACK_HOPS, MIN_LOOPBACK_HOPS, Observations};
 use hopr_utils::statistics::WeightedCollection;
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 
 use crate::{
     EgressConfig,
-    control::{ControlState, EgressControl},
-    priority::immediate_probe_priority,
+    control::{ControlState, CoverageCounters, EgressControl, PathWeights},
 };
 
 pub struct FullNetworkDiscovery<U> {
@@ -54,8 +61,10 @@ impl<U> FullNetworkDiscovery<U> {
 
 /// Ticks every `period(state)`, and never while it is `None`.
 ///
-/// A change of the period restarts the wait, so a new level takes effect at once, including waking a
-/// stream that was paused. Changes that leave the period alone do not disturb the running wait.
+/// Cover traffic only, so it is built only with the `noise` feature. A change of the period restarts the wait, so a new
+/// period takes effect at once, including waking a stream that was paused. Changes that leave the period alone do not
+/// disturb the running wait.
+#[cfg(feature = "noise")]
 fn paced_ticks(
     rx: watch::Receiver<ControlState>,
     period: impl Fn(&ControlState) -> Option<std::time::Duration> + Copy + Send + 'static,
@@ -83,6 +92,7 @@ fn paced_ticks(
 }
 
 /// Resolves once `period` differs from `current`. Pends forever once the control handle is gone.
+#[cfg(feature = "noise")]
 async fn period_changed(
     rx: &mut watch::Receiver<ControlState>,
     period: impl Fn(&ControlState) -> Option<std::time::Duration>,
@@ -127,6 +137,32 @@ fn loopback_routing(me: NodeId, path: Vec<OffchainPublicKey>) -> Option<Destinat
         })
 }
 
+/// Build a zero-hop probe of a direct neighbor.
+fn neighbor_routing(peer: OffchainPublicKey) -> ProbeRouting {
+    let zero_hop = RoutingOptions::Hops(0.try_into().expect("0 is a valid u8"));
+    ProbeRouting::Neighbor(DestinationRouting::Forward {
+        destination: Box::new(peer.into()),
+        pseudonym: Some(HoprPseudonym::random()),
+        forward_options: zero_hop.clone(),
+        return_options: Some(zero_hop),
+    })
+}
+
+/// Every directed edge of the loop `me → path → me`, the closing edge included.
+fn loopback_edge_pairs(
+    me: OffchainPublicKey,
+    path: &[OffchainPublicKey],
+) -> impl Iterator<Item = (OffchainPublicKey, OffchainPublicKey)> {
+    let mut nodes = Vec::with_capacity(path.len() + 2);
+    nodes.push(me);
+    nodes.extend_from_slice(path);
+    nodes.push(me);
+    // The loop always holds at least `me → x → me`, so there is always one pair to walk.
+    let pairs: Vec<_> = nodes.windows(2).map(|edge| (edge[0], edge[1])).collect();
+
+    pairs.into_iter()
+}
+
 /// Hop counts cycled through by loopback probing, in **intermediate relay hops** — not edges.
 ///
 /// A loopback of `h` hops traverses `h + 1` edges. Every entry must lie within
@@ -134,12 +170,14 @@ fn loopback_routing(me: NodeId, path: Vec<OffchainPublicKey>) -> Option<Destinat
 /// discarded when the routing options are constructed.
 const LOOPBACK_HOP_COUNTS: [usize; 2] = [MIN_LOOPBACK_HOPS, MAX_LOOPBACK_HOPS];
 
+/// Candidates one hop count enumeration returns, in no particular order.
+const LOOPBACK_SAMPLE: usize = 100;
+
 /// Stream that cycles through 2- and 3-hop loopback paths with weighted shuffle.
 ///
-/// Shared by both cover traffic and intermediate probing — the caller wraps each
-/// emitted item into the appropriate outer type.
-///
-/// Each tick yields every hop count's `candidates` once, in weighted-shuffle order.
+/// Cover traffic only: it ticks on the configured interval and yields every hop count's candidates
+/// once per tick. Probing is pull driven and does not use it.
+#[cfg(feature = "noise")]
 fn loopback_path_stream(
     ticks: impl futures::Stream<Item = ()>,
     candidates: impl Fn(usize) -> Vec<((Vec<OffchainPublicKey>, PathId), f64)>,
@@ -157,52 +195,14 @@ fn loopback_path_stream(
         })
 }
 
-/// Loopback candidates with `focus` applied.
-///
-/// Without a focus this is the plain candidate set at `base` weight. With one, loops around the
-/// exits weigh more: forward loops `boost` times, return loops half of that (never below `base`).
-/// Focused loops that the default sample also holds are taken out of the default set instead of
-/// being listed twice.
-fn focused_candidates<U>(
-    graph: &U,
-    hops: usize,
-    focus: Option<&HashSet<OffchainPublicKey>>,
-    base: f64,
-    boost: f64,
-) -> Vec<((Vec<OffchainPublicKey>, PathId), f64)>
-where
-    U: NetworkGraphTraverse<NodeId = OffchainPublicKey> + FocusedLoopback,
-{
-    let Some(exits) = focus else {
-        return default_candidates(graph, hops, base);
-    };
-
-    let default = default_candidates(graph, hops, base);
-    let focused: Vec<_> = graph
-        .focused_loopback(hops, Some(100), exits)
-        .into_iter()
-        .map(|(path, path_id, relevance)| {
-            let weight = match relevance {
-                FocusRelevance::Forward => base * boost,
-                FocusRelevance::Return => base * (boost / 2.0).max(1.0),
-            };
-            ((path, path_id), weight)
-        })
-        .collect();
-    let rest: Vec<_> = {
-        let taken: HashSet<_> = focused.iter().map(|(path, _)| path).collect();
-        default.into_iter().filter(|(path, _)| !taken.contains(path)).collect()
-    };
-    focused.into_iter().chain(rest).collect()
-}
-
-/// The unfocused loopback sample, every path at `base` weight.
+/// The unfocused loopback sample, every path at the same weight.
+#[cfg(feature = "noise")]
 fn default_candidates<U>(graph: &U, hops: usize, base: f64) -> Vec<((Vec<OffchainPublicKey>, PathId), f64)>
 where
     U: NetworkGraphTraverse<NodeId = OffchainPublicKey>,
 {
     graph
-        .simple_loopback_to_self(hops, Some(100))
+        .simple_loopback_to_self(hops, Some(LOOPBACK_SAMPLE))
         .into_iter()
         .map(|path| (path, base))
         .collect()
@@ -217,12 +217,12 @@ where
             if #[cfg(feature = "noise")] {
                 let me = self.me;
                 let me_node: NodeId = me.into();
-                let (interval, base) = (self.cfg.interval, self.cfg.base_priority);
+                let interval = self.cfg.interval;
                 let graph = self.graph.clone();
 
-                // Cover traffic follows the noise switch only, never the probing level.
+                // Cover traffic follows the noise switch only.
                 let ticks = paced_ticks(self.control.subscribe(), move |s| s.noise.then_some(interval));
-                let candidates = move |hops| default_candidates(&graph, hops, base);
+                let candidates = move |hops| default_candidates(&graph, hops, 1.0);
 
                 loopback_path_stream(ticks, candidates)
                     .filter_map(move |(path, _)| {
@@ -237,9 +237,614 @@ where
     }
 }
 
+/// A loopback route, and the weight the path owner gives it.
+///
+/// The route is the interface's own [`ProbeRouting`], built as soon as the path is weighed, so the
+/// pass holds exactly the objects the stream hands out. The weight rides alongside because
+/// [`ProbeRouting`] carries no valuation and the pass is ordered by it.
+type WeightedRoute = (ProbeRouting, f64);
+
+/// What was last seen of a neighbor, and how many outcomes it has recorded since its last
+/// disconnect.
+///
+/// Outcomes, not offers: a probe the consumer dropped, or one that never came back, says nothing
+/// about the link, and counting it would retire a peer nobody has measured. The graph's counter is
+/// a lifetime total that never resets, so the count here is kept as the difference since the last
+/// disconnect.
+#[derive(Debug, Clone, Copy, Default)]
+struct NeighborProbeState {
+    outcomes: u32,
+    /// The graph's lifetime probe counter when `outcomes` was last brought up to date.
+    observed: u64,
+    /// The graph's disconnect count when `outcomes` was last reset to zero.
+    disconnects: u64,
+}
+
+/// Per-peer state, and the order in which the peers are offered.
+///
+/// Peers that still need sampling are recorded as they are measured, so a count that has reached
+/// [`EgressConfig::stable_samples`] is what takes a peer out of the sample, and the sample
+/// deliberately does not outlive the pass through the graph that built it.
+#[derive(Debug, Default)]
+struct NeighborSamples {
+    states: HashMap<OffchainPublicKey, NeighborProbeState>,
+    /// Peers still to offer, fresh ones first and then the degraded ones, deepest deficit first.
+    sample: VecDeque<OffchainPublicKey>,
+    /// Measured peers, from which the random re-add draws.
+    measured: Vec<OffchainPublicKey>,
+}
+
+impl NeighborSamples {
+    /// Mutable access to a peer's record.
+    fn entry(&mut self, peer: OffchainPublicKey) -> &mut NeighborProbeState {
+        self.states.entry(peer).or_default()
+    }
+
+    /// Takes the next peer of the current sample that still needs a probe.
+    fn take_next(&mut self, needs_probe: impl Fn(&OffchainPublicKey) -> bool) -> Option<OffchainPublicKey> {
+        while let Some(peer) = self.sample.pop_front() {
+            // A peer may have been measured out or disconnected since the sample was built.
+            if needs_probe(&peer) {
+                return Some(peer);
+            }
+        }
+        None
+    }
+
+    /// Draws a measured peer at random, with probability `probability`.
+    fn readd(&mut self, probability: f64) -> Option<OffchainPublicKey> {
+        if probability <= 0.0 || self.measured.is_empty() || random_float() >= probability {
+            return None;
+        }
+
+        Some(self.measured[random_integer(0, Some(self.measured.len() as u64)) as usize])
+    }
+
+    /// Replaces the sample for the next pass through the graph.
+    fn install(&mut self, sample: VecDeque<OffchainPublicKey>, measured: Vec<OffchainPublicKey>) {
+        self.sample = sample;
+        self.measured = measured;
+    }
+}
+
+/// One full pass over the loopback candidates, with the cursor that carries it across pulls.
+///
+/// The cursor is what makes a consumer that takes fewer probes per window than there are candidates
+/// continue where it stopped, instead of starting the set over each window.
+#[derive(Debug, Default)]
+struct LoopbackPass {
+    /// The candidates in the order they will be offered, already interleaved by the exploration share.
+    paths: Vec<WeightedRoute>,
+    /// How much of `paths` has been offered.
+    cursor: usize,
+    /// Edges with fresh SURB evidence seen while `paths` was built.
+    evidence: HashSet<(OffchainPublicKey, OffchainPublicKey)>,
+    /// Focus `paths` was built for, so a focus change rebuilds it.
+    focus: Option<HashSet<OffchainPublicKey>>,
+}
+
+impl LoopbackPass {
+    /// The next candidate, advancing the cursor.
+    fn next(&mut self) -> Option<ProbeRouting> {
+        let (route, _) = self.paths.get(self.cursor)?.clone();
+        self.cursor += 1;
+        Some(route)
+    }
+
+    /// Whether the pass must be rebuilt before the next candidate is offered.
+    fn is_spent(&self, focus: Option<&HashSet<OffchainPublicKey>>) -> bool {
+        self.paths.is_empty() || self.cursor >= self.paths.len() || self.focus.as_ref() != focus
+    }
+
+    /// Whether a pass ran to its end, i.e. covered its whole candidate set.
+    fn is_complete(&self) -> bool {
+        !self.paths.is_empty() && self.cursor >= self.paths.len()
+    }
+
+    /// Installs a pass built for `focus`, with the cursor back at its start.
+    fn install(
+        &mut self,
+        paths: Vec<WeightedRoute>,
+        evidence: HashSet<(OffchainPublicKey, OffchainPublicKey)>,
+        focus: Option<HashSet<OffchainPublicKey>>,
+    ) {
+        self.paths = paths;
+        self.cursor = 0;
+        self.evidence = evidence;
+        self.focus = focus;
+    }
+}
+
+/// Neighbor probing on its own: which direct peer needs a ping next.
+///
+/// Knows nothing about loopbacks, and shares no state with them. It owns its sample count, because
+/// the graph's `samples` counter is a lifetime total that never resets.
+struct NeighborProber<U> {
+    me: OffchainPublicKey,
+    cfg: EgressConfig,
+    graph: U,
+    samples: NeighborSamples,
+}
+
+impl<U> NeighborProber<U>
+where
+    U: NetworkGraphView<NodeId = OffchainPublicKey, Observed = Observations> + Send + Sync + 'static,
+{
+    /// The next peer to ping, `None` when every known peer is measured and the re-add did not fire.
+    ///
+    /// Re-examines the graph at most once per call, so a graph with nothing left to probe cannot
+    /// make the search spin.
+    async fn next(&mut self) -> Option<OffchainPublicKey> {
+        let mut rebuilt = false;
+
+        loop {
+            // Scoped so the shared borrow of the graph ends before the rebuild below needs `&mut self`.
+            let taken = {
+                let (graph, me, connected_only) = (&self.graph, self.me, self.cfg.probe_connected_only);
+                self.samples
+                    .take_next(|peer| neighbor_needs_probe(graph, me, connected_only, peer))
+            };
+            if let Some(peer) = taken {
+                return Some(peer);
+            }
+
+            // Every measured peer is left alone while it stays connected. Re-add one at random, so a
+            // stale assumption about a static link cannot hold forever.
+            if let Some(peer) = self.samples.readd(self.cfg.readd_probability) {
+                return Some(peer);
+            }
+
+            if rebuilt {
+                return None;
+            }
+            self.rebuild_sample().await;
+            rebuilt = true;
+        }
+    }
+
+    /// Rebuilds the sample from the graph, recording what it says about connectivity.
+    async fn rebuild_sample(&mut self) {
+        let mut fresh = Vec::new();
+        let mut degraded = Vec::new();
+        let mut measured = Vec::new();
+        let mut nodes = self.graph.nodes();
+
+        while let Some(peer) = nodes.next().await {
+            if peer == self.me {
+                continue;
+            }
+
+            let obs = self.graph.edge(&self.me, &peer);
+            let immediate = obs.as_ref().and_then(|obs| obs.immediate_qos());
+            let connected = immediate.and_then(|imm| imm.is_connected());
+
+            let observed = immediate.map_or(0, |imm| imm.probe_samples());
+            let disconnects = immediate.map_or(0, |imm| imm.disconnects());
+
+            let state = self.samples.entry(peer);
+            // The link that was measured is gone, so the count that described it is too. A disconnect
+            // and reconnect that both happened between two rebuilds leaves the state reading
+            // connected, so the count of disconnects is what carries it. The graph's lifetime probe
+            // counter keeps running, so it becomes the new baseline instead of zero.
+            if disconnects > state.disconnects {
+                (state.outcomes, state.observed, state.disconnects) = (0, observed, disconnects);
+            }
+            if observed > state.observed {
+                state.outcomes = state
+                    .outcomes
+                    .saturating_add(u32::try_from(observed - state.observed).unwrap_or(u32::MAX));
+                state.observed = observed;
+            }
+            let outcomes = state.outcomes;
+
+            if self.cfg.probe_connected_only && connected == Some(false) {
+                continue;
+            }
+
+            if outcomes < self.cfg.stable_samples {
+                fresh.push(peer);
+                continue;
+            }
+
+            let deficit = immediate.map_or(0.0, |imm| {
+                let success = imm
+                    .average_probe_rate()
+                    .map_or(0.0, |rate| (self.cfg.min_success_rate - rate).max(0.0));
+                let ack = imm
+                    .ack_rate()
+                    .map_or(0.0, |rate| (self.cfg.min_ack_rate - rate).max(0.0));
+                success + ack
+            });
+
+            if deficit > 0.0 {
+                degraded.push((peer, deficit));
+            } else {
+                measured.push(peer);
+            }
+        }
+
+        // The further below its threshold a peer sits, the more often it is reprobed, so the deepest
+        // deficit leads the sample.
+        degraded.sort_by(|left, right| right.1.total_cmp(&left.1));
+
+        let sample = uniform_shuffle(fresh)
+            .into_iter()
+            .chain(degraded.into_iter().map(|(peer, _)| peer))
+            .collect();
+        self.samples.install(sample, measured);
+    }
+}
+
+/// Loopback probing on its own: which path to measure next.
+///
+/// Knows nothing about neighbors, and shares no state with them. It keeps the persistent cursor
+/// over its candidate set and publishes what each completed pass saw.
+struct LoopbackProber<U> {
+    me: OffchainPublicKey,
+    cfg: EgressConfig,
+    graph: U,
+    pass: LoopbackPass,
+    coverage: Arc<CoverageCounters>,
+    /// How far into the enumeration the next pass starts.
+    ///
+    /// The enumeration returns a stable prefix of a bounded sample, so taking the same first
+    /// `LOOPBACK_SAMPLE` paths every cycle would leave the rest of the network unvisited. Each pass
+    /// therefore starts `LOOPBACK_SAMPLE` paths further in and wraps once the enumeration is
+    /// exhausted, so successive cycles reach different paths.
+    window: usize,
+}
+
+impl<U> LoopbackProber<U>
+where
+    U: NetworkGraphView<NodeId = OffchainPublicKey, Observed = Observations>
+        + NetworkGraphTraverse<NodeId = OffchainPublicKey>
+        + FocusedLoopback
+        + Send
+        + Sync
+        + 'static,
+{
+    /// The next loopback path, taken from the persistent cursor over the current pass.
+    fn next(&mut self, control: &ControlState) -> Option<ProbeRouting> {
+        if self.pass.is_spent(control.focus.as_deref()) {
+            // A pass that ran to its end is a full cycle over the candidate set; report what it saw.
+            if self.pass.is_complete() {
+                tracing::debug!(
+                    paths = self.pass.paths.len(),
+                    edges_with_evidence = self.pass.evidence.len(),
+                    "loopback cycle completed"
+                );
+                self.coverage.record_cycle(self.pass.evidence.len());
+            }
+            self.rebuild_pass(control);
+        }
+
+        self.pass.next()
+    }
+
+    /// Builds one full pass over the loopback candidates: the best paths first, the exploration
+    /// share interleaved among them, and the cursor back at the start of a fresh random order.
+    fn rebuild_pass(&mut self, control: &ControlState) {
+        let mut all = Vec::new();
+        let mut forward = Vec::new();
+        let mut returning = Vec::new();
+        let mut evidence = HashSet::new();
+
+        // Ask for one window more than the pass will use, so a short answer tells us the
+        // enumeration is exhausted and the window has to wrap.
+        let wanted = self.window + LOOPBACK_SAMPLE;
+        let mut exhausted = false;
+
+        for hops in LOOPBACK_HOP_COUNTS {
+            if let Some(exits) = control.focus.as_deref() {
+                let focused = self.graph.focused_loopback(hops, Some(wanted), exits);
+                exhausted |= focused.len() < wanted;
+                for (path, path_id, relevance) in focused.into_iter().skip(self.window) {
+                    if let Some(candidate) = self.weigh_candidate(path, path_id, &control.weights, &mut evidence) {
+                        match relevance {
+                            FocusRelevance::Forward => forward.push(candidate),
+                            FocusRelevance::Return => returning.push(candidate),
+                        }
+                    }
+                }
+            }
+
+            let simple = self.graph.simple_loopback_to_self(hops, Some(wanted));
+            exhausted |= simple.len() < wanted;
+            for (path, path_id) in simple.into_iter().skip(self.window) {
+                if let Some(candidate) = self.weigh_candidate(path, path_id, &control.weights, &mut evidence) {
+                    all.push(candidate);
+                }
+            }
+        }
+
+        self.window = if exhausted { 0 } else { self.window + LOOPBACK_SAMPLE };
+
+        // The best set is the selection, not a weighted draw from it: it is what the path owner
+        // values most. With a focus it also stays around the exits, forward loops ahead of return
+        // ones, so the paths routing will take there are the ones kept measured.
+        let by_weight = |mut paths: Vec<WeightedRoute>| {
+            paths.sort_by(|left, right| right.1.total_cmp(&left.1));
+            paths
+        };
+        let ranked = if control.focus.is_some() {
+            let mut ranked = by_weight(forward);
+            ranked.extend(by_weight(returning));
+            ranked
+        } else {
+            by_weight(all.clone())
+        };
+
+        // A window that spends fewer probes than the set holds cannot re-measure more paths than
+        // that either, so the best set never exceeds the cap the consumer set for it.
+        let best_cap = self
+            .cfg
+            .best_set_size
+            .min(control.best_set_cap.unwrap_or(usize::MAX))
+            .max(1);
+        let explore_share = 1.0 - self.cfg.best_path_share;
+        let paths = split_pass(ranked, all, best_cap, explore_share);
+        tracing::debug!(paths = paths.len(), explore_share, "rebuilt loopback probe pass");
+
+        self.pass.install(paths, evidence, control.focus.as_deref().cloned());
+    }
+
+    /// Weighs a candidate, and skips it when any of its edges already carries fresh SURB evidence.
+    ///
+    /// A path whose edges are already measured by real traffic needs no probe: the probe budget is
+    /// better spent where nothing is known.
+    fn weigh_candidate(
+        &self,
+        path: Vec<OffchainPublicKey>,
+        path_id: PathId,
+        weights: &PathWeights,
+        evidence: &mut HashSet<(OffchainPublicKey, OffchainPublicKey)>,
+    ) -> Option<WeightedRoute> {
+        let intermediates = strip_loopback_endpoints(path, &self.me);
+        let edges: Vec<_> = loopback_edge_pairs(self.me, &intermediates).collect();
+        let mut evidenced = Vec::new();
+
+        for (src, dst) in &edges {
+            if self
+                .graph
+                .edge(src, dst)
+                .is_some_and(|obs| edge_has_fresh_evidence(&obs))
+            {
+                evidenced.push((*src, *dst));
+            }
+        }
+
+        // Only a path every edge of which is already measured by traffic is a wasted probe: the
+        // rest still measures the edges without evidence, and the graph attributes the outcome per
+        // edge. A path with more of them is worth more, so its weight is scaled by that count.
+        // The metric counts edges with evidence, whichever loops they sit on.
+        evidence.extend(evidenced.iter().copied());
+
+        let unmeasured = edges.len().saturating_sub(evidenced.len());
+        if unmeasured == 0 {
+            return None;
+        }
+
+        let weight = weights.weight_of(&intermediates, path_id).unwrap_or(0.0) * unmeasured as f64;
+        let route = ProbeRouting::Looping((loopback_routing(self.me.into(), intermediates)?, path_id));
+
+        Some((route, weight))
+    }
+}
+
+/// Whether `peer` still needs a probe under `probe_connected_only`.
+fn neighbor_needs_probe<U>(
+    graph: &U,
+    me: OffchainPublicKey,
+    probe_connected_only: bool,
+    peer: &OffchainPublicKey,
+) -> bool
+where
+    U: NetworkGraphView<NodeId = OffchainPublicKey, Observed = Observations>,
+{
+    if peer == &me {
+        return false;
+    }
+    match graph.edge(&me, peer) {
+        Some(obs) if probe_connected_only => !(obs.immediate_qos().and_then(|imm| imm.is_connected()) == Some(false)),
+        // A node the graph knows but has no edge from `me` to is still worth a ping: it is the only
+        // way the edge appears.
+        Some(_) | None => true,
+    }
+}
+
+/// Whether the edge carries evidence from real traffic, which probing has no reason to duplicate.
+fn edge_has_fresh_evidence(obs: &Observations) -> bool {
+    // Both signals read the SURB window; either one is evidence that traffic crossed the edge.
+    obs.intermediate_qos().is_some_and(|intermediate| {
+        intermediate.surb_delivery_rate().is_some() || intermediate.traffic_rate().is_some()
+    })
+}
+
+/// A uniform random permutation.
+fn uniform_shuffle<T>(items: Vec<T>) -> Vec<T> {
+    WeightedCollection::new(items.into_iter().map(|item| (item, 1.0)).collect()).into_shuffled()
+}
+
+/// A random permutation in which heavier items come earlier more often.
+fn weighted_shuffle(items: Vec<WeightedRoute>) -> Vec<WeightedRoute> {
+    WeightedCollection::new(
+        items
+            .into_iter()
+            .map(|item| {
+                let weight = item.1;
+                (item, weight)
+            })
+            .collect(),
+    )
+    .into_shuffled()
+}
+
+/// The path a loopback route was selected for, `None` for a route that is not a loopback.
+fn route_path_id(route: &ProbeRouting) -> Option<PathId> {
+    match route {
+        ProbeRouting::Looping((_, path_id)) => Some(*path_id),
+        ProbeRouting::Neighbor(_) => None,
+    }
+}
+
+/// Splits the candidates into the best set and the exploration set, then interleaves them.
+///
+/// The best set is the highest-weighted paths (`ranked` must already be sorted by weight, which is
+/// what makes membership follow the owner's valuation rather than a draw). The order within each
+/// set is still random, so cycles do not replay the same sequence.
+fn split_pass(
+    ranked: Vec<WeightedRoute>,
+    all: Vec<WeightedRoute>,
+    best_cap: usize,
+    explore_share: f64,
+) -> Vec<WeightedRoute> {
+    let best = weighted_shuffle(ranked.into_iter().take(best_cap).collect());
+    let best_paths: HashSet<PathId> = best.iter().filter_map(|(route, _)| route_path_id(route)).collect();
+    let explore = weighted_shuffle(
+        all.into_iter()
+            .filter(|(route, _)| route_path_id(route).is_none_or(|id| !best_paths.contains(&id)))
+            .collect(),
+    );
+
+    interleave(best, explore, explore_share)
+}
+
+/// Interleaves `explore` among `best` so that every prefix holds the exploration share.
+///
+/// The generator cannot see the consumer's windows, so the share is carried by the order itself:
+/// at every position the exploration set takes its turn as soon as it is behind by more than
+/// `explore_share`, whatever the window boundaries turn out to be.
+fn interleave(best: Vec<WeightedRoute>, explore: Vec<WeightedRoute>, explore_share: f64) -> Vec<WeightedRoute> {
+    let mut best = VecDeque::from(best);
+    let mut explore = VecDeque::from(explore);
+    let mut pass = Vec::with_capacity(best.len() + explore.len());
+    let mut explored = 0usize;
+
+    while !best.is_empty() || !explore.is_empty() {
+        let position = pass.len() + 1;
+        let take_explore =
+            !explore.is_empty() && (best.is_empty() || (explored as f64) < explore_share * position as f64);
+
+        let next = if take_explore {
+            explored += 1;
+            explore.pop_front()
+        } else {
+            best.pop_front()
+        };
+
+        if let Some(candidate) = next {
+            pass.push(candidate);
+        }
+    }
+
+    pass
+}
+
+/// Resolves once the control, an explicit wake, or the idle re-read says to look again.
+///
+/// The graph offers no change notification, so a disconnect or a dropped rate is otherwise
+/// invisible to an idle stream. [`EgressControl::wake_probing`](crate::EgressControl::wake_probing)
+/// makes it immediate for a consumer that knows it just wrote, and `recheck` bounds how stale an
+/// idle stream can get for one that does not. `false` means the control handle is gone and nothing
+/// can steer probing any more.
+async fn wait_for_wake(control: &mut watch::Receiver<ControlState>, wake: &Notify, recheck: Duration) -> bool {
+    let woken = wake.notified();
+    let rechecked = futures_time::task::sleep(recheck.into());
+    let mut changed = std::pin::pin!(control.changed());
+    let mut woken = std::pin::pin!(woken);
+    let mut rechecked = std::pin::pin!(rechecked);
+
+    match futures::future::select(
+        std::future::poll_fn(|cx| changed.as_mut().poll(cx)),
+        std::future::poll_fn(|cx| {
+            if woken.as_mut().poll(cx).is_ready() {
+                return std::task::Poll::Ready(true);
+            }
+            match rechecked.as_mut().poll(cx) {
+                std::task::Poll::Ready(_) => std::task::Poll::Ready(true),
+                std::task::Poll::Pending => std::task::Poll::Pending,
+            }
+        }),
+    )
+    .await
+    {
+        Either::Left((Ok(()), _)) => true,
+        Either::Left((Err(_), _)) => false,
+        Either::Right(_) => true,
+    }
+}
+
+/// Stream of neighbor probes, one per pull, driven only by its own state.
+///
+/// Nothing is polled until the consumer pulls, and no timer runs between pulls. While every peer is
+/// measured, it waits on the control handle rather than spinning.
+fn neighbor_probes<U>(
+    prober: NeighborProber<U>,
+    control: watch::Receiver<ControlState>,
+    wake: Arc<Notify>,
+    recheck: Duration,
+) -> impl futures::Stream<Item = ProbeRouting>
+where
+    U: NetworkGraphView<NodeId = OffchainPublicKey, Observed = Observations> + Send + Sync + 'static,
+{
+    futures::stream::unfold((prober, control), move |(mut prober, mut control)| {
+        let wake = wake.clone();
+
+        async move {
+            loop {
+                if let Some(peer) = prober.next().await {
+                    return Some((neighbor_routing(peer), (prober, control)));
+                }
+
+                // Nothing to offer until the peer set or the wake says to look again.
+                if !wait_for_wake(&mut control, &wake, recheck).await {
+                    return futures::future::pending().await;
+                }
+            }
+        }
+    })
+}
+
+/// Stream of loopback probes, one per pull, driven only by its own state.
+///
+/// Nothing is polled until the consumer pulls, and no timer runs between pulls. While there is no
+/// candidate path, it waits on the control handle rather than spinning.
+fn loopback_probes<U>(
+    prober: LoopbackProber<U>,
+    control: watch::Receiver<ControlState>,
+    wake: Arc<Notify>,
+    recheck: Duration,
+) -> impl futures::Stream<Item = ProbeRouting>
+where
+    U: NetworkGraphView<NodeId = OffchainPublicKey, Observed = Observations>
+        + NetworkGraphTraverse<NodeId = OffchainPublicKey>
+        + FocusedLoopback
+        + Send
+        + Sync
+        + 'static,
+{
+    futures::stream::unfold((prober, control), move |(mut prober, mut control)| {
+        let wake = wake.clone();
+
+        async move {
+            loop {
+                let state = control.borrow_and_update().clone();
+                if let Some(probe) = prober.next(&state) {
+                    return Some((probe, (prober, control)));
+                }
+
+                // Nothing to offer until the graph or the wake says to look again.
+                if !wait_for_wake(&mut control, &wake, recheck).await {
+                    return futures::future::pending().await;
+                }
+            }
+        }
+    })
+}
+
 impl<U> ProbingTrafficGeneration for FullNetworkDiscovery<U>
 where
-    U: NetworkGraphView<NodeId = OffchainPublicKey, Observed = hopr_network_graph::Observations>
+    U: NetworkGraphView<NodeId = OffchainPublicKey, Observed = Observations>
         + NetworkGraphTraverse<NodeId = OffchainPublicKey>
         + FocusedLoopback
         + Clone
@@ -247,156 +852,46 @@ where
         + Sync
         + 'static,
 {
+    /// Neighbor and loopback probing are separate streams with no shared state, merged fairly so
+    /// neither can starve the other.
     fn build(&self) -> BoxStream<'static, ProbeRouting> {
-        let cfg = self.cfg;
-        let me = self.me;
-        let rx = self.control.subscribe();
-        let level_period = move |s: &ControlState| s.level.map(|level| level.period(cfg.interval));
-
-        let immediates = immediate_probe_stream(
-            me,
-            cfg,
-            self.graph.clone(),
-            paced_ticks(rx.clone(), level_period).boxed(),
+        let neighbors = neighbor_probes(
+            NeighborProber {
+                me: self.me,
+                cfg: self.cfg,
+                graph: self.graph.clone(),
+                samples: NeighborSamples::default(),
+            },
+            self.control.subscribe(),
+            self.control.wake_handle(),
+            self.cfg.recheck_interval,
         );
 
-        let me_node: NodeId = me.into();
-        let graph = self.graph.clone();
-        let focus_rx = rx.clone();
-        let candidates = move |hops| {
-            let focus = focus_rx.borrow().focus.clone();
-            focused_candidates(&graph, hops, focus.as_deref(), cfg.base_priority, cfg.focus_boost)
-        };
-        let intermediates =
-            loopback_path_stream(paced_ticks(rx, level_period), candidates).filter_map(move |(path, path_id)| {
-                let intermediates = strip_loopback_endpoints(path, &me);
-                let routing = loopback_routing(me_node, intermediates).map(|r| ProbeRouting::Looping((r, path_id)));
-                futures::future::ready(routing)
-            });
+        let loopbacks = loopback_probes(
+            LoopbackProber {
+                me: self.me,
+                cfg: self.cfg,
+                graph: self.graph.clone(),
+                pass: LoopbackPass::default(),
+                coverage: self.control.coverage_counters(),
+                window: 0,
+            },
+            self.control.subscribe(),
+            self.control.wake_handle(),
+            self.cfg.recheck_interval,
+        );
 
-        futures::stream::select(immediates, intermediates).boxed()
+        // Alternate which stream is polled first, so a peer that stays below its thresholds cannot
+        // hold the pull order and stop loopbacks from being measured.
+        futures::stream::select_with_strategy(neighbors, loopbacks, |next: &mut PollNext| next.toggle()).boxed()
     }
-}
-
-/// Cached weighted-shuffle batch with a creation timestamp for TTL checks.
-struct ShuffleCache {
-    probes: Vec<ProbeRouting>,
-    created_at: std::time::Instant,
-}
-
-/// Stream of neighbor probes emitted in bursts per tick.
-///
-/// Each tick emits the entire cached batch. The cache is recomputed when it is
-/// empty (all probes drained) or when `cfg.shuffle_ttl` has expired, whichever
-/// comes first. This avoids re-traversing the graph every tick while still
-/// emitting all peers in each burst.
-///
-/// When `cfg.probe_connected_only` is `true`, only peers with a
-/// `Connected(true)` edge from `me` are included. This assumes that a
-/// background discovery mechanism (e.g. libp2p identify/kademlia) has
-/// already established connections and recorded them in the graph.
-fn immediate_probe_stream<U>(
-    me: OffchainPublicKey,
-    cfg: EgressConfig,
-    graph: U,
-    ticker: BoxStream<'static, ()>,
-) -> impl futures::Stream<Item = ProbeRouting>
-where
-    U: NetworkGraphView<NodeId = OffchainPublicKey, Observed = hopr_network_graph::Observations>
-        + Clone
-        + Send
-        + Sync
-        + 'static,
-{
-    let cache: Option<ShuffleCache> = None;
-
-    futures::stream::unfold((cache, ticker), move |(mut cache, mut ticker)| {
-        let graph = graph.clone();
-
-        async move {
-            use futures::StreamExt as _;
-            ticker.next().await?;
-
-            // Reuse cached shuffle if still within TTL.
-            let needs_refresh = cache
-                .as_ref()
-                .is_none_or(|c| c.probes.is_empty() || c.created_at.elapsed() >= cfg.shuffle_ttl);
-
-            if needs_refresh {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default();
-
-                let weighted: Vec<_> = graph
-                    .nodes()
-                    .filter(|peer| futures::future::ready(peer != &me))
-                    .filter_map(|peer| {
-                        let obs = graph.edge(&me, &peer);
-                        if cfg.probe_connected_only {
-                            // Excludes peers observed to be down, not peers never checked:
-                            // skipping the latter would stop the probe that resolves them,
-                            // leaving them excluded for good.
-                            let known_down = obs
-                                .as_ref()
-                                .and_then(|o| o.immediate_qos())
-                                .and_then(|imm| imm.is_connected())
-                                == Some(false);
-                            if known_down {
-                                return futures::future::ready(None);
-                            }
-                        }
-                        let priority = match obs {
-                            Some(obs) => immediate_probe_priority(
-                                // An unobserved edge scores as poorly as possible, which
-                                // RFC-0010 §4.2.1.4 turns into maximum probing urgency.
-                                obs.score().unwrap_or(0.0),
-                                obs.last_update(),
-                                now,
-                                &cfg,
-                            ),
-                            None => immediate_probe_priority(0.0, std::time::Duration::ZERO, now, &cfg),
-                        };
-                        futures::future::ready(Some((peer, priority)))
-                    })
-                    .collect()
-                    .await;
-
-                let peer_count = weighted.len();
-                let zero_hop = RoutingOptions::Hops(0.try_into().expect("0 is a valid u8"));
-                let wc = WeightedCollection::new(weighted);
-                let probes: Vec<_> = wc
-                    .into_shuffled()
-                    .into_iter()
-                    .map(|peer| {
-                        ProbeRouting::Neighbor(DestinationRouting::Forward {
-                            destination: Box::new(peer.into()),
-                            pseudonym: Some(HoprPseudonym::random()),
-                            forward_options: zero_hop.clone(),
-                            return_options: Some(zero_hop.clone()),
-                        })
-                    })
-                    .collect();
-
-                tracing::debug!(peer_count, probes = probes.len(), "computed new neighbor probe shuffle");
-                cache = Some(ShuffleCache {
-                    probes,
-                    created_at: std::time::Instant::now(),
-                });
-            }
-
-            let batch = cache.as_ref().map(|c| c.probes.clone()).unwrap_or_default();
-            tracing::debug!(probes = batch.len(), "emitting neighbor probe batch");
-
-            Some((futures::stream::iter(batch), (cache, ticker)))
-        }
-    })
-    .flatten()
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, sync::Arc};
+    use std::{collections::HashSet, sync::Arc, time::Duration};
 
+    use anyhow::Context as _;
     use futures::{StreamExt, pin_mut};
     use hopr_api::{
         OffchainKeypair,
@@ -408,9 +903,9 @@ mod tests {
     use tokio::time::timeout;
 
     use super::*;
-    use crate::ProbingLevel;
+    use crate::EgressConfig;
 
-    const TINY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(20);
+    const TINY_TIMEOUT: Duration = Duration::from_millis(20);
 
     #[test]
     fn requested_loopback_hop_counts_must_all_be_routable() {
@@ -434,9 +929,11 @@ mod tests {
 
     fn fast_cfg() -> EgressConfig {
         EgressConfig {
-            interval: std::time::Duration::from_millis(1),
-            shuffle_ttl: std::time::Duration::ZERO,
+            #[cfg(feature = "noise")]
+            interval: Duration::from_millis(1),
             probe_connected_only: false,
+            // Keep the re-add out of the way of the ordering assertions.
+            readd_probability: 0.0,
             ..Default::default()
         }
     }
@@ -445,23 +942,755 @@ mod tests {
         *OffchainKeypair::random().public()
     }
 
-    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-    struct Node {
-        pub id: OffchainPublicKey,
+    /// Helper: mark an edge as fully connected with capacity, so it passes all cost checks.
+    fn mark_edge_ready(graph: &ChannelGraph, src: &OffchainPublicKey, dst: &OffchainPublicKey) {
+        use hopr_api::graph::traits::{EdgeObservableWrite, EdgeWeightType};
+        graph.upsert_edge(src, dst, |obs| {
+            obs.record(EdgeWeightType::Connected(true));
+            obs.record(EdgeWeightType::Immediate(Ok(Duration::from_millis(50))));
+            obs.record(EdgeWeightType::Balance(Some(hopr_api::graph::traits::Balance::from(
+                1000u64,
+            ))));
+        });
     }
 
-    impl From<Node> for OffchainPublicKey {
-        fn from(node: Node) -> Self {
-            node.id
+    /// Records `successes` answered probes followed by `failures` unanswered ones on an edge.
+    fn record_probes(
+        graph: &ChannelGraph,
+        src: &OffchainPublicKey,
+        dst: &OffchainPublicKey,
+        successes: u32,
+        failures: u32,
+    ) {
+        use hopr_api::graph::traits::{EdgeObservableWrite, EdgeWeightType};
+        graph.upsert_edge(src, dst, |obs| {
+            for _ in 0..successes {
+                obs.record(EdgeWeightType::Immediate(Ok(Duration::from_millis(50))));
+            }
+            for _ in 0..failures {
+                obs.record(EdgeWeightType::Immediate(Err(())));
+            }
+        });
+    }
+
+    /// Gives an edge SURB evidence: traffic crossed it and replies came back.
+    fn record_surb_evidence(graph: &ChannelGraph, src: &OffchainPublicKey, dst: &OffchainPublicKey) {
+        use hopr_api::graph::traits::{EdgeObservableWrite, EdgeWeightType};
+        graph.upsert_edge(src, dst, |obs| {
+            obs.record(EdgeWeightType::SurbRoundTrips {
+                expected: 10,
+                observed: 10,
+            });
+        });
+    }
+
+    /// `me → head → {b, c} → me`: two 2-relay loops that differ only in their last relay.
+    #[allow(clippy::type_complexity)]
+    fn two_loops() -> anyhow::Result<(
+        OffchainPublicKey,
+        OffchainPublicKey,
+        OffchainPublicKey,
+        OffchainPublicKey,
+        Arc<ChannelGraph>,
+    )> {
+        let (me, head, b, c) = (random_key(), random_key(), random_key(), random_key());
+        let graph = Arc::new(ChannelGraph::new(me));
+        for node in [head, b, c] {
+            graph.add_node(node);
+        }
+        for (src, dst) in [(me, head), (head, b), (head, c), (b, me), (c, me)] {
+            graph.add_edge(&src, &dst)?;
+            mark_edge_ready(&graph, &src, &dst);
+        }
+        Ok((me, head, b, c, graph))
+    }
+
+    /// Nine loops ending at distinct exits, plus one unrelated loop: `(me, exits, unrelated, graph)`.
+    #[allow(clippy::type_complexity)]
+    fn focus_topology() -> anyhow::Result<(
+        OffchainPublicKey,
+        Vec<OffchainPublicKey>,
+        OffchainPublicKey,
+        Arc<ChannelGraph>,
+    )> {
+        let me = random_key();
+        let graph = Arc::new(ChannelGraph::new(me));
+        let mut exits = Vec::new();
+
+        for _ in 0..9 {
+            let (head, exit) = (random_key(), random_key());
+            for node in [head, exit] {
+                graph.add_node(node);
+            }
+            for (src, dst) in [(me, head), (head, exit), (exit, me)] {
+                graph.add_edge(&src, &dst)?;
+                mark_edge_ready(&graph, &src, &dst);
+            }
+            exits.push(exit);
+        }
+
+        let (head, unrelated) = (random_key(), random_key());
+        for node in [head, unrelated] {
+            graph.add_node(node);
+        }
+        for (src, dst) in [(me, head), (head, unrelated), (unrelated, me)] {
+            graph.add_edge(&src, &dst)?;
+            mark_edge_ready(&graph, &src, &dst);
+        }
+
+        Ok((me, exits, unrelated, graph))
+    }
+
+    /// `count` disjoint 2-relay loops, returned with their first relay.
+    fn disjoint_loops(count: usize) -> anyhow::Result<(OffchainPublicKey, Vec<OffchainPublicKey>, Arc<ChannelGraph>)> {
+        let me = random_key();
+        let graph = Arc::new(ChannelGraph::new(me));
+        let mut heads = Vec::with_capacity(count);
+
+        for _ in 0..count {
+            let (head, last) = (random_key(), random_key());
+            for node in [head, last] {
+                graph.add_node(node);
+            }
+            for (src, dst) in [(me, head), (head, last), (last, me)] {
+                graph.add_edge(&src, &dst)?;
+                mark_edge_ready(&graph, &src, &dst);
+            }
+            heads.push(head);
+        }
+
+        Ok((me, heads, graph))
+    }
+
+    /// `count` relays, every pair connected both ways, each also connected to `me` both ways.
+    fn full_mesh(count: usize) -> anyhow::Result<(OffchainPublicKey, Arc<ChannelGraph>)> {
+        let me = random_key();
+        let graph = Arc::new(ChannelGraph::new(me));
+        let relays: Vec<_> = (0..count).map(|_| random_key()).collect();
+        for relay in &relays {
+            graph.add_node(*relay);
+        }
+
+        for relay in &relays {
+            for (src, dst) in [(me, *relay), (*relay, me)] {
+                graph.add_edge(&src, &dst)?;
+                mark_edge_ready(&graph, &src, &dst);
+            }
+            // A measured neighbor keeps the neighbor stream from holding the pull order.
+            record_probes(&graph, &me, relay, fast_cfg().stable_samples, 0);
+        }
+        for from in &relays {
+            for to in &relays {
+                if from != to {
+                    graph.add_edge(from, to)?;
+                    mark_edge_ready(&graph, from, to);
+                }
+            }
+        }
+        Ok((me, graph))
+    }
+
+    /// Intermediates of a loopback probe, or `None` for a neighbor probe.
+    fn loopback_path(routing: &ProbeRouting) -> Option<Vec<OffchainPublicKey>> {
+        match routing {
+            ProbeRouting::Looping((
+                DestinationRouting::Forward {
+                    forward_options: RoutingOptions::IntermediatePath(path),
+                    ..
+                },
+                _,
+            )) => Some(
+                path.as_ref()
+                    .iter()
+                    .filter_map(|node| match node {
+                        NodeId::Offchain(key) => Some(*key),
+                        _ => None,
+                    })
+                    .collect(),
+            ),
+            _ => None,
         }
     }
 
-    lazy_static::lazy_static! {
-        static ref RANDOM_PEERS: HashSet<Node> = (1..10).map(|_| {
-            Node {
-                id: OffchainPublicKey::from_privkey(&hopr_api::types::crypto_random::random_bytes::<32>()).unwrap(),
+    /// Destinations of neighbor probes, in the order they were offered.
+    fn neighbor_destinations(stream: impl futures::Stream<Item = ProbeRouting>) -> impl futures::Stream<Item = NodeId> {
+        stream.filter_map(|r| {
+            futures::future::ready(match r {
+                ProbeRouting::Neighbor(DestinationRouting::Forward { destination, .. }) => Some(*destination),
+                _ => None,
+            })
+        })
+    }
+
+    /// Pulls until `count` loopback probes have been offered, skipping neighbor probes.
+    async fn loopbacks(
+        stream: &mut (impl futures::Stream<Item = ProbeRouting> + Unpin),
+        count: usize,
+    ) -> anyhow::Result<Vec<Vec<OffchainPublicKey>>> {
+        let mut found = Vec::with_capacity(count);
+        while found.len() < count {
+            let probe = timeout(TINY_TIMEOUT * 400, stream.next())
+                .await
+                .context("timed out waiting for a loopback probe")?
+                .context("the probing stream ended")?;
+            if let Some(path) = loopback_path(&probe) {
+                found.push(path);
             }
-        }).collect::<HashSet<_>>();
+        }
+        Ok(found)
+    }
+
+    #[tokio::test]
+    async fn the_stream_should_emit_nothing_without_pulls_and_hold_no_timer() -> anyhow::Result<()> {
+        let (me, _, _, _, graph) = two_loops()?;
+
+        // The default interval is 30 s. A pull-driven stream ignores it: a pull yields a probe at
+        // once, and a stream nobody pulls yields nothing at all.
+        let cfg = EgressConfig {
+            probe_connected_only: false,
+            ..Default::default()
+        };
+        #[cfg(feature = "noise")]
+        assert_eq!(cfg.interval, Duration::from_secs(30));
+
+        let prober = FullNetworkDiscovery::new(me, cfg, graph);
+        let stream = ProbingTrafficGeneration::build(&prober);
+        pin_mut!(stream);
+
+        let started = std::time::Instant::now();
+        let probe = timeout(TINY_TIMEOUT * 5, stream.next()).await?;
+        assert!(probe.is_some(), "a pull must yield a probe at once");
+        assert!(
+            started.elapsed() < TINY_TIMEOUT * 5,
+            "the stream must not wait out the configured interval"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_stream_should_be_lazy() -> anyhow::Result<()> {
+        let me = random_key();
+        let graph = Arc::new(ChannelGraph::new(me));
+        for _ in 0..3 {
+            graph.record_node(random_key());
+        }
+
+        let prober = FullNetworkDiscovery::new(me, fast_cfg(), graph);
+        let stream = ProbingTrafficGeneration::build(&prober);
+        pin_mut!(stream);
+
+        tokio::time::pause();
+
+        // One pull yields one probe, and no timer produces more while nobody pulls.
+        assert!(timeout(TINY_TIMEOUT * 20, stream.next()).await?.is_some());
+        tokio::time::advance(Duration::from_hours(1)).await;
+        assert!(timeout(TINY_TIMEOUT * 20, stream.next()).await?.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_measured_peer_should_not_be_offered_again() -> anyhow::Result<()> {
+        let me = random_key();
+        let peer = random_key();
+        let graph = Arc::new(ChannelGraph::new(me));
+        graph.record_node(peer);
+        mark_edge_ready(&graph, &me, &peer);
+
+        // N successful outcomes, recorded before the stream is built.
+        let outcomes = fast_cfg().stable_samples;
+        record_probes(&graph, &me, &peer, outcomes, 0);
+
+        let prober = FullNetworkDiscovery::new(me, fast_cfg(), graph);
+        let stream = ProbingTrafficGeneration::build(&prober);
+        pin_mut!(stream);
+
+        for _ in 0..100 {
+            assert!(
+                timeout(TINY_TIMEOUT, stream.next()).await.is_err(),
+                "a measured, connected peer must not be offered again"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn offers_without_recorded_outcomes_are_not_samples() -> anyhow::Result<()> {
+        let me = random_key();
+        let peer = random_key();
+        let graph = Arc::new(ChannelGraph::new(me));
+        graph.record_node(peer);
+
+        let prober = FullNetworkDiscovery::new(me, fast_cfg(), graph.clone());
+        let stream = ProbingTrafficGeneration::build(&prober);
+        pin_mut!(stream);
+
+        // Offered N times and more, but nothing was ever recorded: the peer is still unmeasured.
+        let offers = fast_cfg().stable_samples as usize + 2;
+        let destinations: Vec<NodeId> = timeout(
+            TINY_TIMEOUT * 200,
+            neighbor_destinations(stream.by_ref()).take(offers).collect::<Vec<_>>(),
+        )
+        .await?;
+        assert_eq!(
+            destinations,
+            vec![NodeId::from(peer); offers],
+            "an offer is not a sample, so probing does not stop"
+        );
+
+        // Recording the outcomes is what measures the peer.
+        record_probes(&graph, &me, &peer, fast_cfg().stable_samples, 0);
+        prober.control().wake_probing();
+
+        assert!(
+            timeout(TINY_TIMEOUT * 20, neighbor_destinations(stream).next())
+                .await
+                .is_err(),
+            "once N outcomes are recorded the peer is left alone"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_idle_stream_should_re_read_the_graph_without_a_wake() -> anyhow::Result<()> {
+        let me = random_key();
+        let peer = random_key();
+        let graph = Arc::new(ChannelGraph::new(me));
+        graph.record_node(peer);
+        mark_edge_ready(&graph, &me, &peer);
+
+        let outcomes = fast_cfg().stable_samples;
+        record_probes(&graph, &me, &peer, outcomes, 0);
+
+        let cfg = EgressConfig {
+            // A short recheck keeps the test quick; `futures-time` has its own reactor, so a paused
+            // tokio clock cannot drive it.
+            recheck_interval: Duration::from_millis(5),
+            ..fast_cfg()
+        };
+        let prober = FullNetworkDiscovery::new(me, cfg, graph.clone());
+        let stream = ProbingTrafficGeneration::build(&prober);
+        pin_mut!(stream);
+
+        assert!(
+            timeout(TINY_TIMEOUT, stream.next()).await.is_err(),
+            "the peer starts measured, so the stream parks"
+        );
+
+        // A disconnect and reconnect written to the graph, with no control change and no wake.
+        {
+            use hopr_api::graph::traits::{EdgeObservableWrite, EdgeWeightType};
+            graph.upsert_edge(&me, &peer, |obs| obs.record(EdgeWeightType::Connected(false)));
+            graph.upsert_edge(&me, &peer, |obs| obs.record(EdgeWeightType::Connected(true)));
+        }
+
+        let offered: Vec<NodeId> = timeout(
+            TINY_TIMEOUT * 200,
+            neighbor_destinations(stream.by_ref())
+                .take(outcomes as usize)
+                .collect::<Vec<_>>(),
+        )
+        .await?;
+        assert_eq!(
+            offered,
+            vec![NodeId::from(peer); outcomes as usize],
+            "the reconnected peer must be sampled again, with no wake"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_reconnect_should_restart_the_sample_count() -> anyhow::Result<()> {
+        let me = random_key();
+        let peer = random_key();
+        let graph = Arc::new(ChannelGraph::new(me));
+        graph.record_node(peer);
+        mark_edge_ready(&graph, &me, &peer);
+
+        let outcomes = fast_cfg().stable_samples;
+        record_probes(&graph, &me, &peer, outcomes, 0);
+
+        let prober = FullNetworkDiscovery::new(me, fast_cfg(), graph.clone());
+        let stream = ProbingTrafficGeneration::build(&prober);
+        pin_mut!(stream);
+
+        assert!(
+            timeout(TINY_TIMEOUT, stream.next()).await.is_err(),
+            "the peer starts measured"
+        );
+
+        // The connection drops and comes back while the stream is idle.
+        {
+            use hopr_api::graph::traits::{EdgeObservableWrite, EdgeWeightType};
+            graph.upsert_edge(&me, &peer, |obs| obs.record(EdgeWeightType::Connected(false)));
+        }
+        prober.control().wake_probing();
+
+        let after_reconnect: Vec<NodeId> = timeout(
+            TINY_TIMEOUT * 200,
+            neighbor_destinations(stream.by_ref())
+                .take(outcomes as usize)
+                .collect::<Vec<_>>(),
+        )
+        .await?;
+        assert_eq!(
+            after_reconnect,
+            vec![NodeId::from(peer); outcomes as usize],
+            "a reconnected peer must be sampled again until it has N new outcomes"
+        );
+
+        // The reconnect is only measured once its outcomes are recorded, not by the offers.
+        record_probes(&graph, &me, &peer, outcomes, 0);
+        prober.control().wake_probing();
+
+        assert!(
+            timeout(TINY_TIMEOUT * 20, neighbor_destinations(stream).next())
+                .await
+                .is_err(),
+            "probing stops again once the new outcomes are recorded"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn loopbacks_should_be_offered_while_a_peer_keeps_needing_probes() -> anyhow::Result<()> {
+        // A peer whose probe rate stays below its threshold never leaves the neighbor sample, so the
+        // neighbor stream is always ready. Merging without a fair strategy would let it hold every
+        // pull, and an edge nothing else measures would stay unmeasured.
+        let (me, head, _, _, graph) = two_loops()?;
+        record_probes(&graph, &me, &head, 0, 6);
+
+        let cfg = EgressConfig {
+            min_success_rate: 0.9,
+            ..fast_cfg()
+        };
+        let prober = FullNetworkDiscovery::new(me, cfg, graph);
+        let stream = ProbingTrafficGeneration::build(&prober);
+        pin_mut!(stream);
+
+        let offered = loopbacks(&mut stream, 2).await?;
+
+        assert_eq!(offered.len(), 2, "loopbacks must still be offered");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_lower_rate_should_be_offered_sooner() -> anyhow::Result<()> {
+        let me = random_key();
+        let (deeper, shallower, at_threshold) = (random_key(), random_key(), random_key());
+        let graph = Arc::new(ChannelGraph::new(me));
+        for peer in [deeper, shallower, at_threshold] {
+            graph.record_node(peer);
+            mark_edge_ready(&graph, &me, &peer);
+        }
+
+        let cfg = EgressConfig {
+            // Measured peers with a rate below this are probed again.
+            min_success_rate: 0.8,
+            ..fast_cfg()
+        };
+        let outcomes = cfg.stable_samples;
+
+        // All three start measured at a full success rate.
+        for peer in [deeper, shallower, at_threshold] {
+            record_probes(&graph, &me, &peer, outcomes, 0);
+        }
+        // The rate is an EMA over five samples, so from 1.0 each failure moves it to 0.8, 0.64,
+        // 0.512 and 0.4096: two drop below the threshold, one of them further, and one lands on it.
+        record_probes(&graph, &me, &deeper, 0, 4);
+        record_probes(&graph, &me, &shallower, 0, 2);
+        record_probes(&graph, &me, &at_threshold, 0, 1);
+
+        let prober = FullNetworkDiscovery::new(me, cfg, graph);
+        let stream = ProbingTrafficGeneration::build(&prober);
+        pin_mut!(stream);
+
+        prober.control().wake_probing();
+
+        let first = timeout(TINY_TIMEOUT * 200, neighbor_destinations(stream.by_ref()).next())
+            .await?
+            .context("a degraded peer must be offered again")?;
+        let second = timeout(TINY_TIMEOUT * 200, neighbor_destinations(stream.by_ref()).next())
+            .await?
+            .context("both degraded peers must be offered again")?;
+
+        assert_eq!(
+            first,
+            NodeId::from(deeper),
+            "the peer further below its threshold must lead the pull order"
+        );
+        assert_eq!(second, NodeId::from(shallower), "then the shallower one");
+
+        let later: Vec<NodeId> = timeout(
+            TINY_TIMEOUT * 200,
+            neighbor_destinations(stream.by_ref()).take(4).collect::<Vec<_>>(),
+        )
+        .await?;
+        assert!(
+            later.iter().all(|peer| peer != &NodeId::from(at_threshold)),
+            "a peer exactly at the threshold is never offered again"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fresh_surb_evidence_should_skip_only_a_fully_measured_loop() -> anyhow::Result<()> {
+        // `me → head → b → me`, with evidence written onto one edge only.
+        let (me, head, b, _c, graph) = two_loops()?;
+
+        // Only `me → head` has evidence: the loop still measures `head → b` and `b → me`.
+        record_surb_evidence(&graph, &me, &head);
+        let prober = FullNetworkDiscovery::new(me, fast_cfg(), graph.clone());
+        let stream = ProbingTrafficGeneration::build(&prober);
+        pin_mut!(stream);
+        let offered = loopbacks(&mut stream, 4).await?;
+        assert!(
+            offered.iter().any(|path| path == &vec![head, b]),
+            "a loop with an unmeasured edge must still be offered"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_loop_is_skipped_only_when_every_edge_has_evidence() -> anyhow::Result<()> {
+        let (me, head, b, c, graph) = two_loops()?;
+
+        // Every edge of the `head → b` loop carries evidence; the `head → c` loop has none.
+        for (src, dst) in [(me, head), (head, b), (b, me)] {
+            record_surb_evidence(&graph, &src, &dst);
+        }
+
+        let prober = FullNetworkDiscovery::new(me, fast_cfg(), graph.clone());
+        let stream = ProbingTrafficGeneration::build(&prober);
+        pin_mut!(stream);
+
+        let offered = loopbacks(&mut stream, 6).await?;
+
+        assert!(
+            !offered.iter().any(|path| path.contains(&b)),
+            "a loop whose every edge has evidence is not worth a probe"
+        );
+        assert!(
+            offered.iter().any(|path| path.contains(&c)),
+            "the unmeasured loop must still be offered"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_cursor_should_reach_paths_beyond_the_enumerated_prefix() -> anyhow::Result<()> {
+        // 20 relays in a full mesh give 20 * 19 two-relay loops, while one pass holds at most
+        // LOOPBACK_SAMPLE of them. The window has to walk the enumeration for the rest to be reached.
+        let (me, graph) = full_mesh(20)?;
+        let prober = FullNetworkDiscovery::new(me, fast_cfg(), graph);
+        let stream = ProbingTrafficGeneration::build(&prober);
+        pin_mut!(stream);
+
+        let mut seen: HashSet<Vec<OffchainPublicKey>> = HashSet::new();
+        let mut first_window = Vec::new();
+        let mut second_window = Vec::new();
+
+        for cycle in 0..10 {
+            for pull in 0..200 {
+                let path = loopbacks(&mut stream, 1).await?;
+                let path = path[0].clone();
+                if path.len() == 2 {
+                    seen.insert(path.clone());
+                    match cycle {
+                        0 if pull < 50 => first_window.push(path),
+                        1 if pull < 50 => second_window.push(path),
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        let total = 20 * 19;
+        assert!(
+            seen.len() * 5 >= total * 4,
+            "at least 80% of the {total} two-relay loops must be reached, got {}",
+            seen.len()
+        );
+
+        let overlap = first_window.iter().filter(|path| second_window.contains(path)).count();
+        assert!(
+            overlap < 25,
+            "cycle 2 must not repeat cycle 1's first 50 loops, shared {overlap}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_cursor_should_cover_the_set_before_repeating() -> anyhow::Result<()> {
+        let (me, heads, graph) = disjoint_loops(6)?;
+        let cfg = EgressConfig {
+            // Every pull explores, so the pass is one random permutation of the candidate set.
+            best_path_share: 0.0,
+            ..fast_cfg()
+        };
+        let prober = FullNetworkDiscovery::new(me, cfg, graph);
+        let stream = ProbingTrafficGeneration::build(&prober);
+        pin_mut!(stream);
+
+        // Three windows of two pulls each, all inside the first pass.
+        let mut windows = Vec::new();
+        for _ in 0..3 {
+            let window: HashSet<_> = loopbacks(&mut stream, 2)
+                .await?
+                .iter()
+                .filter_map(|path| path.first().copied())
+                .collect();
+            assert_eq!(window.len(), 2, "a window must not repeat a candidate");
+            windows.push(window);
+        }
+
+        // Consecutive windows continue where the last stopped rather than starting over.
+        for (left, right) in windows.iter().zip(windows.iter().skip(1)) {
+            assert!(
+                left.intersection(right).next().is_none(),
+                "consecutive windows must cover different edges"
+            );
+        }
+
+        // A full pass visits every candidate exactly once before repeating.
+        let covered: HashSet<_> = windows.into_iter().flatten().collect();
+        assert_eq!(
+            covered,
+            heads.iter().copied().collect::<HashSet<_>>(),
+            "a cycle must cover every candidate"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_exploration_share_should_hold_within_a_window() {
+        // Tags at or above 1_000 identify the exploration candidates.
+        let candidate = |tag: usize, weight: f64| {
+            let routing = DestinationRouting::Forward {
+                destination: Box::new(NodeId::Offchain(random_key())),
+                pseudonym: None,
+                forward_options: RoutingOptions::Hops(0u8.try_into().expect("0 is a valid u8")),
+                return_options: None,
+            };
+            (ProbeRouting::Looping((routing, [tag as u64; 5])), weight)
+        };
+        let best: Vec<_> = (0..900).map(|tag| candidate(tag, 1.0)).collect();
+        let explore: Vec<_> = (1_000..1_100).map(|tag| candidate(tag, 1.0)).collect();
+
+        let pass = interleave(best, explore, 0.1);
+
+        assert_eq!(pass.len(), 1_000);
+        for window in pass.chunks(20) {
+            let explored = window
+                .iter()
+                .filter(|(route, _)| route_path_id(route).is_some_and(|id| id[0] >= 1_000))
+                .count();
+            assert!(
+                (1..=3).contains(&explored),
+                "a twenty-pull window held {explored} explorations"
+            );
+        }
+
+        // Over the whole pass the share is exact, give or take one.
+        let explored = pass
+            .iter()
+            .filter(|(route, _)| route_path_id(route).is_some_and(|id| id[0] >= 1_000))
+            .count();
+        assert!((99..=101).contains(&explored), "the cycle held {explored}");
+    }
+
+    #[test]
+    fn the_best_set_should_follow_the_weights() {
+        // Ten paths the owner values, and a hundred and ninety it barely does.
+        let candidate = |tag: usize, weight: f64| {
+            let routing = DestinationRouting::Forward {
+                destination: Box::new(NodeId::Offchain(random_key())),
+                pseudonym: None,
+                forward_options: RoutingOptions::Hops(0u8.try_into().expect("0 is a valid u8")),
+                return_options: None,
+            };
+            (ProbeRouting::Looping((routing, [tag as u64; 5])), weight)
+        };
+        let heavy: Vec<_> = (0..10).map(|tag| candidate(tag, 1.0)).collect();
+        let light: Vec<_> = (10..200).map(|tag| candidate(tag, 0.01)).collect();
+
+        let mut best_slots = 0;
+        let mut heavy_slots = 0;
+
+        for _ in 0..20 {
+            let mut all = heavy.clone();
+            all.extend(light.clone());
+            all.sort_by(|left, right| right.1.total_cmp(&left.1));
+
+            let pass = split_pass(all.clone(), all, 10, 0.0);
+
+            for candidate in pass.iter().take(10) {
+                best_slots += 1;
+                if candidate.1 == 1.0 {
+                    heavy_slots += 1;
+                }
+            }
+        }
+
+        assert!(
+            heavy_slots * 10 >= best_slots * 9,
+            "at least 90% of the best-set slots must be the valued paths, got {heavy_slots} of {best_slots}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_coverage_metric_should_count_every_edge_with_evidence() -> anyhow::Result<()> {
+        // Seven disjoint loops, one evidenced edge each: seven distinct edges in the cycle.
+        let (me, heads, graph) = disjoint_loops(7)?;
+        for head in &heads {
+            record_surb_evidence(&graph, &me, head);
+        }
+
+        let prober = FullNetworkDiscovery::new(me, fast_cfg(), graph);
+        let control = prober.control();
+        let stream = ProbingTrafficGeneration::build(&prober);
+        pin_mut!(stream);
+
+        let before = control.coverage().map_or(0, |coverage| coverage.cycles);
+        let mut rounds = 0;
+        while control.coverage().map_or(0, |coverage| coverage.cycles) <= before && rounds < 40 {
+            loopbacks(&mut stream, 1).await?;
+            rounds += 1;
+        }
+
+        let coverage = control
+            .coverage()
+            .context("a completed cycle must publish its coverage")?;
+        assert_eq!(coverage.edges_with_evidence, 7, "one evidenced edge per loop");
+        assert_eq!(coverage.cycles, before + 1, "exactly one cycle completed");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_coverage_metric_should_match_the_edges_with_evidence() -> anyhow::Result<()> {
+        let (me, head, b, _c, graph) = two_loops()?;
+        record_surb_evidence(&graph, &head, &b);
+
+        let prober = FullNetworkDiscovery::new(me, fast_cfg(), graph);
+        let control = prober.control();
+        let stream = ProbingTrafficGeneration::build(&prober);
+        pin_mut!(stream);
+
+        // One full pass, then the pass after it, which records the first one's coverage.
+        let cycles_before = control.coverage().map_or(0, |coverage| coverage.cycles);
+        let mut rounds = 0;
+        while control.coverage().map_or(0, |coverage| coverage.cycles) == cycles_before && rounds < 20 {
+            loopbacks(&mut stream, 1).await?;
+            rounds += 1;
+        }
+
+        let coverage = control
+            .coverage()
+            .context("a completed cycle must publish its coverage")?;
+        assert_eq!(
+            coverage.edges_with_evidence, 1,
+            "exactly one edge carried fresh evidence in the cycle"
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -476,80 +1705,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn peers_should_have_randomized_order() -> anyhow::Result<()> {
+    async fn neighbors_should_be_covered_across_passes() -> anyhow::Result<()> {
         let me = random_key();
         let graph = Arc::new(ChannelGraph::new(me));
-        for node in RANDOM_PEERS.iter() {
-            graph.record_node(node.clone());
-        }
+        let (peer_a, peer_b) = (random_key(), random_key());
+        graph.record_node(peer_a);
+        graph.record_node(peer_b);
 
-        let peer_count = RANDOM_PEERS.len();
         let prober = FullNetworkDiscovery::new(me, fast_cfg(), graph);
         let stream = ProbingTrafficGeneration::build(&prober);
         pin_mut!(stream);
 
-        let extract_peer = |routing: ProbeRouting| -> OffchainPublicKey {
-            match routing {
-                ProbeRouting::Neighbor(DestinationRouting::Forward { destination, .. }) => {
-                    if let NodeId::Offchain(peer_key) = destination.as_ref() {
-                        *peer_key
-                    } else {
-                        panic!("expected offchain destination");
-                    }
-                }
-                _ => panic!("expected Neighbor Forward routing"),
-            }
-        };
-
-        // Collect two full rounds from the stream.
-        let both_rounds: Vec<OffchainPublicKey> = timeout(
-            TINY_TIMEOUT * 40,
-            stream.take(peer_count * 2).map(extract_peer).collect::<Vec<_>>(),
+        let destinations: Vec<NodeId> = timeout(
+            TINY_TIMEOUT * 50,
+            neighbor_destinations(stream).take(4).collect::<Vec<_>>(),
         )
         .await?;
 
-        let round_1 = &both_rounds[..peer_count];
-        let round_2 = &both_rounds[peer_count..];
-
-        // Both rounds should cover the same set of peers.
-        let set_1: HashSet<_> = round_1.iter().collect();
-        let set_2: HashSet<_> = round_2.iter().collect();
-        assert_eq!(set_1, set_2, "both rounds should cover the same peers");
-
-        // The two rounds should (almost certainly) differ in order.
-        assert_ne!(round_1, round_2, "two rounds should differ in order (probabilistic)");
+        let unique: HashSet<NodeId> = destinations.iter().cloned().collect();
+        let expected: HashSet<NodeId> = [peer_a, peer_b].into_iter().map(NodeId::from).collect();
+        assert_eq!(unique, expected, "every pass must cover all known peers exactly once");
         Ok(())
     }
 
     #[tokio::test]
-    async fn peers_should_be_generated_in_multiple_rounds() -> anyhow::Result<()> {
-        let me = random_key();
-        let graph = Arc::new(ChannelGraph::new(me));
-        graph.record_node(RANDOM_PEERS.iter().next().unwrap().clone());
-
-        let prober = FullNetworkDiscovery::new(me, fast_cfg(), graph);
-        let stream = ProbingTrafficGeneration::build(&prober);
-        pin_mut!(stream);
-
-        assert!(timeout(TINY_TIMEOUT, stream.next()).await?.is_some());
-        assert!(timeout(TINY_TIMEOUT, stream.next()).await?.is_some());
-        Ok(())
-    }
-
-    #[cfg(not(feature = "noise"))]
-    #[tokio::test]
-    async fn cover_traffic_should_produce_empty_stream() -> anyhow::Result<()> {
-        let me = random_key();
-        let prober = FullNetworkDiscovery::new(me, fast_cfg(), Arc::new(ChannelGraph::new(me)));
-        let stream = CoverTrafficGeneration::build(&prober);
-        pin_mut!(stream);
-
-        assert!(timeout(TINY_TIMEOUT, stream.next()).await?.is_none());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn only_neighbor_probes_emitted_when_no_looping_paths_exist() -> anyhow::Result<()> {
+    async fn only_neighbor_probes_are_emitted_when_no_looping_paths_exist() -> anyhow::Result<()> {
         let me = random_key();
         let graph = Arc::new(ChannelGraph::new(me));
 
@@ -575,87 +1755,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn neighbor_probes_should_cover_all_known_nodes_across_rounds() -> anyhow::Result<()> {
-        let me = random_key();
-        let graph = Arc::new(ChannelGraph::new(me));
-
-        let peer_a = random_key();
-        let peer_b = random_key();
-        graph.record_node(peer_a);
-        graph.record_node(peer_b);
-
-        let prober = FullNetworkDiscovery::new(me, fast_cfg(), graph);
-        let stream = ProbingTrafficGeneration::build(&prober);
-        pin_mut!(stream);
-
-        let destinations: Vec<NodeId> = timeout(
-            TINY_TIMEOUT * 50,
-            neighbor_destinations(stream).take(4).collect::<Vec<_>>(),
-        )
-        .await?;
-
-        let unique: HashSet<NodeId> = destinations.iter().cloned().collect();
-        let expected: HashSet<NodeId> = [peer_a, peer_b].into_iter().map(NodeId::from).collect();
-
-        assert_eq!(unique, expected, "probes should cover all known graph peers");
-        assert_eq!(destinations.len(), 4, "should have probes across multiple rounds");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn single_tick_should_emit_all_peers_in_burst() -> anyhow::Result<()> {
-        let me = random_key();
-        let graph = Arc::new(ChannelGraph::new(me));
-
-        let peer_count = RANDOM_PEERS.len();
-        for node in RANDOM_PEERS.iter() {
-            graph.record_node(node.clone());
-        }
-
-        let prober = FullNetworkDiscovery::new(me, fast_cfg(), graph);
-        let stream = ProbingTrafficGeneration::build(&prober);
-        pin_mut!(stream);
-
-        // Collect exactly peer_count items — should all arrive from a single tick burst.
-        let burst: Vec<ProbeRouting> = timeout(TINY_TIMEOUT * 20, stream.take(peer_count).collect::<Vec<_>>()).await?;
-
-        assert_eq!(
-            burst.len(),
-            peer_count,
-            "a single tick should emit all {peer_count} peers"
-        );
-        assert!(
-            burst.iter().all(|r| matches!(r, ProbeRouting::Neighbor(_))),
-            "all burst items should be Neighbor probes"
-        );
-
-        Ok(())
-    }
-
-    /// Extract `NodeId` destinations from a `ProbeRouting::Neighbor` stream.
-    fn neighbor_destinations(stream: impl futures::Stream<Item = ProbeRouting>) -> impl futures::Stream<Item = NodeId> {
-        stream.filter_map(|r| {
-            futures::future::ready(match r {
-                ProbeRouting::Neighbor(DestinationRouting::Forward { destination, .. }) => Some(*destination),
-                _ => None,
-            })
-        })
-    }
-
-    /// Helper: mark an edge as fully connected with capacity, so it passes all cost checks.
-    fn mark_edge_ready(graph: &ChannelGraph, src: &OffchainPublicKey, dst: &OffchainPublicKey) {
-        use hopr_api::graph::traits::{EdgeObservableWrite, EdgeWeightType};
-        graph.upsert_edge(src, dst, |obs| {
-            obs.record(EdgeWeightType::Connected(true));
-            obs.record(EdgeWeightType::Immediate(Ok(std::time::Duration::from_millis(50))));
-            obs.record(EdgeWeightType::Balance(Some(hopr_api::graph::traits::Balance::from(
-                1000u64,
-            ))));
-        });
-    }
-
-    #[tokio::test]
-    async fn loopback_probes_should_be_emitted_for_two_edge_path() -> anyhow::Result<()> {
+    async fn loopback_probes_should_be_emitted_for_a_two_edge_path() -> anyhow::Result<()> {
         // Topology: me → a → b, b → me (connected neighbor)
         // Loopback: me → a → b → me
         let me = random_key();
@@ -665,148 +1765,27 @@ mod tests {
         graph.add_node(a);
         graph.add_node(b);
 
-        // Forward edges
-        graph.add_edge(&me, &a)?;
-        graph.add_edge(&a, &b)?;
-        mark_edge_ready(&graph, &me, &a);
-        mark_edge_ready(&graph, &a, &b);
-
-        // Return edge: b is a connected neighbor of me
-        graph.add_edge(&b, &me)?;
-        mark_edge_ready(&graph, &b, &me);
-
-        // Also need me → b edge so simple_loopback_to_self finds b as a connected neighbor
-        graph.add_edge(&me, &b)?;
-        mark_edge_ready(&graph, &me, &b);
+        for (src, dst) in [(me, a), (a, b), (b, me), (me, b)] {
+            graph.add_edge(&src, &dst)?;
+            mark_edge_ready(&graph, &src, &dst);
+        }
 
         let prober = FullNetworkDiscovery::new(me, fast_cfg(), graph);
         let stream = ProbingTrafficGeneration::build(&prober);
         pin_mut!(stream);
 
-        // Collect enough items to get both neighbor and loopback probes
-        let items: Vec<ProbeRouting> = timeout(TINY_TIMEOUT * 100, stream.take(20).collect::<Vec<_>>()).await?;
+        let offered = loopbacks(&mut stream, 1).await?;
 
-        let looping_count = items.iter().filter(|r| matches!(r, ProbeRouting::Looping(_))).count();
-        let neighbor_count = items.iter().filter(|r| matches!(r, ProbeRouting::Neighbor(_))).count();
-
-        assert!(neighbor_count > 0, "should have neighbor probes");
-        assert!(
-            looping_count > 0,
-            "should have loopback probes (was {looping_count} out of {} total)",
-            items.len()
-        );
-
-        // Verify loopback routing has IntermediatePath
-        for item in &items {
-            if let ProbeRouting::Looping((
-                DestinationRouting::Forward {
-                    destination,
-                    forward_options,
-                    ..
-                },
-                _,
-            )) = item
-            {
-                assert_eq!(
-                    destination.as_ref(),
-                    &NodeId::Offchain(me),
-                    "loopback destination should be me"
-                );
-                assert!(
-                    matches!(forward_options, RoutingOptions::IntermediatePath(_)),
-                    "loopback should use IntermediatePath routing"
-                );
-            }
-        }
-
+        assert_eq!(offered[0], vec![a, b], "the only loop is me → a → b → me");
         Ok(())
-    }
-
-    /// `me → a → {b, c} → me`: two 2-relay loops that differ only in their last relay.
-    fn two_loops() -> anyhow::Result<(
-        OffchainPublicKey,
-        OffchainPublicKey,
-        OffchainPublicKey,
-        Arc<ChannelGraph>,
-    )> {
-        let (me, a, b, c) = (random_key(), random_key(), random_key(), random_key());
-        let graph = Arc::new(ChannelGraph::new(me));
-        for node in [a, b, c] {
-            graph.add_node(node);
-        }
-        for (src, dst) in [(me, a), (a, b), (a, c), (b, me), (c, me)] {
-            graph.add_edge(&src, &dst)?;
-            mark_edge_ready(&graph, &src, &dst);
-        }
-        Ok((me, b, c, graph))
-    }
-
-    /// First relay of a two-relay loopback probe.
-    fn two_relay_loop_head(routing: &ProbeRouting) -> Option<OffchainPublicKey> {
-        match routing {
-            ProbeRouting::Looping((
-                DestinationRouting::Forward {
-                    forward_options: RoutingOptions::IntermediatePath(path),
-                    ..
-                },
-                _,
-            )) => match path.as_ref() {
-                [NodeId::Offchain(head), _] => Some(*head),
-                _ => None,
-            },
-            _ => None,
-        }
-    }
-
-    /// Exit `f` with a forward loop (`a`), a return loop (`f` itself) and an unrelated loop (`c`).
-    ///
-    /// Each two-relay loop is named by its first relay: `me→a→x→me` (forward, as `a→f`), `me→f→y→me`
-    /// (return) and `me→c→z→me`. Returns `(me, f, a, c, graph)`.
-    #[allow(clippy::type_complexity)]
-    fn focus_network() -> anyhow::Result<(
-        OffchainPublicKey,
-        OffchainPublicKey,
-        OffchainPublicKey,
-        OffchainPublicKey,
-        Arc<ChannelGraph>,
-    )> {
-        let (me, a, x, f, y, c, z) = (
-            random_key(),
-            random_key(),
-            random_key(),
-            random_key(),
-            random_key(),
-            random_key(),
-            random_key(),
-        );
-        let graph = Arc::new(ChannelGraph::new(me));
-        for node in [a, x, f, y, c, z] {
-            graph.add_node(node);
-        }
-        for (src, dst) in [
-            (me, a),
-            (a, x),
-            (x, me),
-            (a, f),
-            (me, f),
-            (f, y),
-            (y, me),
-            (me, c),
-            (c, z),
-            (z, me),
-        ] {
-            graph.add_edge(&src, &dst)?;
-            mark_edge_ready(&graph, &src, &dst);
-        }
-        Ok((me, f, a, c, graph))
     }
 
     #[tokio::test]
     async fn no_loopback_probes_should_be_emitted_without_outgoing_channels() -> anyhow::Result<()> {
         use hopr_api::graph::traits::{EdgeObservableWrite, EdgeWeightType};
 
-        // `me → a → x → me` with `a → f` focused, and `me → f → y → me`. The relays fund their channels,
-        // but `me` has none: its edges are only connected and pinged.
+        // `me → a → x → me` with `a → f` focused, and `me → f → y → me`. The relays fund their
+        // channels, but `me` has none: its edges are only connected and pinged.
         let (me, a, x, f, y) = (random_key(), random_key(), random_key(), random_key(), random_key());
         let graph = Arc::new(ChannelGraph::new(me));
         for node in [a, x, f, y] {
@@ -817,7 +1796,7 @@ mod tests {
             if src == me {
                 graph.upsert_edge(&src, &dst, |obs| {
                     obs.record(EdgeWeightType::Connected(true));
-                    obs.record(EdgeWeightType::Immediate(Ok(std::time::Duration::from_millis(50))));
+                    obs.record(EdgeWeightType::Immediate(Ok(Duration::from_millis(50))));
                 });
             } else {
                 mark_edge_ready(&graph, &src, &dst);
@@ -828,7 +1807,15 @@ mod tests {
         let stream = ProbingTrafficGeneration::build(&prober);
         pin_mut!(stream);
 
-        let items: Vec<ProbeRouting> = timeout(TINY_TIMEOUT * 100, stream.take(60).collect::<Vec<_>>()).await?;
+        // The two relays are sampled out and then left alone, so the stream goes quiet instead of
+        // offering a loopback that could never be delivered.
+        let mut items = Vec::new();
+        while let Ok(Some(item)) = timeout(TINY_TIMEOUT * 10, stream.next()).await {
+            items.push(item);
+            if items.len() > 60 {
+                break;
+            }
+        }
 
         assert!(!items.is_empty(), "neighbours should still be probed");
         assert!(
@@ -838,101 +1825,10 @@ mod tests {
         Ok(())
     }
 
-    /// Number of items `stream` yields within `window`.
-    async fn emitted_within(stream: impl futures::Stream<Item = ProbeRouting>, window: std::time::Duration) -> usize {
-        pin_mut!(stream);
-        let deadline = tokio::time::Instant::now() + window;
-        let mut count = 0;
-        while let Ok(Some(_)) = tokio::time::timeout_at(deadline, stream.next()).await {
-            count += 1;
-        }
-        count
-    }
-
-    /// First relay of the loop that leads each round of three two-relay loops, over `rounds` rounds.
-    async fn round_leaders(
-        stream: &mut (impl futures::Stream<Item = ProbeRouting> + Unpin),
-        rounds: usize,
-    ) -> anyhow::Result<Vec<OffchainPublicKey>> {
-        let loops: Vec<OffchainPublicKey> = timeout(
-            TINY_TIMEOUT * 150,
-            stream
-                .filter_map(|r| futures::future::ready(two_relay_loop_head(&r)))
-                .take(rounds * 3)
-                .collect::<Vec<_>>(),
-        )
-        .await?;
-        Ok(loops.into_iter().step_by(3).collect())
-    }
-
-    fn share(leaders: &[OffchainPublicKey], head: &OffchainPublicKey) -> f64 {
-        leaders.iter().filter(|key| *key == head).count() as f64 / leaders.len() as f64
-    }
-
-    #[tokio::test]
-    async fn probing_should_stay_pending_when_level_is_off_and_resume_when_raised() -> anyhow::Result<()> {
-        let (me, _, _, graph) = two_loops()?;
-        let prober = FullNetworkDiscovery::new(me, fast_cfg(), graph);
-        let control = prober.control();
-        control.set_level(None);
-        let stream = ProbingTrafficGeneration::build(&prober);
-        pin_mut!(stream);
-
-        assert!(
-            timeout(TINY_TIMEOUT * 5, stream.next()).await.is_err(),
-            "no probe may be emitted while off"
-        );
-
-        control.set_level(Some(ProbingLevel::High));
-
-        assert!(
-            timeout(TINY_TIMEOUT * 50, stream.next()).await?.is_some(),
-            "the running stream must resume without being rebuilt"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn probing_should_stop_when_level_is_lowered_to_off_on_a_running_stream() -> anyhow::Result<()> {
-        let (me, _, _, graph) = two_loops()?;
-        let prober = FullNetworkDiscovery::new(me, fast_cfg(), graph);
-        let control = prober.control();
-        let stream = ProbingTrafficGeneration::build(&prober);
-        pin_mut!(stream);
-        assert!(timeout(TINY_TIMEOUT * 50, stream.next()).await?.is_some());
-
-        control.set_level(None);
-        // Drain what the round in flight already produced.
-        while timeout(TINY_TIMEOUT, stream.next()).await.is_ok() {}
-
-        assert!(timeout(TINY_TIMEOUT * 5, stream.next()).await.is_err());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn low_level_should_emit_far_fewer_probes_than_high() -> anyhow::Result<()> {
-        let window = std::time::Duration::from_millis(300);
-        let mut counts = Vec::new();
-
-        for level in [ProbingLevel::High, ProbingLevel::Low].map(Some) {
-            let me = random_key();
-            let graph = Arc::new(ChannelGraph::new(me));
-            graph.record_node(random_key());
-            let prober = FullNetworkDiscovery::new(me, fast_cfg(), graph);
-            prober.control().set_level(level);
-            counts.push(emitted_within(ProbingTrafficGeneration::build(&prober), window).await);
-        }
-
-        let (high, low) = (counts[0], counts[1]);
-        assert!(low > 0, "low must still probe");
-        assert!(low * 3 < high, "low ({low}) should be far below high ({high})");
-        Ok(())
-    }
-
     #[cfg(feature = "noise")]
     #[tokio::test]
     async fn cover_traffic_should_stay_pending_until_noise_is_switched_on() -> anyhow::Result<()> {
-        let (me, _, _, graph) = two_loops()?;
+        let (me, _, _, _, graph) = two_loops()?;
         let prober = FullNetworkDiscovery::new(me, fast_cfg(), graph);
         let stream = CoverTrafficGeneration::build(&prober);
         pin_mut!(stream);
@@ -948,24 +1844,21 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "noise")]
+    #[cfg(not(feature = "noise"))]
     #[tokio::test]
-    async fn cover_traffic_should_ignore_the_probing_level() -> anyhow::Result<()> {
-        let (me, _, _, graph) = two_loops()?;
-        let prober = FullNetworkDiscovery::new(me, fast_cfg(), graph);
-        let control = prober.control();
-        control.set_noise(true);
-        control.set_level(None);
+    async fn cover_traffic_should_produce_empty_stream() -> anyhow::Result<()> {
+        let me = random_key();
+        let prober = FullNetworkDiscovery::new(me, fast_cfg(), Arc::new(ChannelGraph::new(me)));
         let stream = CoverTrafficGeneration::build(&prober);
         pin_mut!(stream);
 
-        assert!(timeout(TINY_TIMEOUT * 50, stream.next()).await?.is_some());
+        assert!(timeout(TINY_TIMEOUT, stream.next()).await?.is_none());
         Ok(())
     }
 
     #[tokio::test]
     async fn probing_should_not_depend_on_the_noise_switch() -> anyhow::Result<()> {
-        let (me, _, _, graph) = two_loops()?;
+        let (me, _, _, _, graph) = two_loops()?;
         let prober = FullNetworkDiscovery::new(me, fast_cfg(), graph);
         let stream = ProbingTrafficGeneration::build(&prober);
         pin_mut!(stream);
@@ -976,109 +1869,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unfocused_probing_should_not_favour_any_loop() -> anyhow::Result<()> {
-        let (me, _, _, c, graph) = focus_network()?;
+    async fn a_focus_should_spend_the_best_share_on_the_exits() -> anyhow::Result<()> {
+        let (me, exits, unrelated, graph) = focus_topology()?;
         let prober = FullNetworkDiscovery::new(me, fast_cfg(), graph);
+        prober.control().set_focus(exits.clone());
         let stream = ProbingTrafficGeneration::build(&prober);
         pin_mut!(stream);
 
-        let leaders = round_leaders(&mut stream, 200).await?;
+        // A pass holds nine focused loops and one unrelated loop, in the configured 90/10 split.
+        let offered = loopbacks(&mut stream, exits.len() + 1).await?;
 
-        // Three equal loops: each leads about a third of the rounds.
-        let unrelated = share(&leaders, &c);
-        assert!(
-            (0.2..0.5).contains(&unrelated),
-            "the unrelated loop led {unrelated} of rounds"
-        );
-        Ok(())
-    }
+        let focused = offered
+            .iter()
+            .filter(|path| path.iter().any(|relay| exits.contains(relay)))
+            .count();
+        let explored = offered.iter().filter(|path| path.contains(&unrelated)).count();
 
-    #[tokio::test]
-    async fn focus_should_lead_rounds_with_forward_loops_then_return_loops_then_the_rest() -> anyhow::Result<()> {
-        let (me, f, a, c, graph) = focus_network()?;
-        let prober = FullNetworkDiscovery::new(me, fast_cfg(), graph);
-        prober.control().set_focus([f]);
-        let stream = ProbingTrafficGeneration::build(&prober);
-        pin_mut!(stream);
-
-        let leaders = round_leaders(&mut stream, 300).await?;
-        let (forward, returning, unrelated) = (share(&leaders, &a), share(&leaders, &f), share(&leaders, &c));
-
-        // Weights 3.0 (forward, boost 10), 1.5 (return, half of it) and 0.3: about 62%, 31% and 6% of rounds.
-        assert!(
-            forward > returning,
-            "forward {forward} must lead more often than return {returning}"
-        );
-        assert!(
-            returning > unrelated,
-            "return {returning} must lead more often than the rest {unrelated}"
-        );
-        assert!(unrelated > 0.0, "the rest of the network must still be probed");
-        assert!(unrelated < 0.2, "the unrelated loop led {unrelated} of rounds");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn focus_should_still_lead_rounds_when_the_base_priority_is_zero() -> anyhow::Result<()> {
-        let (me, f, a, c, graph) = focus_network()?;
-        let cfg = EgressConfig {
-            base_priority: 0.0,
-            ..fast_cfg()
-        };
-        let prober = FullNetworkDiscovery::new(me, cfg, graph);
-        prober.control().set_focus([f]);
-        let stream = ProbingTrafficGeneration::build(&prober);
-        pin_mut!(stream);
-
-        let leaders = round_leaders(&mut stream, 300).await?;
-        let (forward, unrelated) = (share(&leaders, &a), share(&leaders, &c));
-
-        // A zero base scales every boost to zero, so all weights tie. The focused loops are listed first
-        // and the focus still leads the rounds.
-        assert!(
-            forward > unrelated,
-            "forward {forward} must lead more often than the rest {unrelated}"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn focus_set_on_a_running_stream_should_take_effect_and_clear_again() -> anyhow::Result<()> {
-        let (me, f, _, c, graph) = focus_network()?;
-        let prober = FullNetworkDiscovery::new(me, fast_cfg(), graph);
-        let control = prober.control();
-        let stream = ProbingTrafficGeneration::build(&prober);
-        pin_mut!(stream);
-
-        control.set_focus([f]);
-        // Skip rounds computed before the update was seen.
-        round_leaders(&mut stream, 5).await?;
-        let focused = round_leaders(&mut stream, 200).await?;
-        assert!(share(&focused, &c) < 0.2, "focus must demote the unrelated loop");
-
-        control.clear_focus();
-        round_leaders(&mut stream, 5).await?;
-        let cleared = round_leaders(&mut stream, 200).await?;
-        assert!(
-            share(&cleared, &c) > 0.2,
-            "clearing the focus must restore even treatment"
-        );
+        assert_eq!(focused, exits.len(), "every focused loop must be measured in the pass");
+        assert_eq!(explored, 1, "the unrelated loop must keep its exploration share");
         Ok(())
     }
 
     #[tokio::test]
     async fn focus_on_an_unknown_exit_should_leave_default_probing_intact() -> anyhow::Result<()> {
-        let (me, _, _, c, graph) = focus_network()?;
+        let (me, _, b, c, graph) = two_loops()?;
         let prober = FullNetworkDiscovery::new(me, fast_cfg(), graph);
         prober.control().set_focus([random_key()]);
         let stream = ProbingTrafficGeneration::build(&prober);
         pin_mut!(stream);
 
-        let leaders = round_leaders(&mut stream, 200).await?;
+        let offered = loopbacks(&mut stream, 6).await?;
+        let heads: HashSet<_> = offered.iter().filter_map(|path| path.last().copied()).collect();
 
-        assert_eq!(leaders.len(), 200, "default loops must keep flowing");
         assert!(
-            share(&leaders, &c) > 0.2,
+            heads.contains(&b) && heads.contains(&c),
             "an unknown exit must not skew the default sample"
         );
         Ok(())
@@ -1138,7 +1962,6 @@ mod tests {
 
         mark_edge_ready(&graph, &me, &connected_peer);
 
-        // Default: probe_connected_only = false
         let prober = FullNetworkDiscovery::new(me, fast_cfg(), graph);
         let stream = ProbingTrafficGeneration::build(&prober);
         pin_mut!(stream);
@@ -1161,10 +1984,10 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn loopback_routing_should_reject_full_path_with_me() -> anyhow::Result<()> {
+    #[test]
+    fn loopback_routing_should_reject_full_path_with_me() -> anyhow::Result<()> {
         // Verify that loopback_routing rejects paths that are too long for BoundedVec.
-        // simple_loopback_to_self now returns [a, b, me] (no leading me); after
+        // simple_loopback_to_self returns [a, b, me] (no leading me); after
         // strip_loopback_endpoints this becomes [a, b], which is the correct input.
         let me = random_key();
         let a = random_key();
@@ -1183,9 +2006,8 @@ mod tests {
         let stripped_path = vec![a, b];
         assert!(
             loopback_routing(me_node, stripped_path).is_some(),
-            "stripped path [a, b] should fit BoundedVec<3> and return Some"
+            "intermediates-only path should be routable"
         );
-
         Ok(())
     }
 }
