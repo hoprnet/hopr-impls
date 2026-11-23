@@ -80,9 +80,6 @@ const SUBSCRIPTION_HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 /// long a channel missed by the subscription stays wrong, while the load stays negligible next to the subscriptions.
 const CHANNEL_RECONCILE_INTERVAL: Duration = Duration::from_mins(5);
 
-/// Upper bound for one reconciliation pass, so a slow Blokli cannot hold up the subscription handling for long.
-const CHANNEL_RECONCILE_TIMEOUT: Duration = Duration::from_secs(60);
-
 /// How often the chain state gauges are refreshed. Independent of the state dump interval.
 #[cfg(feature = "telemetry")]
 const CHAIN_GAUGE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
@@ -549,6 +546,7 @@ where
             channel_by_parties: self.channel_by_parties.clone(),
             event_tx: self.events.0.clone(),
             me,
+            in_flight: Default::default(),
         });
         // Fires once the connection is ready, which starts the first reconciliation.
         let (first_reconcile_tx, first_reconcile_rx) = futures::channel::oneshot::channel::<()>();
@@ -728,20 +726,22 @@ where
                     let channel_by_id = channel_by_id.clone();
                     let channel_by_parties = channel_by_parties.clone();
                     hopr_utils::runtime::prelude::spawn_blocking(move || {
-                        graph.write().add_edge(src.key_id, dst.key_id, *channel.get_id());
-                        backend
-                            .insert_channel(channel)
-                            .map(|old| (channel, old.map(|old| old.diff(&channel))))
+                        reconcile::upsert_channel(
+                            backend.as_ref(),
+                            &graph,
+                            &channel_by_id,
+                            &channel_by_parties,
+                            (src.key_id, dst.key_id),
+                            channel,
+                            false,
+                        )
+                        .map(|upsert| match upsert {
+                            reconcile::Upsert::Written(old) => (channel, old.map(|old| old.diff(&channel))),
+                            reconcile::Upsert::Skipped => (channel, None),
+                        })
                     })
                     .map_err(ConnectorError::backend)
-                    .and_then(move |res| {
-                        let channel_by_id = channel_by_id.clone();
-                        let channel_by_parties = channel_by_parties.clone();
-                        if let Ok((upserted_channel, _)) = &res {
-                            // Rather update the cached entry than invalidating it
-                            channel_by_id.insert(*upserted_channel.get_id(), Some(*upserted_channel));
-                            channel_by_parties.insert(ChannelParties::from(upserted_channel), Some(*upserted_channel));
-                        }
+                    .and_then(|res| {
                         futures::future::ready(res.map(SubscribedEventType::Channel).map_err(ConnectorError::backend))
                     })
                 })
@@ -1030,15 +1030,7 @@ where
                         }
                         Ok(SubscribedEventType::HealthCheck) => {}
                         Ok(SubscribedEventType::ReconcileChannels) => {
-                            match reconciler
-                                .reconcile()
-                                .timeout(futures_time::time::Duration::from(CHANNEL_RECONCILE_TIMEOUT))
-                                .await
-                            {
-                                Ok(Ok(stats)) => tracing::debug!(?stats, "own channels reconciled"),
-                                Ok(Err(error)) => tracing::warn!(%error, "own channel reconciliation failed"),
-                                Err(_) => tracing::warn!("own channel reconciliation timed out"),
-                            }
+                            reconciler.spawn_pass();
                         }
                         #[cfg(feature = "telemetry")]
                         Ok(SubscribedEventType::MetricsRefresh) => {}
