@@ -7,7 +7,10 @@
 //! - an entry fails conversion: it was handed out and is gone, so the channel stays unknown or keeps an old state;
 //! - the stream ends: nothing feeds the channel view any more.
 //!
-//! Starts are paced by [`resync_delay`], so an entry that fails in every snapshot does not turn into a busy loop.
+//! Starts are paced by [`resync_delay`], so a stream that keeps ending does not turn into a busy loop. A restart
+//! replays the state of every subscription that shares the client's connection, not just the graph. So an entry
+//! causes at most one restart: if it fails again after that, Blokli serves malformed data for it, a restart cannot fix
+//! that, and it is only logged until the entry converts.
 //!
 //! A snapshot holds only channels that are not closed, so a channel that closed while no update was received is
 //! missing from it and nothing says so. Blokli sets the cursor on the last entry of a snapshot and on no other entry
@@ -54,6 +57,20 @@ pub(crate) fn resync_delay(restarts: u32) -> Duration {
     }
 }
 
+/// Whether a failed conversion of the channel `id` is worth a restart of the subscription.
+///
+/// A restart is worth it the first time an entry fails: the failure may come from an entry that is not served this
+/// way any more. If the same channel fails again after a restart, restarting again would change nothing. The channel
+/// stays on the list until it converts, which [`conversion_succeeded`] records.
+fn restart_after_failed_conversion(failed: &mut HashSet<String>, id: &str) -> bool {
+    failed.insert(id.to_owned())
+}
+
+/// Takes a channel off the list of failed conversions, so a later failure restarts the subscription once more.
+fn conversion_succeeded(failed: &mut HashSet<String>, id: &str) {
+    failed.remove(id);
+}
+
 /// An entry of the graph subscription, converted.
 pub(crate) type GraphItem = (AccountEntry, AccountEntry, ChannelEntry);
 
@@ -84,6 +101,8 @@ struct State<'a, C> {
     snapshot: HashSet<ChannelId>,
     /// An update that is yielded before the next entry is read.
     queued: Option<GraphUpdate>,
+    /// Channels whose entry failed conversion and caused a restart, and that have not converted since.
+    failed_conversions: HashSet<String>,
 }
 
 impl<C> State<'_, C> {
@@ -125,6 +144,7 @@ where
         in_snapshot: true,
         snapshot: HashSet::new(),
         queued: None,
+        failed_conversions: HashSet::new(),
     };
 
     futures::stream::unfold(state, |mut state| async move {
@@ -163,8 +183,10 @@ where
                 Some(Ok(entry)) => {
                     tracing::trace!(?entry, "new graph event");
                     let ends_snapshot = entry.cursor.is_some();
+                    let channel_id = entry.channel.concrete_channel_id.clone();
                     match model_to_graph_entry(entry) {
                         Ok(item) => {
+                            conversion_succeeded(&mut state.failed_conversions, &channel_id);
                             if state.in_snapshot {
                                 state.snapshot.insert(*item.2.get_id());
                                 if ends_snapshot {
@@ -176,8 +198,15 @@ where
                             return Some((Ok(GraphUpdate::Entry(item)), state));
                         }
                         Err(error) => {
-                            tracing::warn!(%error, "graph entry failed conversion, restarting the graph subscription");
-                            state.restart();
+                            if restart_after_failed_conversion(&mut state.failed_conversions, &channel_id) {
+                                tracing::warn!(%error, %channel_id, "graph entry failed conversion, restarting the graph subscription");
+                                state.restart();
+                            } else {
+                                tracing::error!(
+                                    %error, %channel_id,
+                                    "graph entry fails conversion again after a restart, blokli serves it malformed"
+                                );
+                            }
                             return Some((Err(error), state));
                         }
                     }
@@ -203,6 +232,23 @@ mod tests {
         assert_eq!(Duration::from_secs(5), resync_delay(2));
         assert_eq!(Duration::from_secs(10), resync_delay(3));
         assert_eq!(Duration::from_secs(20), resync_delay(4));
+    }
+
+    #[test]
+    fn a_channel_that_fails_again_after_a_restart_does_not_restart_the_subscription_again() {
+        let mut failed = HashSet::new();
+        assert!(restart_after_failed_conversion(&mut failed, "0xaa"));
+        assert!(!restart_after_failed_conversion(&mut failed, "0xaa"));
+        // another channel still gets its restart
+        assert!(restart_after_failed_conversion(&mut failed, "0xbb"));
+    }
+
+    #[test]
+    fn a_channel_that_converted_in_between_gets_a_restart_again() {
+        let mut failed = HashSet::new();
+        assert!(restart_after_failed_conversion(&mut failed, "0xaa"));
+        conversion_succeeded(&mut failed, "0xaa");
+        assert!(restart_after_failed_conversion(&mut failed, "0xaa"));
     }
 
     #[test]
