@@ -95,10 +95,10 @@ pub(crate) fn upsert_channel<B: Backend>(
                     .get(&parties)
                     .is_some_and(|cached| cached != Some(old));
                 if stale_by_id {
-                    channel_by_id.insert(*old.get_id(), Some(old));
+                    super::cache::put(channel_by_id, old.get_id(), old);
                 }
                 if stale_by_parties {
-                    channel_by_parties.insert(parties, Some(old));
+                    super::cache::put(channel_by_parties, &parties, old);
                 }
                 return Ok(Upsert::Skipped {
                     cache_repaired: stale_by_id || stale_by_parties,
@@ -110,8 +110,8 @@ pub(crate) fn upsert_channel<B: Backend>(
     graph.add_edge(src, dst, *channel.get_id());
     let old = backend.insert_channel(channel)?;
     // Rather update the cached entries than invalidating them, which also replaces a cached `None`.
-    channel_by_id.insert(*channel.get_id(), Some(channel));
-    channel_by_parties.insert(ChannelParties::from(&channel), Some(channel));
+    super::cache::put(channel_by_id, channel.get_id(), channel);
+    super::cache::put(channel_by_parties, &ChannelParties::from(&channel), channel);
     Ok(Upsert::Written(old))
 }
 
