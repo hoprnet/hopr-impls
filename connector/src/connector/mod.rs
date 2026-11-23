@@ -678,10 +678,10 @@ where
                         accounts::update_announced(&announced, &account, old.as_ref(), &me);
                         if let Some(old_account) = &old {
                             if old_account.chain_addr != account.chain_addr {
-                                chain_to_packet.invalidate(&old_account.chain_addr);
+                                cache::invalidate(&chain_to_packet, &old_account.chain_addr);
                             }
                             if old_account.public_key != account.public_key {
-                                packet_to_chain.invalidate(&old_account.public_key);
+                                cache::invalidate(&packet_to_chain, &old_account.public_key);
                             }
                         }
                         Ok::<_, ConnectorError>((account, old))

@@ -35,7 +35,7 @@ where
     fn map_key_to_id(&self, key: &OffchainPublicKey) -> Option<HoprKeyIdent> {
         cache::get_or_load(&self.key_to_id, key, || {
             let start = std::time::Instant::now();
-            tracing::warn!(%key, "cache miss on map_key_to_id");
+            tracing::debug!(%key, "cache miss on map_key_to_id");
             let result = match self.backend.get_account_by_key(key) {
                 Ok(Some(account)) => Some(account.key_id),
                 Ok(None) => None,
@@ -58,7 +58,7 @@ where
     fn map_id_to_public(&self, id: &HoprKeyIdent) -> Option<OffchainPublicKey> {
         cache::get_or_load(&self.id_to_key, id, || {
             let start = std::time::Instant::now();
-            tracing::warn!(%id, "cache miss on map_id_to_public");
+            tracing::debug!(%id, "cache miss on map_id_to_public");
             let result = match self.backend.get_account_by_id(id) {
                 Ok(Some(account)) => Some(account.public_key),
                 Ok(None) => None,
@@ -94,7 +94,7 @@ where
         self.check_connection_state()?;
 
         cache::get_or_load(&self.chain_to_packet, chain, || {
-            tracing::warn!(%chain, "cache miss on chain_key_to_packet_key");
+            tracing::debug!(%chain, "cache miss on chain_key_to_packet_key");
             self.backend
                 .get_account_by_address(chain)
                 .map(|a| a.map(|ac| ac.public_key))
@@ -106,7 +106,7 @@ where
         self.check_connection_state()?;
 
         cache::get_or_load(&self.packet_to_chain, packet, || {
-            tracing::warn!(
+            tracing::debug!(
                 peer_id = packet.to_peerid_str(),
                 "cache miss on packet_key_to_chain_key"
             );

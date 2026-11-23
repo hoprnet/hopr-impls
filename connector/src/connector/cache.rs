@@ -58,3 +58,15 @@ where
 {
     cache.entry_by_ref(key).and_compute_with(|_| Op::Put(Some(value)));
 }
+
+/// Removes the key once any lookup that is loading it has finished. A plain `invalidate` does not wait for an in-flight
+/// computation (moka only locks the key on removal when a removal notifier is configured), so a lookup could write the
+/// removed value back afterwards.
+pub(crate) fn invalidate<K, V, S>(cache: &moka::sync::Cache<K, Option<V>, S>, key: &K)
+where
+    K: Hash + Eq + Clone + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+    cache.entry_by_ref(key).and_compute_with(|_| Op::Remove);
+}

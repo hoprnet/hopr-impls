@@ -303,3 +303,172 @@ async fn a_key_lookup_racing_the_account_subscription_must_not_leave_a_stale_val
 
     Ok(())
 }
+
+/// A lookup that read `Open` must not overwrite the `PendingToClose` the graph subscription stores while it is paused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lookup_racing_a_channel_update_must_not_overwrite_the_newer_state() -> anyhow::Result<()> {
+    let (account_1, account_2) = accounts()?;
+    let me_kp = ChainKeypair::from_secret(&PRIVATE_KEY_1)?;
+    let me = account_1.chain_addr;
+    let peer = account_2.chain_addr;
+    let channel_id = generate_channel_id(&me, &peer);
+
+    let client = BlokliTestStateBuilder::default()
+        .with_accounts([
+            (account_1, HoprBalance::new_base(100), XDaiBalance::new_base(1)),
+            (account_2, HoprBalance::new_base(100), XDaiBalance::new_base(1)),
+        ])
+        .with_hopr_network_chain_info("piz-palu-staging")
+        .build_dynamic_client(MODULE_ADDR.into());
+
+    let backend = GatedBackend::default();
+    let mut connector = HoprBlockchainConnector::new(
+        me_kp.clone(),
+        Default::default(),
+        client,
+        backend.clone(),
+        SafePayloadGenerator::new(
+            &me_kp,
+            contract_addresses_for_network("piz-palu-staging").unwrap().1,
+            MODULE_ADDR.into(),
+        ),
+    );
+    connector.connect().await?;
+    let connector = Arc::new(connector);
+
+    connector.open_channel(&peer, 10.into()).await?.await?;
+    eventually(Duration::from_secs(5), || {
+        backend.inner.get_channel_by_id(&channel_id).unwrap()
+    })
+    .await
+    .expect("the graph subscription stores the opened channel");
+    connector.invalidate_caches();
+
+    let (read_done_tx, read_done_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    *backend.gate.lock() = Some(Gate {
+        channel_id,
+        read_done: read_done_tx,
+        release: release_rx,
+    });
+
+    let lookup = {
+        let connector = connector.clone();
+        std::thread::spawn(move || connector.channel_by_parties(&me, &peer))
+    };
+    let read = read_done_rx
+        .recv_timeout(Duration::from_secs(5))?
+        .expect("open channel");
+    assert_eq!(read.status, ChannelStatus::Open);
+
+    connector.close_channel(&channel_id).await?.await?;
+    let closing = eventually(Duration::from_secs(5), || {
+        backend
+            .inner
+            .get_channel_by_id(&channel_id)
+            .unwrap()
+            .filter(|c| matches!(c.status, ChannelStatus::PendingToClose(_)))
+    })
+    .await
+    .expect("the graph subscription stores the closing channel");
+
+    release_tx.send(())?;
+    lookup.join().expect("lookup thread")?;
+
+    let is_closing = |c: Option<Option<ChannelEntry>>| c.flatten().map(|c| c.status) == Some(closing.status);
+    let settled = eventually(Duration::from_secs(5), || {
+        (is_closing(connector.channel_by_id.get(&channel_id))
+            && is_closing(connector.channel_by_parties.get(&ChannelParties::new(me, peer))))
+        .then_some(())
+    })
+    .await;
+    assert!(
+        settled.is_some(),
+        "the caches serve a stale state for a closing channel"
+    );
+
+    Ok(())
+}
+
+/// The old key an account update replaces is invalidated, and a lookup that is loading it must not write it back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_key_lookup_racing_a_packet_key_change_must_not_resurrect_the_old_key() -> anyhow::Result<()> {
+    let (account_1, _) = accounts()?;
+    let old_key = account_1.public_key;
+    let me_kp = ChainKeypair::from_secret(&PRIVATE_KEY_1)?;
+    let me = me_kp.public().to_address();
+    let new_offchain = OffchainKeypair::from_secret(&hex!(
+        "71bf1f42ebbfcd89c3e197a3fd7cda79b92499e509b6fefa0fe44d02821d146a"
+    ))?;
+    let new_key = *new_offchain.public();
+
+    let client = BlokliTestStateBuilder::default()
+        .with_accounts([(account_1, HoprBalance::new_base(100), XDaiBalance::new_base(1))])
+        .with_hopr_network_chain_info("piz-palu-staging")
+        .build_dynamic_client(MODULE_ADDR.into());
+
+    let backend = GatedBackend::default();
+    let mut connector = HoprBlockchainConnector::new(
+        me_kp.clone(),
+        Default::default(),
+        client,
+        backend.clone(),
+        SafePayloadGenerator::new(
+            &me_kp,
+            contract_addresses_for_network("piz-palu-staging").unwrap().1,
+            MODULE_ADDR.into(),
+        ),
+    );
+    connector.connect().await?;
+    let connector = Arc::new(connector);
+    connector.invalidate_caches();
+
+    let (read_done_tx, read_done_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    *backend.key_gate.lock() = Some(KeyGate {
+        read_done: read_done_tx,
+        release: release_rx,
+    });
+
+    // The lookup reads the account bound to the old key, then pauses.
+    let lookup = {
+        let connector = connector.clone();
+        std::thread::spawn(move || connector.packet_key_to_chain_key(&old_key))
+    };
+    assert_eq!(
+        read_done_rx.recv_timeout(Duration::from_secs(5))?.map(|a| a.chain_addr),
+        Some(me)
+    );
+
+    // The same chain account re-announces with another packet key.
+    // The test client only notifies about an account update when its multiaddresses change.
+    let addr: hopr_api::chain::Multiaddr = "/ip4/127.0.0.1/tcp/1234".parse()?;
+    connector.announce(&[addr], &new_offchain).await?.await?;
+    eventually(Duration::from_secs(5), || {
+        backend.inner.get_account_by_key(&new_key).unwrap()
+    })
+    .await
+    .expect("the account subscription stores the new key");
+
+    release_tx.send(())?;
+    lookup.join().expect("lookup thread")?;
+
+    // The new key gets cached by the handler; once the handler is done, the old key must be gone.
+    eventually(Duration::from_secs(5), || {
+        connector.packet_to_chain.get(&new_key).flatten()
+    })
+    .await
+    .expect("new key cached");
+    let gone = eventually(Duration::from_secs(2), || {
+        connector
+            .packet_to_chain
+            .get(&old_key)
+            .flatten()
+            .is_none()
+            .then_some(())
+    })
+    .await;
+    assert!(gone.is_some(), "the replaced packet key is still cached");
+
+    Ok(())
+}
