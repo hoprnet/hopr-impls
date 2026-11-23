@@ -129,7 +129,7 @@ where
         match self.prepare_ticket_redeem_payload(ticket).await {
             Ok(tx_req) => {
                 Ok(self
-                    .send_tx(tx_req, Some(TICKET_CUSTOM_TIMEOUT_MULTIPLIER), None)
+                    .send_tx(tx_req, Some(TICKET_CUSTOM_TIMEOUT_MULTIPLIER), None, "redeem_ticket")
                     .await
                     .map_err(|e| TicketRedeemError::ProcessingError(ticket.ticket, e))?
                     .map_err(move |tx_tracking_error|

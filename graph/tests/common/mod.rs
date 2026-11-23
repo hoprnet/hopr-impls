@@ -33,8 +33,8 @@ use hopr_api::{
     types::crypto::prelude::{Keypair, OffchainKeypair},
 };
 use hopr_network_graph::{
-    ChannelGraph, DEFAULT_EDGE_PENALTY, DEFAULT_MAX_PLAUSIBLE_LOOPBACK_RTT, DEFAULT_MIN_ACK_RATE, FocusRelevance,
-    FocusedLoopback, Observations,
+    ChannelGraph, ChannelGraphConfig, DEFAULT_EDGE_PENALTY, DEFAULT_MIN_ACK_RATE, FocusRelevance, FocusedLoopback,
+    Observations,
 };
 
 /// A whole network, as one JSON object.
@@ -181,8 +181,15 @@ impl Net {
         let min_ack_rate = scenario.min_ack_rate.unwrap_or(DEFAULT_MIN_ACK_RATE);
 
         let me_key = key_for(&scenario.me);
-        let graph =
-            ChannelGraph::with_edge_params(me_key, edge_penalty, min_ack_rate, DEFAULT_MAX_PLAUSIBLE_LOOPBACK_RTT);
+        let graph = ChannelGraph::with_config(
+            me_key,
+            ChannelGraphConfig {
+                edge_penalty,
+                min_ack_rate,
+                ..ChannelGraphConfig::default()
+            },
+        )
+        .map_err(anyhow::Error::msg)?;
 
         let mut by_name: HashMap<String, OffchainPublicKey> = HashMap::new();
         let mut by_key: HashMap<OffchainPublicKey, String> = HashMap::new();

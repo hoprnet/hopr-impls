@@ -24,17 +24,17 @@ edition      = "2024"
 homepage     = "https://hoprnet.org/"
 license      = "GPL-3.0-only"
 repository   = "https://github.com/hoprnet/hopr-impls"
-rust-version = "1.97"
+rust-version = "1.98"
 
 [workspace.dependencies]
 # In-repo crates (path + version so they are publishable)
-hopr-chain-connector = { path = "connector", version = "0.33.0" }
-hopr-network-graph   = { path = "graph", version = "0.12.1", default-features = false }
+hopr-chain-connector = { path = "connector", version = "0.35.0" }
+hopr-network-graph   = { path = "graph", version = "0.13.0", default-features = false }
 
 # External HOPR crates
-blokli-client = "0.37.0"
+blokli-client = "0.38.0"
 hopr-api      = "6.1.0"
-hopr-utils    = { package = "hopr-utilities", version = "0.20.0", default-features = false }
+hopr-utils    = { package = "hopr-utilities", version = "0.21.0", default-features = false }
 
 # Third-party dependencies (versions mirror hoprnet's workspace to preserve compatibility)
 ahash = "0.8.12"
@@ -103,3 +103,8 @@ tokio-retry = "0.3.2"
 tracing = { version = "0.1.44", features = ["release_max_level_debug"] }
 tracing-core = "0.1.36"
 validator = { version = "0.21.0", features = ["derive"] }
+
+# # Temporary: unreleased blokli-client#87 (unmined diagnosis). Replace with the released version before merging.
+# [patch.crates-io]
+# blokli-client  = { git = "https://github.com/hoprnet/blokli-client", branch = "agent/86-unmined-diagnosis" }
+# hopr-utilities = { git = "https://github.com/hoprnet/hopr-utilities", branch = "agent/blokli-client-0.38" }

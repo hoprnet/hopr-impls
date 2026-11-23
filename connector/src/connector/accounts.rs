@@ -147,11 +147,14 @@ where
     /// | a `Reverted` transaction, or [`ConnectorError::InnerTxFailed`] | [`SubmissionFailure::Reverted`] |
     /// | anything else (other RPC codes, timeouts, transport failures) | [`SubmissionFailure::Unknown`], as an earlier copy may be in the mempool |
     fn submission_failure(&self, error: &Self::Error) -> SubmissionFailure {
-        use blokli_client::errors::TrackingErrorKind;
+        use blokli_client::errors::{RefusalCode, TrackingErrorKind};
 
         let rejection = error.as_transaction_rejection_error();
         if error.is_refused_before_broadcast()
-            || matches!(error.rpc_rejection_code(), Some("FEE_TOO_LOW" | "INSUFFICIENT_FUNDS"))
+            || matches!(
+                error.refusal_code(),
+                Some(RefusalCode::FeeTooLow | RefusalCode::InsufficientFunds)
+            )
             || matches!(rejection, Some(TrackingErrorKind::ValidationFailed))
         {
             SubmissionFailure::NotSubmitted
@@ -209,7 +212,7 @@ where
             .map_err(AnnouncementError::processing)?;
 
         Ok(self
-            .send_tx(tx_req, None, None)
+            .send_tx(tx_req, None, None, "announce")
             .map_err(AnnouncementError::processing)
             .await?
             .boxed())
@@ -222,7 +225,7 @@ where
     ) -> Result<BoxFuture<'_, Result<ChainReceipt, Self::Error>>, Self::Error> {
         let tx_req = self.payload_generator.transfer(*recipient, balance)?;
 
-        Ok(self.send_tx(tx_req, None, None).await?.boxed())
+        Ok(self.send_tx(tx_req, None, None, "withdraw").await?.boxed())
     }
 
     async fn send_erc777(
@@ -233,7 +236,7 @@ where
     ) -> Result<BoxFuture<'_, Result<ChainReceipt, Self::Error>>, Self::Error> {
         let tx_req = self.payload_generator.send_erc777(*recipient, balance, payload)?;
 
-        Ok(self.send_tx(tx_req, None, None).await?.boxed())
+        Ok(self.send_tx(tx_req, None, None, "send_erc777").await?.boxed())
     }
 
     async fn withdraw_from_signer<Cy: Currency + Send>(
@@ -244,7 +247,10 @@ where
     ) -> Result<BoxFuture<'_, Result<ChainReceipt, Self::Error>>, Self::Error> {
         let tx_req = self.payload_generator.transfer(*recipient, balance)?;
 
-        Ok(self.send_tx(tx_req, None, Some(signer.clone())).await?.boxed())
+        Ok(self
+            .send_tx(tx_req, None, Some(signer.clone()), "withdraw_from_signer")
+            .await?
+            .boxed())
     }
 
     async fn register_safe(
@@ -294,7 +300,7 @@ where
             .map_err(SafeRegistrationError::processing)?;
 
         Ok(self
-            .send_tx(tx_req, None, None)
+            .send_tx(tx_req, None, None, "register_safe")
             .map_err(SafeRegistrationError::processing)
             .await?
             .boxed())
