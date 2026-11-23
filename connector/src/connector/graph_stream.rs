@@ -8,8 +8,14 @@
 //! - the stream ends: nothing feeds the channel view any more.
 //!
 //! Starts are paced by [`resync_delay`], so an entry that fails in every snapshot does not turn into a busy loop.
+//!
+//! A snapshot holds only channels that are not closed, so a channel that closed while no update was received is
+//! missing from it and nothing says so. Blokli sets the cursor on the last entry of a snapshot and on no other entry
+//! of it, which marks where the snapshot ends. The stream reports that point together with the channels the snapshot
+//! held, so the channels that the connector knows but the snapshot did not hold can be checked.
 
 use std::{
+    collections::HashSet,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -19,7 +25,10 @@ use blokli_client::{
     api::{BlokliSubscriptionClient, types::OpenedChannelsGraphEntry},
 };
 use futures::{Stream, StreamExt, stream::BoxStream};
-use hopr_api::chain::{AccountEntry, ChannelEntry};
+use hopr_api::{
+    chain::{AccountEntry, ChannelEntry},
+    types::internal::prelude::ChannelId,
+};
 
 use crate::{errors::ConnectorError, utils::model_to_graph_entry};
 
@@ -48,6 +57,18 @@ pub(crate) fn resync_delay(restarts: u32) -> Duration {
 /// An entry of the graph subscription, converted.
 pub(crate) type GraphItem = (AccountEntry, AccountEntry, ChannelEntry);
 
+/// What the graph subscription yields.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum GraphUpdate {
+    /// A converted entry.
+    Entry(GraphItem),
+    /// The snapshot a subscription started with has been delivered completely. Holds the ids of its channels.
+    ///
+    /// It is never sent for a snapshot that was cut short by a failing entry or the end of the stream, and not for a
+    /// snapshot without entries, which has no last entry to carry the cursor.
+    SnapshotComplete(HashSet<ChannelId>),
+}
+
 type RawGraphStream<'a> = BoxStream<'a, Result<OpenedChannelsGraphEntry, BlokliClientError>>;
 
 struct State<'a, C> {
@@ -57,12 +78,20 @@ struct State<'a, C> {
     stream: Option<RawGraphStream<'a>>,
     started: Instant,
     restarts: u32,
+    /// Whether the entries arriving now belong to the snapshot a subscription starts with.
+    in_snapshot: bool,
+    /// The channels of that snapshot so far.
+    snapshot: HashSet<ChannelId>,
+    /// An update that is yielded before the next entry is read.
+    queued: Option<GraphUpdate>,
 }
 
 impl<C> State<'_, C> {
     /// Drops the running subscription so the next poll starts a new one, and updates the pacing.
     fn restart(&mut self) {
         self.stream = None;
+        self.in_snapshot = true;
+        self.snapshot.clear();
         self.restarts = if self.started.elapsed() >= RESYNC_HEALTHY_AFTER {
             1
         } else {
@@ -82,7 +111,7 @@ pub(crate) fn resyncing_graph_stream<'a, C, S>(
     client: &'a C,
     first: S,
     health: Arc<parking_lot::Mutex<SubscriptionHealthHandle>>,
-) -> impl Stream<Item = Result<GraphItem, ConnectorError>> + Send + 'a
+) -> impl Stream<Item = Result<GraphUpdate, ConnectorError>> + Send + 'a
 where
     C: BlokliSubscriptionClient + Send + Sync,
     S: Stream<Item = Result<OpenedChannelsGraphEntry, BlokliClientError>> + Send + 'a,
@@ -93,10 +122,16 @@ where
         stream: Some(first.boxed()),
         started: Instant::now(),
         restarts: 0,
+        in_snapshot: true,
+        snapshot: HashSet::new(),
+        queued: None,
     };
 
     futures::stream::unfold(state, |mut state| async move {
         loop {
+            if let Some(update) = state.queued.take() {
+                return Some((Ok(update), state));
+            }
             let Some(stream) = state.stream.as_mut() else {
                 let delay = resync_delay(state.restarts);
                 if !delay.is_zero() {
@@ -113,6 +148,8 @@ where
                         *state.health.lock() = health;
                         state.stream = Some(stream.boxed());
                         state.started = Instant::now();
+                        state.in_snapshot = true;
+                        state.snapshot.clear();
                     }
                     Err(error) => {
                         state.restart();
@@ -125,8 +162,19 @@ where
             match stream.next().await {
                 Some(Ok(entry)) => {
                     tracing::trace!(?entry, "new graph event");
+                    let ends_snapshot = entry.cursor.is_some();
                     match model_to_graph_entry(entry) {
-                        Ok(item) => return Some((Ok(item), state)),
+                        Ok(item) => {
+                            if state.in_snapshot {
+                                state.snapshot.insert(*item.2.get_id());
+                                if ends_snapshot {
+                                    state.in_snapshot = false;
+                                    state.queued =
+                                        Some(GraphUpdate::SnapshotComplete(std::mem::take(&mut state.snapshot)));
+                                }
+                            }
+                            return Some((Ok(GraphUpdate::Entry(item)), state));
+                        }
                         Err(error) => {
                             tracing::warn!(%error, "graph entry failed conversion, restarting the graph subscription");
                             state.restart();

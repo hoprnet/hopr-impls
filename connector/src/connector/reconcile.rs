@@ -390,6 +390,102 @@ where
     }
 }
 
+/// What closing the channels missing from a snapshot did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SweepStats {
+    /// Known channels that are not closed and that the snapshot did not hold.
+    pub(crate) missing: usize,
+    /// Of those, the channels that were closed.
+    pub(crate) closed: usize,
+    /// Channels that could not be closed.
+    pub(crate) failed: usize,
+}
+
+impl<C, B> OwnChannelReconciler<C, B>
+where
+    C: BlokliQueryClient + Send + Sync + 'static,
+    B: Backend + Send + Sync + 'static,
+{
+    /// Starts closing the channels missing from a snapshot in the background.
+    ///
+    /// Like [`spawn_pass`](Self::spawn_pass), it runs in its own task so that it never holds up the handling of the
+    /// subscriptions.
+    pub(crate) fn spawn_sweep(self: &std::sync::Arc<Self>, snapshot: std::collections::HashSet<ChannelId>) {
+        let this = self.clone();
+        hopr_utils::runtime::prelude::spawn(async move {
+            match this.close_missing(&snapshot).await {
+                Ok(stats) if stats.failed > 0 => {
+                    tracing::warn!(?stats, "channels missing from a snapshot closed incompletely")
+                }
+                Ok(stats) => tracing::debug!(?stats, "channels missing from a snapshot closed"),
+                Err(error) => tracing::warn!(%error, "closing the channels missing from a snapshot failed"),
+            }
+        });
+    }
+
+    /// Closes every known channel that is not closed and that `snapshot` does not hold.
+    ///
+    /// A snapshot lists every channel that is not closed, so a channel it lacks closed while the subscription was
+    /// not delivering updates. A closed channel holds no balance, so it is closed with a zero balance and keeps its
+    /// epoch and ticket index. What differs is applied like a reconciliation row, with the events of the missed
+    /// update.
+    pub(crate) async fn close_missing(
+        &self,
+        snapshot: &std::collections::HashSet<ChannelId>,
+    ) -> Result<SweepStats, ConnectorError> {
+        let (backend, graph, snapshot) = (self.backend.clone(), self.graph.clone(), snapshot.clone());
+        let missing = hopr_utils::runtime::prelude::spawn_blocking(move || {
+            let edges = graph
+                .read()
+                .all_edges()
+                .filter(|(_, _, id)| !snapshot.contains(*id))
+                .map(|(src, dst, id)| ((src, dst), *id))
+                .collect::<Vec<_>>();
+            edges
+                .into_iter()
+                .filter_map(|(keys, id)| match backend.get_channel_by_id(&id) {
+                    Ok(Some(channel)) if !matches!(channel.status, ChannelStatus::Closed) => Some((keys, channel)),
+                    Ok(_) => None,
+                    Err(error) => {
+                        tracing::warn!(%error, %id, "backend error when looking up a channel missing from a snapshot");
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .map_err(ConnectorError::backend)?;
+
+        let mut stats = SweepStats {
+            missing: missing.len(),
+            ..Default::default()
+        };
+        for (keys, local) in missing {
+            let id = *local.get_id();
+            let closed = ChannelBuilder::default()
+                .between(local.source, local.destination)
+                .balance(HoprBalance::zero())
+                .ticket_index(local.ticket_index)
+                .status(ChannelStatus::Closed)
+                .epoch(local.channel_epoch)
+                .build();
+            let result = match closed {
+                Ok(channel) => self.apply(Fetched { channel, keys }).await,
+                Err(error) => Err(ConnectorError::from(error)),
+            };
+            match result {
+                Ok(Applied::Healed) => stats.closed += 1,
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(%error, %id, "failed to close a channel missing from a snapshot");
+                    stats.failed += 1;
+                }
+            }
+        }
+        Ok(stats)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use blokli_client::{
@@ -933,5 +1029,110 @@ mod tests {
         let flag = std::sync::atomic::AtomicBool::new(true);
         drop(InFlightGuard(&flag));
         assert!(!flag.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    /// Makes the channel known locally the way the subscription would have: stored, cached and in the graph.
+    fn seed_known(f: &Fixture, local: ChannelEntry, src: u32, dst: u32) {
+        seed(f, local);
+        f.reconciler
+            .graph
+            .write()
+            .add_edge(HoprKeyIdent::from(src), HoprKeyIdent::from(dst), *local.get_id());
+    }
+
+    fn closed_without_balance(src: &ChainKeypair, dst: &ChainKeypair) -> ChannelEntry {
+        ChannelEntry::builder()
+            .between(src, dst)
+            .amount(0)
+            .ticket_index(0)
+            .status(ChannelStatus::Closed)
+            .epoch(1)
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_sweep_should_close_channels_missing_from_the_snapshot() -> anyhow::Result<()> {
+        // Blokli is not asked: a snapshot lacking a channel is enough to know it closed, and a closed channel holds
+        // no balance.
+        let mut f = fixture(|_, _, _| vec![], true);
+        let own = channel(&f.me, &f.peer, ChannelStatus::Open);
+        // between two other nodes, and about to close
+        let foreign = channel(
+            &f.peer,
+            &f.other,
+            ChannelStatus::PendingToClose(std::time::SystemTime::UNIX_EPOCH),
+        );
+        seed_known(&f, own, 1, 2);
+        seed_known(&f, foreign, 2, 3);
+
+        let stats = f.reconciler.close_missing(&Default::default()).await?;
+
+        assert_eq!(
+            SweepStats {
+                missing: 2,
+                closed: 2,
+                failed: 0
+            },
+            stats
+        );
+        for (before, closed) in [
+            (own, closed_without_balance(&f.me, &f.peer)),
+            (foreign, closed_without_balance(&f.peer, &f.other)),
+        ] {
+            assert_eq!(Some(closed), f.reconciler.backend.get_channel_by_id(before.get_id())?);
+            assert_eq!(Some(Some(closed)), f.reconciler.channel_by_id.get(before.get_id()));
+            assert_eq!(
+                Some(Some(closed)),
+                f.reconciler.channel_by_parties.get(&ChannelParties::from(&before))
+            );
+        }
+        // each channel raises what its closure would have: the balance drops to zero and the channel closes
+        let (mut closed_events, mut decreased_events) = (0, 0);
+        while let Ok(event) = f.events.try_recv() {
+            match event {
+                ChainEvent::ChannelClosed(_) => closed_events += 1,
+                ChainEvent::ChannelBalanceDecreased(..) => decreased_events += 1,
+                other => anyhow::bail!("unexpected event {other}"),
+            }
+        }
+        assert_eq!((2, 2), (closed_events, decreased_events));
+
+        // a second sweep finds nothing: the channels are closed now
+        assert_eq!(
+            SweepStats::default(),
+            f.reconciler.close_missing(&Default::default()).await?
+        );
+        assert!(f.events.try_recv().is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_sweep_should_leave_channels_the_snapshot_held_alone() -> anyhow::Result<()> {
+        let mut f = fixture(|_, _, _| vec![], true);
+        let open = channel(&f.me, &f.peer, ChannelStatus::Open);
+        seed_known(&f, open, 1, 2);
+
+        let snapshot = std::collections::HashSet::from([*open.get_id()]);
+
+        assert_eq!(SweepStats::default(), f.reconciler.close_missing(&snapshot).await?);
+        assert_eq!(Some(open), f.reconciler.backend.get_channel_by_id(open.get_id())?);
+        assert!(f.events.try_recv().is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_sweep_should_skip_channels_that_are_closed_already() -> anyhow::Result<()> {
+        let mut f = fixture(|_, _, _| vec![], true);
+        let closed = channel(&f.me, &f.peer, ChannelStatus::Closed);
+        seed_known(&f, closed, 1, 2);
+
+        assert_eq!(
+            SweepStats::default(),
+            f.reconciler.close_missing(&Default::default()).await?
+        );
+        assert_eq!(Some(closed), f.reconciler.backend.get_channel_by_id(closed.get_id())?);
+        assert!(f.events.try_recv().is_err());
+        Ok(())
     }
 }

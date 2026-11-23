@@ -342,6 +342,16 @@ impl Harness {
     /// Like [`Harness::new`], with the connector running as the given node. Channels with that node as an endpoint
     /// are its own channels, which the connector also reconciles against blokli.
     async fn with_node_key(node_key: ChainKeypair) -> Self {
+        Self::build(node_key, channels(), |entries| entries.to_vec()).await
+    }
+
+    /// Builds the connector over a chain that holds `chain_channels`. `replay` chooses the snapshot that a later
+    /// subscription starts with, from the graph entries of the chain's channels.
+    async fn build(
+        node_key: ChainKeypair,
+        chain_channels: [ChannelEntry; 2],
+        replay: impl FnOnce(&[OpenedChannelsGraphEntry; 2]) -> Vec<OpenedChannelsGraphEntry>,
+    ) -> Self {
         let state_client = BlokliTestStateBuilder::default()
             .with_hopr_network_chain_info("anvil-localhost")
             .with_accounts(
@@ -349,7 +359,7 @@ impl Harness {
                     .into_iter()
                     .map(|a| (a, HoprBalance::zero(), XDaiBalance::zero())),
             )
-            .with_channels(channels())
+            .with_channels(chain_channels)
             .build_static_client();
 
         let entries: [OpenedChannelsGraphEntry; 2] = state_client
@@ -368,7 +378,7 @@ impl Harness {
             inner: state_client,
             graph: Mutex::new(Some(graph_rx)),
             graph_subscriptions: graph_subscriptions.clone(),
-            replay: entries.to_vec(),
+            replay: replay(&entries),
         };
 
         let cfg = BlockchainConnectorConfig {
@@ -578,4 +588,51 @@ async fn an_open_channel_that_closes_directly_emits_a_closed_event() {
         matches!(&event, Ok(Some(ChainEvent::ChannelClosed(channel))) if channel.get_id() == first.get_id()),
         "an Open channel became Closed directly and expected a ChannelClosed event, got {event:?}"
     );
+}
+
+/// A channel that closed while the connector received no updates is missing from the snapshot a new subscription
+/// starts with, and nothing says it closed. The connector must notice and close it.
+#[tokio::test]
+async fn a_channel_that_closed_during_a_gap_is_closed_after_the_snapshot_replay() {
+    let [_, second] = channels();
+    let closed_first = ChannelEntry::builder()
+        .between(&CHAIN_KEYS[0], &CHAIN_KEYS[1])
+        .amount(100)
+        .ticket_index(1)
+        .status(ChannelStatus::Closed)
+        .epoch(1)
+        .build()
+        .unwrap();
+
+    // Blokli sets the cursor on the last entry of a snapshot, which is how the end of one is recognized.
+    let snapshot_end = types::ChannelStatePosition {
+        block: types::Uint64("10".into()),
+        transaction_index: types::Uint64("0".into()),
+        log_index: types::Uint64("0".into()),
+    };
+    let mut harness = Harness::build(ChainKeypair::random(), [closed_first, second], |entries| {
+        // the snapshot holds only the channel that is still open
+        let mut last = entries[1].clone();
+        last.cursor = Some(snapshot_end);
+        vec![last]
+    })
+    .await;
+
+    // The connector learns both channels as open from the live stream.
+    let mut open_first = harness.entries[0].clone();
+    open_first.channel.status = ModelChannelStatus::Open;
+    harness.send(open_first);
+    harness.send(harness.entries[1].clone());
+    harness.connect().await;
+    harness
+        .wait_for_channel_state(&closed_first, |c| c.status == ChannelStatus::Open)
+        .await;
+
+    // The stream ends and the connector subscribes again, which starts with the snapshot.
+    harness.graph_tx.close_channel();
+
+    harness
+        .wait_for_channel_state(&closed_first, |c| c.status == ChannelStatus::Closed)
+        .await;
+    assert_eq!(2, harness.graph_subscriptions.load(Ordering::SeqCst));
 }

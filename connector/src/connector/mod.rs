@@ -569,6 +569,8 @@ where
         enum SubscribedEventType {
             Account((AccountEntry, Option<AccountEntry>)),
             Channel((ChannelEntry, Option<Vec<ChannelChange>>)),
+            /// The graph snapshot has been delivered completely. Holds the ids of the channels it contained.
+            SnapshotComplete(std::collections::HashSet<ChannelId>),
             WinningProbability((WinningProbability, Option<WinningProbability>)),
             TicketPrice((HoprBalance, Option<HoprBalance>)),
             /// A change of the service registry, already decoded into the event it stands for.
@@ -727,32 +729,39 @@ where
                 std::sync::Arc::new(parking_lot::Mutex::new(subscription_health[GRAPH_SUBSCRIPTION].clone()));
             let channel_stream =
                 graph_stream::resyncing_graph_stream(client.as_ref(), channel_stream, graph_health.clone())
-                    .and_then(move |(src, dst, channel)| {
-                        let graph = graph.clone();
-                        let backend = backend.clone();
-                        let channel_by_id = channel_by_id.clone();
-                        let channel_by_parties = channel_by_parties.clone();
-                        hopr_utils::runtime::prelude::spawn_blocking(move || {
-                            reconcile::upsert_channel(
-                                backend.as_ref(),
-                                &graph,
-                                &channel_by_id,
-                                &channel_by_parties,
-                                (src.key_id, dst.key_id),
-                                channel,
-                                false,
+                    .and_then(move |update| match update {
+                        graph_stream::GraphUpdate::SnapshotComplete(seen) => futures::future::Either::Left(
+                            futures::future::ready(Ok(SubscribedEventType::SnapshotComplete(seen))),
+                        ),
+                        graph_stream::GraphUpdate::Entry((src, dst, channel)) => {
+                            let graph = graph.clone();
+                            let backend = backend.clone();
+                            let channel_by_id = channel_by_id.clone();
+                            let channel_by_parties = channel_by_parties.clone();
+                            futures::future::Either::Right(
+                                hopr_utils::runtime::prelude::spawn_blocking(move || {
+                                    reconcile::upsert_channel(
+                                        backend.as_ref(),
+                                        &graph,
+                                        &channel_by_id,
+                                        &channel_by_parties,
+                                        (src.key_id, dst.key_id),
+                                        channel,
+                                        false,
+                                    )
+                                    .map(|upsert| match upsert {
+                                        reconcile::Upsert::Written(old) => (channel, old.map(|old| old.diff(&channel))),
+                                        reconcile::Upsert::Skipped { .. } => (channel, None),
+                                    })
+                                })
+                                .map_err(ConnectorError::backend)
+                                .and_then(|res| {
+                                    futures::future::ready(
+                                        res.map(SubscribedEventType::Channel).map_err(ConnectorError::backend),
+                                    )
+                                }),
                             )
-                            .map(|upsert| match upsert {
-                                reconcile::Upsert::Written(old) => (channel, old.map(|old| old.diff(&channel))),
-                                reconcile::Upsert::Skipped { .. } => (channel, None),
-                            })
-                        })
-                        .map_err(ConnectorError::backend)
-                        .and_then(|res| {
-                            futures::future::ready(
-                                res.map(SubscribedEventType::Channel).map_err(ConnectorError::backend),
-                            )
-                        })
+                        }
                     })
                     .map_err(|error| SubscriptionError::new("graph", error))
                     .fuse();
@@ -1043,6 +1052,10 @@ where
                         Ok(SubscribedEventType::HealthCheck) => {}
                         Ok(SubscribedEventType::ReconcileChannels) => {
                             reconciler.spawn_pass();
+                        }
+                        Ok(SubscribedEventType::SnapshotComplete(snapshot)) => {
+                            tracing::debug!(channels = snapshot.len(), "graph snapshot delivered");
+                            reconciler.spawn_sweep(snapshot);
                         }
                         #[cfg(feature = "telemetry")]
                         Ok(SubscribedEventType::MetricsRefresh) => {}
