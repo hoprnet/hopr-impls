@@ -125,7 +125,7 @@ mod missing_channel_from_dropped_graph_subscription {
         api::{
             AccountSelector, BlokliQueryClient, BlokliSubscriptionClient, BlokliTransactionClient, ChainAddress,
             ChannelSelector, ModulePredictionInput, RedeemedStatsSelector, SafeSelector, ServiceSelector,
-            ServiceTypeId, TicketSelector, TxId, TxReceipt, types,
+            ServiceTypeId, TicketSelector, TransactionTrackingOutcome, TxId, TxReceipt, types,
         },
         errors::BlokliClientError,
     };
@@ -282,7 +282,7 @@ mod missing_channel_from_dropped_graph_subscription {
             &self,
             tx_id: TxId,
             client_timeout: std::time::Duration,
-        ) -> BlokliResult<types::Transaction> {
+        ) -> BlokliResult<TransactionTrackingOutcome> {
             self.inner.track_transaction(tx_id, client_timeout).await
         }
     }
@@ -375,7 +375,6 @@ mod missing_channel_from_dropped_graph_subscription {
     /// `subscribe_graph` entry never arrives. A `kept_peer` channel is opened too, as a control, to
     /// show the drop is selective rather than a blanket subscription failure.
     #[tokio::test]
-    #[ignore = "reproduces hoprnet/hopr-impls#110; fails until the connector backfills missed subscription events"]
     async fn connector_should_still_find_an_own_channel_whose_graph_subscription_event_was_dropped()
     -> anyhow::Result<()> {
         let me = ChainKeypair::random();
