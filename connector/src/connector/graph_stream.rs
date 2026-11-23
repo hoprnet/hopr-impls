@@ -99,6 +99,9 @@ struct State<'a, C> {
     in_snapshot: bool,
     /// The channels of that snapshot so far.
     snapshot: HashSet<ChannelId>,
+    /// Whether the snapshot held an entry that could be neither converted nor identified, so its channels are not
+    /// all known.
+    snapshot_incomplete: bool,
     /// An update that is yielded before the next entry is read.
     queued: Option<GraphUpdate>,
     /// Channels whose entry failed conversion and caused a restart, and that have not converted since.
@@ -106,11 +109,42 @@ struct State<'a, C> {
 }
 
 impl<C> State<'_, C> {
+    /// Starts collecting the channels of a snapshot.
+    fn begin_snapshot(&mut self) {
+        self.in_snapshot = true;
+        self.snapshot.clear();
+        self.snapshot_incomplete = false;
+    }
+
+    /// Records an entry of the snapshot in progress, and ends the snapshot when the entry is its last.
+    ///
+    /// `id` is the channel of the entry, or `None` when it could not be identified. A snapshot with such an entry
+    /// cannot tell which channels it holds, so it is not reported.
+    fn observe_snapshot_entry(&mut self, id: Option<ChannelId>, ends_snapshot: bool) {
+        if !self.in_snapshot {
+            return;
+        }
+        match id {
+            Some(id) => {
+                self.snapshot.insert(id);
+            }
+            None => self.snapshot_incomplete = true,
+        }
+        if ends_snapshot {
+            self.in_snapshot = false;
+            let snapshot = std::mem::take(&mut self.snapshot);
+            if std::mem::take(&mut self.snapshot_incomplete) {
+                tracing::warn!("graph snapshot held an unidentifiable entry, so it is not used to close channels");
+            } else {
+                self.queued = Some(GraphUpdate::SnapshotComplete(snapshot));
+            }
+        }
+    }
+
     /// Drops the running subscription so the next poll starts a new one, and updates the pacing.
     fn restart(&mut self) {
         self.stream = None;
-        self.in_snapshot = true;
-        self.snapshot.clear();
+        self.begin_snapshot();
         self.restarts = if self.started.elapsed() >= RESYNC_HEALTHY_AFTER {
             1
         } else {
@@ -143,6 +177,7 @@ where
         restarts: 0,
         in_snapshot: true,
         snapshot: HashSet::new(),
+        snapshot_incomplete: false,
         queued: None,
         failed_conversions: HashSet::new(),
     };
@@ -168,8 +203,7 @@ where
                         *state.health.lock() = health;
                         state.stream = Some(stream.boxed());
                         state.started = Instant::now();
-                        state.in_snapshot = true;
-                        state.snapshot.clear();
+                        state.begin_snapshot();
                     }
                     Err(error) => {
                         state.restart();
@@ -183,18 +217,18 @@ where
                 Some(Ok(entry)) => {
                     tracing::trace!(?entry, "new graph event");
                     let ends_snapshot = entry.cursor.is_some();
+                    // Updates, resumed entries and the last entry of a snapshot carry a cursor, the other entries
+                    // of a snapshot do not. So an entry without one, while no snapshot is in progress, is the start
+                    // of a snapshot that blokli-client began on its own, after it lost or rejected its position.
+                    if !state.in_snapshot && !ends_snapshot {
+                        tracing::debug!("graph snapshot started by the client");
+                        state.begin_snapshot();
+                    }
                     let channel_id = entry.channel.concrete_channel_id.clone();
                     match model_to_graph_entry(entry) {
                         Ok(item) => {
                             conversion_succeeded(&mut state.failed_conversions, &channel_id);
-                            if state.in_snapshot {
-                                state.snapshot.insert(*item.2.get_id());
-                                if ends_snapshot {
-                                    state.in_snapshot = false;
-                                    state.queued =
-                                        Some(GraphUpdate::SnapshotComplete(std::mem::take(&mut state.snapshot)));
-                                }
-                            }
+                            state.observe_snapshot_entry(Some(*item.2.get_id()), ends_snapshot);
                             return Some((Ok(GraphUpdate::Entry(item)), state));
                         }
                         Err(error) => {
@@ -206,6 +240,8 @@ where
                                     %error, %channel_id,
                                     "graph entry fails conversion again after a restart, blokli serves it malformed"
                                 );
+                                // The channel is in the snapshot even though it cannot be converted.
+                                state.observe_snapshot_entry(channel_id.parse().ok(), ends_snapshot);
                             }
                             return Some((Err(error), state));
                         }
@@ -249,6 +285,74 @@ mod tests {
         assert!(restart_after_failed_conversion(&mut failed, "0xaa"));
         conversion_succeeded(&mut failed, "0xaa");
         assert!(restart_after_failed_conversion(&mut failed, "0xaa"));
+    }
+
+    fn state() -> State<'static, ()> {
+        State {
+            client: &(),
+            health: Arc::new(parking_lot::Mutex::new(SubscriptionHealthHandle::untracked("graph"))),
+            stream: None,
+            started: Instant::now(),
+            restarts: 0,
+            in_snapshot: true,
+            snapshot: HashSet::new(),
+            snapshot_incomplete: false,
+            queued: None,
+            failed_conversions: HashSet::new(),
+        }
+    }
+
+    fn id(n: u8) -> ChannelId {
+        ChannelId::from(hopr_api::types::crypto::prelude::Hash::from([n; 32]))
+    }
+
+    #[test]
+    fn a_snapshot_is_reported_with_its_channels_when_its_last_entry_arrives() {
+        let mut state = state();
+        state.observe_snapshot_entry(Some(id(1)), false);
+        state.observe_snapshot_entry(Some(id(2)), false);
+        assert!(state.queued.is_none());
+
+        state.observe_snapshot_entry(Some(id(3)), true);
+
+        match state.queued.take() {
+            Some(GraphUpdate::SnapshotComplete(seen)) => assert_eq!(HashSet::from([id(1), id(2), id(3)]), seen),
+            _ => panic!("the snapshot was not reported"),
+        }
+        assert!(!state.in_snapshot);
+    }
+
+    #[test]
+    fn entries_after_a_snapshot_are_not_part_of_it() {
+        let mut state = state();
+        state.observe_snapshot_entry(Some(id(1)), true);
+        state.queued = None;
+
+        state.observe_snapshot_entry(Some(id(2)), true);
+
+        assert!(state.queued.is_none());
+    }
+
+    #[test]
+    fn a_snapshot_with_an_unidentifiable_entry_is_not_reported() {
+        let mut state = state();
+        state.observe_snapshot_entry(Some(id(1)), false);
+        state.observe_snapshot_entry(None, false);
+        state.observe_snapshot_entry(Some(id(2)), true);
+
+        assert!(state.queued.is_none());
+        assert!(!state.in_snapshot);
+
+        // the next snapshot starts clean
+        state.begin_snapshot();
+        state.observe_snapshot_entry(Some(id(1)), true);
+        assert!(matches!(state.queued, Some(GraphUpdate::SnapshotComplete(_))));
+    }
+
+    #[test]
+    fn a_channel_id_survives_the_round_trip_through_its_text() {
+        let original = id(7);
+        assert_eq!(Ok(original), original.to_string().parse::<ChannelId>());
     }
 
     #[test]

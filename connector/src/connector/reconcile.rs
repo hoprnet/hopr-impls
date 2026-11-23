@@ -115,6 +115,58 @@ pub(crate) fn upsert_channel<B: Backend>(
     Ok(Upsert::Written(old))
 }
 
+/// A channel that is not closed, as it was stored when a snapshot completed, with the key IDs of its endpoints.
+pub(crate) type Missing = ((HoprKeyIdent, HoprKeyIdent), ChannelEntry);
+
+/// Reads the channels that are known and not closed, but that a completed snapshot did not hold.
+///
+/// This must run in the order of the graph stream, when the snapshot has just completed and before the next entry
+/// is handled: a channel that a later live entry opens or changes is not in the snapshot, yet it is not missing from
+/// it. The graph lock is held while reading, so no writer is seen halfway.
+pub(crate) fn missing_from_snapshot<B: Backend>(
+    backend: &B,
+    graph: &Graph,
+    snapshot: &std::collections::HashSet<ChannelId>,
+) -> Vec<Missing> {
+    let graph = graph.read();
+    graph
+        .all_edges()
+        .filter(|(_, _, id)| !snapshot.contains(*id))
+        .filter_map(|(src, dst, id)| match backend.get_channel_by_id(id) {
+            Ok(Some(channel)) if !matches!(channel.status, ChannelStatus::Closed) => Some(((src, dst), channel)),
+            Ok(_) => None,
+            Err(error) => {
+                tracing::warn!(%error, %id, "backend error when looking up a channel missing from a snapshot");
+                None
+            }
+        })
+        .collect()
+}
+
+/// Replaces `expected` by `closed` in the backend, the graph and both caches, unless the channel has changed since.
+///
+/// Like [`upsert_channel`] it holds the graph write lock for the whole operation. A channel that changed after
+/// `expected` was read has a newer state than the snapshot, which cannot be told from a closure, so it is left alone.
+pub(crate) fn close_if_unchanged<B: Backend>(
+    backend: &B,
+    graph: &Graph,
+    channel_by_id: &ChannelByIdCache,
+    channel_by_parties: &ChannelByPartiesCache,
+    (src, dst): (HoprKeyIdent, HoprKeyIdent),
+    expected: ChannelEntry,
+    closed: ChannelEntry,
+) -> Result<Upsert, B::Error> {
+    let mut graph = graph.write();
+    if backend.get_channel_by_id(expected.get_id())? != Some(expected) {
+        return Ok(Upsert::Skipped { cache_repaired: false });
+    }
+    graph.add_edge(src, dst, *closed.get_id());
+    let old = backend.insert_channel(closed)?;
+    super::cache::put(channel_by_id, closed.get_id(), closed);
+    super::cache::put(channel_by_parties, &ChannelParties::from(&closed), closed);
+    Ok(Upsert::Written(old))
+}
+
 /// What applying one row did.
 enum Applied {
     Healed,
@@ -367,7 +419,11 @@ where
         .await
         .map_err(ConnectorError::backend)?
         .map_err(ConnectorError::backend)?;
+        self.finish(channel, upsert).await
+    }
 
+    /// Raises the events of a write and tells what it did.
+    async fn finish(&self, channel: ChannelEntry, upsert: Upsert) -> Result<Applied, ConnectorError> {
         match upsert {
             Upsert::Skipped { cache_repaired: true } => {
                 tracing::debug!(id = %channel.get_id(), "stale channel cache entry repaired by reconciliation");
@@ -410,10 +466,10 @@ where
     ///
     /// Like [`spawn_pass`](Self::spawn_pass), it runs in its own task so that it never holds up the handling of the
     /// subscriptions.
-    pub(crate) fn spawn_sweep(self: &std::sync::Arc<Self>, snapshot: std::collections::HashSet<ChannelId>) {
+    pub(crate) fn spawn_sweep(self: &std::sync::Arc<Self>, missing: Vec<Missing>) {
         let this = self.clone();
         hopr_utils::runtime::prelude::spawn(async move {
-            match this.close_missing(&snapshot).await {
+            match this.close_missing(missing).await {
                 Ok(stats) if stats.failed > 0 => {
                     tracing::warn!(?stats, "channels missing from a snapshot closed incompletely")
                 }
@@ -423,54 +479,40 @@ where
         });
     }
 
-    /// Closes every known channel that is not closed and that `snapshot` does not hold.
+    /// Closes the channels that a completed snapshot did not hold, as [`missing_from_snapshot`] read them.
     ///
     /// A snapshot lists every channel that is not closed, so a channel it lacks closed while the subscription was
     /// not delivering updates. A closed channel holds no balance, so it is closed with a zero balance and keeps its
-    /// epoch and ticket index. What differs is applied like a reconciliation row, with the events of the missed
-    /// update.
-    pub(crate) async fn close_missing(
-        &self,
-        snapshot: &std::collections::HashSet<ChannelId>,
-    ) -> Result<SweepStats, ConnectorError> {
-        let (backend, graph, snapshot) = (self.backend.clone(), self.graph.clone(), snapshot.clone());
-        let missing = hopr_utils::runtime::prelude::spawn_blocking(move || {
-            let edges = graph
-                .read()
-                .all_edges()
-                .filter(|(_, _, id)| !snapshot.contains(*id))
-                .map(|(src, dst, id)| ((src, dst), *id))
-                .collect::<Vec<_>>();
-            edges
-                .into_iter()
-                .filter_map(|(keys, id)| match backend.get_channel_by_id(&id) {
-                    Ok(Some(channel)) if !matches!(channel.status, ChannelStatus::Closed) => Some((keys, channel)),
-                    Ok(_) => None,
-                    Err(error) => {
-                        tracing::warn!(%error, %id, "backend error when looking up a channel missing from a snapshot");
-                        None
-                    }
-                })
-                .collect::<Vec<_>>()
-        })
-        .await
-        .map_err(ConnectorError::backend)?;
-
+    /// epoch and ticket index. A channel that has changed since it was read is skipped. What is closed raises the
+    /// events of the missed update.
+    pub(crate) async fn close_missing(&self, missing: Vec<Missing>) -> Result<SweepStats, ConnectorError> {
         let mut stats = SweepStats {
             missing: missing.len(),
             ..Default::default()
         };
-        for (keys, local) in missing {
-            let id = *local.get_id();
+        for (keys, expected) in missing {
+            let id = *expected.get_id();
             let closed = ChannelBuilder::default()
-                .between(local.source, local.destination)
+                .between(expected.source, expected.destination)
                 .balance(HoprBalance::zero())
-                .ticket_index(local.ticket_index)
+                .ticket_index(expected.ticket_index)
                 .status(ChannelStatus::Closed)
-                .epoch(local.channel_epoch)
+                .epoch(expected.channel_epoch)
                 .build();
             let result = match closed {
-                Ok(channel) => self.apply(Fetched { channel, keys }).await,
+                Ok(closed) => {
+                    let (backend, graph) = (self.backend.clone(), self.graph.clone());
+                    let (by_id, by_parties) = (self.channel_by_id.clone(), self.channel_by_parties.clone());
+                    match hopr_utils::runtime::prelude::spawn_blocking(move || {
+                        close_if_unchanged(backend.as_ref(), &graph, &by_id, &by_parties, keys, expected, closed)
+                    })
+                    .await
+                    {
+                        Ok(Ok(upsert)) => self.finish(closed, upsert).await,
+                        Ok(Err(error)) => Err(ConnectorError::backend(error)),
+                        Err(error) => Err(ConnectorError::backend(error)),
+                    }
+                }
                 Err(error) => Err(ConnectorError::from(error)),
             };
             match result {
@@ -1040,6 +1082,12 @@ mod tests {
             .add_edge(HoprKeyIdent::from(src), HoprKeyIdent::from(dst), *local.get_id());
     }
 
+    /// Reads what a completed snapshot lacks, then closes it, as the connector does.
+    async fn sweep(f: &Fixture, snapshot: &std::collections::HashSet<ChannelId>) -> anyhow::Result<SweepStats> {
+        let missing = missing_from_snapshot(f.reconciler.backend.as_ref(), &f.reconciler.graph, snapshot);
+        Ok(f.reconciler.close_missing(missing).await?)
+    }
+
     fn closed_without_balance(src: &ChainKeypair, dst: &ChainKeypair) -> ChannelEntry {
         ChannelEntry::builder()
             .between(src, dst)
@@ -1066,7 +1114,7 @@ mod tests {
         seed_known(&f, own, 1, 2);
         seed_known(&f, foreign, 2, 3);
 
-        let stats = f.reconciler.close_missing(&Default::default()).await?;
+        let stats = sweep(&f, &Default::default()).await?;
 
         assert_eq!(
             SweepStats {
@@ -1099,10 +1147,7 @@ mod tests {
         assert_eq!((2, 2), (closed_events, decreased_events));
 
         // a second sweep finds nothing: the channels are closed now
-        assert_eq!(
-            SweepStats::default(),
-            f.reconciler.close_missing(&Default::default()).await?
-        );
+        assert_eq!(SweepStats::default(), sweep(&f, &Default::default()).await?);
         assert!(f.events.try_recv().is_err());
         Ok(())
     }
@@ -1115,7 +1160,7 @@ mod tests {
 
         let snapshot = std::collections::HashSet::from([*open.get_id()]);
 
-        assert_eq!(SweepStats::default(), f.reconciler.close_missing(&snapshot).await?);
+        assert_eq!(SweepStats::default(), sweep(&f, &snapshot).await?);
         assert_eq!(Some(open), f.reconciler.backend.get_channel_by_id(open.get_id())?);
         assert!(f.events.try_recv().is_err());
         Ok(())
@@ -1127,11 +1172,37 @@ mod tests {
         let closed = channel(&f.me, &f.peer, ChannelStatus::Closed);
         seed_known(&f, closed, 1, 2);
 
-        assert_eq!(
-            SweepStats::default(),
-            f.reconciler.close_missing(&Default::default()).await?
-        );
+        assert_eq!(SweepStats::default(), sweep(&f, &Default::default()).await?);
         assert_eq!(Some(closed), f.reconciler.backend.get_channel_by_id(closed.get_id())?);
+        assert!(f.events.try_recv().is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_sweep_should_not_close_a_channel_that_changed_after_the_snapshot_completed() -> anyhow::Result<()> {
+        let mut f = fixture(|_, _, _| vec![], true);
+        let open = channel(&f.me, &f.peer, ChannelStatus::Open);
+        seed_known(&f, open, 1, 2);
+
+        // The channel is read as missing when the snapshot completes ...
+        let missing = missing_from_snapshot(f.reconciler.backend.as_ref(), &f.reconciler.graph, &Default::default());
+        assert_eq!(1, missing.len());
+        // ... then a live entry changes it, and it is no longer what the snapshot was compared with.
+        let updated = channel_at(&f.me, &f.peer, ChannelStatus::Open, 2);
+        seed(&f, updated);
+
+        let stats = f.reconciler.close_missing(missing).await?;
+
+        assert_eq!(
+            SweepStats {
+                missing: 1,
+                closed: 0,
+                failed: 0
+            },
+            stats
+        );
+        assert_eq!(Some(updated), f.reconciler.backend.get_channel_by_id(open.get_id())?);
+        assert_eq!(Some(Some(updated)), f.reconciler.channel_by_id.get(open.get_id()));
         assert!(f.events.try_recv().is_err());
         Ok(())
     }

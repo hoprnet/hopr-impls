@@ -636,3 +636,51 @@ async fn a_channel_that_closed_during_a_gap_is_closed_after_the_snapshot_replay(
         .await;
     assert_eq!(2, harness.graph_subscriptions.load(Ordering::SeqCst));
 }
+
+/// Blokli-client starts a snapshot on its own when it loses its position. The connector sees it as entries without a
+/// cursor after entries that had one, and a channel the snapshot lacks has closed.
+#[tokio::test]
+async fn a_snapshot_started_by_the_client_closes_the_channels_it_lacks() {
+    let [first, second] = channels();
+    let position = |n: u64| types::ChannelStatePosition {
+        block: types::Uint64(n.to_string()),
+        transaction_index: types::Uint64("0".into()),
+        log_index: types::Uint64("0".into()),
+    };
+    let mut harness = Harness::new().await;
+
+    // Both channels arrive with a cursor, like live updates.
+    for (entry, block) in harness.entries.clone().into_iter().zip([1, 2]) {
+        let mut entry = entry;
+        entry.cursor = Some(position(block));
+        harness.send(entry);
+    }
+    harness.connect().await;
+    harness
+        .wait_for_channel_state(&first, |c| c.status == ChannelStatus::Open)
+        .await;
+    harness
+        .wait_for_channel_state(&second, |c| c.status == ChannelStatus::Open)
+        .await;
+
+    // A snapshot that holds only the second channel: its entries carry no cursor but the last one's.
+    let mut replayed = harness.entries[1].clone();
+    replayed.cursor = None;
+    harness.send(replayed);
+    let mut last = harness.entries[1].clone();
+    last.cursor = Some(position(3));
+    harness.send(last);
+
+    harness
+        .wait_for_channel_state(&first, |c| c.status == ChannelStatus::Closed)
+        .await;
+    assert!(
+        harness
+            .connector
+            .channel_by_id(second.get_id())
+            .unwrap()
+            .is_some_and(|c| c.status == ChannelStatus::Open)
+    );
+    // no new subscription was needed for it
+    assert_eq!(1, harness.graph_subscriptions.load(Ordering::SeqCst));
+}
