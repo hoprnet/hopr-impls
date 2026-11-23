@@ -29,8 +29,9 @@ use crate::{
     errors::ConnectorError,
     metrics::{PHASE_TRACK, record_tx_outcome},
     utils::{
-        ParsedChainInfo, model_to_account_entry, model_to_graph_entry, model_to_service_registry_config,
-        model_to_ticket_params, process_channel_changes_into_events,
+        OpenChannelCounter, ParsedChainInfo, event_for_first_seen_channel, model_to_account_entry,
+        model_to_graph_entry, model_to_service_registry_config, model_to_ticket_params,
+        process_channel_changes_into_events,
     },
 };
 
@@ -848,6 +849,7 @@ where
                 .fuse();
 
             let mut account_counter = 0;
+            let mut open_channels = OpenChannelCounter::default();
             let mut channel_counter = 0;
             if min_accounts == 0 && min_channels == 0 {
                 tracing::info!(account_counter, channel_counter, time = ?sync_started.elapsed(), "on-chain graph has been synced");
@@ -884,14 +886,14 @@ where
                 if connection_ready_tx.is_some() && !event_type.is_tick() {
                     match event_type {
                         SubscribedEventType::Account(_) => account_counter += 1,
-                        SubscribedEventType::Channel(_) => channel_counter += 1,
+                        SubscribedEventType::Channel((channel, _)) => channel_counter = open_channels.observe(channel),
                         // Service registry events deliberately do not count towards the connection
                         // quota: a node with no services must still reach the Ready state.
                         _ => {}
                     }
 
                     let pct_synced =
-                        ((account_counter + channel_counter) * 100 / (min_accounts + min_channels)).clamp(0, 100);
+                        ((account_counter + channel_counter) * 100 / (min_accounts + min_channels).max(1)).clamp(0, 100);
                     tracing::debug!(
                         pct_synced,
                         sync_quota,
@@ -955,7 +957,9 @@ where
                                 src = %new_channel.source, dst = %new_channel.destination,
                                 "channel opened"
                             );
-                            let _ = event_tx.broadcast_direct(ChainEvent::ChannelOpened(new_channel)).await;
+                            if let Some(event) = event_for_first_seen_channel(new_channel) {
+                                let _ = event_tx.broadcast_direct(event).await;
+                            }
                         }
                         Ok(SubscribedEventType::WinningProbability((new, old))) => {
                             let old = old.unwrap_or_default();
