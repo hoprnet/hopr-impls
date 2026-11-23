@@ -60,7 +60,9 @@ fn is_newer(old: &ChannelEntry, new: &ChannelEntry) -> bool {
 /// Outcome of [`upsert_channel`].
 pub(crate) enum Upsert {
     /// Nothing was written: the channel is unchanged, or the update was older than the local state.
-    Skipped,
+    ///
+    /// `cache_repaired` tells whether a cached entry that disagreed with the backend was overwritten.
+    Skipped { cache_repaired: bool },
     /// The channel was written; holds the value it replaced.
     Written(Option<ChannelEntry>),
 }
@@ -82,7 +84,26 @@ pub(crate) fn upsert_channel<B: Backend>(
     let mut graph = graph.write();
     if only_if_not_older {
         match backend.get_channel_by_id(channel.get_id())? {
-            Some(old) if !is_newer(&old, &channel) => return Ok(Upsert::Skipped),
+            Some(old) if !is_newer(&old, &channel) => {
+                // The backend holds the newer (or the same) value, so it is what the caches must agree with,
+                // not the row. An entry that is not cached is left to be loaded from the backend on demand.
+                let parties = ChannelParties::from(&old);
+                let stale_by_id = channel_by_id
+                    .get(old.get_id())
+                    .is_some_and(|cached| cached != Some(old));
+                let stale_by_parties = channel_by_parties
+                    .get(&parties)
+                    .is_some_and(|cached| cached != Some(old));
+                if stale_by_id {
+                    channel_by_id.insert(*old.get_id(), Some(old));
+                }
+                if stale_by_parties {
+                    channel_by_parties.insert(parties, Some(old));
+                }
+                return Ok(Upsert::Skipped {
+                    cache_repaired: stale_by_id || stale_by_parties,
+                });
+            }
             _ => {}
         }
     }
@@ -92,6 +113,13 @@ pub(crate) fn upsert_channel<B: Backend>(
     channel_by_id.insert(*channel.get_id(), Some(channel));
     channel_by_parties.insert(ChannelParties::from(&channel), Some(channel));
     Ok(Upsert::Written(old))
+}
+
+/// What applying one row did.
+enum Applied {
+    Healed,
+    CacheRepaired,
+    Unchanged,
 }
 
 /// A channel row of Blokli converted for storing.
@@ -109,6 +137,8 @@ pub(crate) struct ReconcileStats {
     pub(crate) healed: usize,
     /// Rows that could not be converted or stored.
     pub(crate) failed: usize,
+    /// Channels whose cached entry disagreed with the backend and was overwritten, without any event.
+    pub(crate) cache_repaired: usize,
     /// Direction queries that failed, so the pass did not see every channel.
     pub(crate) incomplete: usize,
 }
@@ -305,8 +335,9 @@ where
         };
         for row in rows {
             match self.apply(row).await {
-                Ok(true) => stats.healed += 1,
-                Ok(false) => {}
+                Ok(Applied::Healed) => stats.healed += 1,
+                Ok(Applied::CacheRepaired) => stats.cache_repaired += 1,
+                Ok(Applied::Unchanged) => {}
                 Err(error) => {
                     tracing::warn!(%error, "failed to apply reconciled channel");
                     failed += 1;
@@ -326,7 +357,7 @@ where
     }
 
     /// Stores the channel unless it is unchanged or older than the local view, and returns whether it did.
-    async fn apply(&self, row: Fetched) -> Result<bool, ConnectorError> {
+    async fn apply(&self, row: Fetched) -> Result<Applied, ConnectorError> {
         let Fetched { channel, keys } = row;
         let (backend, graph) = (self.backend.clone(), self.graph.clone());
         let (by_id, by_parties) = (self.channel_by_id.clone(), self.channel_by_parties.clone());
@@ -338,18 +369,22 @@ where
         .map_err(ConnectorError::backend)?;
 
         match upsert {
-            Upsert::Skipped => Ok(false),
+            Upsert::Skipped { cache_repaired: true } => {
+                tracing::debug!(id = %channel.get_id(), "stale channel cache entry repaired by reconciliation");
+                Ok(Applied::CacheRepaired)
+            }
+            Upsert::Skipped { cache_repaired: false } => Ok(Applied::Unchanged),
             Upsert::Written(Some(old)) => {
                 tracing::debug!(id = %channel.get_id(), "channel healed by reconciliation");
                 process_channel_changes_into_events(channel, old.diff(&channel), &self.me, &self.event_tx).await;
-                Ok(true)
+                Ok(Applied::Healed)
             }
             Upsert::Written(None) => {
                 tracing::debug!(id = %channel.get_id(), "channel learned by reconciliation");
                 if let Some(event) = event_for_first_seen_channel(channel) {
                     let _ = self.event_tx.broadcast_direct(event).await;
                 }
-                Ok(true)
+                Ok(Applied::Healed)
             }
         }
     }
@@ -602,6 +637,7 @@ mod tests {
                 seen: 2,
                 healed: 2,
                 failed: 0,
+                cache_repaired: 0,
                 incomplete: 0
             },
             stats
@@ -750,6 +786,7 @@ mod tests {
                 seen: 2,
                 healed: 1,
                 failed: 1,
+                cache_repaired: 0,
                 incomplete: 0
             },
             stats
@@ -781,6 +818,7 @@ mod tests {
                 seen: 1,
                 healed: 1,
                 failed: 0,
+                cache_repaired: 0,
                 incomplete: 1
             },
             stats
@@ -846,6 +884,47 @@ mod tests {
         assert_eq!(0, f.reconciler.reconcile().await?.healed);
         assert_eq!(Some(local), f.reconciler.backend.get_channel_by_id(local.get_id())?);
         assert!(f.events.try_recv().is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reconciliation_should_repair_stale_cache_entries_without_events() -> anyhow::Result<()> {
+        let mut f = fixture(|me, peer, _| vec![channel(me, peer, ChannelStatus::Open)], true);
+        let open = channel(&f.me, &f.peer, ChannelStatus::Open);
+        let stale = channel_at(&f.me, &f.peer, ChannelStatus::Closed, 0);
+        f.reconciler.backend.insert_channel(open)?;
+        let parties = ChannelParties::from(&open);
+
+        for (by_id, by_parties) in [(Some(stale), None), (None, Some(stale))] {
+            f.reconciler.channel_by_id.insert(*open.get_id(), by_id);
+            f.reconciler.channel_by_parties.insert(parties, by_parties);
+
+            let stats = f.reconciler.reconcile().await?;
+
+            assert_eq!(1, stats.cache_repaired);
+            assert_eq!(0, stats.healed);
+            assert_eq!(Some(Some(open)), f.reconciler.channel_by_id.get(open.get_id()));
+            assert_eq!(Some(Some(open)), f.reconciler.channel_by_parties.get(&parties));
+            assert!(f.events.try_recv().is_err());
+
+            // nothing is left to repair
+            assert_eq!(0, f.reconciler.reconcile().await?.cache_repaired);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reconciliation_should_repair_caches_against_the_backend_for_a_stale_row() -> anyhow::Result<()> {
+        // Blokli's row is older than the backend: the caches follow the backend, not the row.
+        let f = fixture(|me, peer, _| vec![channel_at(me, peer, ChannelStatus::Open, 1)], true);
+        let local = channel_at(&f.me, &f.peer, ChannelStatus::Closed, 2);
+        f.reconciler.backend.insert_channel(local)?;
+        f.reconciler.channel_by_id.insert(*local.get_id(), None);
+
+        let stats = f.reconciler.reconcile().await?;
+
+        assert_eq!(1, stats.cache_repaired);
+        assert_eq!(Some(Some(local)), f.reconciler.channel_by_id.get(local.get_id()));
         Ok(())
     }
 

@@ -737,7 +737,7 @@ where
                         )
                         .map(|upsert| match upsert {
                             reconcile::Upsert::Written(old) => (channel, old.map(|old| old.diff(&channel))),
-                            reconcile::Upsert::Skipped => (channel, None),
+                            reconcile::Upsert::Skipped { .. } => (channel, None),
                         })
                     })
                     .map_err(ConnectorError::backend)
