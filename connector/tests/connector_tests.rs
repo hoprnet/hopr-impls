@@ -418,7 +418,7 @@ mod missing_channel_from_dropped_graph_subscription {
         let mock_client = BlokliTestStateBuilder::default()
             .with_hopr_network_chain_info("anvil-localhost")
             .with_accounts(accounts)
-            .with_channels([dropped_channel.clone(), kept_channel])
+            .with_channels([dropped_channel, kept_channel])
             .build_static_client();
 
         let wrapped_client = DroppingGraphSubscriptionClient {
