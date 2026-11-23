@@ -5,7 +5,9 @@ use hopr_api::{
     types::internal::prelude::TicketBuilder,
 };
 
-use crate::{OutgoingIndexStore, TicketManagerError, TicketQueue, backend::ValueCachedQueue};
+use crate::{OutgoingIndexStore, TicketManagerError};
+#[cfg(feature = "manager")]
+use crate::{TicketQueue, backend::ValueCachedQueue};
 
 /// Tracks outgoing ticket indices for a channel, starting from 0.
 #[derive(Debug)]
@@ -166,11 +168,13 @@ impl OutgoingIndexCache {
     }
 }
 
+#[cfg(feature = "manager")]
 #[derive(Debug)]
 pub struct CachedQueueMap<Q>(
     pub(crate) dashmap::DashMap<ChannelId, ChannelTicketQueue<ValueCachedQueue<Q>>, ahash::RandomState>,
 );
 
+#[cfg(feature = "manager")]
 impl<Q> Default for CachedQueueMap<Q> {
     fn default() -> Self {
         Self(dashmap::DashMap::with_hasher(ahash::RandomState::default()))
@@ -190,6 +194,7 @@ pub trait UnrealizedValue {
 }
 impl UnrealizedValue for () {}
 
+#[cfg(feature = "manager")]
 impl<Q: TicketQueue> UnrealizedValue for CachedQueueMap<Q> {
     /// Returns the total value of the tickets in the given queue, or `None` if no such ticket queue exists.
     fn unrealized_value(
@@ -237,12 +242,14 @@ impl<Q: TicketQueue> UnrealizedValue for CachedQueueMap<Q> {
     }
 }
 
+#[cfg(feature = "manager")]
 #[derive(Debug)]
 pub struct ChannelTicketQueue<Q> {
     pub(crate) queue: std::sync::Arc<parking_lot::RwLock<(Q, ChannelTicketStats)>>,
     pub(crate) redeem_lock: std::sync::Arc<AtomicBool>,
 }
 
+#[cfg(feature = "manager")]
 impl<Q: TicketQueue> From<Q> for ChannelTicketQueue<Q> {
     fn from(queue: Q) -> Self {
         let stats = ChannelTicketStats {
@@ -256,6 +263,7 @@ impl<Q: TicketQueue> From<Q> for ChannelTicketQueue<Q> {
     }
 }
 
+#[cfg(feature = "manager")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub(crate) struct ChannelTicketStats {
     pub winning_tickets: u128,

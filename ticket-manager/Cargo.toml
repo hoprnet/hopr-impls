@@ -17,21 +17,24 @@ name = "hopr-ticket-manager"
 readme = "README.md"
 repository.workspace = true
 rust-version.workspace = true
-version = "0.11.1"
+version = "0.12.0"
 
 [features]
-cli     = ["dep:clap", "dep:strum"]
-default = ["cli", "redb"]
+cli     = ["dep:clap", "dep:strum", "manager"]
+default = ["cli", "manager", "redb"]
+# Incoming ticket queues, redemption and `HoprTicketManager`. Entry nodes only issue tickets
+# and can build with `default-features = false` to get the `HoprTicketFactory` alone.
+manager = ["dep:ahash", "dep:hashbrown"]
 redb    = ["dep:postcard", "dep:redb", "hopr-api/serde"]
 serde   = ["dep:serde", "dep:serde_json", "hopr-api/serde"]
 
 [dependencies]
-ahash       = { workspace = true }
+ahash       = { workspace = true, optional = true }
 anyhow      = { workspace = true }
 clap        = { workspace = true, optional = true }
 dashmap     = { workspace = true, features = ["inline"] }
 futures     = { workspace = true }
-hashbrown   = { workspace = true, features = ["inline-more"] }
+hashbrown   = { workspace = true, optional = true, features = ["inline-more"] }
 parking_lot = { workspace = true, features = ["arc_lock"] }
 postcard    = { workspace = true, optional = true, features = ["use-std"] }
 rand        = { workspace = true, optional = true }
@@ -65,10 +68,11 @@ hopr-chain-connector = { workspace = true, features = [
 [[bin]]
 name              = "ticket-inspector"
 path              = "src/bin/ticket_inspector.rs"
-required-features = ["cli", "redb"]
+required-features = ["cli", "manager", "redb"]
 
 [[bench]]
-harness = false
-name    = "ticket_manager_bench"
+harness           = false
+name              = "ticket_manager_bench"
+required-features = ["manager", "redb"]
 
 [lib]

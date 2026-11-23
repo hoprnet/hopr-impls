@@ -105,6 +105,7 @@ impl<S: OutgoingIndexStore + 'static> HoprTicketFactory<S> {
         }
     }
 
+    #[cfg(feature = "manager")]
     pub(crate) fn new_shared<Q: UnrealizedValue + Send + Sync + 'static>(
         store: std::sync::Arc<parking_lot::RwLock<S>>,
         queue_map: std::sync::Weak<Q>,
@@ -340,14 +341,15 @@ where
 
 #[cfg(test)]
 mod tests {
-    use hopr_api::{
-        tickets::{TicketFactory, TicketManagement},
-        types::crypto::prelude::Keypair,
-    };
+    #[cfg(feature = "manager")]
+    use hopr_api::tickets::TicketManagement;
+    use hopr_api::{tickets::TicketFactory, types::crypto::prelude::Keypair};
     use hopr_chain_connector::ChainKeypair;
 
     use super::*;
-    use crate::{MemoryStore, traits::tests::generate_owned_tickets};
+    use crate::MemoryStore;
+    #[cfg(feature = "manager")]
+    use crate::traits::tests::generate_owned_tickets;
 
     fn create_factory() -> anyhow::Result<HoprTicketFactory<MemoryStore>> {
         Ok(HoprTicketFactory::new(MemoryStore::default()))
@@ -369,6 +371,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "manager")]
     #[test]
     fn ticket_factory_remaining_incoming_channel_stake_should_be_reduced_by_unrealized_value() -> anyhow::Result<()> {
         let (manager, factory) = crate::HoprTicketManager::new_with_factory(MemoryStore::default());

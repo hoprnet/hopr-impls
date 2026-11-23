@@ -1,19 +1,22 @@
-use hopr_api::chain::{ChannelId, RedeemableTicket, VerifiedTicket};
+use hopr_api::chain::ChannelId;
+#[cfg(feature = "manager")]
+use hopr_api::chain::{RedeemableTicket, VerifiedTicket};
 
-use crate::{
-    OutgoingIndexStore,
-    traits::{TicketQueue, TicketQueueStore},
-};
+use crate::OutgoingIndexStore;
+#[cfg(feature = "manager")]
+use crate::traits::{TicketQueue, TicketQueueStore};
 
 /// Simple non-persistent ticket queue store backed by a `HashMap` and [`MemoryTicketQueue`].
 ///
 /// Useful for non-persistent and testing scenarios.
 #[derive(Clone, Debug, Default)]
 pub struct MemoryStore {
+    #[cfg(feature = "manager")]
     tickets: std::collections::HashMap<ChannelId, MemoryTicketQueue>,
     out_indices: std::collections::HashMap<(ChannelId, u32), u64>,
 }
 
+#[cfg(feature = "manager")]
 impl TicketQueueStore for MemoryStore {
     type Queue = MemoryTicketQueue;
 
@@ -67,11 +70,13 @@ impl OutgoingIndexStore for MemoryStore {
 /// This is suitable for testing where ticket persistence is not required.
 ///
 /// The implementation might not be particularly efficient for production use.
+#[cfg(feature = "manager")]
 #[derive(Clone, Debug, Default)]
 pub struct MemoryTicketQueue(
     std::sync::Arc<parking_lot::RwLock<std::collections::BinaryHeap<std::cmp::Reverse<RedeemableTicket>>>>,
 );
 
+#[cfg(feature = "manager")]
 impl TicketQueue for MemoryTicketQueue {
     type Error = std::convert::Infallible;
 
@@ -108,7 +113,7 @@ impl TicketQueue for MemoryTicketQueue {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "manager"))]
 mod tests {
     use super::*;
     use crate::traits::tests::*;

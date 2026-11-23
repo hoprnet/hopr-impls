@@ -1,12 +1,14 @@
-use std::str::FromStr;
-
-use hopr_api::{
-    chain::{ChannelId, RedeemableTicket, VerifiedTicket},
-    types::primitive::prelude::BytesRepresentable,
+use hopr_api::{chain::ChannelId, types::primitive::prelude::BytesRepresentable};
+use redb::{ReadableDatabase, ReadableTable, TableDefinition};
+#[cfg(feature = "manager")]
+use {
+    crate::{TicketQueue, TicketQueueStore},
+    hopr_api::chain::{RedeemableTicket, VerifiedTicket},
+    redb::{ReadableTableMetadata, TableHandle},
+    std::str::FromStr,
 };
-use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle};
 
-use crate::{OutgoingIndexStore, TicketQueue, TicketQueueStore};
+use crate::OutgoingIndexStore;
 
 const OUT_IDX_TABLE: TableDefinition<([u8; ChannelId::SIZE], u32), u64> = TableDefinition::new("channel_out_index");
 
@@ -86,15 +88,19 @@ impl OutgoingIndexStore for RedbStore {
     }
 }
 
+#[cfg(feature = "manager")]
 const TABLE_QUEUE_NAME_PREFIX: &str = "ctq_";
 
+#[cfg(feature = "manager")]
 type TicketTableDef<'a> = TableDefinition<'a, u128, Vec<u8>>;
 
+#[cfg(feature = "manager")]
 #[inline]
 fn make_index(ticket: &RedeemableTicket) -> u128 {
     ((ticket.verified_ticket().channel_epoch as u128) << 64) | ticket.verified_ticket().index as u128
 }
 
+#[cfg(feature = "manager")]
 impl TicketQueueStore for RedbStore {
     type Queue = RedbTicketQueue;
 
@@ -150,11 +156,13 @@ impl TicketQueueStore for RedbStore {
 
 /// Implementation of [`TicketQueue`] using `redb` database and `postcard` serializer,
 /// associated with the [`RedbStore`].
+#[cfg(feature = "manager")]
 pub struct RedbTicketQueue {
     db: std::sync::Weak<redb::Database>,
     channel_id: ChannelId,
 }
 
+#[cfg(feature = "manager")]
 impl TicketQueue for RedbTicketQueue {
     type Error = RedbStoreError;
 
@@ -307,7 +315,7 @@ impl From<redb::CommitError> for RedbStoreError {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "manager"))]
 mod tests {
     use super::*;
     use crate::traits::tests::*;

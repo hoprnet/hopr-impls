@@ -1,4 +1,6 @@
-use hopr_api::chain::{ChannelId, HoprBalance, RedeemableTicket, VerifiedTicket};
+use hopr_api::chain::ChannelId;
+#[cfg(feature = "manager")]
+use hopr_api::chain::{HoprBalance, RedeemableTicket, VerifiedTicket};
 
 /// Allows loading and saving outgoing ticket indices.
 pub trait OutgoingIndexStore {
@@ -20,6 +22,7 @@ pub trait OutgoingIndexStore {
 /// Allows loading ticket queues from a storage.
 ///
 /// This trait reflects the possibility of a node to relay packets for receiving tickets.
+#[cfg(feature = "manager")]
 pub trait TicketQueueStore {
     /// Type of per-channel incoming ticket queues.
     type Queue: TicketQueue;
@@ -47,6 +50,7 @@ pub trait TicketQueueStore {
 /// epochs.
 ///
 /// The implementations must honor the natural ordering of tickets.
+#[cfg(feature = "manager")]
 pub trait TicketQueue {
     type Error: std::error::Error + Send + Sync + 'static;
     /// Number of tickets in the queue.
@@ -90,6 +94,7 @@ pub trait TicketQueue {
     }
 }
 
+#[cfg(feature = "manager")]
 pub(crate) fn default_total_value<Q: TicketQueue + ?Sized>(
     queue: &Q,
     epoch: u32,
@@ -108,7 +113,7 @@ pub(crate) fn default_total_value<Q: TicketQueue + ?Sized>(
 }
 
 // Contains general utilities and test helpers for ticket queue implementations.
-#[cfg(test)]
+#[cfg(all(test, feature = "manager"))]
 pub mod tests {
     use std::ops::RangeBounds;
 

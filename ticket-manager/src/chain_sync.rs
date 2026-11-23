@@ -3,7 +3,9 @@ use std::sync::Arc;
 use futures::StreamExt;
 use hopr_api::chain::{ChainReadChannelOperations, ChannelSelector};
 
-use crate::{HoprTicketFactory, HoprTicketManager, OutgoingIndexStore, TicketManagerError, TicketQueueStore};
+use crate::{HoprTicketFactory, OutgoingIndexStore, TicketManagerError};
+#[cfg(feature = "manager")]
+use crate::{HoprTicketManager, TicketQueueStore};
 
 /// Creates a [`HoprTicketFactory`] backed by the given `store` and pre-seeds it
 /// from the node's current outgoing channels.
@@ -37,6 +39,7 @@ where
     Ok(factory)
 }
 
+#[cfg(feature = "manager")]
 /// Creates a [`HoprTicketManager`] and its companion [`HoprTicketFactory`], both backed
 /// by the given `store`, and pre-seeds them from the node's current channel state.
 ///
