@@ -3,7 +3,11 @@ use hopr_api::{
     types::{crypto::prelude::OffchainPublicKey, primitive::prelude::Address},
 };
 
-use crate::{backend::Backend, connector::HoprBlockchainConnector, errors::ConnectorError};
+use crate::{
+    backend::Backend,
+    connector::{HoprBlockchainConnector, cache},
+    errors::ConnectorError,
+};
 
 pub struct HoprKeyMapper<B> {
     pub(crate) id_to_key: moka::sync::Cache<HoprKeyIdent, Option<OffchainPublicKey>, ahash::RandomState>,
@@ -29,9 +33,9 @@ where
     B: Backend + Send + Sync + 'static,
 {
     fn map_key_to_id(&self, key: &OffchainPublicKey) -> Option<HoprKeyIdent> {
-        self.key_to_id.get_with_by_ref(key, || {
+        cache::get_or_load(&self.key_to_id, key, || {
             let start = std::time::Instant::now();
-            tracing::warn!(%key, "cache miss on map_key_to_id");
+            tracing::debug!(%key, "cache miss on map_key_to_id");
             let result = match self.backend.get_account_by_key(key) {
                 Ok(Some(account)) => Some(account.key_id),
                 Ok(None) => None,
@@ -46,14 +50,15 @@ where
                 found = result.is_some(),
                 "map_key_to_id backend lookup"
             );
-            result
+            Ok::<_, std::convert::Infallible>(result)
         })
+        .unwrap_or_else(|never| match never {})
     }
 
     fn map_id_to_public(&self, id: &HoprKeyIdent) -> Option<OffchainPublicKey> {
-        self.id_to_key.get_with_by_ref(id, || {
+        cache::get_or_load(&self.id_to_key, id, || {
             let start = std::time::Instant::now();
-            tracing::warn!(%id, "cache miss on map_id_to_public");
+            tracing::debug!(%id, "cache miss on map_id_to_public");
             let result = match self.backend.get_account_by_id(id) {
                 Ok(Some(account)) => Some(account.public_key),
                 Ok(None) => None,
@@ -68,8 +73,9 @@ where
                 found = result.is_some(),
                 "map_id_to_public backend lookup"
             );
-            result
+            Ok::<_, std::convert::Infallible>(result)
         })
+        .unwrap_or_else(|never| match never {})
     }
 }
 
@@ -87,20 +93,20 @@ where
     fn chain_key_to_packet_key(&self, chain: &Address) -> Result<Option<OffchainPublicKey>, Self::Error> {
         self.check_connection_state()?;
 
-        Ok(self.chain_to_packet.try_get_with_by_ref(chain, || {
-            tracing::warn!(%chain, "cache miss on chain_key_to_packet_key");
+        cache::get_or_load(&self.chain_to_packet, chain, || {
+            tracing::debug!(%chain, "cache miss on chain_key_to_packet_key");
             self.backend
                 .get_account_by_address(chain)
                 .map(|a| a.map(|ac| ac.public_key))
                 .map_err(ConnectorError::backend)
-        })?)
+        })
     }
 
     fn packet_key_to_chain_key(&self, packet: &OffchainPublicKey) -> Result<Option<Address>, Self::Error> {
         self.check_connection_state()?;
 
-        Ok(self.packet_to_chain.try_get_with_by_ref(packet, || {
-            tracing::warn!(
+        cache::get_or_load(&self.packet_to_chain, packet, || {
+            tracing::debug!(
                 peer_id = packet.to_peerid_str(),
                 "cache miss on packet_key_to_chain_key"
             );
@@ -108,7 +114,7 @@ where
                 .get_account_by_key(packet)
                 .map(|a| a.map(|ac| ac.chain_addr))
                 .map_err(ConnectorError::backend)
-        })?)
+        })
     }
 
     fn key_id_mapper_ref(&self) -> &Self::Mapper {

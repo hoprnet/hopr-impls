@@ -80,22 +80,33 @@ pub(crate) fn model_to_graph_entry(
 ) -> Result<(AccountEntry, AccountEntry, ChannelEntry), ConnectorError> {
     let src = model_to_account_entry(model.source)?;
     let dst = model_to_account_entry(model.destination)?;
-    let channel = ChannelBuilder::default()
-        .between(src.chain_addr, dst.chain_addr)
-        .balance(model.channel.balance.0.parse()?)
+    let channel = model_to_channel_entry(&model.channel, src.chain_addr, dst.chain_addr)?;
+
+    Ok((src, dst, channel))
+}
+
+/// Converts a channel model into a [`ChannelEntry`] between the given, already resolved, endpoints.
+///
+/// The model only carries the numeric key IDs of its endpoints, so the caller supplies their addresses.
+pub(crate) fn model_to_channel_entry(
+    model: &blokli_client::api::types::Channel,
+    source: Address,
+    destination: Address,
+) -> Result<ChannelEntry, ConnectorError> {
+    Ok(ChannelBuilder::default()
+        .between(source, destination)
+        .balance(model.balance.0.parse()?)
         .ticket_index(
             model
-                .channel
                 .ticket_index
                 .0
                 .parse()
                 .map_err(|e| ConnectorError::TypeConversion(format!("invalid ticket index: {e}")))?,
         )
-        .status(match model.channel.status {
+        .status(match model.status {
             blokli_client::api::types::ChannelStatus::Open => ChannelStatus::Open,
             blokli_client::api::types::ChannelStatus::PendingToClose => ChannelStatus::PendingToClose(
                 model
-                    .channel
                     .closure_time
                     .as_ref()
                     .ok_or(ConnectorError::TypeConversion("invalid closure time".into()))
@@ -109,10 +120,11 @@ pub(crate) fn model_to_graph_entry(
             // never happens, still a case to cover
             _ => return Err(ConnectorError::TypeConversion("invalid channel status".into())),
         })
-        .epoch(model.channel.epoch as u32)
-        .build()?;
-
-    Ok((src, dst, channel))
+        .epoch(
+            u32::try_from(model.epoch)
+                .map_err(|_| ConnectorError::TypeConversion(format!("invalid channel epoch {}", model.epoch)))?,
+        )
+        .build()?)
 }
 
 pub(crate) fn model_to_redeemed_stats(
@@ -369,6 +381,35 @@ pub(crate) fn model_to_service_registry_config(
     })
 }
 
+/// The event announcing a channel the connector has not known before, matching the channel's status.
+///
+/// A first-seen `Closed` channel yields no event: there is no earlier state to finalize, and `ChannelClosed`
+/// is documented as the end of a closure the consumer can have seen begin.
+pub(crate) fn event_for_first_seen_channel(channel: ChannelEntry) -> Option<ChainEvent> {
+    match channel.status {
+        ChannelStatus::Open => Some(ChainEvent::ChannelOpened(channel)),
+        ChannelStatus::PendingToClose(_) => Some(ChainEvent::ChannelClosureInitiated(channel)),
+        ChannelStatus::Closed => None,
+    }
+}
+
+/// Counts the distinct channels seen as `Open`, the quantity the connection quota is computed from.
+///
+/// The graph subscription replays every channel and delivers all later updates, so counting events would
+/// count a channel once per status change or replay, and count channels that are not open at all.
+#[derive(Debug, Default)]
+pub(crate) struct OpenChannelCounter(std::collections::HashSet<ChannelId>);
+
+impl OpenChannelCounter {
+    /// Records the channel and returns the number of distinct open channels seen so far.
+    pub(crate) fn observe(&mut self, channel: &ChannelEntry) -> u32 {
+        if matches!(channel.status, ChannelStatus::Open) {
+            self.0.insert(*channel.get_id());
+        }
+        self.0.len() as u32
+    }
+}
+
 pub(crate) async fn process_channel_changes_into_events(
     new_channel: ChannelEntry,
     changes: Vec<ChannelChange>,
@@ -394,8 +435,16 @@ pub(crate) async fn process_channel_changes_into_events(
                 tracing::debug!(id = %new_channel.get_id(), "channel closed");
                 let _ = event_tx.broadcast_direct(ChainEvent::ChannelClosed(new_channel)).await;
             }
+            // The intermediate PendingToClose update was missed, so the channel went straight to Closed.
             ChannelChange::Status {
-                left: ChannelStatus::Closed,
+                left: ChannelStatus::Open,
+                right: ChannelStatus::Closed,
+            } => {
+                tracing::debug!(id = %new_channel.get_id(), "channel closed without a pending closure");
+                let _ = event_tx.broadcast_direct(ChainEvent::ChannelClosed(new_channel)).await;
+            }
+            ChannelChange::Status {
+                left: ChannelStatus::Closed | ChannelStatus::PendingToClose(_),
                 right: ChannelStatus::Open,
             } => {
                 tracing::debug!(id = %new_channel.get_id(), "channel reopened");
@@ -437,5 +486,128 @@ pub(crate) async fn process_channel_changes_into_events(
             },
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, SystemTime};
+
+    use hopr_api::types::crypto::prelude::{ChainKeypair, Keypair};
+
+    use super::*;
+
+    fn channel(status: ChannelStatus, epoch: u32) -> ChannelEntry {
+        ChannelEntry::builder()
+            .between(
+                &ChainKeypair::from_secret(&[1u8; 32]).unwrap(),
+                &ChainKeypair::from_secret(&[2u8; 32]).unwrap(),
+            )
+            .amount(10)
+            .ticket_index(0)
+            .status(status)
+            .epoch(epoch)
+            .build()
+            .unwrap()
+    }
+
+    fn pending() -> ChannelStatus {
+        ChannelStatus::PendingToClose(SystemTime::UNIX_EPOCH + Duration::from_secs(1000))
+    }
+
+    async fn events_for(new: ChannelEntry, old: ChannelEntry) -> Vec<ChainEvent> {
+        let (tx, mut rx) = async_broadcast::broadcast(16);
+        let me = Address::default();
+        process_channel_changes_into_events(new, old.diff(&new), &me, &tx).await;
+        drop(tx);
+        let mut events = Vec::new();
+        while let Ok(event) = rx.recv().await {
+            events.push(event);
+        }
+        events
+    }
+
+    #[tokio::test]
+    async fn open_to_closed_should_emit_channel_closed() {
+        let events = events_for(channel(ChannelStatus::Closed, 1), channel(ChannelStatus::Open, 1)).await;
+        assert!(matches!(events.as_slice(), [ChainEvent::ChannelClosed(c)] if c.status == ChannelStatus::Closed));
+    }
+
+    #[tokio::test]
+    async fn pending_to_close_to_open_should_emit_channel_opened() {
+        let events = events_for(channel(ChannelStatus::Open, 1), channel(pending(), 1)).await;
+        assert!(matches!(events.as_slice(), [ChainEvent::ChannelOpened(c)] if c.status == ChannelStatus::Open));
+    }
+
+    #[tokio::test]
+    async fn closed_to_open_should_still_emit_channel_opened() {
+        let events = events_for(channel(ChannelStatus::Open, 2), channel(ChannelStatus::Closed, 1)).await;
+        assert!(matches!(events.as_slice(), [ChainEvent::ChannelOpened(_)]));
+    }
+
+    #[tokio::test]
+    async fn epoch_change_alone_should_not_emit_an_event() {
+        // ChainEvent has no variant for an epoch change.
+        let events = events_for(channel(ChannelStatus::Open, 2), channel(ChannelStatus::Open, 1)).await;
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn first_seen_channel_event_should_match_the_status() {
+        assert!(matches!(
+            event_for_first_seen_channel(channel(ChannelStatus::Open, 1)),
+            Some(ChainEvent::ChannelOpened(_))
+        ));
+        assert!(matches!(
+            event_for_first_seen_channel(channel(pending(), 1)),
+            Some(ChainEvent::ChannelClosureInitiated(_))
+        ));
+        assert!(event_for_first_seen_channel(channel(ChannelStatus::Closed, 1)).is_none());
+    }
+
+    #[test]
+    fn channel_model_with_a_negative_epoch_should_be_rejected() {
+        let model = |epoch: i32| blokli_client::api::types::Channel {
+            balance: blokli_client::api::types::TokenValueString(HoprBalance::from(10_u32).to_string()),
+            closure_time: None,
+            concrete_channel_id: String::new(),
+            destination: 2,
+            epoch,
+            source: 1,
+            status: blokli_client::api::types::ChannelStatus::Open,
+            ticket_index: blokli_client::api::types::Uint64("0".into()),
+        };
+        let (src, dst) = (Address::new(&[1u8; Address::SIZE]), Address::new(&[2u8; Address::SIZE]));
+
+        assert!(matches!(
+            model_to_channel_entry(&model(-1), src, dst),
+            Err(ConnectorError::TypeConversion(_))
+        ));
+        assert_eq!(3, model_to_channel_entry(&model(3), src, dst).unwrap().channel_epoch);
+    }
+
+    #[test]
+    fn open_channel_counter_should_count_distinct_open_channels_only() {
+        let mut counter = OpenChannelCounter::default();
+        let open = channel(ChannelStatus::Open, 1);
+
+        assert_eq!(1, counter.observe(&open));
+        // a replay or an update of the same channel does not count again
+        assert_eq!(1, counter.observe(&open));
+        assert_eq!(1, counter.observe(&channel(ChannelStatus::Open, 2)));
+
+        let other = ChannelEntry::builder()
+            .between(
+                &ChainKeypair::from_secret(&[1u8; 32]).unwrap(),
+                &ChainKeypair::from_secret(&[3u8; 32]).unwrap(),
+            )
+            .amount(1)
+            .ticket_index(0)
+            .status(pending())
+            .epoch(1)
+            .build()
+            .unwrap();
+        // a channel that is not open does not count
+        assert_eq!(1, counter.observe(&other));
     }
 }

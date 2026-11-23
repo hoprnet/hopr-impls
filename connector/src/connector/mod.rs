@@ -29,15 +29,20 @@ use crate::{
     errors::ConnectorError,
     metrics::{PHASE_TRACK, record_tx_outcome},
     utils::{
-        ParsedChainInfo, model_to_account_entry, model_to_graph_entry, model_to_service_registry_config,
-        model_to_ticket_params, process_channel_changes_into_events,
+        OpenChannelCounter, ParsedChainInfo, event_for_first_seen_channel, model_to_account_entry,
+        model_to_graph_entry, model_to_service_registry_config, model_to_ticket_params,
+        process_channel_changes_into_events,
     },
 };
 
 mod accounts;
+mod cache;
+#[cfg(test)]
+mod channel_cache_race_tests;
 mod channels;
 mod events;
 mod keys;
+mod reconcile;
 mod safe;
 mod sequencer;
 #[cfg(test)]
@@ -71,6 +76,12 @@ const TICKET_CUSTOM_TIMEOUT_MULTIPLIER: u32 = 4;
 
 /// How often the health of the chain subscriptions is checked.
 const SUBSCRIPTION_HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How often the node's own channels are reconciled against Blokli, after the one right when the connection is ready.
+///
+/// A pass costs two channel queries (plus an account lookup for each unknown endpoint). Every few minutes bounds how
+/// long a channel missed by the subscription stays wrong, while the load stays negligible next to the subscriptions.
+const CHANNEL_RECONCILE_INTERVAL: Duration = Duration::from_mins(5);
 
 /// How often the chain state gauges are refreshed. Independent of the state dump interval.
 #[cfg(feature = "telemetry")]
@@ -530,6 +541,19 @@ where
 
         let channel_by_id = self.channel_by_id.clone();
         let channel_by_parties = self.channel_by_parties.clone();
+        let reconciler = std::sync::Arc::new(reconcile::OwnChannelReconciler {
+            client: self.client.clone(),
+            backend: self.backend.clone(),
+            graph: self.graph.clone(),
+            channel_by_id: self.channel_by_id.clone(),
+            channel_by_parties: self.channel_by_parties.clone(),
+            event_tx: self.events.0.clone(),
+            me,
+            in_flight: Default::default(),
+        });
+        // Fires once the connection is ready, which starts the first reconciliation.
+        let (first_reconcile_tx, first_reconcile_rx) = futures::channel::oneshot::channel::<()>();
+        let mut first_reconcile_tx = Some(first_reconcile_tx);
 
         // Query chain info to populate the cache
         let initial_chain_values = self.query_cached_chain_info().await?;
@@ -553,6 +577,8 @@ where
             Service(ServiceEvent),
             /// Time to check the health of the subscriptions.
             HealthCheck,
+            /// Time to reconcile the node's own channels with Blokli.
+            ReconcileChannels,
             /// Time to refresh the chain state gauges.
             #[cfg(feature = "telemetry")]
             MetricsRefresh,
@@ -562,7 +588,7 @@ where
             /// Whether the value is a timer tick rather than chain data.
             fn is_tick(&self) -> bool {
                 match self {
-                    SubscribedEventType::HealthCheck => true,
+                    SubscribedEventType::HealthCheck | SubscribedEventType::ReconcileChannels => true,
                     #[cfg(feature = "telemetry")]
                     SubscribedEventType::MetricsRefresh => true,
                     _ => false,
@@ -663,22 +689,22 @@ where
                     let chain_to_packet = chain_to_packet.clone();
                     let packet_to_chain = packet_to_chain.clone();
                     hopr_utils::runtime::prelude::spawn_blocking(move || {
-                        mapper.key_to_id.insert(account.public_key, Some(account.key_id));
-                        mapper.id_to_key.insert(account.key_id, Some(account.public_key));
-                        chain_to_packet.insert(account.chain_addr, Some(account.public_key));
-                        packet_to_chain.insert(account.public_key, Some(account.chain_addr));
                         graph.write().add_node(account.key_id);
-                        let old = mapper
-                            .backend
-                            .insert_account(account.clone())
-                            .map_err(ConnectorError::backend)?;
+                        let stored = mapper.backend.insert_account(account.clone());
+                        // Caches are written after the backend, serialized per key with the lookups. They are
+                        // filled even when the backend write failed, so the mapping is not lost.
+                        cache::put(&mapper.key_to_id, &account.public_key, account.key_id);
+                        cache::put(&mapper.id_to_key, &account.key_id, account.public_key);
+                        cache::put(&chain_to_packet, &account.chain_addr, account.public_key);
+                        cache::put(&packet_to_chain, &account.public_key, account.chain_addr);
+                        let old = stored.map_err(ConnectorError::backend)?;
                         accounts::update_announced(&announced, &account, old.as_ref(), &me);
                         if let Some(old_account) = &old {
                             if old_account.chain_addr != account.chain_addr {
-                                chain_to_packet.invalidate(&old_account.chain_addr);
+                                cache::invalidate(&chain_to_packet, &old_account.chain_addr);
                             }
                             if old_account.public_key != account.public_key {
-                                packet_to_chain.invalidate(&old_account.public_key);
+                                cache::invalidate(&packet_to_chain, &old_account.public_key);
                             }
                         }
                         Ok::<_, ConnectorError>((account, old))
@@ -703,20 +729,22 @@ where
                     let channel_by_id = channel_by_id.clone();
                     let channel_by_parties = channel_by_parties.clone();
                     hopr_utils::runtime::prelude::spawn_blocking(move || {
-                        graph.write().add_edge(src.key_id, dst.key_id, *channel.get_id());
-                        backend
-                            .insert_channel(channel)
-                            .map(|old| (channel, old.map(|old| old.diff(&channel))))
+                        reconcile::upsert_channel(
+                            backend.as_ref(),
+                            &graph,
+                            &channel_by_id,
+                            &channel_by_parties,
+                            (src.key_id, dst.key_id),
+                            channel,
+                            false,
+                        )
+                        .map(|upsert| match upsert {
+                            reconcile::Upsert::Written(old) => (channel, old.map(|old| old.diff(&channel))),
+                            reconcile::Upsert::Skipped { .. } => (channel, None),
+                        })
                     })
                     .map_err(ConnectorError::backend)
-                    .and_then(move |res| {
-                        let channel_by_id = channel_by_id.clone();
-                        let channel_by_parties = channel_by_parties.clone();
-                        if let Ok((upserted_channel, _)) = &res {
-                            // Rather update the cached entry than invalidating it
-                            channel_by_id.insert(*upserted_channel.get_id(), Some(*upserted_channel));
-                            channel_by_parties.insert(ChannelParties::from(upserted_channel), Some(*upserted_channel));
-                        }
+                    .and_then(|res| {
                         futures::future::ready(res.map(SubscribedEventType::Channel).map_err(ConnectorError::backend))
                     })
                 })
@@ -848,15 +876,30 @@ where
                 .fuse();
 
             let mut account_counter = 0;
+            let mut open_channels = OpenChannelCounter::default();
             let mut channel_counter = 0;
             if min_accounts == 0 && min_channels == 0 {
                 tracing::info!(account_counter, channel_counter, time = ?sync_started.elapsed(), "on-chain graph has been synced");
                 let _ = connection_ready_tx.take().unwrap().send(Ok(()));
+                let _ = first_reconcile_tx.take().map(|tx| tx.send(()));
             }
 
             let health_checks =
                 futures_time::stream::interval(futures_time::time::Duration::from(SUBSCRIPTION_HEALTH_CHECK_INTERVAL))
                     .map(|_| Ok::<_, SubscriptionError>(SubscribedEventType::HealthCheck));
+            // The first pass runs once the connection is ready (if it never is, the task is aborted and the
+            // sender dropped), the following ones at a fixed interval.
+            let reconcile_ticks = futures::stream::select(
+                first_reconcile_rx
+                    .into_stream()
+                    .filter_map(|ready| futures::future::ready(ready.ok()))
+                    .map(|_| Ok::<_, SubscriptionError>(SubscribedEventType::ReconcileChannels)),
+                futures::stream::unfold((), |_| async {
+                    futures_time::task::sleep(futures_time::time::Duration::from(CHANNEL_RECONCILE_INTERVAL)).await;
+                    Some((Ok::<_, SubscriptionError>(SubscribedEventType::ReconcileChannels), ()))
+                }),
+            );
+            let health_checks = futures::stream::select(health_checks, reconcile_ticks);
             #[cfg(feature = "telemetry")]
             let health_checks = (
                 health_checks,
@@ -884,14 +927,14 @@ where
                 if connection_ready_tx.is_some() && !event_type.is_tick() {
                     match event_type {
                         SubscribedEventType::Account(_) => account_counter += 1,
-                        SubscribedEventType::Channel(_) => channel_counter += 1,
+                        SubscribedEventType::Channel((channel, _)) => channel_counter = open_channels.observe(channel),
                         // Service registry events deliberately do not count towards the connection
                         // quota: a node with no services must still reach the Ready state.
                         _ => {}
                     }
 
                     let pct_synced =
-                        ((account_counter + channel_counter) * 100 / (min_accounts + min_channels)).clamp(0, 100);
+                        ((account_counter + channel_counter) * 100 / (min_accounts + min_channels).max(1)).clamp(0, 100);
                     tracing::debug!(
                         pct_synced,
                         sync_quota,
@@ -906,6 +949,7 @@ where
                     if account_counter >= min_accounts && channel_counter >= min_channels {
                         tracing::info!(account_counter, channel_counter, time = ?sync_started.elapsed(), "on-chain graph has been synced");
                         let _ = connection_ready_tx.take().unwrap().send(Ok(()));
+                        let _ = first_reconcile_tx.take().map(|tx| tx.send(()));
                     }
                 }
             })
@@ -925,6 +969,7 @@ where
                     ));
                 }
                 let event_tx = event_tx.clone();
+                let reconciler = reconciler.clone();
                 async move {
                     match event_type {
                         Ok(SubscribedEventType::Account((new_account, old_account))) => {
@@ -955,7 +1000,9 @@ where
                                 src = %new_channel.source, dst = %new_channel.destination,
                                 "channel opened"
                             );
-                            let _ = event_tx.broadcast_direct(ChainEvent::ChannelOpened(new_channel)).await;
+                            if let Some(event) = event_for_first_seen_channel(new_channel) {
+                                let _ = event_tx.broadcast_direct(event).await;
+                            }
                         }
                         Ok(SubscribedEventType::WinningProbability((new, old))) => {
                             let old = old.unwrap_or_default();
@@ -985,6 +1032,9 @@ where
                             let _ = event_tx.broadcast_direct(event).await;
                         }
                         Ok(SubscribedEventType::HealthCheck) => {}
+                        Ok(SubscribedEventType::ReconcileChannels) => {
+                            reconciler.spawn_pass();
+                        }
                         #[cfg(feature = "telemetry")]
                         Ok(SubscribedEventType::MetricsRefresh) => {}
                         Err(SubscriptionError { subscription, error }) => {
