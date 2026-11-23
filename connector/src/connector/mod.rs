@@ -39,6 +39,7 @@ mod accounts;
 mod channels;
 mod events;
 mod keys;
+mod reconcile;
 mod safe;
 mod sequencer;
 #[cfg(test)]
@@ -72,6 +73,15 @@ const TICKET_CUSTOM_TIMEOUT_MULTIPLIER: u32 = 4;
 
 /// How often the health of the chain subscriptions is checked.
 const SUBSCRIPTION_HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How often the node's own channels are reconciled against Blokli, after the one right when the connection is ready.
+///
+/// A pass costs two channel queries (plus an account lookup for each unknown endpoint). Every few minutes bounds how
+/// long a channel missed by the subscription stays wrong, while the load stays negligible next to the subscriptions.
+const CHANNEL_RECONCILE_INTERVAL: Duration = Duration::from_mins(5);
+
+/// Upper bound for one reconciliation pass, so a slow Blokli cannot hold up the subscription handling for long.
+const CHANNEL_RECONCILE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How often the chain state gauges are refreshed. Independent of the state dump interval.
 #[cfg(feature = "telemetry")]
@@ -531,6 +541,18 @@ where
 
         let channel_by_id = self.channel_by_id.clone();
         let channel_by_parties = self.channel_by_parties.clone();
+        let reconciler = std::sync::Arc::new(reconcile::OwnChannelReconciler {
+            client: self.client.clone(),
+            backend: self.backend.clone(),
+            graph: self.graph.clone(),
+            channel_by_id: self.channel_by_id.clone(),
+            channel_by_parties: self.channel_by_parties.clone(),
+            event_tx: self.events.0.clone(),
+            me,
+        });
+        // Fires once the connection is ready, which starts the first reconciliation.
+        let (first_reconcile_tx, first_reconcile_rx) = futures::channel::oneshot::channel::<()>();
+        let mut first_reconcile_tx = Some(first_reconcile_tx);
 
         // Query chain info to populate the cache
         let initial_chain_values = self.query_cached_chain_info().await?;
@@ -554,6 +576,8 @@ where
             Service(ServiceEvent),
             /// Time to check the health of the subscriptions.
             HealthCheck,
+            /// Time to reconcile the node's own channels with Blokli.
+            ReconcileChannels,
             /// Time to refresh the chain state gauges.
             #[cfg(feature = "telemetry")]
             MetricsRefresh,
@@ -563,7 +587,7 @@ where
             /// Whether the value is a timer tick rather than chain data.
             fn is_tick(&self) -> bool {
                 match self {
-                    SubscribedEventType::HealthCheck => true,
+                    SubscribedEventType::HealthCheck | SubscribedEventType::ReconcileChannels => true,
                     #[cfg(feature = "telemetry")]
                     SubscribedEventType::MetricsRefresh => true,
                     _ => false,
@@ -854,11 +878,25 @@ where
             if min_accounts == 0 && min_channels == 0 {
                 tracing::info!(account_counter, channel_counter, time = ?sync_started.elapsed(), "on-chain graph has been synced");
                 let _ = connection_ready_tx.take().unwrap().send(Ok(()));
+                let _ = first_reconcile_tx.take().map(|tx| tx.send(()));
             }
 
             let health_checks =
                 futures_time::stream::interval(futures_time::time::Duration::from(SUBSCRIPTION_HEALTH_CHECK_INTERVAL))
                     .map(|_| Ok::<_, SubscriptionError>(SubscribedEventType::HealthCheck));
+            // The first pass runs once the connection is ready (if it never is, the task is aborted and the
+            // sender dropped), the following ones at a fixed interval.
+            let reconcile_ticks = futures::stream::select(
+                first_reconcile_rx
+                    .into_stream()
+                    .filter_map(|ready| futures::future::ready(ready.ok()))
+                    .map(|_| Ok::<_, SubscriptionError>(SubscribedEventType::ReconcileChannels)),
+                futures::stream::unfold((), |_| async {
+                    futures_time::task::sleep(futures_time::time::Duration::from(CHANNEL_RECONCILE_INTERVAL)).await;
+                    Some((Ok::<_, SubscriptionError>(SubscribedEventType::ReconcileChannels), ()))
+                }),
+            );
+            let health_checks = futures::stream::select(health_checks, reconcile_ticks);
             #[cfg(feature = "telemetry")]
             let health_checks = (
                 health_checks,
@@ -908,6 +946,7 @@ where
                     if account_counter >= min_accounts && channel_counter >= min_channels {
                         tracing::info!(account_counter, channel_counter, time = ?sync_started.elapsed(), "on-chain graph has been synced");
                         let _ = connection_ready_tx.take().unwrap().send(Ok(()));
+                        let _ = first_reconcile_tx.take().map(|tx| tx.send(()));
                     }
                 }
             })
@@ -927,6 +966,7 @@ where
                     ));
                 }
                 let event_tx = event_tx.clone();
+                let reconciler = reconciler.clone();
                 async move {
                     match event_type {
                         Ok(SubscribedEventType::Account((new_account, old_account))) => {
@@ -989,6 +1029,17 @@ where
                             let _ = event_tx.broadcast_direct(event).await;
                         }
                         Ok(SubscribedEventType::HealthCheck) => {}
+                        Ok(SubscribedEventType::ReconcileChannels) => {
+                            match reconciler
+                                .reconcile()
+                                .timeout(futures_time::time::Duration::from(CHANNEL_RECONCILE_TIMEOUT))
+                                .await
+                            {
+                                Ok(Ok(stats)) => tracing::debug!(?stats, "own channels reconciled"),
+                                Ok(Err(error)) => tracing::warn!(%error, "own channel reconciliation failed"),
+                                Err(_) => tracing::warn!("own channel reconciliation timed out"),
+                            }
+                        }
                         #[cfg(feature = "telemetry")]
                         Ok(SubscribedEventType::MetricsRefresh) => {}
                         Err(SubscriptionError { subscription, error }) => {
