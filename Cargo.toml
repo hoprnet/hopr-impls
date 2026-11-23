@@ -32,7 +32,7 @@ hopr-chain-connector = { path = "connector", version = "0.36.0" }
 hopr-network-graph   = { path = "graph", version = "0.13.0", default-features = false }
 
 # External HOPR crates
-blokli-client = "0.38.0"
+blokli-client = "0.38.1"
 hopr-api      = "6.1.0"
 hopr-utils    = { package = "hopr-utilities", version = "0.21.0", default-features = false }
 
