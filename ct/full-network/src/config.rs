@@ -3,85 +3,108 @@ use serde::{Deserialize, Serialize};
 use validator::{Validate, ValidationError, ValidationErrors};
 
 /// Configuration for the probing mechanism
+///
+/// Deserialization runs [`Validate::validate`], so a config taken from a file cannot hold a value
+/// the probing code would have to defend against.
 #[derive(Debug, Clone, Copy, PartialEq, smart_default::SmartDefault)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(deny_unknown_fields))]
+#[cfg_attr(
+    feature = "serde",
+    derive(Serialize, Deserialize),
+    serde(try_from = "EgressConfigFields")
+)]
 pub struct EgressConfig {
-    /// The delay between individual probing rounds for neighbor discovery.
+    /// The delay between individual cover-traffic rounds.
     ///
-    /// A loopback is sent once per round, and the graph counts its outcome for
-    /// `hopr_network_graph::LOOPBACK_WINDOW`. Validation rejects an interval above half of that, because a
-    /// failing relay's evidence would expire between rounds and it would read as unprobed, not dead.
-    #[cfg_attr(
-        feature = "serde",
-        serde(default = "default_probing_interval", with = "humantime_serde")
-    )]
+    /// The delay between individual cover-traffic rounds.
+    ///
+    /// Cover traffic only, which is why this exists only with the `noise` feature: probe generation
+    /// is pull driven and never reads a clock. Validation rejects an interval above half of the
+    /// loopback evidence window, because a failing relay's evidence would expire between
+    /// cover-traffic rounds.
+    #[cfg(feature = "noise")]
     #[default(default_probing_interval())]
     pub interval: std::time::Duration,
 
-    /// Weight for the staleness factor in probe priority (0.0–1.0).
+    /// How long an idle probe stream waits before re-reading the graph on its own.
     ///
-    /// Higher values prioritize probing edges that haven't been measured recently.
-    /// Set to `0.0` to disable staleness-based probing (edges are not prioritized by age).
-    /// At least one of `staleness_weight`, `quality_weight`, or `base_priority` must be positive.
-    #[cfg_attr(feature = "serde", serde(default = "default_staleness_weight"))]
-    #[default(default_staleness_weight())]
-    pub staleness_weight: f64,
+    /// A stream with nothing to offer cannot see a disconnect, a dropped rate or a new channel: the
+    /// graph has no change notification and the generator reads no clock. Re-reading after this long
+    /// bounds how stale an idle stream can be, and
+    /// [`EgressControl::wake_probing`](crate::EgressControl::wake_probing) makes it immediate for a
+    /// consumer that knows it just wrote. Must be greater than zero.
+    #[default(default_recheck_interval())]
+    pub recheck_interval: std::time::Duration,
 
-    /// Weight for the inverse quality factor in probe priority (0.0–1.0).
+    /// When `true`, neighbor probes are only sent to peers that are not observed to be down.
     ///
-    /// Higher values prioritize probing edges with poor quality scores.
-    /// Set to `0.0` to disable quality-based probing (edges are not prioritized by their score).
-    /// At least one of `staleness_weight`, `quality_weight`, or `base_priority` must be positive.
-    #[cfg_attr(feature = "serde", serde(default = "default_quality_weight"))]
-    #[default(default_quality_weight())]
-    pub quality_weight: f64,
-
-    /// Minimum probe chance added for all peers regardless of measurements (0.0–1.0).
-    ///
-    /// Ensures that even well-measured, recently-probed peers retain some chance of re-probing.
-    /// Set to `0.0` only when `staleness_weight` and/or `quality_weight` are sufficient to
-    /// guarantee all peers receive probe opportunities.
-    /// At least one of `staleness_weight`, `quality_weight`, or `base_priority` must be positive.
-    #[cfg_attr(feature = "serde", serde(default = "default_base_priority"))]
-    #[default(default_base_priority())]
-    pub base_priority: f64,
-
-    /// TTL for the cached weighted shuffle order.
-    ///
-    /// When expired, the graph is re-traversed and a new priority-ordered shuffle is computed.
-    /// Defaults to `2 × interval`.
-    #[cfg_attr(feature = "serde", serde(default = "default_shuffle_ttl", with = "humantime_serde"))]
-    #[default(default_shuffle_ttl())]
-    pub shuffle_ttl: std::time::Duration,
-
-    /// When `true`, neighbor probes are only sent to peers that have a
-    /// `Connected(true)` edge in the graph (i.e. the background discovery
-    /// process has already established a transport-level connection).
-    ///
-    /// When `false`, all known peers are probed regardless of connection
-    /// state — useful during bootstrap or when discovery runs out-of-band.
-    #[cfg_attr(feature = "serde", serde(default = "just_true"))]
+    /// A peer whose connectivity was never observed is still probed: skipping it would suppress the
+    /// probe that establishes whether it is reachable.
     #[default(just_true())]
     pub probe_connected_only: bool,
 
-    /// Factor by which forward-focused loopbacks outweigh other loopbacks (>= 1.0). Return-focused
-    /// loopbacks get `max(focus_boost / 2, 1.0)`.
+    /// Probes a peer needs before it counts as measured (`N`).
     ///
-    /// Applies only while a focus is set with `EgressControl::set_focus`. Loopbacks are emitted in
-    /// a weighted shuffle, so a higher factor makes focused loops lead each round more often.
-    /// `1.0` gives focused loops no advantage.
-    #[cfg_attr(feature = "serde", serde(default = "default_focus_boost"))]
-    #[default(default_focus_boost())]
-    pub focus_boost: f64,
+    /// A peer below `N` is probed on every pull until it reaches the count. From there on it is left
+    /// alone while it stays connected. Must be at least
+    /// [`hopr_network_graph::PROBE_SUCCESS_AVERAGING_WINDOW`]: below the success-rate averaging window
+    /// the count says nothing about the rate it is meant to measure.
+    #[default(default_stable_samples())]
+    pub stable_samples: u32,
+
+    /// Probe success rate below which a measured peer is probed again.
+    ///
+    /// The further below the threshold the rate sits, the earlier the peer is offered. In
+    /// `[0.0, 1.0]`; `0.0` disables the trigger.
+    #[default(default_min_success_rate())]
+    pub min_success_rate: f64,
+
+    /// Acknowledgement rate below which a measured peer is probed again.
+    ///
+    /// The further below the threshold the rate sits, the earlier the peer is offered. In
+    /// `[0.0, 1.0]`; `0.0` disables the trigger.
+    #[default(default_min_ack_rate())]
+    pub min_ack_rate: f64,
+
+    /// Chance that a measured, healthy peer is offered again on a pull.
+    ///
+    /// Keeps a stale assumption about a static link from holding forever, at a small steady cost. In
+    /// `[0.0, 1.0]`; `0.0` stops the re-add.
+    #[default(default_readd_probability())]
+    pub readd_probability: f64,
+
+    /// Share of loopback probes that keep the best paths measured; the rest explores.
+    ///
+    /// The best set is the focused loops while a focus is set, and the paths the planner values most
+    /// otherwise. In `[0.0, 1.0]`; `0.9` sends a tenth of the loopbacks to the rest of the network.
+    #[default(default_best_path_share())]
+    pub best_path_share: f64,
+
+    /// Most paths the best set holds. At least 1.
+    #[default(default_best_set_size())]
+    pub best_set_size: usize,
 }
 
 impl EgressConfig {
-    /// Validates the config, additionally ensuring `self.interval >= probe_timeout`.
+    /// Validates the config, additionally ensuring the cover-traffic interval is at least
+    /// `probe_timeout`.
     ///
-    /// Pinging more frequently than the probe timeout would cause probes to overlap;
-    /// this check prevents that misconfiguration.
+    /// Rounds closer together than the probe timeout would overlap; this check prevents that
+    /// misconfiguration. Only exists with the `noise` feature, which is the only thing that paces on
+    /// the interval.
+    #[cfg(feature = "noise")]
     pub fn validate_against_probe_timeout(&self, probe_timeout: std::time::Duration) -> anyhow::Result<()> {
-        self.validate()
+        self.validate_against_loopback_window(probe_timeout, hopr_network_graph::LOOPBACK_WINDOW)
+    }
+
+    /// Like [`validate_against_probe_timeout`](Self::validate_against_probe_timeout), with the interval
+    /// checked against the graph's configured loopback `window` instead of the default one.
+    #[cfg(feature = "noise")]
+    pub fn validate_against_loopback_window(
+        &self,
+        probe_timeout: std::time::Duration,
+        window: std::time::Duration,
+    ) -> anyhow::Result<()> {
+        self.validate_for_window(window)
             .map_err(|e| anyhow::anyhow!("invalid EgressConfig: {e}"))?;
         anyhow::ensure!(
             self.interval >= probe_timeout,
@@ -91,52 +114,84 @@ impl EgressConfig {
         );
         Ok(())
     }
-}
 
-impl Validate for EgressConfig {
-    fn validate(&self) -> Result<(), ValidationErrors> {
+    /// The checks of [`Validate::validate`], with the interval held against `window` instead of the
+    /// default loopback window.
+    ///
+    /// `window` only matters for the interval, which exists only with the `noise` feature.
+    #[cfg_attr(not(feature = "noise"), allow(unused_variables))]
+    fn validate_for_window(&self, window: std::time::Duration) -> Result<(), ValidationErrors> {
         let mut errors = ValidationErrors::new();
 
-        if !(0.0..=1.0).contains(&self.staleness_weight) {
+        // Below the success-rate averaging window the sample count says nothing about the rate it is
+        // meant to measure, so probing would stop on noise instead of on a measurement.
+        if (self.stable_samples as usize) < hopr_network_graph::PROBE_SUCCESS_AVERAGING_WINDOW {
             errors.add(
-                "staleness_weight",
-                ValidationError::new("staleness_weight must be between 0.0 and 1.0"),
-            );
-        }
-        if !(0.0..=1.0).contains(&self.quality_weight) {
-            errors.add(
-                "quality_weight",
-                ValidationError::new("quality_weight must be between 0.0 and 1.0"),
-            );
-        }
-        if !(0.0..=1.0).contains(&self.base_priority) {
-            errors.add(
-                "base_priority",
-                ValidationError::new("base_priority must be between 0.0 and 1.0"),
+                "stable_samples",
+                ValidationError::new("stable_samples_below_averaging_window").with_message(
+                    format!(
+                        "stable_samples must be at least {} (the probe success-rate averaging window)",
+                        hopr_network_graph::PROBE_SUCCESS_AVERAGING_WINDOW
+                    )
+                    .into(),
+                ),
             );
         }
 
-        // The loopback evidence of one round must still be counted when the next one is sent, with room for
-        // the probe timeout and a late round, or a failing relay reads as unprobed instead of starved.
-        if self.interval > hopr_network_graph::LOOPBACK_WINDOW / 2 {
+        // The loopback evidence of one cover-traffic round must still be counted when the next one is
+        // sent, with room for the probe timeout and a late round, or a failing relay reads as unprobed
+        // instead of starved.
+        #[cfg(feature = "noise")]
+        if self.interval > window / 2 {
             errors.add(
                 "interval",
-                ValidationError::new("interval must fit twice in the 60 s loopback evidence window"),
+                ValidationError::new("interval_exceeds_loopback_window")
+                    .with_message(format!("interval must fit twice in the {window:?} loopback evidence window").into()),
+            );
+        }
+
+        if self.recheck_interval.is_zero() {
+            errors.add(
+                "recheck_interval",
+                ValidationError::new("zero_recheck_interval")
+                    .with_message("recheck_interval must be greater than zero".into()),
             );
         }
 
         // Also rejects NaN, which no comparison satisfies.
-        if !(self.focus_boost >= 1.0 && self.focus_boost.is_finite()) {
+        for (field, rate) in [
+            ("min_success_rate", self.min_success_rate),
+            ("min_ack_rate", self.min_ack_rate),
+        ] {
+            if !(0.0..=1.0).contains(&rate) {
+                errors.add(
+                    field,
+                    ValidationError::new("rate_threshold_out_of_range")
+                        .with_message(format!("{field} must be between 0.0 and 1.0, got {rate}").into()),
+                );
+            }
+        }
+
+        if !(0.0..=1.0).contains(&self.readd_probability) {
             errors.add(
-                "focus_boost",
-                ValidationError::new("focus_boost must be finite and at least 1.0"),
+                "readd_probability",
+                ValidationError::new("readd_probability_out_of_range")
+                    .with_message("readd_probability must be between 0.0 and 1.0".into()),
             );
         }
 
-        if self.staleness_weight + self.quality_weight + self.base_priority <= 0.0 {
+        if !(0.0..=1.0).contains(&self.best_path_share) {
             errors.add(
-                "weights",
-                ValidationError::new("at least one priority weight must be positive"),
+                "best_path_share",
+                ValidationError::new("best_path_share_out_of_range")
+                    .with_message("best_path_share must be between 0.0 and 1.0".into()),
+            );
+        }
+
+        if self.best_set_size == 0 {
+            errors.add(
+                "best_set_size",
+                ValidationError::new("empty_best_set").with_message("best_set_size must be at least 1".into()),
             );
         }
 
@@ -144,31 +199,137 @@ impl Validate for EgressConfig {
     }
 }
 
-#[inline]
-const fn default_staleness_weight() -> f64 {
-    0.4
+impl Validate for EgressConfig {
+    /// Holds the interval against the default [`hopr_network_graph::LOOPBACK_WINDOW`]; use
+    /// [`validate_against_loopback_window`](EgressConfig::validate_against_loopback_window) for a configured one.
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        self.validate_for_window(hopr_network_graph::LOOPBACK_WINDOW)
+    }
+}
+
+/// The wire form of [`EgressConfig`].
+///
+/// Split out so deserialization can run [`Validate::validate`] before an `EgressConfig` exists: a
+/// config file is the one path that could otherwise hand probing a value outside its bounds. Every
+/// field repeats [`EgressConfig`]'s default, so an omitted field deserializes to the same value.
+#[cfg(feature = "serde")]
+#[derive(serde::Deserialize, Validate)]
+#[serde(deny_unknown_fields)]
+struct EgressConfigFields {
+    #[cfg(feature = "noise")]
+    #[serde(default = "default_probing_interval", with = "humantime_serde")]
+    interval: std::time::Duration,
+    #[serde(default = "default_recheck_interval", with = "humantime_serde")]
+    #[validate(custom(function = "positive_duration"))]
+    recheck_interval: std::time::Duration,
+    #[serde(default = "just_true")]
+    probe_connected_only: bool,
+    #[serde(default = "default_stable_samples")]
+    stable_samples: u32,
+    #[serde(default = "default_min_success_rate")]
+    #[validate(custom(function = "unit_interval"))]
+    min_success_rate: f64,
+    #[serde(default = "default_min_ack_rate")]
+    #[validate(custom(function = "unit_interval"))]
+    min_ack_rate: f64,
+    #[serde(default = "default_readd_probability")]
+    #[validate(custom(function = "unit_interval"))]
+    readd_probability: f64,
+    #[serde(default = "default_best_path_share")]
+    #[validate(custom(function = "unit_interval"))]
+    best_path_share: f64,
+    #[serde(default = "default_best_set_size")]
+    best_set_size: usize,
+}
+
+/// Rejects anything outside `[0, 1]`.
+///
+/// Custom rather than `#[validate(range(..))]` because `range` lets `NaN` through: both of its
+/// comparisons are false for it, and a threshold of `NaN` would silently never trigger.
+#[cfg(feature = "serde")]
+fn unit_interval(value: f64) -> Result<(), ValidationError> {
+    if (0.0..=1.0).contains(&value) {
+        Ok(())
+    } else {
+        Err(ValidationError::new("unit_interval")
+            .with_message(format!("must be between 0.0 and 1.0, got {value}").into()))
+    }
+}
+
+/// Rejects a zero duration, which would make an idle stream spin.
+#[cfg(feature = "serde")]
+fn positive_duration(value: &std::time::Duration) -> Result<(), ValidationError> {
+    if value.is_zero() {
+        Err(ValidationError::new("positive_duration").with_message("must be greater than zero".into()))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(feature = "serde")]
+impl TryFrom<EgressConfigFields> for EgressConfig {
+    /// The validation failures, joined, so serde reports why the config was rejected.
+    type Error = String;
+
+    fn try_from(fields: EgressConfigFields) -> Result<Self, Self::Error> {
+        // The wire form carries its own field bounds, so a value outside them is rejected here,
+        // named by the field it belongs to, before the config exists.
+        fields.validate().map_err(|errors| errors.to_string())?;
+
+        let cfg = EgressConfig {
+            #[cfg(feature = "noise")]
+            interval: fields.interval,
+            recheck_interval: fields.recheck_interval,
+            probe_connected_only: fields.probe_connected_only,
+            stable_samples: fields.stable_samples,
+            min_success_rate: fields.min_success_rate,
+            min_ack_rate: fields.min_ack_rate,
+            readd_probability: fields.readd_probability,
+            best_path_share: fields.best_path_share,
+            best_set_size: fields.best_set_size,
+        };
+
+        cfg.validate().map(|()| cfg).map_err(|errors| errors.to_string())
+    }
 }
 
 #[inline]
-const fn default_quality_weight() -> f64 {
-    0.3
+const fn default_stable_samples() -> u32 {
+    // The floor, so the default measures the longest average an edge keeps before it stops probing.
+    hopr_network_graph::PROBE_SUCCESS_AVERAGING_WINDOW as u32
 }
 
 #[inline]
-const fn default_base_priority() -> f64 {
-    0.3
+const fn default_min_success_rate() -> f64 {
+    0.5
 }
 
 #[inline]
-const fn default_focus_boost() -> f64 {
-    10.0
+const fn default_min_ack_rate() -> f64 {
+    0.5
 }
 
 #[inline]
-const fn default_shuffle_ttl() -> std::time::Duration {
-    std::time::Duration::from_secs(default_probing_interval().as_secs() * 2)
+const fn default_readd_probability() -> f64 {
+    0.01
 }
 
+#[inline]
+const fn default_best_path_share() -> f64 {
+    0.9
+}
+
+#[inline]
+const fn default_best_set_size() -> usize {
+    100
+}
+
+#[inline]
+const fn default_recheck_interval() -> std::time::Duration {
+    std::time::Duration::from_secs(30)
+}
+
+#[cfg(feature = "noise")]
 #[inline]
 const fn default_probing_interval() -> std::time::Duration {
     std::time::Duration::from_secs(30)
@@ -183,11 +344,13 @@ const fn just_true() -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "noise")]
     #[test]
     fn the_default_probing_interval_should_pass_validation() {
         assert!(EgressConfig::default().validate().is_ok());
     }
 
+    #[cfg(feature = "noise")]
     #[test]
     fn an_interval_that_does_not_fit_twice_in_the_loopback_window_should_be_invalid() {
         let half = hopr_network_graph::LOOPBACK_WINDOW / 2;
@@ -205,6 +368,7 @@ mod tests {
         assert!(err.field_errors().contains_key("interval"), "{err}");
     }
 
+    #[cfg(feature = "noise")]
     #[test]
     fn an_interval_too_large_to_double_should_be_invalid_instead_of_panicking() {
         let huge = EgressConfig {
@@ -215,6 +379,32 @@ mod tests {
         assert!(err.field_errors().contains_key("interval"), "{err}");
     }
 
+    #[cfg(feature = "noise")]
+    #[test]
+    fn an_interval_should_be_checked_against_the_configured_loopback_window() {
+        let timeout = std::time::Duration::from_secs(3);
+        let cfg = EgressConfig {
+            interval: std::time::Duration::from_secs(60),
+            ..EgressConfig::default()
+        };
+
+        assert!(
+            cfg.validate_against_probe_timeout(timeout).is_err(),
+            "60 s does not fit twice in the default 60 s window"
+        );
+        assert!(
+            cfg.validate_against_loopback_window(timeout, std::time::Duration::from_secs(120))
+                .is_ok(),
+            "exactly twice fits"
+        );
+        assert!(
+            cfg.validate_against_loopback_window(timeout, std::time::Duration::from_secs(119))
+                .is_err(),
+            "one second short of twice does not"
+        );
+    }
+
+    #[cfg(feature = "noise")]
     #[test]
     fn interval_less_than_probe_timeout_is_invalid() {
         let cfg = EgressConfig::default(); // interval = 30s
@@ -222,6 +412,7 @@ mod tests {
         assert!(cfg.validate_against_probe_timeout(timeout).is_err());
     }
 
+    #[cfg(feature = "noise")]
     #[test]
     fn interval_equal_to_probe_timeout_is_valid() {
         let cfg = EgressConfig::default(); // interval = 30s
@@ -237,128 +428,142 @@ mod tests {
     }
 
     #[test]
-    fn all_zero_weights_are_invalid() {
-        let cfg = EgressConfig {
-            staleness_weight: 0.0,
-            quality_weight: 0.0,
-            base_priority: 0.0,
+    fn stable_samples_at_the_averaging_window_are_accepted_and_one_below_are_rejected() {
+        let floor = hopr_network_graph::PROBE_SUCCESS_AVERAGING_WINDOW as u32;
+
+        let at_floor = EgressConfig {
+            stable_samples: floor,
             ..Default::default()
         };
-        let err = cfg.validate().unwrap_err();
-        assert!(err.field_errors().contains_key("weights"));
+        assert!(at_floor.validate().is_ok(), "the averaging window is the floor");
+
+        let below_floor = EgressConfig {
+            stable_samples: floor - 1,
+            ..Default::default()
+        };
+        let err = below_floor.validate().unwrap_err();
+        assert!(err.field_errors().contains_key("stable_samples"), "{err}");
     }
 
     #[test]
-    fn zero_staleness_weight_alone_is_valid() {
-        let cfg = EgressConfig {
-            staleness_weight: 0.0,
-            ..Default::default()
-        };
-        assert!(cfg.validate().is_ok());
+    fn the_default_stable_samples_should_be_accepted() {
+        assert!(EgressConfig::default().stable_samples >= hopr_network_graph::PROBE_SUCCESS_AVERAGING_WINDOW as u32);
     }
 
     #[test]
-    fn zero_quality_weight_alone_is_valid() {
-        let cfg = EgressConfig {
-            quality_weight: 0.0,
-            ..Default::default()
-        };
-        assert!(cfg.validate().is_ok());
-    }
-
-    #[test]
-    fn zero_base_priority_alone_is_valid() {
-        let cfg = EgressConfig {
-            base_priority: 0.0,
-            ..Default::default()
-        };
-        assert!(cfg.validate().is_ok());
-    }
-
-    #[test]
-    fn staleness_weight_above_one_is_invalid() {
-        let cfg = EgressConfig {
-            staleness_weight: 1.1,
-            ..Default::default()
-        };
-        let err = cfg.validate().unwrap_err();
-        assert!(err.field_errors().contains_key("staleness_weight"));
-    }
-
-    #[test]
-    fn quality_weight_above_one_is_invalid() {
-        let cfg = EgressConfig {
-            quality_weight: 1.1,
-            ..Default::default()
-        };
-        let err = cfg.validate().unwrap_err();
-        assert!(err.field_errors().contains_key("quality_weight"));
-    }
-
-    #[test]
-    fn base_priority_above_one_is_invalid() {
-        let cfg = EgressConfig {
-            base_priority: 1.1,
-            ..Default::default()
-        };
-        let err = cfg.validate().unwrap_err();
-        assert!(err.field_errors().contains_key("base_priority"));
-    }
-
-    #[test]
-    fn focus_boost_below_one_nan_or_infinite_is_invalid() {
-        for focus_boost in [0.99, 0.0, -1.0, f64::NAN, f64::INFINITY] {
-            let cfg = EgressConfig {
-                focus_boost,
+    fn a_rate_threshold_outside_zero_to_one_should_be_invalid() {
+        for rate in [f64::NAN, -0.1, 1.1, f64::INFINITY] {
+            let success = EgressConfig {
+                min_success_rate: rate,
                 ..Default::default()
             };
-            let err = cfg.validate().unwrap_err();
-            assert!(err.field_errors().contains_key("focus_boost"), "{focus_boost}");
+            let err = success.validate().unwrap_err();
+            assert!(err.field_errors().contains_key("min_success_rate"), "{rate}: {err}");
+
+            let ack = EgressConfig {
+                min_ack_rate: rate,
+                ..Default::default()
+            };
+            let err = ack.validate().unwrap_err();
+            assert!(err.field_errors().contains_key("min_ack_rate"), "{rate}: {err}");
         }
     }
 
     #[test]
-    fn focus_boost_of_one_is_valid() {
+    fn a_rate_threshold_of_zero_or_one_is_valid() {
+        for rate in [0.0, 1.0] {
+            let cfg = EgressConfig {
+                min_success_rate: rate,
+                min_ack_rate: rate,
+                ..Default::default()
+            };
+            assert!(cfg.validate().is_ok(), "{rate}");
+        }
+    }
+
+    #[test]
+    fn readd_probability_outside_zero_to_one_should_be_invalid() {
+        for probability in [f64::NAN, -0.1, 1.1] {
+            let cfg = EgressConfig {
+                readd_probability: probability,
+                ..Default::default()
+            };
+            let err = cfg.validate().unwrap_err();
+            assert!(err.field_errors().contains_key("readd_probability"), "{probability}");
+        }
+    }
+
+    #[test]
+    fn best_path_share_outside_zero_to_one_should_be_invalid() {
+        for share in [f64::NAN, -0.1, 1.1] {
+            let cfg = EgressConfig {
+                best_path_share: share,
+                ..Default::default()
+            };
+            let err = cfg.validate().unwrap_err();
+            assert!(err.field_errors().contains_key("best_path_share"), "{share}");
+        }
+    }
+
+    #[test]
+    fn an_empty_best_set_should_be_invalid() {
         let cfg = EgressConfig {
-            focus_boost: 1.0,
+            best_set_size: 0,
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.field_errors().contains_key("best_set_size"), "{err}");
+    }
+
+    #[cfg(feature = "serde")]
+    fn deserialize_floats(entries: impl IntoIterator<Item = (&'static str, f64)>) -> Result<EgressConfig, String> {
+        use serde::de::value::{Error as ValueError, F64Deserializer, MapDeserializer};
+
+        let map: Vec<(&'static str, F64Deserializer<ValueError>)> = entries
+            .into_iter()
+            .map(|(key, value)| (key, F64Deserializer::<ValueError>::new(value)))
+            .collect();
+
+        EgressConfig::deserialize(MapDeserializer::<_, ValueError>::new(map.into_iter()))
+            .map_err(|error| error.to_string())
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn deserializing_a_rate_threshold_above_one_should_fail() {
+        let error = deserialize_floats([("min_success_rate", 1.5)]).unwrap_err();
+        assert!(error.contains("min_success_rate"), "{error}");
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn deserializing_a_negative_probability_should_fail() {
+        let error = deserialize_floats([("readd_probability", -0.5)]).unwrap_err();
+        assert!(error.contains("readd_probability"), "{error}");
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn deserializing_a_valid_field_should_keep_every_other_default() -> anyhow::Result<()> {
+        let cfg = deserialize_floats([("best_path_share", 0.5)]).map_err(anyhow::Error::msg)?;
+
+        assert_eq!(
+            cfg,
+            EgressConfig {
+                best_path_share: 0.5,
+                ..Default::default()
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn zero_readd_probability_and_full_exploration_should_be_valid() {
+        let cfg = EgressConfig {
+            readd_probability: 0.0,
+            best_path_share: 0.0,
             ..Default::default()
         };
         assert!(cfg.validate().is_ok());
-    }
-
-    #[test]
-    fn negative_staleness_weight_is_invalid() {
-        let cfg = EgressConfig {
-            staleness_weight: -0.1,
-            quality_weight: 0.5,
-            base_priority: 0.5,
-            ..Default::default()
-        };
-        let err = cfg.validate().unwrap_err();
-        assert!(err.field_errors().contains_key("staleness_weight"));
-    }
-
-    #[test]
-    fn negative_quality_weight_is_invalid() {
-        let cfg = EgressConfig {
-            staleness_weight: 0.5,
-            quality_weight: -0.1,
-            base_priority: 0.5,
-            ..Default::default()
-        };
-        let err = cfg.validate().unwrap_err();
-        assert!(err.field_errors().contains_key("quality_weight"));
-    }
-
-    #[test]
-    fn negative_base_priority_is_invalid() {
-        let cfg = EgressConfig {
-            staleness_weight: 0.5,
-            quality_weight: 0.5,
-            base_priority: -0.1,
-            ..Default::default()
-        };
-        let err = cfg.validate().unwrap_err();
-        assert!(err.field_errors().contains_key("base_priority"));
     }
 }

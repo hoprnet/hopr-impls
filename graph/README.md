@@ -67,6 +67,21 @@ The private reporter applies a 5-second deadline and a 32 KiB record budget, emi
 and `analysis_required`. Graph observations are not atomic with any other component. `HOPR_STATE_DUMP_INTERVAL` defaults to 60 seconds,
 accepts 5 through 86400, and disables reads at zero.
 
+## Loopback window
+
+The graph counts the outcome of a loopback over an edge for `LOOPBACK_WINDOW`, 60 seconds by default, which suits most callers.
+`ChannelGraph::with_config` takes a `ChannelGraphConfig` whose `loopback_window` sets another one between 12 seconds and 1 hour; it is
+validated once and fixed for the life of the graph, and every edge gets it. `ChannelGraph::new` keeps the default. `with_edge_params` is
+deprecated in favour of `with_config`. Outcomes expire by whole buckets (one twelfth of the window), so the window is an approximate
+retention period: an outcome can expire up to one bucket early. The cover-traffic interval of `hopr-ct-full-network` must fit twice in the
+window: check it with `EgressConfig::validate_against_loopback_window`. The graph does not call it: the caller that builds the graph must
+also run that check, because `validate_against_probe_timeout` and `Validate::validate` only know the default window. Probe generation is
+pull driven and has no interval of its own, so only cover traffic is bounded here. A longer window delays noticing that a relay stopped
+returning loops by up to the added span.
+
+`PROBE_SUCCESS_AVERAGING_WINDOW` is the averaging window of an edge's probe success rate, five samples. Probing that stops re-probing a
+connected neighbour waits at least that many samples, so the decision rests on a measured rate instead of on noise.
+
 ## License
 
 GPL-3.0-only

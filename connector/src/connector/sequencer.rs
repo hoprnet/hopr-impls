@@ -3,7 +3,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use blokli_client::api::{BlokliQueryClient, BlokliTransactionClient};
+use blokli_client::{
+    api::{BlokliQueryClient, BlokliTransactionClient, TransactionTrackingOutcome},
+    errors::{RefusalCode, TrackingErrorKind},
+};
 use futures::{FutureExt, SinkExt, StreamExt, TryFutureExt};
 use hopr_api::{
     Address,
@@ -37,6 +40,9 @@ type TxRequest<T> = (
 pub struct TransactionSequencer<C, R> {
     sender: futures::channel::mpsc::Sender<TxRequest<R>>,
     client: std::sync::Arc<C>,
+    // Shared with the queue task, to drop the nonce of a signer whose transaction was found dropped
+    current_nonce: moka::sync::Cache<Address, std::sync::Arc<AtomicU64>>,
+    own_signer: Address,
     queue_depth: std::sync::Arc<QueueDepth>,
 }
 
@@ -95,12 +101,13 @@ impl moka::Expiry<Address, std::sync::Arc<AtomicU64>> for FixedTti {
 impl<C, R> TransactionSequencer<C, R>
 where
     C: BlokliQueryClient + BlokliTransactionClient + Send + Sync + 'static,
-    R: SignableTransaction + Send + Sync + 'static,
+    R: SignableTransaction + Clone + Send + Sync + 'static,
 {
     pub fn new(signer: ChainKeypair, client: std::sync::Arc<C>, nonce_gap_tolerance: Duration) -> Self {
         tracing::debug!(signer = %signer.public().to_address(), "starting transaction sequencer");
 
         let client_clone = client.clone();
+        let signer_addr_own = signer.public().to_address();
         let (sender, receiver) = futures::channel::mpsc::channel::<TxRequest<R>>(TX_QUEUE_CAPACITY);
 
         // Nonce of our node signer never expires, all other signers expire after a few minutes
@@ -110,6 +117,8 @@ where
                 tti: OTHER_SIGNER_NONCE_EXPIRATION,
             })
             .build();
+
+        let current_nonce_handle = current_nonce.clone();
 
         // Tracking ids Blokli has already handed out to this sequencer.
         //
@@ -143,37 +152,60 @@ where
                         let nonce_gaps = nonce_gaps.clone();
                         let issued_tx_ids = issued_tx_ids.clone();
                         async move {
+                            // The nonce counter the submission selected its nonce from, set once it is read
+                            let mut selected_nonce = None;
                             // Outer `Err`: the transaction never reached Blokli, inner: Blokli's outcome
                             let submission = async {
-                                let chain_info = client.query_chain_info().map_err(ConnectorError::from).await?;
-                                tracing::debug!(chain_id = chain_info.chain_id, "chain info retrieved for tx");
-
-                                let parsed_chain_info = model_to_chain_info(chain_info)?;
-                                let chain_id = parsed_chain_info.info.chain_id;
-                                let gas_estimation = GasEstimation::from(parsed_chain_info);
-                                tracing::debug!(?gas_estimation, "gas estimation used for tx");
+                                let (chain_id, gas_estimation) = read_gas_estimation(client.as_ref()).await?;
 
                                 let pending = client
                                     .query_transaction_count(&signer_addr.into())
                                     .map_err(ConnectorError::from)
                                     .await?;
-                                let local_nonce = current_nonce.entry(signer_addr).or_default().into_value();
+                                let local_nonce =
+                                    selected_nonce.insert(current_nonce.entry(signer_addr).or_default().into_value());
                                 let nonce =
-                                    sync_nonce(&local_nonce, &nonce_gaps, signer_addr, pending, nonce_gap_tolerance);
-                                tracing::Span::current().record("nonce", nonce);
+                                    sync_nonce(local_nonce, &nonce_gaps, signer_addr, pending, nonce_gap_tolerance);
                                 if signer_addr == node_address {
                                     record_nonce("local", nonce);
                                     record_nonce("chain_pending", pending);
                                 }
 
-                                let tx = tx
-                                    .sign_and_encode_to_eip2718(nonce, chain_id, gas_estimation.into(), &signer)
-                                    .await?;
-                                tracing::debug!("submitting transaction");
-                                Ok(client
-                                    .submit_and_track_transaction(&tx)
-                                    .map_err(ConnectorError::from)
-                                    .await)
+                                submit_with_retry(
+                                    nonce,
+                                    gas_estimation,
+                                    pending,
+                                    local_nonce,
+                                    |nonce, gas_estimation| {
+                                        tracing::Span::current().record("nonce", nonce);
+                                        let tx = tx.clone();
+                                        let client = &client;
+                                        let signer = &signer;
+                                        async move {
+                                            let tx = tx
+                                                .sign_and_encode_to_eip2718(
+                                                    nonce,
+                                                    chain_id,
+                                                    gas_estimation.into(),
+                                                    signer,
+                                                )
+                                                .await?;
+                                            tracing::debug!("submitting transaction");
+                                            Ok(client
+                                                .submit_and_track_transaction(&tx)
+                                                .map_err(ConnectorError::from)
+                                                .await)
+                                        }
+                                    },
+                                    || async {
+                                        client
+                                            .query_transaction_count(&signer_addr.into())
+                                            .map_err(ConnectorError::from)
+                                            .await
+                                    },
+                                    || async { read_gas_estimation(&*client).await.map(|(_, gas)| gas) },
+                                )
+                                .await
                             }
                             .await;
 
@@ -183,11 +215,14 @@ where
                             );
                             match nonce_consumed(&submission, deduplicated) {
                                 Some(true) => {
-                                    let prev_nonce = current_nonce
-                                        .entry(signer_addr)
-                                        .or_default()
-                                        .value()
-                                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                    // Counted on the counter the submission selected its nonce from, not on a fresh
+                                    // lookup: tracking may have invalidated the entry meanwhile, and a new entry would
+                                    // be advanced past the pending count of the chain, which reuses the nonce of
+                                    // another transaction. The orphaned counter takes the increment instead, and the
+                                    // next submission re-reads the pending count into the new entry.
+                                    let prev_nonce = selected_nonce
+                                        .as_deref()
+                                        .map_or(0, |nonce| nonce.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
 
                                     tracing::debug!(
                                         prev_nonce,
@@ -236,9 +271,138 @@ where
         Self {
             sender,
             client,
+            current_nonce: current_nonce_handle,
+            own_signer: signer_addr_own,
             queue_depth,
         }
     }
+}
+
+type Submission = errors::Result<errors::Result<blokli_client::api::TxId>>;
+
+/// Reads the chain id and the fees to sign with from Blokli.
+async fn read_gas_estimation<C: BlokliQueryClient + Sync>(client: &C) -> errors::Result<(u64, GasEstimation)> {
+    let chain_info = client.query_chain_info().map_err(ConnectorError::from).await?;
+    tracing::debug!(chain_id = chain_info.chain_id, "chain info retrieved for tx");
+
+    let parsed_chain_info = model_to_chain_info(chain_info)?;
+    let chain_id = parsed_chain_info.info.chain_id;
+    let gas_estimation = GasEstimation::from(parsed_chain_info);
+    tracing::debug!(?gas_estimation, "gas estimation used for tx");
+    Ok((chain_id, gas_estimation))
+}
+
+/// Signs and submits a transaction with `nonce` and `gas` through `attempt`, and corrects it once
+/// when Blokli's refusal says what was wrong with it.
+///
+/// - `NONCE_TOO_HIGH`: the nonce was not consumed and the local nonce is ahead of what the chain expects. The chain's
+///   pending count is re-read through `read_pending` and adopted as the local nonce. The pending count never goes below
+///   `first_pending`, the one read at the start of the submission, and one that does not lie below the refused nonce is
+///   not worth a retry.
+/// - `NONCE_TOO_LOW`: the nonce was already used and the local nonce is behind. The pending count is re-read and
+///   adopted the same way, but only if it lies above the refused nonce.
+/// - `FEE_TOO_LOW`: the nonce was not consumed. The fees are read again through `read_gas`, and the transaction is
+///   signed at the same nonce only if they are higher than the ones just refused. Blokli caches its estimate for a
+///   block, so an unchanged estimate would be refused again.
+///
+/// The correction happens at most once per submission, whatever the refusal: a second refusal is
+/// returned as is. Failing to read the corrected value returns the first refusal.
+async fn submit_with_retry<A, AFut, P, PFut, G, GFut>(
+    nonce: u64,
+    gas: GasEstimation,
+    first_pending: u64,
+    local: &AtomicU64,
+    mut attempt: A,
+    read_pending: P,
+    read_gas: G,
+) -> Submission
+where
+    A: FnMut(u64, GasEstimation) -> AFut,
+    AFut: Future<Output = Submission>,
+    P: FnOnce() -> PFut,
+    PFut: Future<Output = errors::Result<u64>>,
+    G: FnOnce() -> GFut,
+    GFut: Future<Output = errors::Result<GasEstimation>>,
+{
+    let first = attempt(nonce, gas).await;
+    let Ok(Err(error)) = &first else {
+        return first;
+    };
+
+    match error.refusal_code() {
+        Some(code @ (RefusalCode::NonceTooHigh | RefusalCode::NonceTooLow)) => match read_pending().await {
+            Ok(re_read) => {
+                let pending = re_read.max(first_pending);
+                let usable = if code == RefusalCode::NonceTooHigh {
+                    pending < nonce
+                } else {
+                    pending > nonce
+                };
+                if !usable {
+                    tracing::warn!(
+                        nonce,
+                        pending,
+                        ?code,
+                        "pending count does not correct the refused nonce"
+                    );
+                    return first;
+                }
+                tracing::warn!(
+                    nonce,
+                    pending,
+                    ?code,
+                    "nonce refused, retrying once with the chain's pending count"
+                );
+                local.store(pending, std::sync::atomic::Ordering::Relaxed);
+                attempt(pending, gas).await
+            }
+            Err(error) => {
+                tracing::warn!(%error, ?code, "failed to re-read the pending count after a refused nonce");
+                first
+            }
+        },
+        Some(RefusalCode::FeeTooLow) => match read_gas().await {
+            Ok(new_gas)
+                if new_gas.max_fee_per_gas > gas.max_fee_per_gas
+                    || new_gas.max_priority_fee_per_gas > gas.max_priority_fee_per_gas =>
+            {
+                tracing::warn!(
+                    nonce,
+                    old_max_fee = gas.max_fee_per_gas,
+                    new_max_fee = new_gas.max_fee_per_gas,
+                    "fees refused as too low, retrying once with Blokli's current estimate"
+                );
+                attempt(nonce, new_gas).await
+            }
+            Ok(_) => {
+                tracing::warn!(nonce, "fees refused as too low, but Blokli's estimate did not increase");
+                first
+            }
+            Err(error) => {
+                tracing::warn!(%error, "failed to re-read the fees after they were refused as too low");
+                first
+            }
+        },
+        _ => first,
+    }
+}
+
+/// Whether Blokli found a timed out transaction to leave its nonce unused, so that the local nonce is ahead.
+///
+/// This is the case when the RPC node dropped the transaction, or an earlier nonce of the signer is missing
+/// altogether. Every later transaction of the signer then waits for a nonce that is never mined, until the
+/// local nonce is read from the chain again. A transaction that is merely underpriced or queued behind pending
+/// ones keeps its nonce, and a replaced one lost it to another transaction.
+fn nonce_is_free(error: &ConnectorError) -> bool {
+    error
+        .unmined_diagnosis()
+        .is_some_and(|diagnosis| reason_leaves_nonce_free(&diagnosis.reason))
+}
+
+fn reason_leaves_nonce_free(reason: &blokli_client::api::types::UnminedReason) -> bool {
+    use blokli_client::api::types::UnminedReason;
+
+    matches!(reason, UnminedReason::Dropped | UnminedReason::NonceGap)
 }
 
 /// Records a tracking id returned by Blokli.
@@ -346,7 +510,7 @@ fn submit_outcome(
         Ok(Ok(_)) if deduplicated => "deduplicated",
         Ok(Ok(_)) => "accepted",
         Ok(Err(error)) if error.is_refused_before_broadcast() => "refused_before_broadcast",
-        Ok(Err(error)) if error.rpc_rejection_code().is_some() => "rpc_rejected",
+        Ok(Err(error)) if error.refusal_code().is_some() => "rpc_rejected",
         Ok(Err(_)) => "unknown",
     }
 }
@@ -398,10 +562,12 @@ fn nonce_consumed(
     if error.is_refused_before_broadcast() {
         return Some(false);
     }
-    match error.rpc_rejection_code() {
-        Some("NONCE_TOO_LOW" | "REPLACEMENT_UNDERPRICED") => Some(true),
-        Some("FEE_TOO_LOW" | "INSUFFICIENT_FUNDS") => Some(false),
-        // NONCE_TOO_HIGH, unverified ALREADY_KNOWN, unclassified RPC errors, transport failures
+    match error.refusal_code() {
+        // a transaction already holds this nonce, mined or pending: it is consumed whatever the cache says
+        Some(RefusalCode::ReplacementUnderpriced) => Some(true),
+        Some(RefusalCode::FeeTooLow | RefusalCode::InsufficientFunds) => Some(false),
+        // NONCE_TOO_LOW or NONCE_TOO_HIGH refused again after their correction, unverified ALREADY_KNOWN,
+        // unclassified RPC errors, transport failures
         _ => None,
     }
 }
@@ -422,6 +588,10 @@ where
         operation: &'static str,
     ) -> errors::Result<impl Future<Output = errors::Result<blokli_client::api::types::Transaction>>> {
         let (notifier_tx, notifier_rx) = futures::channel::oneshot::channel();
+        let signer_addr = custom_signer
+            .as_ref()
+            .map_or(self.own_signer, |signer| signer.public().to_address());
+        let current_nonce = self.current_nonce.clone();
 
         self.queue_depth.enqueued();
         self.sender
@@ -448,11 +618,29 @@ where
                     .client
                     .track_transaction(tx_id, timeout_until_finalized)
                     .await
-                    .map_err(ConnectorError::from);
+                    .map_err(ConnectorError::from)
+                    .and_then(|outcome| match outcome {
+                        TransactionTrackingOutcome::Confirmed(tx) => Ok(tx),
+                        // The client deadline elapsed without a terminal status. This was reported as a
+                        // timeout before the client distinguished the two, and is kept that way here.
+                        TransactionTrackingOutcome::StatusUnknown { .. } => {
+                            Err(ConnectorError::from(blokli_client::errors::BlokliClientError::from(
+                                blokli_client::errors::ErrorKind::TrackingError(TrackingErrorKind::Timeout),
+                            )))
+                        }
+                    });
                 tracing::debug!(?tracked, "transaction tracking done");
                 let waited = tracking_started.elapsed();
                 // A confirmed transaction is classified where the Safe execution result is known.
                 if let Err(error) = &tracked {
+                    if nonce_is_free(error) {
+                        tracing::warn!(
+                            %signer_addr,
+                            diagnosis = ?error.unmined_diagnosis(),
+                            "transaction left unmined with its nonce unused, re-reading the nonce from the chain"
+                        );
+                        current_nonce.invalidate(&signer_addr);
+                    }
                     record_tx_outcome(
                         operation,
                         PHASE_TRACK,
@@ -487,7 +675,7 @@ mod tests {
     use super::*;
 
     fn failed(kind: ErrorKind) -> errors::Result<errors::Result<blokli_client::api::TxId>> {
-        Ok(Err(ConnectorError::ClientError(kind.into())))
+        Ok(Err(errors::test_support::client_error(kind)))
     }
 
     fn rpc_refusal(code: &str) -> errors::Result<errors::Result<blokli_client::api::TxId>> {
@@ -501,7 +689,6 @@ mod tests {
     #[test]
     fn nonce_is_consumed_by_a_broadcast_tx_or_a_competing_one() {
         assert_eq!(Some(true), nonce_consumed(&Ok(Ok("tx-1".into())), false));
-        assert_eq!(Some(true), nonce_consumed(&rpc_refusal("NONCE_TOO_LOW"), false));
         assert_eq!(
             Some(true),
             nonce_consumed(&rpc_refusal("REPLACEMENT_UNDERPRICED"), false)
@@ -579,10 +766,267 @@ mod tests {
 
     #[test]
     fn nonce_consumption_is_unknown_when_the_result_does_not_tell() {
-        for code in ["NONCE_TOO_HIGH", "ALREADY_KNOWN", "RPC_ERROR"] {
+        // the nonce codes reach here only after their single correction was refused as well
+        for code in ["NONCE_TOO_HIGH", "NONCE_TOO_LOW", "ALREADY_KNOWN", "RPC_ERROR"] {
             assert_eq!(None, nonce_consumed(&rpc_refusal(code), false), "{code}");
         }
         assert_eq!(None, nonce_consumed(&failed(ErrorKind::Timeout), false), "transport");
+    }
+
+    const LOW_FEE: u128 = 1_000;
+    const HIGH_FEE: u128 = 5_000;
+
+    fn gas(max_fee_per_gas: u128) -> GasEstimation {
+        GasEstimation {
+            max_fee_per_gas,
+            ..GasEstimation::default()
+        }
+    }
+
+    /// What a run of [`submit_with_retry`] did.
+    struct Run {
+        /// Nonce and max fee of every attempt, in order.
+        attempts: Vec<(u64, u128)>,
+        /// The local nonce after the run.
+        local: u64,
+        result: Submission,
+        pending_reads: usize,
+        gas_reads: usize,
+    }
+
+    /// Setup of a run: the nonce, the pending counts and the fees Blokli returns, and the attempt results.
+    struct Setup {
+        nonce: u64,
+        first_pending: u64,
+        pending: errors::Result<u64>,
+        new_gas: errors::Result<GasEstimation>,
+        outcomes: Vec<Submission>,
+    }
+
+    impl Setup {
+        fn new(nonce: u64, pending: u64, outcomes: Vec<Submission>) -> Self {
+            Self {
+                nonce,
+                first_pending: pending,
+                pending: Ok(pending),
+                new_gas: Ok(gas(HIGH_FEE)),
+                outcomes,
+            }
+        }
+
+        async fn run(self) -> Run {
+            let attempts = std::sync::Mutex::new(Vec::new());
+            let outcomes = std::sync::Mutex::new(self.outcomes.into_iter());
+            let local = AtomicU64::new(self.nonce);
+            let reads = std::sync::Mutex::new((0usize, 0usize));
+            let result = submit_with_retry(
+                self.nonce,
+                gas(LOW_FEE),
+                self.first_pending,
+                &local,
+                |nonce, gas| {
+                    attempts.lock().unwrap().push((nonce, gas.max_fee_per_gas));
+                    let outcome = outcomes.lock().unwrap().next().expect("unexpected extra attempt");
+                    async move { outcome }
+                },
+                || {
+                    reads.lock().unwrap().0 += 1;
+                    async { self.pending }
+                },
+                || {
+                    reads.lock().unwrap().1 += 1;
+                    async { self.new_gas }
+                },
+            )
+            .await;
+            let (pending_reads, gas_reads) = reads.into_inner().unwrap();
+            Run {
+                attempts: attempts.into_inner().unwrap(),
+                local: local.load(std::sync::atomic::Ordering::Relaxed),
+                result,
+                pending_reads,
+                gas_reads,
+            }
+        }
+    }
+
+    fn ok() -> Submission {
+        Ok(Ok("tx-1".into()))
+    }
+
+    #[tokio::test]
+    async fn too_high_nonce_is_resubmitted_once_with_the_pending_count() {
+        let run = Setup::new(9, 5, vec![rpc_refusal("NONCE_TOO_HIGH"), ok()]).run().await;
+
+        assert_eq!(
+            vec![(9, LOW_FEE), (5, LOW_FEE)],
+            run.attempts,
+            "re-signed with the re-read nonce"
+        );
+        assert_eq!(5, run.local, "pending count adopted as the local nonce");
+        assert_eq!(Some(true), nonce_consumed(&run.result, false));
+        assert_eq!(0, run.gas_reads, "the fees are not read for a nonce refusal");
+    }
+
+    #[tokio::test]
+    async fn too_high_nonce_never_retries_below_the_first_pending_count() {
+        let mut setup = Setup::new(9, 7, vec![rpc_refusal("NONCE_TOO_HIGH"), ok()]);
+        setup.pending = Ok(5);
+        let run = setup.run().await;
+
+        assert_eq!(vec![9, 7], run.attempts.iter().map(|a| a.0).collect::<Vec<_>>());
+        assert_eq!(7, run.local, "the lower re-read count is not adopted");
+    }
+
+    #[tokio::test]
+    async fn too_high_nonce_is_not_resigned_when_pending_reaches_it() {
+        let mut setup = Setup::new(9, 9, vec![rpc_refusal("NONCE_TOO_HIGH")]);
+        setup.pending = Ok(5);
+        let run = setup.run().await;
+
+        assert_eq!(1, run.attempts.len(), "same nonce is not signed again");
+        assert_eq!(9, run.local);
+        assert_eq!(None, nonce_consumed(&run.result, false));
+    }
+
+    #[tokio::test]
+    async fn too_low_nonce_is_resubmitted_once_with_the_pending_count() {
+        let mut setup = Setup::new(5, 5, vec![rpc_refusal("NONCE_TOO_LOW"), ok()]);
+        setup.pending = Ok(8);
+        let run = setup.run().await;
+
+        assert_eq!(vec![(5, LOW_FEE), (8, LOW_FEE)], run.attempts);
+        assert_eq!(8, run.local, "pending count adopted as the local nonce");
+        assert_eq!(Some(true), nonce_consumed(&run.result, false));
+        assert_eq!(0, run.gas_reads);
+    }
+
+    #[tokio::test]
+    async fn too_low_nonce_is_not_resigned_when_pending_does_not_pass_it() {
+        let run = Setup::new(5, 5, vec![rpc_refusal("NONCE_TOO_LOW")]).run().await;
+
+        assert_eq!(1, run.attempts.len());
+        assert_eq!(5, run.local);
+        assert_eq!(None, nonce_consumed(&run.result, false), "left for a re-read");
+    }
+
+    #[tokio::test]
+    async fn nonce_refusals_are_not_retried_twice() {
+        for (code, pending) in [("NONCE_TOO_HIGH", 5), ("NONCE_TOO_LOW", 12)] {
+            let mut setup = Setup::new(9, 5, vec![rpc_refusal(code), rpc_refusal(code)]);
+            setup.pending = Ok(pending);
+            let run = setup.run().await;
+
+            assert_eq!(2, run.attempts.len(), "{code}");
+            assert_eq!(None, nonce_consumed(&run.result, false), "{code}: left for a re-read");
+        }
+    }
+
+    #[tokio::test]
+    async fn nonce_refusals_are_returned_when_the_pending_count_cannot_be_read() {
+        for code in ["NONCE_TOO_HIGH", "NONCE_TOO_LOW"] {
+            let mut setup = Setup::new(9, 5, vec![rpc_refusal(code)]);
+            setup.pending = Err(ConnectorError::ServerNotHealthy);
+            let run = setup.run().await;
+
+            assert_eq!(1, run.attempts.len(), "{code}");
+            assert_eq!(9, run.local, "{code}");
+            assert_eq!(None, nonce_consumed(&run.result, false), "{code}");
+        }
+    }
+
+    #[tokio::test]
+    async fn too_low_fees_are_resubmitted_once_at_the_same_nonce_with_the_current_estimate() {
+        let run = Setup::new(9, 5, vec![rpc_refusal("FEE_TOO_LOW"), ok()]).run().await;
+
+        assert_eq!(
+            vec![(9, LOW_FEE), (9, HIGH_FEE)],
+            run.attempts,
+            "same nonce, higher fees"
+        );
+        assert_eq!(9, run.local, "the nonce did not move");
+        assert_eq!(Some(true), nonce_consumed(&run.result, false));
+        assert_eq!(0, run.pending_reads, "the pending count is not read for a fee refusal");
+    }
+
+    #[tokio::test]
+    async fn too_low_fees_are_not_resigned_when_the_estimate_did_not_increase() {
+        for new_gas in [gas(LOW_FEE), gas(LOW_FEE - 1)] {
+            let mut setup = Setup::new(9, 5, vec![rpc_refusal("FEE_TOO_LOW")]);
+            setup.new_gas = Ok(new_gas);
+            let run = setup.run().await;
+
+            assert_eq!(1, run.attempts.len());
+            assert_eq!(Some(false), nonce_consumed(&run.result, false), "nonce stays free");
+        }
+    }
+
+    #[tokio::test]
+    async fn too_low_fees_are_returned_when_the_estimate_cannot_be_read() {
+        let mut setup = Setup::new(9, 5, vec![rpc_refusal("FEE_TOO_LOW")]);
+        setup.new_gas = Err(ConnectorError::ServerNotHealthy);
+        let run = setup.run().await;
+
+        assert_eq!(1, run.attempts.len());
+        assert_eq!(Some(false), nonce_consumed(&run.result, false));
+    }
+
+    #[tokio::test]
+    async fn too_low_fees_are_not_retried_twice() {
+        let run = Setup::new(9, 5, vec![rpc_refusal("FEE_TOO_LOW"), rpc_refusal("FEE_TOO_LOW")])
+            .run()
+            .await;
+
+        assert_eq!(2, run.attempts.len());
+        assert_eq!(1, run.gas_reads);
+        assert_eq!(Some(false), nonce_consumed(&run.result, false));
+    }
+
+    #[tokio::test]
+    async fn other_refusals_and_successes_are_not_resubmitted() {
+        for code in [
+            "REPLACEMENT_UNDERPRICED",
+            "INSUFFICIENT_FUNDS",
+            "ALREADY_KNOWN",
+            "RPC_ERROR",
+        ] {
+            let run = Setup::new(9, 5, vec![rpc_refusal(code)]).run().await;
+            assert_eq!(vec![(9, LOW_FEE)], run.attempts, "{code}");
+            assert_eq!(9, run.local, "{code}");
+            assert_eq!((0, 0), (run.pending_reads, run.gas_reads), "{code}: nothing is read");
+        }
+        let run = Setup::new(9, 5, vec![ok()]).run().await;
+        assert_eq!((vec![(9, LOW_FEE)], 9), (run.attempts, run.local));
+    }
+
+    #[test]
+    fn nonce_is_free_only_for_a_dropped_transaction_or_a_missing_earlier_nonce() {
+        use blokli_client::api::types::UnminedReason;
+
+        for (reason, free) in [
+            (UnminedReason::Dropped, true),
+            (UnminedReason::NonceGap, true),
+            (UnminedReason::Underpriced, false),
+            (UnminedReason::Queued, false),
+            (UnminedReason::Replaced, false),
+            (UnminedReason::Undetermined, false),
+            (UnminedReason::Unknown("FUTURE".into()), false),
+        ] {
+            assert_eq!(free, reason_leaves_nonce_free(&reason), "{reason:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_diagnosed_dropped_timeout_frees_the_nonce_and_a_plain_timeout_does_not() {
+        use blokli_client::api::types::UnminedReason;
+
+        let dropped = errors::test_support::timed_out_error(UnminedReason::Dropped, 0).await;
+        let underpriced = errors::test_support::timed_out_error(UnminedReason::Underpriced, 0).await;
+        let plain = errors::test_support::client_error(ErrorKind::TrackingError(TrackingErrorKind::Timeout));
+
+        assert!(nonce_is_free(&dropped));
+        assert!(!nonce_is_free(&underpriced));
+        assert!(!nonce_is_free(&plain));
     }
 
     #[test]
@@ -721,5 +1165,103 @@ mod tests {
         );
         assert_eq!(None, nonce_gap_age(&gaps, signer, 8, 8), "caught up");
         assert!(gaps.get(&signer).is_none());
+    }
+
+    /// A transaction whose "signed" bytes are the nonce it was signed with.
+    #[derive(Clone)]
+    struct NonceTx;
+
+    #[async_trait::async_trait]
+    impl SignableTransaction for NonceTx {
+        async fn sign_and_encode_to_eip2718(
+            self,
+            nonce: u64,
+            _chain_id: u64,
+            _max_gas: Option<GasEstimation>,
+            _chain_keypair: &ChainKeypair,
+        ) -> hopr_api::types::chain::errors::Result<Box<[u8]>> {
+            Ok(Box::from(nonce.to_be_bytes()))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn nonce_is_counted_on_the_counter_that_selected_it_when_tracking_invalidates_the_entry() {
+        use std::sync::{Arc, Mutex, mpsc};
+
+        let signer = ChainKeypair::random();
+        let signer_addr = signer.public().to_address();
+
+        // The nonces the chain was asked to include, and the hold on the first submission signed with nonce 1.
+        let submitted = Arc::new(Mutex::new(Vec::<u64>::new()));
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let entered_tx = Mutex::new(entered_tx);
+        let release_rx = Mutex::new(release_rx);
+        let mutator = {
+            let submitted = submitted.clone();
+            let held = std::sync::atomic::AtomicBool::new(false);
+            move |signed_tx: &[u8], _: &mut blokli_client::BlokliTestState| {
+                let nonce = u64::from_be_bytes(signed_tx.try_into().expect("nonce bytes"));
+                submitted.lock().unwrap().push(nonce);
+                if nonce == 1 && !held.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    entered_tx.lock().unwrap().send(()).unwrap();
+                    release_rx.lock().unwrap().recv().unwrap();
+                }
+                Ok(())
+            }
+        };
+        // The chain's pending count of the signer stays 0 throughout.
+        let client = Arc::new(
+            blokli_client::BlokliTestClient::new(blokli_client::BlokliTestState::default(), mutator)
+                .with_tx_simulation_delay(Duration::ZERO),
+        );
+        let sequencer = TransactionSequencer::<_, NonceTx>::new(signer.clone(), client, Duration::from_hours(1));
+        let wait = Duration::from_secs(10);
+        let submitted_count = |count: usize| {
+            let submitted = submitted.clone();
+            async move {
+                tokio::time::timeout(wait, async {
+                    while submitted.lock().unwrap().len() < count {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("submissions did not arrive");
+            }
+        };
+
+        // A takes nonce 0
+        let _a = sequencer
+            .enqueue_transaction(NonceTx, wait, None, "test")
+            .await
+            .unwrap();
+        submitted_count(1).await;
+
+        // B takes nonce 1 and stays in flight
+        let _b = sequencer
+            .enqueue_transaction(NonceTx, wait, None, "test")
+            .await
+            .unwrap();
+        tokio::task::spawn_blocking(move || entered_rx.recv_timeout(wait))
+            .await
+            .unwrap()
+            .expect("B reached the chain");
+
+        // Tracking of A finds it dropped and invalidates the nonce of the signer, as the tracking future does
+        sequencer.current_nonce.invalidate(&signer_addr);
+
+        // C waits behind B, and B then succeeds
+        let _c = sequencer
+            .enqueue_transaction(NonceTx, wait, None, "test")
+            .await
+            .unwrap();
+        release_tx.send(()).unwrap();
+        submitted_count(3).await;
+
+        assert_eq!(
+            vec![0, 1, 0],
+            *submitted.lock().unwrap(),
+            "C is signed with the nonce of the chain's pending count, not with the one B used"
+        );
     }
 }

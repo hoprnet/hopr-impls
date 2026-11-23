@@ -1,64 +1,102 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::HashSet,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    },
+};
 
-use hopr_api::types::crypto::types::OffchainPublicKey;
+use hopr_api::types::{crypto::types::OffchainPublicKey, internal::routing::PathId};
 // Only the `sync` primitives of tokio are used. They need no tokio runtime, so the handle works
 // under any async executor.
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 
-/// Pace of probing traffic, relative to the configured [`EgressConfig::interval`](crate::EgressConfig).
+/// A function that values a loopback path the way the component that routes traffic does.
+type PathWeightFn = dyn Fn(&[OffchainPublicKey], PathId) -> Option<f64> + Send + Sync;
+
+/// How much a loopback path is worth probing, as judged by the component that routes traffic.
 ///
-/// The graph counts the outcome of a loopback for `hopr_network_graph::LOOPBACK_WINDOW` (60 s). A level whose
-/// period exceeds half of it (`Low`, and `Medium` at the 30 s default interval) can let the evidence of a failing
-/// relay expire between rounds, so it reads as unprobed again and may be routed until the next loop fails. The
-/// level and the window are independent on purpose, and this is accepted: a slow pace trades slower detection
-/// for less traffic.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ProbingLevel {
-    /// One tenth of the configured pace.
-    Low,
-    /// Half of the configured pace.
-    Medium,
-    /// The configured pace.
-    #[default]
-    High,
-    /// Twice the configured pace. Overcharge for a short burst, such as a new session that needs path evidence fast.
-    Ultra,
-}
+/// Probing follows the same weight distribution as routing, so it watches the paths routing will
+/// use and keeps the same spread. The generator never computes the distribution itself: whoever
+/// owns the path planner hands one in with [`EgressControl::set_path_weights`].
+#[derive(Clone)]
+pub struct PathWeights(Arc<PathWeightFn>);
 
-impl ProbingLevel {
-    /// Pace multiplier applied to the configured probing rate, always positive.
-    pub const fn multiplier(self) -> f64 {
-        match self {
-            Self::Low => 0.1,
-            Self::Medium => 0.5,
-            Self::High => 1.0,
-            Self::Ultra => 2.0,
-        }
+impl PathWeights {
+    /// Values every path the same.
+    pub fn uniform() -> Self {
+        Self(Arc::new(|_, _| Some(1.0)))
     }
 
-    /// Interval between probing rounds at this level.
-    pub fn period(self, interval: std::time::Duration) -> std::time::Duration {
-        interval.div_f64(self.multiplier())
+    /// Builds a weigher from `f`, which returns `None` for a path it does not value.
+    pub fn new(f: impl Fn(&[OffchainPublicKey], PathId) -> Option<f64> + Send + Sync + 'static) -> Self {
+        Self(Arc::new(f))
+    }
+
+    /// The weight of `path`, `None` when the owner does not value it.
+    ///
+    /// A weight that is not a positive finite number is treated as unvalued rather than as a
+    /// negative one, which a weighted draw would read as "never".
+    pub fn weight_of(&self, path: &[OffchainPublicKey], path_id: PathId) -> Option<f64> {
+        (self.0)(path, path_id).filter(|weight| weight.is_finite() && *weight > 0.0)
+    }
+}
+
+impl Default for PathWeights {
+    fn default() -> Self {
+        Self::uniform()
+    }
+}
+
+impl std::fmt::Debug for PathWeights {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PathWeights").finish_non_exhaustive()
+    }
+}
+
+/// What the last completed loopback cycle saw evidence for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Coverage {
+    /// Distinct edges that held fresh SURB evidence when the cycle was built.
+    pub edges_with_evidence: usize,
+    /// Cycles the generator completed since the stream was built.
+    pub cycles: u64,
+}
+
+/// Counters a running stream publishes into; see [`EgressControl::coverage`].
+#[derive(Debug, Default)]
+pub(crate) struct CoverageCounters {
+    edges_with_evidence: AtomicUsize,
+    cycles: AtomicU64,
+}
+
+impl CoverageCounters {
+    /// Records a completed cycle that saw `edges_with_evidence` edges carrying evidence.
+    pub(crate) fn record_cycle(&self, edges_with_evidence: usize) {
+        self.edges_with_evidence.store(edges_with_evidence, Ordering::Relaxed);
+        self.cycles.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> Option<Coverage> {
+        match self.cycles.load(Ordering::Relaxed) {
+            0 => None,
+            cycles => Some(Coverage {
+                edges_with_evidence: self.edges_with_evidence.load(Ordering::Relaxed),
+                cycles,
+            }),
+        }
     }
 }
 
 /// State shared between a [`EgressControl`] and the streams it steers.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct ControlState {
-    /// `None` switches probing off.
-    pub(crate) level: Option<ProbingLevel>,
+    /// Cap on the loopback best set, `None` when only `EgressConfig::best_set_size` applies.
+    pub(crate) best_set_cap: Option<usize>,
     pub(crate) noise: bool,
     pub(crate) focus: Option<Arc<HashSet<OffchainPublicKey>>>,
-}
-
-impl Default for ControlState {
-    fn default() -> Self {
-        Self {
-            level: Some(ProbingLevel::default()),
-            noise: false,
-            focus: None,
-        }
-    }
+    /// How the path owner values a loopback path.
+    pub(crate) weights: PathWeights,
 }
 
 /// Cloneable handle that steers the traffic a `FullNetworkDiscovery` generates.
@@ -68,12 +106,16 @@ impl Default for ControlState {
 #[derive(Debug, Clone)]
 pub struct EgressControl {
     state: Arc<watch::Sender<ControlState>>,
+    coverage: Arc<CoverageCounters>,
+    wake: Arc<Notify>,
 }
 
 impl Default for EgressControl {
     fn default() -> Self {
         Self {
             state: Arc::new(watch::channel(ControlState::default()).0),
+            coverage: Arc::new(CoverageCounters::default()),
+            wake: Arc::new(Notify::new()),
         }
     }
 }
@@ -83,17 +125,42 @@ impl EgressControl {
         self.state.subscribe()
     }
 
-    /// Sets the probing pace. `None` stops all probing traffic.
-    ///
-    /// Does not affect cover traffic, see [`Self::set_noise`].
-    pub fn set_level(&self, level: Option<ProbingLevel>) {
-        self.state
-            .send_if_modified(|s| std::mem::replace(&mut s.level, level) != level);
+    pub(crate) fn coverage_counters(&self) -> Arc<CoverageCounters> {
+        self.coverage.clone()
     }
 
-    /// Current probing pace, `None` when probing is off.
-    pub fn level(&self) -> Option<ProbingLevel> {
-        self.state.borrow().level
+    pub(crate) fn wake_handle(&self) -> Arc<Notify> {
+        self.wake.clone()
+    }
+
+    /// Tells an idle probe stream to re-examine the graph.
+    ///
+    /// The graph is read through `NetworkGraphView`, which has no change notification and gives
+    /// the generator no clock, so an idle stream cannot notice on its own that a neighbour
+    /// disconnected or that a recorded outcome dropped its rate. Whoever records those
+    /// observations calls this after writing them, and the next pull sees the new state.
+    pub fn wake_probing(&self) {
+        self.wake.notify_one();
+    }
+
+    /// Caps the loopback best set to `cap` paths, `None` to keep the plain `best_set_size` cap.
+    ///
+    /// The cap is what one consumer window can re-measure, so the best set never exceeds it and one
+    /// window of pulls can re-measure every best path. `Some(0)` is treated as `None`.
+    pub fn set_best_set_cap(&self, cap: Option<usize>) {
+        let cap = cap.filter(|cap| *cap > 0);
+        self.state
+            .send_if_modified(|s| std::mem::replace(&mut s.best_set_cap, cap) != cap);
+    }
+
+    /// Cap on the loopback best set, `None` when only `best_set_size` applies.
+    pub fn best_set_cap(&self) -> Option<usize> {
+        self.state.borrow().best_set_cap
+    }
+
+    /// Sets how the path owner values a loopback path. Probing then follows the routing distribution.
+    pub fn set_path_weights(&self, weights: PathWeights) {
+        self.state.send_modify(|s| s.weights = weights);
     }
 
     /// Switches cover traffic on or off. Off by default.
@@ -111,9 +178,10 @@ impl EgressControl {
 
     /// Biases loopback probing towards loops around `exits`.
     ///
-    /// Replaces any earlier focus. Loops elsewhere in the network are still probed, at a lower
-    /// weight (see `EgressConfig::focus_boost`). Exits unknown to the graph produce no focused
-    /// loops. An empty set clears the focus.
+    /// Replaces any earlier focus. The best set is then drawn from the loops around the exits, so
+    /// most loopback probes keep those measured; the rest of the network is still explored at the
+    /// configured exploration share. Exits unknown to the graph produce no focused loops. An empty
+    /// set clears the focus.
     pub fn set_focus(&self, exits: impl IntoIterator<Item = OffchainPublicKey>) {
         let exits: HashSet<_> = exits.into_iter().collect();
         self.state.send_modify(|s| {
@@ -130,12 +198,16 @@ impl EgressControl {
     pub fn focus(&self) -> Option<Arc<HashSet<OffchainPublicKey>>> {
         self.state.borrow().focus.clone()
     }
+
+    /// Edges the last completed loopback cycle saw fresh SURB evidence for, `None` before the first
+    /// cycle completes.
+    pub fn coverage(&self) -> Option<Coverage> {
+        self.coverage.snapshot()
+    }
 }
 
 #[cfg(test)]
 mod handle {
-    use std::time::Duration;
-
     use hopr_api::{OffchainKeypair, types::crypto::keypairs::Keypair};
 
     use super::*;
@@ -145,26 +217,13 @@ mod handle {
     }
 
     #[test]
-    fn level_should_stretch_the_configured_interval() {
-        let interval = Duration::from_secs(30);
-
-        for (level, expected) in [
-            (ProbingLevel::Low, Duration::from_secs(300)),
-            (ProbingLevel::Medium, Duration::from_secs(60)),
-            (ProbingLevel::High, interval),
-            (ProbingLevel::Ultra, Duration::from_secs(15)),
-        ] {
-            assert_eq!(level.period(interval), expected, "{level:?}");
-        }
-    }
-
-    #[test]
-    fn control_should_start_at_full_pace_with_noise_off_and_no_focus() {
+    fn control_should_start_with_noise_off_and_no_focus() {
         let control = EgressControl::default();
 
-        assert_eq!(control.level(), Some(ProbingLevel::High));
         assert!(!control.noise());
         assert!(control.focus().is_none());
+        assert!(control.best_set_cap().is_none());
+        assert!(control.coverage().is_none());
     }
 
     #[test]
@@ -172,11 +231,54 @@ mod handle {
         let control = EgressControl::default();
         let clone = control.clone();
 
-        clone.set_level(Some(ProbingLevel::Low));
         clone.set_noise(true);
+        clone.set_best_set_cap(Some(7));
 
-        assert_eq!(control.level(), Some(ProbingLevel::Low));
         assert!(control.noise());
+        assert_eq!(control.best_set_cap(), Some(7));
+    }
+
+    #[test]
+    fn a_zero_best_set_cap_should_read_as_unset() {
+        let control = EgressControl::default();
+
+        control.set_best_set_cap(Some(0));
+
+        assert!(control.best_set_cap().is_none(), "a best set of zero paths is no cap");
+    }
+
+    #[test]
+    fn coverage_should_stay_unset_until_a_cycle_completes() {
+        let control = EgressControl::default();
+        let counters = control.coverage_counters();
+
+        counters.record_cycle(3);
+
+        assert_eq!(
+            control.coverage(),
+            Some(Coverage {
+                edges_with_evidence: 3,
+                cycles: 1
+            })
+        );
+    }
+
+    #[test]
+    fn the_default_weights_should_value_every_path_the_same() {
+        let weights = PathWeights::default();
+
+        assert_eq!(weights.weight_of(&[random_key(), random_key()], [0; 5]), Some(1.0));
+    }
+
+    #[test]
+    fn a_weight_that_is_not_positive_and_finite_should_read_as_unvalued() {
+        for weight in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let weights = PathWeights::new(move |_, _| Some(weight));
+            assert_eq!(weights.weight_of(&[], [0; 5]), None, "{weight}");
+        }
+
+        let unknown = PathWeights::new(|_, _| None);
+        assert_eq!(unknown.weight_of(&[], [0; 5]), None);
     }
 
     #[test]
@@ -216,9 +318,9 @@ mod handle {
         let mut rx = control.subscribe();
         rx.mark_unchanged();
 
-        control.set_level(Some(ProbingLevel::High));
         control.set_noise(false);
         control.clear_focus();
+        control.set_best_set_cap(None);
 
         assert!(!rx.has_changed().unwrap_or(true), "no-op setters must not wake streams");
     }
