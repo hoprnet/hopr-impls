@@ -583,9 +583,19 @@ async fn an_open_channel_that_closes_directly_emits_a_closed_event() {
         .wait_for_channel_state(&first, |c| c.status == ChannelStatus::Closed)
         .await;
 
-    let event = tokio::time::timeout(RECOVERY_WAIT, events.next()).await;
+    // The Opened events of the initial entries may still be in flight when the subscription starts, so skip
+    // everything that is not the closure.
+    let event = tokio::time::timeout(RECOVERY_WAIT, async {
+        while let Some(event) = events.next().await {
+            if matches!(&event, ChainEvent::ChannelClosed(channel) if channel.get_id() == first.get_id()) {
+                return Some(event);
+            }
+        }
+        None
+    })
+    .await;
     assert!(
-        matches!(&event, Ok(Some(ChainEvent::ChannelClosed(channel))) if channel.get_id() == first.get_id()),
+        matches!(&event, Ok(Some(_))),
         "an Open channel became Closed directly and expected a ChannelClosed event, got {event:?}"
     );
 }
