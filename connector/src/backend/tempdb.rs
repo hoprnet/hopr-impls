@@ -97,8 +97,6 @@ impl TempDbBackend {
     /// Begins a write that is not flushed to disk on commit.
     ///
     /// The database lives in a temporary file deleted on exit, so a flush protects nothing.
-    /// Flushing every write made the initial sync of thousands of accounts and channels take
-    /// minutes on slow disks.
     fn begin_write(&self) -> Result<redb::WriteTransaction, TempDbError> {
         let mut write_tx = self.db.begin_write()?;
         write_tx.set_durability(redb::Durability::None)?;
