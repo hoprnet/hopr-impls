@@ -27,7 +27,7 @@ use hopr_api::chain::{AccountEntry, ChannelEntry};
 
 use crate::{errors::ConnectorError, utils::model_to_graph_entry};
 
-/// Delay before the second start in a row, doubled for every further one.
+/// Delay before the second restart in a row, doubled for every further one.
 const RESYNC_BACKOFF_INITIAL: Duration = Duration::from_secs(5);
 
 /// Longest delay between two starts.
@@ -82,12 +82,26 @@ struct State<'a, C> {
 impl<C> State<'_, C> {
     /// Drops the running subscription so the next poll starts a new one, and updates the pacing.
     fn restart(&mut self) {
+        // Dropping the stream makes blokli-client mark its handle as ended. That is not a failure of the
+        // subscription, so the health checks must not see it: they get an untracked handle until the new
+        // subscription has one.
+        {
+            let mut health = self.health.lock();
+            *health = SubscriptionHealthHandle::untracked(health.subscription().name());
+        }
         self.stream = None;
         self.restarts = if self.started.elapsed() >= RESYNC_HEALTHY_AFTER {
             1
         } else {
             self.restarts.saturating_add(1)
         };
+    }
+
+    /// Like [`restart`](Self::restart), after the start of a new subscription failed. The failed start counts as a
+    /// short-lived subscription, so that repeated failures keep backing off.
+    fn restart_after_failed_start(&mut self) {
+        self.started = Instant::now();
+        self.restart();
     }
 }
 
@@ -136,7 +150,7 @@ where
                         state.started = Instant::now();
                     }
                     Err(error) => {
-                        state.restart();
+                        state.restart_after_failed_start();
                         return Some((Err(ConnectorError::from(error)), state));
                     }
                 }
@@ -179,6 +193,61 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn state_with<'a>(
+        client: &'a (),
+        stream: Option<RawGraphStream<'a>>,
+        health: SubscriptionHealthHandle,
+    ) -> State<'a, ()> {
+        State {
+            client,
+            health: Arc::new(parking_lot::Mutex::new(health)),
+            stream,
+            started: Instant::now(),
+            restarts: 0,
+            failed_conversions: HashSet::new(),
+        }
+    }
+
+    #[test]
+    fn restarting_does_not_leave_an_ended_handle_for_the_health_check() {
+        use blokli_client::{
+            BlokliClient, BlokliClientConfig, SubscriptionEnd, SubscriptionStatus, api::BlokliSubscriptionClient,
+        };
+
+        let client = BlokliClient::new("http://localhost:1".parse().unwrap(), BlokliClientConfig::default());
+        let (stream, health) = client.subscribe_graph_with_health().unwrap();
+        let name = health.subscription().name();
+        let observer = health.clone();
+        let mut state = state_with(&(), Some(stream.boxed()), health);
+
+        state.restart();
+
+        // the dropped stream ended its own handle, which nobody observes any more
+        assert_eq!(
+            SubscriptionStatus::Ended(SubscriptionEnd::Cancelled),
+            observer.get().status
+        );
+        let shared = state.health.lock().clone();
+        assert_eq!(name, shared.subscription().name());
+        assert_eq!(SubscriptionStatus::Untracked, shared.get().status);
+    }
+
+    #[test]
+    fn failed_starts_keep_backing_off_after_a_long_lived_subscription() {
+        let mut state = state_with(&(), None, SubscriptionHealthHandle::untracked("graph"));
+        state.started = Instant::now() - RESYNC_HEALTHY_AFTER - Duration::from_secs(1);
+        state.restarts = 0;
+
+        state.restart();
+        assert_eq!(Duration::ZERO, resync_delay(state.restarts));
+
+        // the immediate restart failed to subscribe
+        state.restart_after_failed_start();
+        assert_eq!(Duration::from_secs(5), resync_delay(state.restarts));
+        state.restart_after_failed_start();
+        assert_eq!(Duration::from_secs(10), resync_delay(state.restarts));
+    }
 
     #[test]
     fn the_first_restart_is_immediate_and_later_ones_back_off() {
