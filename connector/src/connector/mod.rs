@@ -89,8 +89,8 @@ const SUBSCRIPTION_HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 /// long a channel missed by the subscription stays wrong, while the load stays negligible next to the subscriptions.
 const CHANNEL_RECONCILE_INTERVAL: Duration = Duration::from_mins(5);
 
-/// Position of the graph subscription in the list of subscription health handles.
-const GRAPH_SUBSCRIPTION: usize = 1;
+/// Name of the graph subscription in the list of subscription health handles.
+const GRAPH_SUBSCRIPTION: &str = "graph";
 
 /// How often the chain state gauges are refreshed. Independent of the state dump interval.
 #[cfg(feature = "telemetry")]
@@ -744,8 +744,13 @@ where
 
             // Stream of channel graph updates. It starts over from a full snapshot when an entry fails conversion or
             // the stream ends, because the client's resume cursor never resends an entry it has handed out.
-            let graph_health =
-                std::sync::Arc::new(parking_lot::Mutex::new(subscription_health[GRAPH_SUBSCRIPTION].clone()));
+            let graph_health = std::sync::Arc::new(parking_lot::Mutex::new(
+                subscription_health
+                    .iter()
+                    .find(|handle| handle.subscription().name() == GRAPH_SUBSCRIPTION)
+                    .cloned()
+                    .unwrap_or_else(|| SubscriptionHealthHandle::untracked(GRAPH_SUBSCRIPTION)),
+            ));
             let channel_stream =
                 graph_stream::resyncing_graph_stream(client.as_ref(), channel_stream, graph_health.clone())
                     .and_then(move |(src, dst, channel)| {
@@ -994,7 +999,12 @@ where
                 if matches!(event_type, Ok(SubscribedEventType::HealthCheck)) {
                     // The graph subscription may have been restarted, which gives it a new health handle.
                     let mut current = subscription_health.clone();
-                    current[GRAPH_SUBSCRIPTION] = graph_health.lock().clone();
+                    if let Some(handle) = current
+                        .iter_mut()
+                        .find(|handle| handle.subscription().name() == GRAPH_SUBSCRIPTION)
+                    {
+                        *handle = graph_health.lock().clone();
+                    }
                     update_chain_health(&checked_health, &current, &mut previous_health);
                 }
                 // The gauge refresh reads the chain and must not hold up the subscription stream.
