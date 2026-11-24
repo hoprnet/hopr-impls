@@ -46,12 +46,14 @@ struct ScriptedGraphClient<T> {
     graph_subscriptions: Arc<AtomicUsize>,
     /// What every later subscription replays first: the full, valid snapshot, as a fresh blokli subscription would.
     replay: Vec<OpenedChannelsGraphEntry>,
+    /// Accounts that blokli reports and delivers on top of the inner client's, as the node receives them raw.
+    extra_accounts: Vec<types::Account>,
 }
 
 #[async_trait::async_trait]
 impl<T: BlokliQueryClient + Send + Sync> BlokliQueryClient for ScriptedGraphClient<T> {
     async fn count_accounts(&self, selector: AccountSelector) -> Result<u32, BlokliClientError> {
-        self.inner.count_accounts(selector).await
+        Ok(self.inner.count_accounts(selector).await? + self.extra_accounts.len() as u32)
     }
 
     async fn query_accounts(&self, selector: AccountSelector) -> Result<Vec<types::Account>, BlokliClientError> {
@@ -207,7 +209,12 @@ impl<T: BlokliSubscriptionClient + Send + Sync> BlokliSubscriptionClient for Scr
         &self,
         selector: AccountSelector,
     ) -> Result<impl futures::Stream<Item = Result<types::Account, BlokliClientError>> + Send, BlokliClientError> {
-        self.inner.subscribe_accounts(selector)
+        let extra = self.extra_accounts.clone();
+        // merged, because the inner stream may stay open once it has delivered its accounts
+        Ok(futures::stream::select(
+            self.inner.subscribe_accounts(selector)?,
+            futures::stream::iter(extra.into_iter().map(Ok)),
+        ))
     }
 
     fn subscribe_graph(&self) -> Result<impl futures::Stream<Item = GraphResult> + Send, BlokliClientError> {
@@ -352,6 +359,18 @@ impl Harness {
         chain_channels: [ChannelEntry; 2],
         replay: impl FnOnce(&[OpenedChannelsGraphEntry; 2]) -> Vec<OpenedChannelsGraphEntry>,
     ) -> Self {
+        Self::build_with(node_key, chain_channels, replay, 50, vec![]).await
+    }
+
+    /// Like [`Harness::build`], with the given sync tolerance and raw accounts that the account subscription
+    /// delivers (and the account count includes) in addition to the chain's own.
+    async fn build_with(
+        node_key: ChainKeypair,
+        chain_channels: [ChannelEntry; 2],
+        replay: impl FnOnce(&[OpenedChannelsGraphEntry; 2]) -> Vec<OpenedChannelsGraphEntry>,
+        sync_tolerance: usize,
+        extra_accounts: Vec<types::Account>,
+    ) -> Self {
         let state_client = BlokliTestStateBuilder::default()
             .with_hopr_network_chain_info("anvil-localhost")
             .with_accounts(
@@ -379,10 +398,11 @@ impl Harness {
             graph: Mutex::new(Some(graph_rx)),
             graph_subscriptions: graph_subscriptions.clone(),
             replay: replay(&entries),
+            extra_accounts,
         };
 
         let cfg = BlockchainConnectorConfig {
-            sync_tolerance: 50,
+            sync_tolerance,
             ..Default::default()
         };
         let connector =
@@ -693,4 +713,34 @@ async fn a_snapshot_started_by_the_client_closes_the_channels_it_lacks() {
     );
     // no new subscription was needed for it
     assert_eq!(1, harness.graph_subscriptions.load(Ordering::SeqCst));
+}
+
+/// An account whose packet key is not a point on the curve is rejected, but it still counts in the total that
+/// blokli reports. It must count as received, or `connect()` can never finish at a sync tolerance of 100.
+#[tokio::test]
+async fn a_rejected_account_does_not_keep_connect_from_finishing_at_full_tolerance() {
+    let invalid = types::Account {
+        chain_key: Address::new(&[9u8; Address::SIZE]).to_string(),
+        keyid: 99,
+        multi_addresses: vec![],
+        // 32 bytes that are not a valid curve point
+        packet_key: "02".repeat(32),
+        safe_address: None,
+    };
+    let mut harness = Harness::build_with(
+        ChainKeypair::random(),
+        channels(),
+        |entries| entries.to_vec(),
+        100,
+        vec![invalid],
+    )
+    .await;
+
+    for entry in harness.entries.clone() {
+        harness.send(entry);
+    }
+
+    tokio::time::timeout(RECOVERY_WAIT, harness.connect())
+        .await
+        .expect("connect never finished");
 }

@@ -575,6 +575,8 @@ where
         #[derive(Debug)]
         enum SubscribedEventType {
             Account((AccountEntry, Option<AccountEntry>)),
+            /// An account event that was received but not stored: it was rejected or its backend write failed.
+            AccountSkipped(ConnectorError),
             Channel((ChannelEntry, Option<Vec<ChannelChange>>)),
             /// The graph snapshot has been delivered completely. Holds the ids of the channels it contained.
             ///
@@ -710,39 +712,53 @@ where
             let account_stream = account_stream
                 .inspect_ok(|entry| tracing::trace!(?entry, "new account event"))
                 .map_err(ConnectorError::from)
-                .try_filter_map(|account| futures::future::ready(model_to_account_entry(account).map(Some)))
-                .and_then(move |account| {
+                .map_ok(model_to_account_entry)
+                .and_then(move |parsed| {
                     let graph = graph_clone.clone();
                     let mapper = mapper.clone();
                     let announced = announced.clone();
                     let chain_to_packet = chain_to_packet.clone();
                     let packet_to_chain = packet_to_chain.clone();
-                    hopr_utils::runtime::prelude::spawn_blocking(move || {
-                        graph.write().add_node(account.key_id);
-                        let stored = mapper.backend.insert_account(account.clone());
-                        // Caches are written after the backend, serialized per key with the lookups. They are
-                        // filled even when the backend write failed, so the mapping is not lost.
-                        cache::put(&mapper.key_to_id, &account.public_key, account.key_id);
-                        cache::put(&mapper.id_to_key, &account.key_id, account.public_key);
-                        cache::put(&chain_to_packet, &account.chain_addr, account.public_key);
-                        cache::put(&packet_to_chain, &account.public_key, account.chain_addr);
-                        let old = stored.map_err(ConnectorError::backend)?;
-                        accounts::update_announced(&announced, &account, old.as_ref(), &me);
-                        if let Some(old_account) = &old {
-                            if old_account.chain_addr != account.chain_addr {
-                                cache::invalidate(&chain_to_packet, &old_account.chain_addr);
-                            }
-                            if old_account.public_key != account.public_key {
-                                cache::invalidate(&packet_to_chain, &old_account.public_key);
-                            }
+                    // An account that is rejected or not stored is still a received event. It is reported as
+                    // `AccountSkipped` so that the sync gate counts it, otherwise one such account keeps
+                    // `connect()` from ever finishing at a tolerance of 100.
+                    let account = match parsed {
+                        Ok(account) => account,
+                        Err(error) => {
+                            return futures::future::Either::Left(futures::future::ready(Ok(
+                                SubscribedEventType::AccountSkipped(error),
+                            )));
                         }
-                        Ok::<_, ConnectorError>((account, old))
-                    })
-                    .map(|result| {
-                        result
-                            .map_err(ConnectorError::backend)?
-                            .map(SubscribedEventType::Account)
-                    })
+                    };
+                    futures::future::Either::Right(
+                        hopr_utils::runtime::prelude::spawn_blocking(move || {
+                            graph.write().add_node(account.key_id);
+                            let stored = mapper.backend.insert_account(account.clone());
+                            // Caches are written after the backend, serialized per key with the lookups. They are
+                            // filled even when the backend write failed, so the mapping is not lost.
+                            cache::put(&mapper.key_to_id, &account.public_key, account.key_id);
+                            cache::put(&mapper.id_to_key, &account.key_id, account.public_key);
+                            cache::put(&chain_to_packet, &account.chain_addr, account.public_key);
+                            cache::put(&packet_to_chain, &account.public_key, account.chain_addr);
+                            let old = match stored {
+                                Ok(old) => old,
+                                Err(error) => {
+                                    return SubscribedEventType::AccountSkipped(ConnectorError::backend(error));
+                                }
+                            };
+                            accounts::update_announced(&announced, &account, old.as_ref(), &me);
+                            if let Some(old_account) = &old {
+                                if old_account.chain_addr != account.chain_addr {
+                                    cache::invalidate(&chain_to_packet, &old_account.chain_addr);
+                                }
+                                if old_account.public_key != account.public_key {
+                                    cache::invalidate(&packet_to_chain, &old_account.public_key);
+                                }
+                            }
+                            SubscribedEventType::Account((account, old))
+                        })
+                        .map_err(ConnectorError::backend),
+                    )
                 })
                 .map_err(|error| SubscriptionError::new("accounts", error))
                 .fuse();
@@ -988,7 +1004,7 @@ where
                 }
                 if connection_ready_tx.is_some() && !event_type.is_tick() {
                     match event_type {
-                        SubscribedEventType::Account(_) => account_counter += 1,
+                        SubscribedEventType::Account(_) | SubscribedEventType::AccountSkipped(_) => account_counter += 1,
                         SubscribedEventType::Channel((channel, _)) => channel_counter = open_channels.observe(channel),
                         // Service registry events deliberately do not count towards the connection
                         // quota: a node with no services must still reach the Ready state.
@@ -1056,6 +1072,9 @@ where
                                     .broadcast_direct(ChainEvent::Announcement(new_account.clone()))
                                     .await;
                             }
+                        }
+                        Ok(SubscribedEventType::AccountSkipped(error)) => {
+                            tracing::error!(%error, "account event was not stored");
                         }
                         Ok(SubscribedEventType::Channel((new_channel, Some(changes)))) => {
                             tracing::debug!(
