@@ -278,6 +278,12 @@ mod tests {
         let me = key(1);
         let graph = ChannelGraph::new(me);
         route(&graph, me, key(2), 100);
+        // With a single live dispatcher, tracing rebuilds callsite interest from the *calling* thread's
+        // dispatcher, so a concurrent test could cache `never` for this one. A second live dispatcher
+        // makes every rebuild consult all registered dispatchers.
+        static PIN: std::sync::LazyLock<tracing::Dispatch> =
+            std::sync::LazyLock::new(|| tracing::Dispatch::new(Counts::default()));
+        std::sync::LazyLock::force(&PIN);
         let logs = Counts::default();
         tracing::subscriber::with_default(logs.clone(), || {
             for _ in 0..1000 {
