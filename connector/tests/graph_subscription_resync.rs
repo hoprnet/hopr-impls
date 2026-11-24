@@ -744,3 +744,34 @@ async fn a_rejected_account_does_not_keep_connect_from_finishing_at_full_toleran
         .await
         .expect("connect never finished");
 }
+
+/// A channel that closed between the open channels being counted and the graph snapshot is counted in the total but
+/// not delivered. The delivered snapshot says that nothing more is coming, so `connect()` must finish at 100.
+#[tokio::test]
+async fn a_channel_closed_in_the_setup_gap_does_not_keep_connect_from_finishing_at_full_tolerance() {
+    let [_, second] = channels();
+    let mut harness = Harness::build_with(
+        ChainKeypair::random(),
+        channels(),
+        |entries| entries.to_vec(),
+        100,
+        vec![],
+    )
+    .await;
+
+    // The snapshot only holds the second channel; its last entry carries the cursor.
+    let mut last = harness.entries[1].clone();
+    last.cursor = Some(types::ChannelStatePosition {
+        block: types::Uint64("10".into()),
+        transaction_index: types::Uint64("0".into()),
+        log_index: types::Uint64("0".into()),
+    });
+    harness.send(last);
+
+    tokio::time::timeout(RECOVERY_WAIT, harness.connect())
+        .await
+        .expect("connect never finished");
+    harness
+        .wait_for_channel_state(&second, |c| c.status == ChannelStatus::Open)
+        .await;
+}

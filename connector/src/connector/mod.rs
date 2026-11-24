@@ -948,6 +948,9 @@ where
             let mut account_counter = 0;
             let mut open_channels = OpenChannelCounter::default();
             let mut channel_counter = 0;
+            // Set once the graph snapshot has been delivered completely. A channel that closed after the open
+            // channels were counted is never part of the snapshot, so counting alone could not reach the total.
+            let mut snapshot_delivered = false;
             if min_accounts == 0 && min_channels == 0 {
                 tracing::info!(account_counter, channel_counter, time = ?sync_started.elapsed(), "on-chain graph has been synced");
                 let _ = connection_ready_tx.take().unwrap().send(Ok(()));
@@ -1006,6 +1009,7 @@ where
                     match event_type {
                         SubscribedEventType::Account(_) | SubscribedEventType::AccountSkipped(_) => account_counter += 1,
                         SubscribedEventType::Channel((channel, _)) => channel_counter = open_channels.observe(channel),
+                        SubscribedEventType::SnapshotComplete(_) => snapshot_delivered = true,
                         // Service registry events deliberately do not count towards the connection
                         // quota: a node with no services must still reach the Ready state.
                         _ => {}
@@ -1026,7 +1030,7 @@ where
                     // Send the completion notification
                     // once we reach the expected number of accounts and channels with
                     // the given tolerance
-                    if account_counter >= min_accounts && channel_counter >= min_channels {
+                    if account_counter >= min_accounts && (channel_counter >= min_channels || snapshot_delivered) {
                         tracing::info!(account_counter, channel_counter, time = ?sync_started.elapsed(), "on-chain graph has been synced");
                         let _ = connection_ready_tx.take().unwrap().send(Ok(()));
                         let _ = first_reconcile_tx.take().map(|tx| tx.send(()));
