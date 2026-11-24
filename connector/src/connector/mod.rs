@@ -1,4 +1,9 @@
-use std::{cmp::Ordering, str::FromStr, sync::atomic::Ordering as AtomicOrdering, time::Duration};
+use std::{
+    cmp::Ordering,
+    str::FromStr,
+    sync::atomic::{AtomicU32, Ordering as AtomicOrdering},
+    time::Duration,
+};
 
 use blokli_client::{
     BlokliClientError, SubscriptionHealth, SubscriptionHealthHandle, SubscriptionStatus,
@@ -59,10 +64,11 @@ type EventsChannel = (
 );
 
 const MIN_CONNECTION_TIMEOUT: Duration = Duration::from_millis(100);
-/// Share of the connection budget the service registry pre-read may take.
+/// Budget of the service registry pre-read, as a share of the connection sync timeout.
 ///
-/// The read is auxiliary: it only decides whether the subscription replay is suppressed, so it must
-/// never be able to spend the budget the channel graph needs to sync.
+/// The read is auxiliary: it only decides whether the subscription replay is suppressed. It runs
+/// before the graph sync starts and is not counted against the sync timeout, so it can never
+/// spend the time the channel graph needs to sync.
 const REGISTRY_READ_BUDGET_DIVISOR: u32 = 4;
 const MIN_TX_CONFIRM_TIMEOUT: Duration = Duration::from_secs(1);
 /// With Gnosis Chain (5 s blocks, finality 3) this waits 60 s, longer than Blokli's unmined timeout (45 s), so the
@@ -83,8 +89,8 @@ const SUBSCRIPTION_HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 /// long a channel missed by the subscription stays wrong, while the load stays negligible next to the subscriptions.
 const CHANNEL_RECONCILE_INTERVAL: Duration = Duration::from_mins(5);
 
-/// Position of the graph subscription in the list of subscription health handles.
-const GRAPH_SUBSCRIPTION: usize = 1;
+/// Name of the graph subscription in the list of subscription health handles.
+const GRAPH_SUBSCRIPTION: &str = "graph";
 
 /// How often the chain state gauges are refreshed. Independent of the state dump interval.
 #[cfg(feature = "telemetry")]
@@ -356,7 +362,9 @@ where
 /// Configuration of the [`HoprBlockchainConnector`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, smart_default::SmartDefault)]
 pub struct BlockchainConnectorConfig {
-    /// Maximum time to wait for [connection](HoprBlockchainConnector::connect) to complete.
+    /// Maximum time to wait for the on-chain graph to sync during [connection](HoprBlockchainConnector::connect).
+    ///
+    /// The service registry is read before the sync starts, within a quarter of this time on top of it.
     ///
     /// Default is 30 seconds, minimum is 100 milliseconds.
     #[default(Duration::from_secs(30))]
@@ -517,7 +525,6 @@ where
             .count as f64
             * sync_quota)
             .round() as u32;
-        tracing::debug!(min_accounts, min_channels, "connection thresholds");
 
         let server_health = self.client.query_health().await?;
         if !server_health.eq_ignore_ascii_case("OK") {
@@ -606,24 +613,38 @@ where
 
         let ticket_values = self.ticket_values.clone();
         let health = self.health.clone();
-        let registry_read_budget = timeout / REGISTRY_READ_BUDGET_DIVISOR;
+
+        // The registry subscriptions below are snapshot-first: each replays the state that
+        // already exists as a `Registered` event before it reports any change. `connect` does
+        // not wait for those replays, and an event broadcast before a consumer subscribes is
+        // dropped, so a consumer that subscribes right after `connect` would see the
+        // pre-existing registry as either a burst of fresh registrations or nothing at all,
+        // depending on scheduling. Reading that state here, immediately before subscribing,
+        // lets the handlers below drop each replayed registration once. The read has its own
+        // budget and runs before the sync timeout starts.
+        //
+        // This read and the subscriptions share no watermark, so the suppression is
+        // best-effort: anything created in the gap is replayed as though it were new, and so is
+        // the whole registry when the read is given up on. See the module documentation of
+        // `services` for what a consumer may and may not conclude from a registry event.
+        let registry_read_started = std::time::Instant::now();
+        let (mut replayed_services, mut replayed_service_types) =
+            read_replayed_registry(&client, timeout / REGISTRY_READ_BUDGET_DIVISOR).await;
+        tracing::info!(elapsed = ?registry_read_started.elapsed(), "read the service registry");
+
+        // Counts of the accounts and open channels received so far, for the timeout report.
+        let sync_progress = std::sync::Arc::new((AtomicU32::new(0), AtomicU32::new(0)));
+        let task_sync_progress = sync_progress.clone();
+
+        tracing::info!(
+            accounts_needed = min_accounts,
+            open_channels_needed = min_channels,
+            sync_tolerance = self.cfg.sync_tolerance,
+            ?timeout,
+            "syncing the on-chain graph from Blokli"
+        );
         hopr_utils::runtime::prelude::spawn(async move {
             let sync_started = std::time::Instant::now();
-
-            // The registry subscriptions below are snapshot-first: each replays the state that
-            // already exists as a `Registered` event before it reports any change. `connect` does
-            // not wait for those replays, and an event broadcast before a consumer subscribes is
-            // dropped, so a consumer that subscribes right after `connect` would see the
-            // pre-existing registry as either a burst of fresh registrations or nothing at all,
-            // depending on scheduling. Reading that state here, immediately before subscribing,
-            // lets the handlers below drop each replayed registration once.
-            //
-            // This read and the subscriptions share no watermark, so the suppression is
-            // best-effort: anything created in the gap is replayed as though it were new, and so is
-            // the whole registry when the read is given up on. See the module documentation of
-            // `services` for what a consumer may and may not conclude from a registry event.
-            let (mut replayed_services, mut replayed_service_types) =
-                read_replayed_registry(&client, registry_read_budget).await;
 
             // Each subscription comes with its own health, checked below to tell whether the chain
             // feed still works.
@@ -728,8 +749,13 @@ where
 
             // Stream of channel graph updates. It starts over from a full snapshot when an entry fails conversion or
             // the stream ends, because the client's resume cursor never resends an entry it has handed out.
-            let graph_health =
-                std::sync::Arc::new(parking_lot::Mutex::new(subscription_health[GRAPH_SUBSCRIPTION].clone()));
+            let graph_health = std::sync::Arc::new(parking_lot::Mutex::new(
+                subscription_health
+                    .iter()
+                    .find(|handle| handle.subscription().name() == GRAPH_SUBSCRIPTION)
+                    .cloned()
+                    .unwrap_or_else(|| SubscriptionHealthHandle::untracked(GRAPH_SUBSCRIPTION)),
+            ));
             let channel_stream =
                 graph_stream::resyncing_graph_stream(client.as_ref(), channel_stream, graph_health.clone())
                     .and_then(move |update| match update {
@@ -952,6 +978,14 @@ where
                 .merge();
             futures::stream::Abortable::new(with_health_checks(subscriptions, health_checks), abort_reg)
             .inspect_ok(move |event_type| {
+                if connection_ready_tx.is_some() && matches!(event_type, SubscribedEventType::HealthCheck) {
+                    tracing::info!(
+                        accounts = format!("{account_counter}/{min_accounts}"),
+                        open_channels = format!("{channel_counter}/{min_channels}"),
+                        elapsed = ?sync_started.elapsed(),
+                        "on-chain graph sync in progress"
+                    );
+                }
                 if connection_ready_tx.is_some() && !event_type.is_tick() {
                     match event_type {
                         SubscribedEventType::Account(_) => account_counter += 1,
@@ -960,6 +994,8 @@ where
                         // quota: a node with no services must still reach the Ready state.
                         _ => {}
                     }
+                    task_sync_progress.0.store(account_counter, AtomicOrdering::Relaxed);
+                    task_sync_progress.1.store(channel_counter, AtomicOrdering::Relaxed);
 
                     let pct_synced =
                         ((account_counter + channel_counter) * 100 / (min_accounts + min_channels).max(1)).clamp(0, 100);
@@ -985,7 +1021,12 @@ where
                 if matches!(event_type, Ok(SubscribedEventType::HealthCheck)) {
                     // The graph subscription may have been restarted, which gives it a new health handle.
                     let mut current = subscription_health.clone();
-                    current[GRAPH_SUBSCRIPTION] = graph_health.lock().clone();
+                    if let Some(handle) = current
+                        .iter_mut()
+                        .find(|handle| handle.subscription().name() == GRAPH_SUBSCRIPTION)
+                    {
+                        *handle = graph_health.lock().clone();
+                    }
                     update_chain_health(&checked_health, &current, &mut previous_health);
                 }
                 // The gauge refresh reads the chain and must not hold up the subscription stream.
@@ -1100,7 +1141,12 @@ where
                 }
                 Err(_) => {
                     abort_handle.abort();
-                    tracing::error!(min_accounts, min_channels, "connection timeout when syncing");
+                    tracing::error!(
+                        accounts = format!("{}/{min_accounts}", sync_progress.0.load(AtomicOrdering::Relaxed)),
+                        open_channels = format!("{}/{min_channels}", sync_progress.1.load(AtomicOrdering::Relaxed)),
+                        ?timeout,
+                        "timed out syncing the on-chain graph from Blokli"
+                    );
                     Err(ConnectorError::ConnectionTimeout)
                 }
             })

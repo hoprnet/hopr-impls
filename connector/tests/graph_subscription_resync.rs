@@ -1,7 +1,7 @@
 //! Tests for how the connector keeps its channel view correct when the graph subscription drops an entry or ends.
 //!
-//! Every test asserts the expected behaviour. They fail until the connector recovers from lost updates, notices a
-//! finished graph stream and emits an event for every channel status change.
+//! The tests assert that the connector recovers from lost updates by restarting the graph subscription, notices a
+//! finished graph stream, and emits an event for every channel status change.
 #![cfg(feature = "testing")]
 
 use std::{

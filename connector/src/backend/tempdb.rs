@@ -46,6 +46,12 @@ impl From<redb::StorageError> for TempDbError {
     }
 }
 
+impl From<redb::SetDurabilityError> for TempDbError {
+    fn from(error: redb::SetDurabilityError) -> Self {
+        Self::Database(error.into())
+    }
+}
+
 impl From<redb::CommitError> for TempDbError {
     fn from(error: redb::CommitError) -> Self {
         Self::Database(error.into())
@@ -87,6 +93,15 @@ impl TempDbBackend {
             _tmp: std::sync::Arc::new(file),
         })
     }
+
+    /// Begins a write that is not flushed to disk on commit.
+    ///
+    /// The database lives in a temporary file deleted on exit, so a flush protects nothing.
+    fn begin_write(&self) -> Result<redb::WriteTransaction, TempDbError> {
+        let mut write_tx = self.db.begin_write()?;
+        write_tx.set_durability(redb::Durability::None)?;
+        Ok(write_tx)
+    }
 }
 
 const ACCOUNTS_TABLE_DEF: TableDefinition<u32, Vec<u8>> = TableDefinition::new("id_accounts");
@@ -112,7 +127,7 @@ impl super::Backend for TempDbBackend {
     }
 
     fn insert_account(&self, account: AccountEntry) -> Result<Option<AccountEntry>, Self::Error> {
-        let write_tx = self.db.begin_write()?;
+        let write_tx = self.begin_write()?;
         let old_value = {
             let mut accounts = write_tx.open_table(ACCOUNTS_TABLE_DEF)?;
             let old_value = accounts
@@ -146,7 +161,7 @@ impl super::Backend for TempDbBackend {
     }
 
     fn insert_channel(&self, channel: ChannelEntry) -> Result<Option<ChannelEntry>, Self::Error> {
-        let write_tx = self.db.begin_write()?;
+        let write_tx = self.begin_write()?;
         let old_value = {
             let mut channels = write_tx.open_table(CHANNELS_TABLE_DEF)?;
             let channel_id: [u8; ChannelId::SIZE] = channel.get_id().into();
