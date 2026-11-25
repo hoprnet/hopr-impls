@@ -113,20 +113,28 @@ pub(crate) fn default_total_value<Q: TicketQueue + ?Sized>(
 }
 
 // Contains general utilities and test helpers for ticket queue implementations.
-#[cfg(all(test, feature = "manager"))]
+#[cfg(test)]
 pub mod tests {
+    #[cfg(feature = "manager")]
     use std::ops::RangeBounds;
 
+    use hopr_api::{chain::ChannelId, types::crypto::prelude::*};
+    #[cfg(feature = "manager")]
     use hopr_api::{
-        chain::{ChannelId, HoprBalance, RedeemableTicket, WinningProbability},
-        types::{crypto::prelude::*, crypto_random::Randomizable, internal::prelude::TicketBuilder},
+        chain::{HoprBalance, RedeemableTicket, WinningProbability},
+        types::{crypto_random::Randomizable, internal::prelude::TicketBuilder},
     };
+    #[cfg(feature = "manager")]
     use rand::prelude::SliceRandom;
 
-    use crate::{OutgoingIndexStore, TicketQueue, TicketQueueStore};
+    use crate::OutgoingIndexStore;
+    #[cfg(feature = "manager")]
+    use crate::{TicketQueue, TicketQueueStore};
 
+    #[cfg(feature = "manager")]
     const TICKET_VALUE: u64 = 10;
 
+    #[cfg(feature = "manager")]
     pub fn generate_owned_tickets(
         issuer: &ChainKeypair,
         recipient: &ChainKeypair,
@@ -161,10 +169,12 @@ pub mod tests {
         Ok(tickets)
     }
 
+    #[cfg(feature = "manager")]
     pub fn generate_tickets() -> anyhow::Result<Vec<RedeemableTicket>> {
         generate_owned_tickets(&ChainKeypair::random(), &ChainKeypair::random(), 5, 1..=2)
     }
 
+    #[cfg(feature = "manager")]
     pub fn fill_queue<Q: TicketQueue, I: Iterator<Item = RedeemableTicket>>(
         queue: &mut Q,
         iter: I,
@@ -175,6 +185,7 @@ pub mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "manager")]
     pub fn queue_maintains_natural_ticket_order<Q: TicketQueue>(mut queue: Q) -> anyhow::Result<()> {
         let mut tickets = generate_tickets()?;
         tickets.shuffle(&mut rand::rng());
@@ -197,6 +208,7 @@ pub mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "manager")]
     pub fn queue_returns_all_tickets<Q: TicketQueue>(mut queue: Q) -> anyhow::Result<()> {
         let mut tickets = generate_tickets()?;
         tickets.sort();
@@ -210,6 +222,7 @@ pub mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "manager")]
     pub fn queue_is_empty_when_drained<Q: TicketQueue>(mut queue: Q) -> anyhow::Result<()> {
         fill_queue(&mut queue, generate_tickets()?.into_iter())?;
         assert!(!queue.is_empty()?);
@@ -224,6 +237,7 @@ pub mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "manager")]
     pub fn queue_returns_empty_iterator_when_drained<Q: TicketQueue>(mut queue: Q) -> anyhow::Result<()> {
         fill_queue(&mut queue, generate_tickets()?.into_iter())?;
         assert!(!queue.is_empty()?);
@@ -246,6 +260,7 @@ pub mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "manager")]
     pub fn queue_returns_correct_total_ticket_value<Q: TicketQueue>(mut queue: Q) -> anyhow::Result<()> {
         let tickets = generate_tickets()?;
         fill_queue(&mut queue, tickets.iter().copied())?;
@@ -274,6 +289,7 @@ pub mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "manager")]
     pub fn queue_returns_correct_total_ticket_value_with_min_index<Q: TicketQueue>(mut queue: Q) -> anyhow::Result<()> {
         let tickets = generate_tickets()?;
         fill_queue(&mut queue, tickets.iter().copied())?;
@@ -289,6 +305,7 @@ pub mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "manager")]
     pub fn ticket_store_should_create_new_queue_for_channel<S: TicketQueueStore>(mut store: S) -> anyhow::Result<()> {
         assert_eq!(0, store.iter_queues()?.count());
 
@@ -300,6 +317,7 @@ pub mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "manager")]
     pub fn ticket_store_should_open_existing_queue_for_channel<S: TicketQueueStore>(
         mut store: S,
     ) -> anyhow::Result<()> {
@@ -318,6 +336,7 @@ pub mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "manager")]
     pub fn ticket_store_should_delete_existing_queue_for_channel<S: TicketQueueStore>(
         mut store: S,
     ) -> anyhow::Result<()> {
@@ -336,6 +355,7 @@ pub mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "manager")]
     pub fn ticket_store_should_delete_existing_queue_for_channel_and_return_neglected_tickets<S: TicketQueueStore>(
         mut store: S,
     ) -> anyhow::Result<()> {
@@ -359,6 +379,7 @@ pub mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "manager")]
     pub fn ticket_store_should_iterate_existing_queues_for_channel<S: TicketQueueStore>(
         mut store: S,
     ) -> anyhow::Result<()> {
@@ -381,6 +402,7 @@ pub mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "manager")]
     pub fn ticket_store_should_not_fail_to_delete_non_existing_queue_for_channel<S: TicketQueueStore>(
         mut store: S,
     ) -> anyhow::Result<()> {

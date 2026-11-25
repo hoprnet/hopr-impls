@@ -1,16 +1,19 @@
 //! Implements complete logic of ticket management in the HOPR protocol.
 //!
-//! There are two major parts in the architecture of the ticket management:
-//! - [`HoprTicketManager`] is responsible for managing the incoming ticket queues and ticket redemption.
-//! - [`HoprTicketFactory`] is responsible for managing outgoing ticket indices and creating outgoing tickets.
-//!
-//! Usually, they are created together via [`HoprTicketManager::new_with_factory`].
-//!
-//! The `manager` feature (on by default) provides the [`HoprTicketManager`] and the incoming ticket queues.
-//! Without it, only the [`HoprTicketFactory`] and the outgoing index stores are built, which is all an
-//! entry node needs.
-//!
-//! See the [`HoprTicketManager`] and [`HoprTicketFactory`] documentation for complete details.
+//! The [`HoprTicketFactory`] is responsible for managing outgoing ticket indices and creating outgoing tickets.
+//! It is all an entry node needs.
+#![cfg_attr(
+    feature = "manager",
+    doc = "//! The [`HoprTicketManager`] is responsible for managing the incoming ticket queues and ticket \
+           redemption.\n//! It is provided by the `manager` feature (on by default); usually both are created \
+           together via\n//! [`HoprTicketManager::new_with_factory`].\n//!\n//! See the [`HoprTicketManager`] and \
+           [`HoprTicketFactory`] documentation for complete details."
+)]
+#![cfg_attr(
+    not(feature = "manager"),
+    doc = "//! The `HoprTicketManager` (incoming ticket queues and redemption) is not built without the `manager` \
+           feature.\n//!\n//! See the [`HoprTicketFactory`] documentation for complete details."
+)]
 
 mod backend;
 mod chain_sync;

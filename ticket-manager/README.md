@@ -10,7 +10,7 @@ Part of the [HOPR](https://hoprnet.org/) protocol implementation.
 | --------- | ------- | ------------------------------------------------------------------------ |
 | `manager` | yes     | `HoprTicketManager`, incoming ticket queues, `ticket_manager_from_chain` |
 | `redb`    | yes     | `RedbStore`, durable outgoing indices (and ticket queues with `manager`) |
-| `cli`     | yes     | `ticket-inspector` binary (implies `manager`)                            |
+| `cli`     | yes     | `ticket-inspector` binary (implies `manager`, needs `redb`)              |
 | `serde`   | no      | serde support                                                            |
 
 Entry nodes only issue tickets. Build with `default-features = false, features = ["redb"]` to get the `HoprTicketFactory`,

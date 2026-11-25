@@ -38,7 +38,7 @@ use crate::{
 /// The outgoing indices are **not** automatically synchronized back to the underlying store for performance reasons.
 /// The user is responsible for calling [`save_outgoing_indices`](HoprTicketFactory::save_outgoing_indices) to save
 /// the outgoing indices to the store, typically periodically and once more on shutdown. The store itself must
-/// outlive the process (e.g. a [`RedbStore`](crate::RedbStore) opened on a kept file): indices that never reached
+/// outlive the process (e.g. a `RedbStore` opened on a kept file): indices that never reached
 /// a durable store are issued again after a restart, because the factory then resumes from the on-chain ticket index.
 ///
 /// This usage is typical for all kinds of nodes (Entry/Relay/Exit).
@@ -48,14 +48,14 @@ use crate::{
 /// The Relay nodes typically need to validate incoming tickets in their incoming packet pipeline **before**
 /// they forward the packet to the outgoing packet pipeline (out to the next hop).
 ///
-/// The `HoprTicketFactory` in this case maintains a weak reference to [`HoprTicketManager`](crate::HoprTicketManager)
+/// The `HoprTicketFactory` in this case maintains a weak reference to `HoprTicketManager`
 /// if they were created together via
-/// [`HoprTicketManager::new_with_factory`](crate::HoprTicketManager::new_with_factory).
+/// `HoprTicketManager::new_with_factory`.
 ///
 /// By using this weak reference, it can get the [remaining channel
 /// stake](hopr_api::tickets::TicketFactory::remaining_incoming_channel_stake) on the given channel by subtracting the
 /// value of unredeemed tickets in the matching channel queue of the associated
-/// [`HoprTicketManager`](crate::HoprTicketManager).
+/// `HoprTicketManager`.
 ///
 /// This is useful for Relay nodes that need to validate incoming tickets before forwarding them to the outgoing packet
 /// pipeline.
@@ -314,12 +314,12 @@ where
     /// ## Implementation details
     ///
     /// If this instance is created as standalone (via [`HoprTicketFactory::new`]), or the
-    /// [`HoprTicketManager`](crate::HoprTicketManager) that has been initially
-    /// [created](crate::HoprTicketManager::new_with_factory) with this instance is dropped, this method
+    /// `HoprTicketManager` that has been initially
+    /// created with this instance is dropped, this method
     /// returns `Ok(channel.balance)`.
     ///
     /// Otherwise, as per requirements, this method returns the balance of the `channel` diminished by the total value
-    /// of unredeemed tickets tracked by the associated [`HoprTicketManager`](crate::HoprTicketManager).
+    /// of unredeemed tickets tracked by the associated `HoprTicketManager`.
     fn remaining_incoming_channel_stake(&self, channel: &ChannelEntry) -> Result<HoprBalance, Self::Error> {
         if let Some(queue_map) = self.queue_map.upgrade() {
             // Here we do not use the current channel ticket index as the minimum index we should start
