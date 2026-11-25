@@ -603,20 +603,21 @@ async fn an_open_channel_that_closes_directly_emits_a_closed_event() {
         .wait_for_channel_state(&first, |c| c.status == ChannelStatus::Closed)
         .await;
 
-    // The Opened events of the initial entries may still be in flight when the subscription starts, so skip
-    // everything that is not the closure.
-    let event = tokio::time::timeout(RECOVERY_WAIT, async {
+    // The initial sync can still have its `ChannelOpened` events queued, so skip everything up to the close.
+    let mut seen = Vec::new();
+    let closed_event = tokio::time::timeout(RECOVERY_WAIT, async {
         while let Some(event) = events.next().await {
             if matches!(&event, ChainEvent::ChannelClosed(channel) if channel.get_id() == first.get_id()) {
-                return Some(event);
+                return true;
             }
+            seen.push(event);
         }
-        None
+        false
     })
     .await;
     assert!(
-        matches!(&event, Ok(Some(_))),
-        "an Open channel became Closed directly and expected a ChannelClosed event, got {event:?}"
+        matches!(closed_event, Ok(true)),
+        "an Open channel became Closed directly and expected a ChannelClosed event, got {seen:?}"
     );
 }
 
