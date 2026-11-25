@@ -57,7 +57,7 @@ host supplies paths using the `run_state_reporting` callback. Path sampling runs
 allocation and supply a non-draining view. This avoids coupling the graph to a particular routing/SURB counter implementation.
 
 Samples prioritize missing path components, underfunding, disconnection/low acknowledgement rates, and poor probes/health, with
-deterministic endpoint ordering for ties. Both samples share a 3 KiB JSON budget, so fewer rows may fit than the count caps.
+deterministic endpoint ordering for ties. Both samples share a 16 KiB JSON budget, so fewer rows may fit than the count caps.
 `local_edges_omitted` and `paths.edges_omitted` include both count-limit and byte-budget omissions; aggregate counts survive trimming.
 Self-loops count once in the sample and once in each direction.
 
@@ -108,8 +108,8 @@ identities and canonical slots; candidates returned to the transport are not nec
 
 At most two query examples are retained; repeated queries coalesce into their latest evidence and occurrence count. Recording never waits
 for the diagnostic lock; contention preserves totals and increments an explicit lost-sample count. Forward/return coverage is preferred when
-replacing samples. Examples share the existing 3 KiB graph budget with current edge samples; older/successful query examples and edge detail
-may be omitted to fit. The cumulative search counters are not reset by snapshot reads and are not interval counters.
+replacing samples. Examples share the existing 16 KiB graph budget with current edge samples; older/successful query examples and edge
+detail may be omitted to fit. The cumulative search counters are not reset by snapshot reads and are not interval counters.
 
 ## Cross-stage identifiers
 
