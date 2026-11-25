@@ -3,6 +3,18 @@ name: Close release
 on:
   workflow_dispatch:
     inputs:
+      crate:
+        description: Crate to release (folder). Keep in sync with the workspace members.
+        required: true
+        type: choice
+        options:
+          - connector
+          - ct/full-network
+          - ct/immediate
+          - graph
+          - session-server-forwarder
+          - ticket-manager
+          - transport/p2p
       release_type:
         description: Version type after release
         required: true
@@ -18,8 +30,40 @@ concurrency:
   group: release
   cancel-in-progress: false
 jobs:
+  resolve-crate:
+    name: Resolve crate
+    runs-on: depot-ubuntu-24.04-2
+    permissions:
+      contents: read
+    outputs:
+      package: ${{ steps.resolve.outputs.package }}
+      file: ${{ steps.resolve.outputs.file }}
+      tag_prefix: ${{ steps.resolve.outputs.tag_prefix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Resolve package, version file and tag prefix
+        id: resolve
+        env:
+          CRATE: ${{ inputs.crate }}
+        run: |
+          file="${CRATE}/Cargo.toml"
+          package=$(grep -m1 -E '^name\s*=' "${file}" | awk -F\" '{print $2}')
+          if [[ -z "${package}" ]]; then
+            echo "No package name found in ${file}" >&2
+            exit 1
+          fi
+          # Folder name with '/' replaced, so nested crates do not create nested tags.
+          tag_prefix="${CRATE//\//-}-v"
+          echo "package=${package}" | tee -a "$GITHUB_OUTPUT"
+          echo "file=${file}" | tee -a "$GITHUB_OUTPUT"
+          echo "tag_prefix=${tag_prefix}" | tee -a "$GITHUB_OUTPUT"
   build-library:
     name: Build Library
+    needs:
+      - resolve-crate
     uses: hoprnet/hopr-workflows/.github/workflows/build-library.yaml@43c833e72dffe4f2f3be60193733e5657f8aa0d7 # build-library-v4.0.0
     permissions:
       contents: read
@@ -28,16 +72,16 @@ jobs:
       repo_sha: ${{ github.sha }}
       version_type: release
       architecture: x86_64-linux
-      build_file: Cargo.toml
-      # Empty so the reusable workflow releases the whole virtual workspace
-      # (`cargo release publish --workspace`); "hopr-impls" is not a crate.
-      package_name: ""
+      build_file: ${{ needs.resolve-crate.outputs.file }}
+      # Publish only the selected crate (`cargo release publish --package <name>`).
+      package_name: ${{ needs.resolve-crate.outputs.package }}
       runner: depot-ubuntu-24.04-4
     secrets:
       cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
   release:
     name: Close release
     needs:
+      - resolve-crate
       - build-library
     runs-on: depot-ubuntu-24.04-2
     permissions:
@@ -48,13 +92,12 @@ jobs:
         uses: hoprnet/hopr-workflows/actions/release-version@5a0ab31494b624f9ad1b713d0475d73e10da02e9 # release-version-v5.5.1
         with:
           source_branch: ${{ github.ref_name }}
-          file: Cargo.toml
+          file: ${{ needs.resolve-crate.outputs.file }}
+          release_tag_prefix: ${{ needs.resolve-crate.outputs.tag_prefix }}
           release_type: ${{ inputs.release_type }}
-          # This is a virtual workspace with independent per-crate versions, so there is no
-          # single repo version to bump. Disable the automatic post-release bump: the publish
-          # step (`cargo release publish --workspace`) already releases only crates whose
-          # version is not yet on crates.io, and each crate's version is bumped in the PR that
-          # changes it. This avoids re-versioning every crate on every release.
+          # This is a virtual workspace with independent per-crate versions. Disable the
+          # automatic post-release bump: each crate's version is bumped in the PR that changes
+          # it. This avoids re-versioning the selected crate right after every release.
           bump_version: false
           cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
           zulip_api_key: ${{ secrets.ZULIP_API_KEY }}
