@@ -573,9 +573,20 @@ async fn an_open_channel_that_closes_directly_emits_a_closed_event() {
         .wait_for_channel_state(&first, |c| c.status == ChannelStatus::Closed)
         .await;
 
-    let event = tokio::time::timeout(RECOVERY_WAIT, events.next()).await;
+    // The initial sync can still have its `ChannelOpened` events queued, so skip everything up to the close.
+    let mut seen = Vec::new();
+    let closed_event = tokio::time::timeout(RECOVERY_WAIT, async {
+        while let Some(event) = events.next().await {
+            if matches!(&event, ChainEvent::ChannelClosed(channel) if channel.get_id() == first.get_id()) {
+                return true;
+            }
+            seen.push(event);
+        }
+        false
+    })
+    .await;
     assert!(
-        matches!(&event, Ok(Some(ChainEvent::ChannelClosed(channel))) if channel.get_id() == first.get_id()),
-        "an Open channel became Closed directly and expected a ChannelClosed event, got {event:?}"
+        matches!(closed_event, Ok(true)),
+        "an Open channel became Closed directly and expected a ChannelClosed event, got {seen:?}"
     );
 }
