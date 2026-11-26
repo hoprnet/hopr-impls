@@ -578,11 +578,15 @@ where
             /// An account event that was received but not stored: it was rejected or its backend write failed.
             AccountSkipped(ConnectorError),
             Channel((ChannelEntry, Option<Vec<ChannelChange>>)),
-            /// The graph snapshot has been delivered completely. Holds the ids of the channels it contained.
+            /// The graph snapshot has been delivered completely.
             ///
-            /// Holds the known channels that are not closed and that the snapshot did not hold, read when the
-            /// snapshot completed.
-            SnapshotComplete(Vec<reconcile::Missing>),
+            /// `missing` holds the known channels that are not closed and that the snapshot did not hold, read when
+            /// the snapshot completed. `all_stored` is true when every entry of the snapshot was converted and
+            /// stored, which is what the sync gate needs.
+            SnapshotComplete {
+                missing: Vec<reconcile::Missing>,
+                all_stored: bool,
+            },
             WinningProbability((WinningProbability, Option<WinningProbability>)),
             TicketPrice((HoprBalance, Option<HoprBalance>)),
             /// A change of the service registry, already decoded into the event it stands for.
@@ -772,19 +776,22 @@ where
                     .cloned()
                     .unwrap_or_else(|| SubscriptionHealthHandle::untracked(GRAPH_SUBSCRIPTION)),
             ));
+            // Cleared when a graph write fails, and read when a snapshot completes.
+            let stored_ok = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
             let channel_stream =
                 graph_stream::resyncing_graph_stream(client.as_ref(), channel_stream, graph_health.clone())
                     .and_then(move |update| match update {
                         // The channels missing from the snapshot are read right here, before the next entry of the
                         // stream is handled. Entries that follow are newer than the snapshot.
-                        graph_stream::GraphUpdate::SnapshotComplete(seen) => {
+                        graph_stream::GraphUpdate::SnapshotComplete { seen, all_converted } => {
+                            let all_stored = all_converted && stored_ok.swap(true, AtomicOrdering::SeqCst);
                             let graph = graph.clone();
                             let backend = backend.clone();
                             futures::future::Either::Left(
                                 hopr_utils::runtime::prelude::spawn_blocking(move || {
                                     reconcile::missing_from_snapshot(backend.as_ref(), &graph, &seen)
                                 })
-                                .map_ok(SubscribedEventType::SnapshotComplete)
+                                .map_ok(move |missing| SubscribedEventType::SnapshotComplete { missing, all_stored })
                                 .map_err(ConnectorError::backend),
                             )
                         }
@@ -793,6 +800,7 @@ where
                             let backend = backend.clone();
                             let channel_by_id = channel_by_id.clone();
                             let channel_by_parties = channel_by_parties.clone();
+                            let stored_ok = stored_ok.clone();
                             futures::future::Either::Right(
                                 hopr_utils::runtime::prelude::spawn_blocking(move || {
                                     reconcile::upsert_channel(
@@ -809,11 +817,14 @@ where
                                         reconcile::Upsert::Skipped { .. } => (channel, None),
                                     })
                                 })
-                                .map_err(ConnectorError::backend)
-                                .and_then(|res| {
-                                    futures::future::ready(
-                                        res.map(SubscribedEventType::Channel).map_err(ConnectorError::backend),
-                                    )
+                                .map(move |joined| {
+                                    let res = joined
+                                        .map_err(ConnectorError::backend)
+                                        .and_then(|res| res.map_err(ConnectorError::backend));
+                                    if res.is_err() {
+                                        stored_ok.store(false, AtomicOrdering::SeqCst);
+                                    }
+                                    res.map(SubscribedEventType::Channel)
                                 }),
                             )
                         }
@@ -1009,7 +1020,7 @@ where
                     match event_type {
                         SubscribedEventType::Account(_) | SubscribedEventType::AccountSkipped(_) => account_counter += 1,
                         SubscribedEventType::Channel((channel, _)) => channel_counter = open_channels.observe(channel),
-                        SubscribedEventType::SnapshotComplete(_) => snapshot_delivered = true,
+                        SubscribedEventType::SnapshotComplete { all_stored, .. } => snapshot_delivered |= *all_stored,
                         // Service registry events deliberately do not count towards the connection
                         // quota: a node with no services must still reach the Ready state.
                         _ => {}
@@ -1130,7 +1141,7 @@ where
                         Ok(SubscribedEventType::ReconcileChannels) => {
                             reconciler.spawn_pass();
                         }
-                        Ok(SubscribedEventType::SnapshotComplete(missing)) => {
+                        Ok(SubscribedEventType::SnapshotComplete { missing, .. }) => {
                             tracing::debug!(missing = missing.len(), "graph snapshot delivered");
                             if !missing.is_empty() {
                                 reconciler.spawn_sweep(missing);

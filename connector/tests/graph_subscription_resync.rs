@@ -776,3 +776,51 @@ async fn a_channel_closed_in_the_setup_gap_does_not_keep_connect_from_finishing_
         .wait_for_channel_state(&second, |c| c.status == ChannelStatus::Open)
         .await;
 }
+
+/// An entry that fails conversion in the first stream and again in the replayed snapshot is never stored. The
+/// snapshot then does not prove that everything arrived, so `connect()` must not finish at a tolerance of 100.
+#[tokio::test]
+async fn a_twice_malformed_channel_keeps_connect_from_finishing_at_full_tolerance() {
+    let [first, _] = channels();
+    let position = types::ChannelStatePosition {
+        block: types::Uint64("10".into()),
+        transaction_index: types::Uint64("0".into()),
+        log_index: types::Uint64("0".into()),
+    };
+    let break_entry = |entry: &mut OpenedChannelsGraphEntry| entry.channel.closure_time = None;
+    // the entry is only malformed when it is not open
+    let pending = |entry: &mut OpenedChannelsGraphEntry| {
+        entry.channel.status = ModelChannelStatus::PendingToClose;
+        break_entry(entry);
+    };
+
+    // The node owns the first channel; the snapshot replays it malformed, followed by the second as its last entry.
+    let mut harness = Harness::build_with(
+        CHAIN_KEYS[0].clone(),
+        channels(),
+        move |entries| {
+            let mut broken = entries[0].clone();
+            pending(&mut broken);
+            let mut last = entries[1].clone();
+            last.cursor = Some(position);
+            vec![broken, last]
+        },
+        100,
+        vec![],
+    )
+    .await;
+
+    let mut broken = harness.entries[0].clone();
+    pending(&mut broken);
+    harness.send(broken);
+    harness.send(harness.entries[1].clone());
+
+    let connected = tokio::time::timeout(RECOVERY_WAIT, harness.connector.connect()).await;
+    assert!(
+        connected.is_err(),
+        "connect() finished although a channel was never stored: {connected:?}"
+    );
+    // not connected, so the lookup errors; it must in any case not find the channel
+    assert!(!matches!(harness.connector.channel_by_id(first.get_id()), Ok(Some(_))));
+    assert_eq!(2, harness.graph_subscriptions.load(Ordering::SeqCst));
+}
