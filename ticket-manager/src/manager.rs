@@ -453,7 +453,11 @@ where
                 // on the same channel are received, or if tickets on the same channel are being
                 // rapidly redeemed or neglected.
                 // Such a scenario is likely not realistic.
-                let mut queue = e.get().queue.write();
+                // The map entry guard is released before locking the queue, so that the queue's
+                // (possibly slow) store I/O does not block other users of the same map shard.
+                let queue = e.get().queue.clone();
+                drop(e);
+                let mut queue = queue.write();
 
                 // If the next ticket ready in this queue is from a previous epoch, we must
                 // drain and neglect all the tickets from the queue. The channel has
@@ -588,6 +592,39 @@ mod tests {
             },
             mgr.ticket_stats(Some(channel.get_id()))?
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn ticket_manager_published_value_should_follow_epoch_changes() -> anyhow::Result<()> {
+        let mgr = create_mgr()?;
+        let src = ChainKeypair::random();
+        let dst = ChainKeypair::random();
+        let tickets = generate_owned_tickets(&src, &dst, 2, 1..=2)?;
+        let channel_id = tickets[0].ticket_id().id;
+
+        let check = |expected: HoprBalance| -> anyhow::Result<()> {
+            let q = mgr.channel_tickets.0.get(&channel_id).unwrap();
+            assert_eq!(expected, *q.unrealized_value.lock());
+            assert_eq!(expected, q.queue.read().0.cached_unrealized_value());
+            assert_eq!(Some(expected), mgr.channel_tickets.unrealized_value(&channel_id, None)?);
+            Ok(())
+        };
+
+        let (epoch_1, epoch_2): (Vec<_>, Vec<_>) = tickets
+            .into_iter()
+            .partition(|t| t.verified_ticket().channel_epoch == 1);
+
+        mgr.insert_incoming_ticket(epoch_1[0])?;
+        check(epoch_1[0].verified_ticket().amount)?;
+        mgr.insert_incoming_ticket(epoch_1[1])?;
+        check(epoch_1[0].verified_ticket().amount + epoch_1[1].verified_ticket().amount)?;
+
+        // A ticket from a newer epoch neglects all the previous ones
+        let neglected = mgr.insert_incoming_ticket(epoch_2[0])?;
+        assert_eq!(2, neglected.len());
+        check(epoch_2[0].verified_ticket().amount)?;
 
         Ok(())
     }

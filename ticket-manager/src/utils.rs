@@ -197,17 +197,17 @@ impl<Q: TicketQueue> UnrealizedValue for CachedQueueMap<Q> {
         channel_id: &ChannelId,
         min_index: Option<u64>,
     ) -> Result<Option<HoprBalance>, TicketManagerError> {
+        if min_index.is_none() {
+            // Fast path: read the value published by `ValueCachedQueue` without taking the queue lock,
+            // because that lock is held for the whole duration of a (fsync-ing) push or pop.
+            // Only the shard read lock and the cell's mutex are held, both for a few instructions.
+            return Ok(self.0.get(channel_id).map(|q| *q.unrealized_value.lock()));
+        }
+
         if let Some(ticket_queue) = self.0.get(channel_id) {
             // There is low contention on this read lock, because write locks are acquired only
             // when a new winning ticket has been added, redeemed or neglected, all of which are fairly rare operations.
             let queue = ticket_queue.queue.read();
-
-            if min_index.is_none() {
-                // Fast path: the current epoch and its aggregated value are tracked in memory
-                // by `ValueCachedQueue`. No peek() call needed — avoids a redb read transaction
-                // on the hot per-packet decode path (decoder.rs:validate_and_replace_ticket).
-                return Ok(Some(queue.0.cached_unrealized_value()));
-            }
 
             // Slow path: a minimum index was given, so we must peek to learn the current epoch
             // and then do a full scan via total_value.
@@ -241,10 +241,13 @@ impl<Q: TicketQueue> UnrealizedValue for CachedQueueMap<Q> {
 pub struct ChannelTicketQueue<Q> {
     pub(crate) queue: std::sync::Arc<parking_lot::RwLock<(Q, ChannelTicketStats)>>,
     pub(crate) redeem_lock: std::sync::Arc<AtomicBool>,
+    /// Unrealized value of the queue, readable without taking the `queue` lock.
+    pub(crate) unrealized_value: std::sync::Arc<parking_lot::Mutex<HoprBalance>>,
 }
 
-impl<Q: TicketQueue> From<Q> for ChannelTicketQueue<Q> {
-    fn from(queue: Q) -> Self {
+impl<Q: TicketQueue> From<ValueCachedQueue<Q>> for ChannelTicketQueue<ValueCachedQueue<Q>> {
+    fn from(queue: ValueCachedQueue<Q>) -> Self {
+        let unrealized_value = queue.published_value();
         let stats = ChannelTicketStats {
             winning_tickets: queue.len().unwrap_or(0) as u128,
             ..Default::default()
@@ -252,6 +255,7 @@ impl<Q: TicketQueue> From<Q> for ChannelTicketQueue<Q> {
         Self {
             queue: std::sync::Arc::new(parking_lot::RwLock::new((queue, stats))),
             redeem_lock: std::sync::Arc::new(AtomicBool::new(false)),
+            unrealized_value,
         }
     }
 }

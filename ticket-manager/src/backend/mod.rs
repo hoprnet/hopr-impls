@@ -3,7 +3,10 @@ mod memory;
 #[cfg(feature = "redb")]
 mod redb;
 
-use std::ops::{AddAssign, SubAssign};
+use std::{
+    ops::{AddAssign, SubAssign},
+    sync::Arc,
+};
 
 use hopr_api::chain::{HoprBalance, RedeemableTicket};
 pub use memory::*;
@@ -31,6 +34,9 @@ pub struct ValueCachedQueue<Q> {
     // (invariant maintained by the ticket manager); this avoids calling peek() when
     // the current epoch is needed, which would otherwise require I/O on the redb backend.
     current_epoch: Option<u32>,
+    // Copy of `cached_unrealized_value` that readers can take without locking the queue.
+    // It is refreshed by `publish` after every mutation of the cache.
+    published_value: Arc<parking_lot::Mutex<HoprBalance>>,
 }
 
 impl<Q: TicketQueue> ValueCachedQueue<Q> {
@@ -47,11 +53,27 @@ impl<Q: TicketQueue> ValueCachedQueue<Q> {
                 .add_assign(ticket.verified_ticket().amount);
         });
 
-        Ok(Self {
+        let this = Self {
             queue,
             value_cache,
             current_epoch,
-        })
+            published_value: Arc::default(),
+        };
+        this.publish();
+        Ok(this)
+    }
+
+    /// Returns the shared cell that always holds the current
+    /// [`cached_unrealized_value`](Self::cached_unrealized_value).
+    ///
+    /// Reading the cell does not require access to the queue, so it never waits for queue I/O.
+    pub(crate) fn published_value(&self) -> Arc<parking_lot::Mutex<HoprBalance>> {
+        self.published_value.clone()
+    }
+
+    /// Copies the cached unrealized value into the shared cell. Called after every change to the cache.
+    fn publish(&self) {
+        *self.published_value.lock() = self.cached_unrealized_value();
     }
 
     /// Returns the total unrealized value of tickets in the queue without any I/O.
@@ -89,6 +111,7 @@ impl<Q: TicketQueue> TicketQueue for ValueCachedQueue<Q> {
             .entry(epoch)
             .or_default()
             .add_assign(ticket.verified_ticket().amount);
+        self.publish();
         self.queue.push(ticket)
     }
 
@@ -103,6 +126,7 @@ impl<Q: TicketQueue> TicketQueue for ValueCachedQueue<Q> {
             // Keep current_epoch consistent with what remains in the queue after the pop.
             // If the queue still has tickets, they share the same epoch; if empty, reset to None.
             self.current_epoch = self.queue.peek()?.map(|t| t.verified_ticket().channel_epoch);
+            self.publish();
         }
         Ok(ticket)
     }
@@ -133,6 +157,7 @@ pub mod tests {
     use hopr_api::chain::HoprBalance;
 
     use crate::{
+        TicketQueue,
         backend::{ValueCachedQueue, memory},
         traits::tests::*,
     };
@@ -185,6 +210,42 @@ pub mod tests {
 
         let queue_2 = ValueCachedQueue::new(queue_1)?;
         assert_eq!(total_value_per_epoch, queue_2.value_cache);
+
+        Ok(())
+    }
+
+    /// The shared cell must always equal `cached_unrealized_value` after push, pop and drain.
+    #[test]
+    fn published_value_follows_cached_unrealized_value() -> anyhow::Result<()> {
+        let all = generate_tickets()?;
+        let tickets: Vec<_> = all
+            .into_iter()
+            .filter(|t| t.verified_ticket().channel_epoch == 2)
+            .collect();
+
+        let mut queue = ValueCachedQueue::new(memory::MemoryTicketQueue::default())?;
+        let cell = queue.published_value();
+        assert_eq!(HoprBalance::default(), *cell.lock());
+
+        for t in &tickets {
+            queue.push(*t)?;
+            assert_eq!(queue.cached_unrealized_value(), *cell.lock());
+        }
+        assert_ne!(HoprBalance::default(), *cell.lock());
+
+        queue.pop()?;
+        assert_eq!(queue.cached_unrealized_value(), *cell.lock());
+
+        queue.drain()?;
+        assert_eq!(HoprBalance::default(), *cell.lock());
+        assert_eq!(queue.cached_unrealized_value(), *cell.lock());
+
+        // A queue created over existing tickets starts with a correct cell
+        let mut inner = memory::MemoryTicketQueue::default();
+        fill_queue(&mut inner, tickets.iter().copied())?;
+        let queue = ValueCachedQueue::new(inner)?;
+        assert_ne!(HoprBalance::default(), queue.cached_unrealized_value());
+        assert_eq!(queue.cached_unrealized_value(), *queue.published_value().lock());
 
         Ok(())
     }
