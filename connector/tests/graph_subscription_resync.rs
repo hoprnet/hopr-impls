@@ -46,12 +46,14 @@ struct ScriptedGraphClient<T> {
     graph_subscriptions: Arc<AtomicUsize>,
     /// What every later subscription replays first: the full, valid snapshot, as a fresh blokli subscription would.
     replay: Vec<OpenedChannelsGraphEntry>,
+    /// Accounts that blokli reports and delivers on top of the inner client's, as the node receives them raw.
+    extra_accounts: Vec<types::Account>,
 }
 
 #[async_trait::async_trait]
 impl<T: BlokliQueryClient + Send + Sync> BlokliQueryClient for ScriptedGraphClient<T> {
     async fn count_accounts(&self, selector: AccountSelector) -> Result<u32, BlokliClientError> {
-        self.inner.count_accounts(selector).await
+        Ok(self.inner.count_accounts(selector).await? + self.extra_accounts.len() as u32)
     }
 
     async fn query_accounts(&self, selector: AccountSelector) -> Result<Vec<types::Account>, BlokliClientError> {
@@ -207,7 +209,12 @@ impl<T: BlokliSubscriptionClient + Send + Sync> BlokliSubscriptionClient for Scr
         &self,
         selector: AccountSelector,
     ) -> Result<impl futures::Stream<Item = Result<types::Account, BlokliClientError>> + Send, BlokliClientError> {
-        self.inner.subscribe_accounts(selector)
+        let extra = self.extra_accounts.clone();
+        // merged, because the inner stream may stay open once it has delivered its accounts
+        Ok(futures::stream::select(
+            self.inner.subscribe_accounts(selector)?,
+            futures::stream::iter(extra.into_iter().map(Ok)),
+        ))
     }
 
     fn subscribe_graph(&self) -> Result<impl futures::Stream<Item = GraphResult> + Send, BlokliClientError> {
@@ -352,6 +359,18 @@ impl Harness {
         chain_channels: [ChannelEntry; 2],
         replay: impl FnOnce(&[OpenedChannelsGraphEntry; 2]) -> Vec<OpenedChannelsGraphEntry>,
     ) -> Self {
+        Self::build_with(node_key, chain_channels, replay, 50, vec![]).await
+    }
+
+    /// Like [`Harness::build`], with the given sync tolerance and raw accounts that the account subscription
+    /// delivers (and the account count includes) in addition to the chain's own.
+    async fn build_with(
+        node_key: ChainKeypair,
+        chain_channels: [ChannelEntry; 2],
+        replay: impl FnOnce(&[OpenedChannelsGraphEntry; 2]) -> Vec<OpenedChannelsGraphEntry>,
+        sync_tolerance: usize,
+        extra_accounts: Vec<types::Account>,
+    ) -> Self {
         let state_client = BlokliTestStateBuilder::default()
             .with_hopr_network_chain_info("anvil-localhost")
             .with_accounts(
@@ -379,10 +398,11 @@ impl Harness {
             graph: Mutex::new(Some(graph_rx)),
             graph_subscriptions: graph_subscriptions.clone(),
             replay: replay(&entries),
+            extra_accounts,
         };
 
         let cfg = BlockchainConnectorConfig {
-            sync_tolerance: 50,
+            sync_tolerance,
             ..Default::default()
         };
         let connector =
@@ -694,4 +714,113 @@ async fn a_snapshot_started_by_the_client_closes_the_channels_it_lacks() {
     );
     // no new subscription was needed for it
     assert_eq!(1, harness.graph_subscriptions.load(Ordering::SeqCst));
+}
+
+/// An account whose packet key is not a point on the curve is rejected, but it still counts in the total that
+/// blokli reports. It must count as received, or `connect()` can never finish at a sync tolerance of 100.
+#[tokio::test]
+async fn a_rejected_account_does_not_keep_connect_from_finishing_at_full_tolerance() {
+    let invalid = types::Account {
+        chain_key: Address::new(&[9u8; Address::SIZE]).to_string(),
+        keyid: 99,
+        multi_addresses: vec![],
+        // 32 bytes that are not a valid curve point
+        packet_key: "02".repeat(32),
+        safe_address: None,
+    };
+    let mut harness = Harness::build_with(
+        ChainKeypair::random(),
+        channels(),
+        |entries| entries.to_vec(),
+        100,
+        vec![invalid],
+    )
+    .await;
+
+    for entry in harness.entries.clone() {
+        harness.send(entry);
+    }
+
+    tokio::time::timeout(RECOVERY_WAIT, harness.connect())
+        .await
+        .expect("connect never finished");
+}
+
+/// A channel that closed between the open channels being counted and the graph snapshot is counted in the total but
+/// not delivered. The delivered snapshot says that nothing more is coming, so `connect()` must finish at 100.
+#[tokio::test]
+async fn a_channel_closed_in_the_setup_gap_does_not_keep_connect_from_finishing_at_full_tolerance() {
+    let [_, second] = channels();
+    let mut harness = Harness::build_with(
+        ChainKeypair::random(),
+        channels(),
+        |entries| entries.to_vec(),
+        100,
+        vec![],
+    )
+    .await;
+
+    // The snapshot only holds the second channel; its last entry carries the cursor.
+    let mut last = harness.entries[1].clone();
+    last.cursor = Some(types::ChannelStatePosition {
+        block: types::Uint64("10".into()),
+        transaction_index: types::Uint64("0".into()),
+        log_index: types::Uint64("0".into()),
+    });
+    harness.send(last);
+
+    tokio::time::timeout(RECOVERY_WAIT, harness.connect())
+        .await
+        .expect("connect never finished");
+    harness
+        .wait_for_channel_state(&second, |c| c.status == ChannelStatus::Open)
+        .await;
+}
+
+/// An entry that fails conversion in the first stream and again in the replayed snapshot is never stored. The
+/// snapshot then does not prove that everything arrived, so `connect()` must not finish at a tolerance of 100.
+#[tokio::test]
+async fn a_twice_malformed_channel_keeps_connect_from_finishing_at_full_tolerance() {
+    let [first, _] = channels();
+    let position = types::ChannelStatePosition {
+        block: types::Uint64("10".into()),
+        transaction_index: types::Uint64("0".into()),
+        log_index: types::Uint64("0".into()),
+    };
+    let break_entry = |entry: &mut OpenedChannelsGraphEntry| entry.channel.closure_time = None;
+    // the entry is only malformed when it is not open
+    let pending = |entry: &mut OpenedChannelsGraphEntry| {
+        entry.channel.status = ModelChannelStatus::PendingToClose;
+        break_entry(entry);
+    };
+
+    // The node owns the first channel; the snapshot replays it malformed, followed by the second as its last entry.
+    let mut harness = Harness::build_with(
+        CHAIN_KEYS[0].clone(),
+        channels(),
+        move |entries| {
+            let mut broken = entries[0].clone();
+            pending(&mut broken);
+            let mut last = entries[1].clone();
+            last.cursor = Some(position);
+            vec![broken, last]
+        },
+        100,
+        vec![],
+    )
+    .await;
+
+    let mut broken = harness.entries[0].clone();
+    pending(&mut broken);
+    harness.send(broken);
+    harness.send(harness.entries[1].clone());
+
+    let connected = tokio::time::timeout(RECOVERY_WAIT, harness.connector.connect()).await;
+    assert!(
+        connected.is_err(),
+        "connect() finished although a channel was never stored: {connected:?}"
+    );
+    // not connected, so the lookup errors; it must in any case not find the channel
+    assert!(!matches!(harness.connector.channel_by_id(first.get_id()), Ok(Some(_))));
+    assert_eq!(2, harness.graph_subscriptions.load(Ordering::SeqCst));
 }

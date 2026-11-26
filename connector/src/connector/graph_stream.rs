@@ -79,11 +79,18 @@ pub(crate) type GraphItem = (AccountEntry, AccountEntry, ChannelEntry);
 pub(crate) enum GraphUpdate {
     /// A converted entry.
     Entry(GraphItem),
-    /// The snapshot a subscription started with has been delivered completely. Holds the ids of its channels.
+    /// The snapshot a subscription started with has been delivered completely. Holds the ids of its channels, and
+    /// whether every entry of it was converted.
+    ///
+    /// `all_converted` is false when an entry of the snapshot failed conversion for good, so that channel was not
+    /// stored even though its id is part of the set (the set keeps the channel from being closed by a reconcile).
     ///
     /// It is never sent for a snapshot that was cut short by a failing entry or the end of the stream, and not for a
     /// snapshot without entries, which has no last entry to carry the cursor.
-    SnapshotComplete(HashSet<ChannelId>),
+    SnapshotComplete {
+        seen: HashSet<ChannelId>,
+        all_converted: bool,
+    },
 }
 
 type RawGraphStream<'a> = BoxStream<'a, Result<OpenedChannelsGraphEntry, BlokliClientError>>;
@@ -102,6 +109,8 @@ struct State<'a, C> {
     /// Whether the snapshot held an entry that could be neither converted nor identified, so its channels are not
     /// all known.
     snapshot_incomplete: bool,
+    /// Whether the snapshot held an entry that failed conversion, so it was not handed out.
+    snapshot_unconverted: bool,
     /// An update that is yielded before the next entry is read.
     queued: Option<GraphUpdate>,
     /// Channels whose entry failed conversion and caused a restart, and that have not converted since.
@@ -114,15 +123,20 @@ impl<C> State<'_, C> {
         self.in_snapshot = true;
         self.snapshot.clear();
         self.snapshot_incomplete = false;
+        self.snapshot_unconverted = false;
     }
 
     /// Records an entry of the snapshot in progress, and ends the snapshot when the entry is its last.
     ///
     /// `id` is the channel of the entry, or `None` when it could not be identified. A snapshot with such an entry
-    /// cannot tell which channels it holds, so it is not reported.
-    fn observe_snapshot_entry(&mut self, id: Option<ChannelId>, ends_snapshot: bool) {
+    /// cannot tell which channels it holds, so it is not reported. `converted` is false for an entry that failed
+    /// conversion, which the snapshot reports as `all_converted == false`.
+    fn observe_snapshot_entry(&mut self, id: Option<ChannelId>, converted: bool, ends_snapshot: bool) {
         if !self.in_snapshot {
             return;
+        }
+        if !converted {
+            self.snapshot_unconverted = true;
         }
         match id {
             Some(id) => {
@@ -133,10 +147,14 @@ impl<C> State<'_, C> {
         if ends_snapshot {
             self.in_snapshot = false;
             let snapshot = std::mem::take(&mut self.snapshot);
+            let all_converted = !std::mem::take(&mut self.snapshot_unconverted);
             if std::mem::take(&mut self.snapshot_incomplete) {
                 tracing::warn!("graph snapshot held an unidentifiable entry, so it is not used to close channels");
             } else {
-                self.queued = Some(GraphUpdate::SnapshotComplete(snapshot));
+                self.queued = Some(GraphUpdate::SnapshotComplete {
+                    seen: snapshot,
+                    all_converted,
+                });
             }
         }
     }
@@ -192,6 +210,7 @@ where
         in_snapshot: true,
         snapshot: HashSet::new(),
         snapshot_incomplete: false,
+        snapshot_unconverted: false,
         queued: None,
         failed_conversions: HashSet::new(),
     };
@@ -242,7 +261,7 @@ where
                     match model_to_graph_entry(entry) {
                         Ok(item) => {
                             conversion_succeeded(&mut state.failed_conversions, &channel_id);
-                            state.observe_snapshot_entry(Some(*item.2.get_id()), ends_snapshot);
+                            state.observe_snapshot_entry(Some(*item.2.get_id()), true, ends_snapshot);
                             return Some((Ok(GraphUpdate::Entry(item)), state));
                         }
                         Err(error) => {
@@ -255,7 +274,7 @@ where
                                     "graph entry fails conversion again after a restart, blokli serves it malformed"
                                 );
                                 // The channel is in the snapshot even though it cannot be converted.
-                                state.observe_snapshot_entry(channel_id.parse().ok(), ends_snapshot);
+                                state.observe_snapshot_entry(channel_id.parse().ok(), false, ends_snapshot);
                             }
                             return Some((Err(error), state));
                         }
@@ -289,6 +308,7 @@ mod tests {
             in_snapshot: true,
             snapshot: HashSet::new(),
             snapshot_incomplete: false,
+            snapshot_unconverted: false,
             queued: None,
             failed_conversions: HashSet::new(),
         }
@@ -370,6 +390,7 @@ mod tests {
             in_snapshot: true,
             snapshot: HashSet::new(),
             snapshot_incomplete: false,
+            snapshot_unconverted: false,
             queued: None,
             failed_conversions: HashSet::new(),
         }
@@ -382,26 +403,56 @@ mod tests {
     #[test]
     fn a_snapshot_is_reported_with_its_channels_when_its_last_entry_arrives() {
         let mut state = state();
-        state.observe_snapshot_entry(Some(id(1)), false);
-        state.observe_snapshot_entry(Some(id(2)), false);
+        state.observe_snapshot_entry(Some(id(1)), true, false);
+        state.observe_snapshot_entry(Some(id(2)), true, false);
         assert!(state.queued.is_none());
 
-        state.observe_snapshot_entry(Some(id(3)), true);
+        state.observe_snapshot_entry(Some(id(3)), true, true);
 
         match state.queued.take() {
-            Some(GraphUpdate::SnapshotComplete(seen)) => assert_eq!(HashSet::from([id(1), id(2), id(3)]), seen),
+            Some(GraphUpdate::SnapshotComplete { seen, all_converted }) => {
+                assert_eq!(HashSet::from([id(1), id(2), id(3)]), seen);
+                assert!(all_converted);
+            }
             _ => panic!("the snapshot was not reported"),
         }
         assert!(!state.in_snapshot);
     }
 
     #[test]
+    fn a_snapshot_with_a_twice_failed_entry_is_reported_as_not_fully_converted() {
+        let mut state = state();
+        state.observe_snapshot_entry(Some(id(1)), true, false);
+        state.observe_snapshot_entry(Some(id(2)), false, false);
+        state.observe_snapshot_entry(Some(id(3)), true, true);
+
+        match state.queued.take() {
+            Some(GraphUpdate::SnapshotComplete { seen, all_converted }) => {
+                assert_eq!(HashSet::from([id(1), id(2), id(3)]), seen);
+                assert!(!all_converted);
+            }
+            _ => panic!("the snapshot was not reported"),
+        }
+
+        // the next snapshot starts clean
+        state.begin_snapshot();
+        state.observe_snapshot_entry(Some(id(1)), true, true);
+        assert!(matches!(
+            state.queued,
+            Some(GraphUpdate::SnapshotComplete {
+                all_converted: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn entries_after_a_snapshot_are_not_part_of_it() {
         let mut state = state();
-        state.observe_snapshot_entry(Some(id(1)), true);
+        state.observe_snapshot_entry(Some(id(1)), true, true);
         state.queued = None;
 
-        state.observe_snapshot_entry(Some(id(2)), true);
+        state.observe_snapshot_entry(Some(id(2)), true, true);
 
         assert!(state.queued.is_none());
     }
@@ -409,17 +460,17 @@ mod tests {
     #[test]
     fn a_snapshot_with_an_unidentifiable_entry_is_not_reported() {
         let mut state = state();
-        state.observe_snapshot_entry(Some(id(1)), false);
-        state.observe_snapshot_entry(None, false);
-        state.observe_snapshot_entry(Some(id(2)), true);
+        state.observe_snapshot_entry(Some(id(1)), true, false);
+        state.observe_snapshot_entry(None, true, false);
+        state.observe_snapshot_entry(Some(id(2)), true, true);
 
         assert!(state.queued.is_none());
         assert!(!state.in_snapshot);
 
         // the next snapshot starts clean
         state.begin_snapshot();
-        state.observe_snapshot_entry(Some(id(1)), true);
-        assert!(matches!(state.queued, Some(GraphUpdate::SnapshotComplete(_))));
+        state.observe_snapshot_entry(Some(id(1)), true, true);
+        assert!(matches!(state.queued, Some(GraphUpdate::SnapshotComplete { .. })));
     }
 
     #[test]

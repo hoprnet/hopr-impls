@@ -575,12 +575,19 @@ where
         #[derive(Debug)]
         enum SubscribedEventType {
             Account((AccountEntry, Option<AccountEntry>)),
+            /// An account event that was rejected by conversion. It is safe to skip, so the sync gate counts it.
+            /// A failed backend write is an error instead, so it never counts.
+            AccountSkipped(ConnectorError),
             Channel((ChannelEntry, Option<Vec<ChannelChange>>)),
-            /// The graph snapshot has been delivered completely. Holds the ids of the channels it contained.
+            /// The graph snapshot has been delivered completely.
             ///
-            /// Holds the known channels that are not closed and that the snapshot did not hold, read when the
-            /// snapshot completed.
-            SnapshotComplete(Vec<reconcile::Missing>),
+            /// `missing` holds the known channels that are not closed and that the snapshot did not hold, read when
+            /// the snapshot completed. `all_stored` is true when every entry of the snapshot was converted and
+            /// stored, which is what the sync gate needs.
+            SnapshotComplete {
+                missing: Vec<reconcile::Missing>,
+                all_stored: bool,
+            },
             WinningProbability((WinningProbability, Option<WinningProbability>)),
             TicketPrice((HoprBalance, Option<HoprBalance>)),
             /// A change of the service registry, already decoded into the event it stands for.
@@ -710,39 +717,53 @@ where
             let account_stream = account_stream
                 .inspect_ok(|entry| tracing::trace!(?entry, "new account event"))
                 .map_err(ConnectorError::from)
-                .try_filter_map(|account| futures::future::ready(model_to_account_entry(account).map(Some)))
-                .and_then(move |account| {
+                .map_ok(model_to_account_entry)
+                .and_then(move |parsed| {
                     let graph = graph_clone.clone();
                     let mapper = mapper.clone();
                     let announced = announced.clone();
                     let chain_to_packet = chain_to_packet.clone();
                     let packet_to_chain = packet_to_chain.clone();
-                    hopr_utils::runtime::prelude::spawn_blocking(move || {
-                        graph.write().add_node(account.key_id);
-                        let stored = mapper.backend.insert_account(account.clone());
-                        // Caches are written after the backend, serialized per key with the lookups. They are
-                        // filled even when the backend write failed, so the mapping is not lost.
-                        cache::put(&mapper.key_to_id, &account.public_key, account.key_id);
-                        cache::put(&mapper.id_to_key, &account.key_id, account.public_key);
-                        cache::put(&chain_to_packet, &account.chain_addr, account.public_key);
-                        cache::put(&packet_to_chain, &account.public_key, account.chain_addr);
-                        let old = stored.map_err(ConnectorError::backend)?;
-                        accounts::update_announced(&announced, &account, old.as_ref(), &me);
-                        if let Some(old_account) = &old {
-                            if old_account.chain_addr != account.chain_addr {
-                                cache::invalidate(&chain_to_packet, &old_account.chain_addr);
-                            }
-                            if old_account.public_key != account.public_key {
-                                cache::invalidate(&packet_to_chain, &old_account.public_key);
-                            }
+                    // An account that conversion rejects is still a received event. It is reported as
+                    // `AccountSkipped` so that the sync gate counts it, otherwise one such account keeps
+                    // `connect()` from ever finishing at a tolerance of 100. A failed backend write is an error:
+                    // the account is missing, so it must not count.
+                    let account = match parsed {
+                        Ok(account) => account,
+                        Err(error) => {
+                            return futures::future::Either::Left(futures::future::ready(Ok(
+                                SubscribedEventType::AccountSkipped(error),
+                            )));
                         }
-                        Ok::<_, ConnectorError>((account, old))
-                    })
-                    .map(|result| {
-                        result
-                            .map_err(ConnectorError::backend)?
-                            .map(SubscribedEventType::Account)
-                    })
+                    };
+                    futures::future::Either::Right(
+                        hopr_utils::runtime::prelude::spawn_blocking(move || {
+                            graph.write().add_node(account.key_id);
+                            let stored = mapper.backend.insert_account(account.clone());
+                            // Caches are written after the backend, serialized per key with the lookups. They are
+                            // filled even when the backend write failed, so the mapping is not lost.
+                            cache::put(&mapper.key_to_id, &account.public_key, account.key_id);
+                            cache::put(&mapper.id_to_key, &account.key_id, account.public_key);
+                            cache::put(&chain_to_packet, &account.chain_addr, account.public_key);
+                            cache::put(&packet_to_chain, &account.public_key, account.chain_addr);
+                            let old = match stored {
+                                Ok(old) => old,
+                                Err(error) => return Err(ConnectorError::backend(error)),
+                            };
+                            accounts::update_announced(&announced, &account, old.as_ref(), &me);
+                            if let Some(old_account) = &old {
+                                if old_account.chain_addr != account.chain_addr {
+                                    cache::invalidate(&chain_to_packet, &old_account.chain_addr);
+                                }
+                                if old_account.public_key != account.public_key {
+                                    cache::invalidate(&packet_to_chain, &old_account.public_key);
+                                }
+                            }
+                            Ok(SubscribedEventType::Account((account, old)))
+                        })
+                        .map_err(ConnectorError::backend)
+                        .map(|res| res.and_then(|res| res)),
+                    )
                 })
                 .map_err(|error| SubscriptionError::new("accounts", error))
                 .fuse();
@@ -756,19 +777,22 @@ where
                     .cloned()
                     .unwrap_or_else(|| SubscriptionHealthHandle::untracked(GRAPH_SUBSCRIPTION)),
             ));
+            // Cleared when a graph write fails, and read when a snapshot completes.
+            let stored_ok = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
             let channel_stream =
                 graph_stream::resyncing_graph_stream(client.as_ref(), channel_stream, graph_health.clone())
                     .and_then(move |update| match update {
                         // The channels missing from the snapshot are read right here, before the next entry of the
                         // stream is handled. Entries that follow are newer than the snapshot.
-                        graph_stream::GraphUpdate::SnapshotComplete(seen) => {
+                        graph_stream::GraphUpdate::SnapshotComplete { seen, all_converted } => {
+                            let all_stored = all_converted && stored_ok.swap(true, AtomicOrdering::SeqCst);
                             let graph = graph.clone();
                             let backend = backend.clone();
                             futures::future::Either::Left(
                                 hopr_utils::runtime::prelude::spawn_blocking(move || {
                                     reconcile::missing_from_snapshot(backend.as_ref(), &graph, &seen)
                                 })
-                                .map_ok(SubscribedEventType::SnapshotComplete)
+                                .map_ok(move |missing| SubscribedEventType::SnapshotComplete { missing, all_stored })
                                 .map_err(ConnectorError::backend),
                             )
                         }
@@ -777,6 +801,7 @@ where
                             let backend = backend.clone();
                             let channel_by_id = channel_by_id.clone();
                             let channel_by_parties = channel_by_parties.clone();
+                            let stored_ok = stored_ok.clone();
                             futures::future::Either::Right(
                                 hopr_utils::runtime::prelude::spawn_blocking(move || {
                                     reconcile::upsert_channel(
@@ -793,11 +818,14 @@ where
                                         reconcile::Upsert::Skipped { .. } => (channel, None),
                                     })
                                 })
-                                .map_err(ConnectorError::backend)
-                                .and_then(|res| {
-                                    futures::future::ready(
-                                        res.map(SubscribedEventType::Channel).map_err(ConnectorError::backend),
-                                    )
+                                .map(move |joined| {
+                                    let res = joined
+                                        .map_err(ConnectorError::backend)
+                                        .and_then(|res| res.map_err(ConnectorError::backend));
+                                    if res.is_err() {
+                                        stored_ok.store(false, AtomicOrdering::SeqCst);
+                                    }
+                                    res.map(SubscribedEventType::Channel)
                                 }),
                             )
                         }
@@ -932,6 +960,9 @@ where
             let mut account_counter = 0;
             let mut open_channels = OpenChannelCounter::default();
             let mut channel_counter = 0;
+            // Set once the graph snapshot has been delivered completely. A channel that closed after the open
+            // channels were counted is never part of the snapshot, so counting alone could not reach the total.
+            let mut snapshot_delivered = false;
             if min_accounts == 0 && min_channels == 0 {
                 tracing::info!(account_counter, channel_counter, time = ?sync_started.elapsed(), "on-chain graph has been synced");
                 let _ = connection_ready_tx.take().unwrap().send(Ok(()));
@@ -988,8 +1019,9 @@ where
                 }
                 if connection_ready_tx.is_some() && !event_type.is_tick() {
                     match event_type {
-                        SubscribedEventType::Account(_) => account_counter += 1,
+                        SubscribedEventType::Account(_) | SubscribedEventType::AccountSkipped(_) => account_counter += 1,
                         SubscribedEventType::Channel((channel, _)) => channel_counter = open_channels.observe(channel),
+                        SubscribedEventType::SnapshotComplete { all_stored, .. } => snapshot_delivered |= *all_stored,
                         // Service registry events deliberately do not count towards the connection
                         // quota: a node with no services must still reach the Ready state.
                         _ => {}
@@ -1010,7 +1042,7 @@ where
                     // Send the completion notification
                     // once we reach the expected number of accounts and channels with
                     // the given tolerance
-                    if account_counter >= min_accounts && channel_counter >= min_channels {
+                    if account_counter >= min_accounts && (channel_counter >= min_channels || snapshot_delivered) {
                         tracing::info!(account_counter, channel_counter, time = ?sync_started.elapsed(), "on-chain graph has been synced");
                         let _ = connection_ready_tx.take().unwrap().send(Ok(()));
                         let _ = first_reconcile_tx.take().map(|tx| tx.send(()));
@@ -1056,6 +1088,9 @@ where
                                     .broadcast_direct(ChainEvent::Announcement(new_account.clone()))
                                     .await;
                             }
+                        }
+                        Ok(SubscribedEventType::AccountSkipped(error)) => {
+                            tracing::error!(%error, "account event was rejected and skipped");
                         }
                         Ok(SubscribedEventType::Channel((new_channel, Some(changes)))) => {
                             tracing::debug!(
@@ -1107,7 +1142,7 @@ where
                         Ok(SubscribedEventType::ReconcileChannels) => {
                             reconciler.spawn_pass();
                         }
-                        Ok(SubscribedEventType::SnapshotComplete(missing)) => {
+                        Ok(SubscribedEventType::SnapshotComplete { missing, .. }) => {
                             tracing::debug!(missing = missing.len(), "graph snapshot delivered");
                             if !missing.is_empty() {
                                 reconciler.spawn_sweep(missing);
