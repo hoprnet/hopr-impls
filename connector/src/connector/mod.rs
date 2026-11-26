@@ -575,7 +575,8 @@ where
         #[derive(Debug)]
         enum SubscribedEventType {
             Account((AccountEntry, Option<AccountEntry>)),
-            /// An account event that was received but not stored: it was rejected or its backend write failed.
+            /// An account event that was rejected by conversion. It is safe to skip, so the sync gate counts it.
+            /// A failed backend write is an error instead, so it never counts.
             AccountSkipped(ConnectorError),
             Channel((ChannelEntry, Option<Vec<ChannelChange>>)),
             /// The graph snapshot has been delivered completely.
@@ -723,9 +724,10 @@ where
                     let announced = announced.clone();
                     let chain_to_packet = chain_to_packet.clone();
                     let packet_to_chain = packet_to_chain.clone();
-                    // An account that is rejected or not stored is still a received event. It is reported as
+                    // An account that conversion rejects is still a received event. It is reported as
                     // `AccountSkipped` so that the sync gate counts it, otherwise one such account keeps
-                    // `connect()` from ever finishing at a tolerance of 100.
+                    // `connect()` from ever finishing at a tolerance of 100. A failed backend write is an error:
+                    // the account is missing, so it must not count.
                     let account = match parsed {
                         Ok(account) => account,
                         Err(error) => {
@@ -746,9 +748,7 @@ where
                             cache::put(&packet_to_chain, &account.public_key, account.chain_addr);
                             let old = match stored {
                                 Ok(old) => old,
-                                Err(error) => {
-                                    return SubscribedEventType::AccountSkipped(ConnectorError::backend(error));
-                                }
+                                Err(error) => return Err(ConnectorError::backend(error)),
                             };
                             accounts::update_announced(&announced, &account, old.as_ref(), &me);
                             if let Some(old_account) = &old {
@@ -759,9 +759,10 @@ where
                                     cache::invalidate(&packet_to_chain, &old_account.public_key);
                                 }
                             }
-                            SubscribedEventType::Account((account, old))
+                            Ok(SubscribedEventType::Account((account, old)))
                         })
-                        .map_err(ConnectorError::backend),
+                        .map_err(ConnectorError::backend)
+                        .map(|res| res.and_then(|res| res)),
                     )
                 })
                 .map_err(|error| SubscriptionError::new("accounts", error))
@@ -1089,7 +1090,7 @@ where
                             }
                         }
                         Ok(SubscribedEventType::AccountSkipped(error)) => {
-                            tracing::error!(%error, "account event was not stored");
+                            tracing::error!(%error, "account event was rejected and skipped");
                         }
                         Ok(SubscribedEventType::Channel((new_channel, Some(changes)))) => {
                             tracing::debug!(
