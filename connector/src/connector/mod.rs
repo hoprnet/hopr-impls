@@ -576,6 +576,11 @@ where
         enum SubscribedEventType {
             Account((AccountEntry, Option<AccountEntry>)),
             Channel((ChannelEntry, Option<Vec<ChannelChange>>)),
+            /// The graph snapshot has been delivered completely. Holds the ids of the channels it contained.
+            ///
+            /// Holds the known channels that are not closed and that the snapshot did not hold, read when the
+            /// snapshot completed.
+            SnapshotComplete(Vec<reconcile::Missing>),
             WinningProbability((WinningProbability, Option<WinningProbability>)),
             TicketPrice((HoprBalance, Option<HoprBalance>)),
             /// A change of the service registry, already decoded into the event it stands for.
@@ -753,32 +758,49 @@ where
             ));
             let channel_stream =
                 graph_stream::resyncing_graph_stream(client.as_ref(), channel_stream, graph_health.clone())
-                    .and_then(move |(src, dst, channel)| {
-                        let graph = graph.clone();
-                        let backend = backend.clone();
-                        let channel_by_id = channel_by_id.clone();
-                        let channel_by_parties = channel_by_parties.clone();
-                        hopr_utils::runtime::prelude::spawn_blocking(move || {
-                            reconcile::upsert_channel(
-                                backend.as_ref(),
-                                &graph,
-                                &channel_by_id,
-                                &channel_by_parties,
-                                (src.key_id, dst.key_id),
-                                channel,
-                                false,
+                    .and_then(move |update| match update {
+                        // The channels missing from the snapshot are read right here, before the next entry of the
+                        // stream is handled. Entries that follow are newer than the snapshot.
+                        graph_stream::GraphUpdate::SnapshotComplete(seen) => {
+                            let graph = graph.clone();
+                            let backend = backend.clone();
+                            futures::future::Either::Left(
+                                hopr_utils::runtime::prelude::spawn_blocking(move || {
+                                    reconcile::missing_from_snapshot(backend.as_ref(), &graph, &seen)
+                                })
+                                .map_ok(SubscribedEventType::SnapshotComplete)
+                                .map_err(ConnectorError::backend),
                             )
-                            .map(|upsert| match upsert {
-                                reconcile::Upsert::Written(old) => (channel, old.map(|old| old.diff(&channel))),
-                                reconcile::Upsert::Skipped { .. } => (channel, None),
-                            })
-                        })
-                        .map_err(ConnectorError::backend)
-                        .and_then(|res| {
-                            futures::future::ready(
-                                res.map(SubscribedEventType::Channel).map_err(ConnectorError::backend),
+                        }
+                        graph_stream::GraphUpdate::Entry((src, dst, channel)) => {
+                            let graph = graph.clone();
+                            let backend = backend.clone();
+                            let channel_by_id = channel_by_id.clone();
+                            let channel_by_parties = channel_by_parties.clone();
+                            futures::future::Either::Right(
+                                hopr_utils::runtime::prelude::spawn_blocking(move || {
+                                    reconcile::upsert_channel(
+                                        backend.as_ref(),
+                                        &graph,
+                                        &channel_by_id,
+                                        &channel_by_parties,
+                                        (src.key_id, dst.key_id),
+                                        channel,
+                                        false,
+                                    )
+                                    .map(|upsert| match upsert {
+                                        reconcile::Upsert::Written(old) => (channel, old.map(|old| old.diff(&channel))),
+                                        reconcile::Upsert::Skipped { .. } => (channel, None),
+                                    })
+                                })
+                                .map_err(ConnectorError::backend)
+                                .and_then(|res| {
+                                    futures::future::ready(
+                                        res.map(SubscribedEventType::Channel).map_err(ConnectorError::backend),
+                                    )
+                                }),
                             )
-                        })
+                        }
                     })
                     .map_err(|error| SubscriptionError::new("graph", error))
                     .fuse();
@@ -1084,6 +1106,12 @@ where
                         Ok(SubscribedEventType::HealthCheck) => {}
                         Ok(SubscribedEventType::ReconcileChannels) => {
                             reconciler.spawn_pass();
+                        }
+                        Ok(SubscribedEventType::SnapshotComplete(missing)) => {
+                            tracing::debug!(missing = missing.len(), "graph snapshot delivered");
+                            if !missing.is_empty() {
+                                reconciler.spawn_sweep(missing);
+                            }
                         }
                         #[cfg(feature = "telemetry")]
                         Ok(SubscribedEventType::MetricsRefresh) => {}
