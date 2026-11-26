@@ -1705,6 +1705,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn probe_streams_should_resume_when_a_loop_appears_after_start() -> anyhow::Result<()> {
+        let (me, a, b) = (random_key(), random_key(), random_key());
+        let graph = Arc::new(ChannelGraph::new(me));
+        let mut cfg = fast_cfg();
+        // The production timer uses a separate reactor, so Tokio's paused clock cannot drive it.
+        // Keep it well beyond the test timeout: only a topology notification can resume the streams.
+        cfg.recheck_interval = Duration::from_secs(3600);
+        let prober = FullNetworkDiscovery::new(me, cfg, graph.clone());
+        let mut stream = ProbingTrafficGeneration::build(&prober);
+
+        // A pending poll makes the merged stream poll both sources against the empty graph.
+        assert!(futures::poll!(stream.next()).is_pending());
+
+        for node in [a, b] {
+            graph.add_node(node);
+        }
+        for (src, dst) in [(me, a), (a, b), (b, me), (me, b)] {
+            graph.add_edge(&src, &dst).context("adding loop edge")?;
+            mark_edge_ready(&graph, &src, &dst);
+        }
+
+        // A newly created generator must find both probes, proving the fixture itself is usable.
+        let fresh_prober = FullNetworkDiscovery::new(me, cfg, graph);
+        let mut fresh_stream = ProbingTrafficGeneration::build(&fresh_prober);
+        assert_eq!(loopbacks(&mut fresh_stream, 1).await?, vec![vec![a, b]]);
+        assert!(
+            timeout(TINY_TIMEOUT * 10, neighbor_destinations(fresh_stream).next())
+                .await?
+                .is_some(),
+            "the populated graph must offer a neighbor probe"
+        );
+
+        let (mut neighbor, mut loopback) = (false, false);
+        let _ = timeout(TINY_TIMEOUT * 10, async {
+            while !(neighbor && loopback) {
+                match stream.next().await {
+                    Some(ProbeRouting::Neighbor(_)) => neighbor = true,
+                    Some(ProbeRouting::Looping(_)) => loopback = true,
+                    None => break,
+                }
+                // A neighbor can be offered repeatedly before any result is recorded.
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        anyhow::ensure!(
+            neighbor && loopback,
+            "adding a usable loop must wake both idle probe streams: neighbor={neighbor}, loopback={loopback}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn neighbors_should_be_covered_across_passes() -> anyhow::Result<()> {
         let me = random_key();
         let graph = Arc::new(ChannelGraph::new(me));
