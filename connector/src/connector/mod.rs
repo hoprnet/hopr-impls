@@ -35,8 +35,7 @@ use crate::{
     metrics::{PHASE_TRACK, record_tx_outcome},
     utils::{
         OpenChannelCounter, ParsedChainInfo, event_for_first_seen_channel, model_to_account_entry,
-        model_to_graph_entry, model_to_service_registry_config, model_to_ticket_params,
-        process_channel_changes_into_events,
+        model_to_service_registry_config, model_to_ticket_params, process_channel_changes_into_events,
     },
 };
 
@@ -46,6 +45,7 @@ mod cache;
 mod channel_cache_race_tests;
 mod channels;
 mod events;
+mod graph_stream;
 mod keys;
 mod reconcile;
 mod safe;
@@ -88,6 +88,9 @@ const SUBSCRIPTION_HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 /// A pass costs two channel queries (plus an account lookup for each unknown endpoint). Every few minutes bounds how
 /// long a channel missed by the subscription stays wrong, while the load stays negligible next to the subscriptions.
 const CHANNEL_RECONCILE_INTERVAL: Duration = Duration::from_mins(5);
+
+/// Name of the graph subscription in the list of subscription health handles.
+const GRAPH_SUBSCRIPTION: &str = "graph";
 
 /// How often the chain state gauges are refreshed. Independent of the state dump interval.
 #[cfg(feature = "telemetry")]
@@ -739,38 +742,46 @@ where
                 .map_err(|error| SubscriptionError::new("accounts", error))
                 .fuse();
 
-            // Stream of channel graph updates
-            let channel_stream = channel_stream
-                .map_err(ConnectorError::from)
-                .inspect_ok(|entry| tracing::trace!(?entry, "new graph event"))
-                .try_filter_map(|graph_event| futures::future::ready(model_to_graph_entry(graph_event).map(Some)))
-                .and_then(move |(src, dst, channel)| {
-                    let graph = graph.clone();
-                    let backend = backend.clone();
-                    let channel_by_id = channel_by_id.clone();
-                    let channel_by_parties = channel_by_parties.clone();
-                    hopr_utils::runtime::prelude::spawn_blocking(move || {
-                        reconcile::upsert_channel(
-                            backend.as_ref(),
-                            &graph,
-                            &channel_by_id,
-                            &channel_by_parties,
-                            (src.key_id, dst.key_id),
-                            channel,
-                            false,
-                        )
-                        .map(|upsert| match upsert {
-                            reconcile::Upsert::Written(old) => (channel, old.map(|old| old.diff(&channel))),
-                            reconcile::Upsert::Skipped { .. } => (channel, None),
+            // Stream of channel graph updates. It starts over from a full snapshot when an entry fails conversion or
+            // the stream ends, because the client's resume cursor never resends an entry it has handed out.
+            let graph_health = std::sync::Arc::new(parking_lot::Mutex::new(
+                subscription_health
+                    .iter()
+                    .find(|handle| handle.subscription().name() == GRAPH_SUBSCRIPTION)
+                    .cloned()
+                    .unwrap_or_else(|| SubscriptionHealthHandle::untracked(GRAPH_SUBSCRIPTION)),
+            ));
+            let channel_stream =
+                graph_stream::resyncing_graph_stream(client.as_ref(), channel_stream, graph_health.clone())
+                    .and_then(move |(src, dst, channel)| {
+                        let graph = graph.clone();
+                        let backend = backend.clone();
+                        let channel_by_id = channel_by_id.clone();
+                        let channel_by_parties = channel_by_parties.clone();
+                        hopr_utils::runtime::prelude::spawn_blocking(move || {
+                            reconcile::upsert_channel(
+                                backend.as_ref(),
+                                &graph,
+                                &channel_by_id,
+                                &channel_by_parties,
+                                (src.key_id, dst.key_id),
+                                channel,
+                                false,
+                            )
+                            .map(|upsert| match upsert {
+                                reconcile::Upsert::Written(old) => (channel, old.map(|old| old.diff(&channel))),
+                                reconcile::Upsert::Skipped { .. } => (channel, None),
+                            })
+                        })
+                        .map_err(ConnectorError::backend)
+                        .and_then(|res| {
+                            futures::future::ready(
+                                res.map(SubscribedEventType::Channel).map_err(ConnectorError::backend),
+                            )
                         })
                     })
-                    .map_err(ConnectorError::backend)
-                    .and_then(|res| {
-                        futures::future::ready(res.map(SubscribedEventType::Channel).map_err(ConnectorError::backend))
-                    })
-                })
-                .map_err(|error| SubscriptionError::new("graph", error))
-                .fuse();
+                    .map_err(|error| SubscriptionError::new("graph", error))
+                    .fuse();
 
             // Stream of ticket parameter updates (ticket price, minimum winning probability)
             let ticket_params_stream = ticket_params_stream
@@ -986,7 +997,15 @@ where
             })
             .for_each(move |event_type| {
                 if matches!(event_type, Ok(SubscribedEventType::HealthCheck)) {
-                    update_chain_health(&checked_health, &subscription_health, &mut previous_health);
+                    // The graph subscription may have been restarted, which gives it a new health handle.
+                    let mut current = subscription_health.clone();
+                    if let Some(handle) = current
+                        .iter_mut()
+                        .find(|handle| handle.subscription().name() == GRAPH_SUBSCRIPTION)
+                    {
+                        *handle = graph_health.lock().clone();
+                    }
+                    update_chain_health(&checked_health, &current, &mut previous_health);
                 }
                 // The gauge refresh reads the chain and must not hold up the subscription stream.
                 #[cfg(feature = "telemetry")]
