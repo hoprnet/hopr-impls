@@ -11,9 +11,9 @@ pub(crate) const MAX_PATH_GRAPH_EDGES: usize = 4;
 /// Maximum supplied paths inspected per read (four destinations, four pairs, two legs).
 #[cfg(any(feature = "serde", test))]
 pub(crate) const MAX_GRAPH_PATHS: usize = 32;
-/// Serialized graph detail budget, leaving room for the other operational sections.
+/// Serialized graph detail budget, leaving room for the record envelope.
 #[cfg(any(feature = "serde", test))]
-pub(crate) const MAX_GRAPH_STATE_BYTES: usize = 3 * 1024;
+pub(crate) const MAX_GRAPH_STATE_BYTES: usize = 16 * 1024;
 
 /// Read observations without traversing or allocating the whole graph.
 /// Implementations must respect the sample limits and preserve omission counts.
@@ -58,25 +58,38 @@ pub(crate) struct GraphState {
 }
 #[cfg(any(feature = "serde", test))]
 impl GraphState {
-    /// Drop lowest-priority rows until the graph fits its reserved payload budget.
-    /// Keep both scopes represented when possible; counts continue to describe full coverage.
+    /// Drop detail until the graph fits its reserved payload budget.
     pub(crate) fn bound_bytes(&mut self) {
-        while serde_json::to_vec(self).map_or(usize::MAX, |json| json.len()) > MAX_GRAPH_STATE_BYTES {
-            let path_len = self.paths.as_ref().map_or(0, |p| p.edges.len());
-            if !self.local_edges.is_empty() && (self.local_edges.len() >= path_len || path_len <= 1) {
+        self.bound_bytes_to(MAX_GRAPH_STATE_BYTES);
+    }
+
+    fn bound_bytes_to(&mut self, limit: usize) {
+        const MIN_LOCAL_EDGES: usize = 4;
+
+        while serde_json::to_vec(self).map_or(usize::MAX, |json| json.len()) > limit {
+            if self.searches.samples.len() > 1 {
+                self.drop_search_sample();
+            } else if self.local_edges.len() > MIN_LOCAL_EDGES {
+                self.local_edges.pop();
+                self.local_edges_omitted += 1;
+            } else if !self.searches.samples.is_empty() {
+                self.drop_search_sample();
+            } else if !self.local_edges.is_empty() {
                 self.local_edges.pop();
                 self.local_edges_omitted += 1;
             } else if let Some(paths) = self.paths.as_mut().filter(|p| !p.edges.is_empty()) {
                 paths.edges.pop();
                 paths.edges_omitted += 1;
-            } else if !self.searches.samples.is_empty() {
-                let victim = self.searches.samples.iter().position(|s| s.returned > 0).unwrap_or(0);
-                let sample = self.searches.samples.remove(victim);
-                self.searches.samples_omitted = self.searches.samples_omitted.saturating_add(sample.occurrences);
             } else {
                 break;
             }
         }
+    }
+
+    fn drop_search_sample(&mut self) {
+        let victim = self.searches.samples.iter().position(|s| s.returned > 0).unwrap_or(0);
+        let sample = self.searches.samples.remove(victim);
+        self.searches.samples_omitted = self.searches.samples_omitted.saturating_add(sample.occurrences);
     }
 
     #[cfg(test)]
@@ -230,12 +243,142 @@ impl SearchRecord {
 
 #[cfg(test)]
 mod coverage_tests {
+    use anyhow::Context as _;
     use hopr_api::{
         graph::NetworkGraphWrite,
         types::crypto::prelude::{Keypair, OffchainKeypair},
     };
 
     use super::*;
+    #[cfg(feature = "serde")]
+    use crate::state_reporting::{MAX_SNAPSHOT_BYTES, Record, Section};
+
+    fn graph_with_incident_edges() -> anyhow::Result<GraphState> {
+        let me = *OffchainKeypair::from_secret(&[1; 32]).context("local key")?.public();
+        let graph = crate::ChannelGraph::new(me);
+        for index in 0u16..406 {
+            let mut secret = [2; 32];
+            secret[..2].copy_from_slice(&index.to_be_bytes());
+            let peer = *OffchainKeypair::from_secret(&secret).context("peer key")?.public();
+            graph.upsert_edge(&me, &peer, |_| {});
+            graph.upsert_edge(&peer, &me, |_| {});
+        }
+        Ok(graph.graph_state(None))
+    }
+
+    fn full_sample(row: &GraphEdge, occurrences: u64) -> SearchRecord {
+        let key = row.source.as_ref().expect("present source").to_string();
+        SearchRecord {
+            selection_id: u64::MAX,
+            search_id: u64::MAX,
+            phase: "phase2",
+            kind: "simple_paths",
+            direction: "forward",
+            source: key.clone(),
+            destination: Some(key.clone()),
+            length: usize::MAX,
+            take_count: Some(usize::MAX),
+            value_function: "forward",
+            graph_ticket_face_value: Some(hopr_api::graph::traits::Balance::MAX.to_string()),
+            graph_min_ack_rate: 0.12345678901234568,
+            graph_edge_penalty: 0.12345678901234568,
+            outcome: "no_eligible_paths",
+            returned: 0,
+            limit_reached: true,
+            cycles_skipped: u64::MAX,
+            excluded_skipped: u64::MAX,
+            below_minimum: u64::MAX,
+            target_too_early: u64::MAX,
+            depth_limited: u64::MAX,
+            rejected_prefix: Some([u64::MAX; 5]),
+            rejected_prefix_nodes: Some(vec![key.clone(); 5]),
+            rejected_reason: Some("value_below_minimum"),
+            rejected_evaluation_id: Some(u64::MAX),
+            rejected_examples_omitted: u64::MAX,
+            rejected_prefix_truncated: true,
+            rejected_edge: Some(row.clone()),
+            returned_path: Some([u64::MAX; 5]),
+            returned_path_nodes: Some(vec![key; 5]),
+            returned_paths_omitted: usize::MAX,
+            elapsed_us: u64::MAX,
+            recorded_at_ms: u64::MAX,
+            occurrences,
+        }
+    }
+
+    fn full_row(mut row: GraphEdge) -> GraphEdge {
+        row.source_slot = u64::MAX;
+        row.destination_slot = u64::MAX;
+        row.observation = Some(GraphObservation {
+            balance: Some(hopr_api::graph::traits::Balance::MAX.to_string()),
+            is_connected: Some(false),
+            ack_rate: Some(0.12345678901234568),
+            immediate_probe_rate: Some(0.12345678901234568),
+            intermediate_probe_rate: Some(0.12345678901234568),
+            immediate_latency_ms: Some(u64::MAX),
+            intermediate_latency_ms: Some(u64::MAX),
+            score: Some(0.12345678901234568),
+            health: Some(0.12345678901234568),
+            updated_at_ms: u64::MAX,
+        });
+        row
+    }
+
+    #[test]
+    fn graph_should_keep_local_rows_and_coverage_when_trimming() -> anyhow::Result<()> {
+        let mut state = graph_with_incident_edges()?;
+        let row = full_row(state.local_edges[0].clone());
+        state.local_edges = vec![row.clone(); MAX_LOCAL_GRAPH_EDGES];
+        state.searches.samples = vec![full_sample(&row, 3), full_sample(&row, 5)];
+        state.bound_bytes_to(3 * 1024);
+
+        assert!(!state.local_edges.is_empty());
+        assert_eq!(state.local_edges.len() + state.local_edges_omitted, 812);
+        assert_eq!(
+            state.searches.samples_omitted,
+            8 - state.searches.samples.iter().map(|s| s.occurrences).sum::<u64>()
+        );
+        assert!(serde_json::to_vec(&state).context("serialize graph state")?.len() <= 3 * 1024);
+        Ok(())
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn graph_should_fit_all_capped_details_and_the_record_envelope() -> anyhow::Result<()> {
+        let mut state = graph_with_incident_edges()?;
+        let row = full_row(state.local_edges[0].clone());
+        state.local_edges = vec![row.clone(); MAX_LOCAL_GRAPH_EDGES];
+        state.paths = Some(PathGraphState {
+            sampled_paths: MAX_GRAPH_PATHS,
+            requested_edges: MAX_PATH_GRAPH_EDGES,
+            edges: vec![row.clone(); MAX_PATH_GRAPH_EDGES],
+            ..Default::default()
+        });
+        state.searches.samples = vec![full_sample(&row, 3), full_sample(&row, 5)];
+        state.bound_bytes();
+
+        assert_eq!(state.local_edges.len(), MAX_LOCAL_GRAPH_EDGES);
+        assert_eq!(state.local_edges_omitted, 804);
+        assert_eq!(state.searches.samples.len(), 2);
+        assert_eq!(
+            state.paths.as_ref().expect("path sample").edges.len(),
+            MAX_PATH_GRAPH_EDGES
+        );
+        assert!(serde_json::to_vec(&state).context("serialize graph state")?.len() <= MAX_GRAPH_STATE_BYTES);
+        let record = Record {
+            schema_version: u8::MAX,
+            component: "graph",
+            instance: "i".repeat(120),
+            sequence: u64::MAX,
+            collected_at_ms: u64::MAX,
+            collection_ms: u64::MAX,
+            reason: "sampled_path_unavailable".to_owned(),
+            analysis_required: true,
+            state: Section::Ok { value: state },
+        };
+        assert!(record.to_json()?.len() <= MAX_SNAPSHOT_BYTES);
+        Ok(())
+    }
 
     #[test]
     fn borrowed_graph_reads_and_path_trimming_preserve_coverage_totals() -> anyhow::Result<()> {
@@ -253,7 +396,7 @@ mod coverage_tests {
             edges: vec![row; 8],
             ..Default::default()
         });
-        state.bound_bytes();
+        state.bound_bytes_to(3 * 1024);
         let paths = state.paths.as_ref().unwrap();
         assert!(paths.edges_omitted > 0);
         assert_eq!(paths.edges.len() + paths.edges_omitted, 8);
