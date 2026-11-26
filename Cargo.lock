@@ -3893,7 +3893,7 @@ dependencies = [
 
 [[package]]
 name = "hopr-chain-connector"
-version = "0.36.1"
+version = "0.36.2"
 dependencies = [
  "ahash",
  "anyhow",
@@ -3966,7 +3966,7 @@ dependencies = [
 
 [[package]]
 name = "hopr-network-graph"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "anyhow",
  "assertables",
