@@ -77,16 +77,12 @@ use crate::{
 /// is designed to be high-performance and to be called per each incoming packet **before** it is forwarded to a next
 /// hop.
 ///
-/// This operation acquires the read-part of an RW lock in `HoprTicketManager` (per incoming channel). This may block
-/// the hot-path only if one of the following (write) operations is performed at the same moment:
-///     1. A new incoming winning ticket is inserted into the same incoming channel queue of the `HoprTicketManager`.
-///     2. Ticket redemption has just finished in that particular channel, and the redeemed ticket is dropped from the
-///     same incoming channel queue of the `HoprTicketManager`.
-///     3. Ticket neglection has just finished in that particular channel, and the neglected ticket is dropped from the
-///     same incoming channel queue of the `HoprTicketManager`.
-///
-/// All 3 of these operations are not expected to happen very often on a single channel; therefore, high contention
-/// on the RW lock is not expected.
+/// This operation reads the channel's unrealized value from a cell in `HoprTicketManager` that each queue update
+/// refreshes. It takes no lock on the queue itself, so it does not wait for a winning-ticket insertion, a
+/// redemption or a neglection, whose store I/O runs under the queue's write lock. Only the brief map shard read
+/// and the cell's mutex are taken; the map shard is not held across store I/O, except while the first ticket of a
+/// new channel is inserted. A minimum index (the `min_index` argument of `unrealized_value`) takes the slower path
+/// that reads the queue under its read lock.
 pub struct HoprTicketFactory<S> {
     out_idx_tracker: OutgoingIndexCache,
     queue_map: std::sync::Weak<dyn UnrealizedValue + Send + Sync + 'static>,
@@ -405,6 +401,152 @@ mod tests {
         drop(manager);
 
         assert_eq!(channel.balance, factory.remaining_incoming_channel_stake(&channel)?);
+
+        Ok(())
+    }
+
+    /// The stake read on the packet decode path must not wait for a slow ticket queue write.
+    #[test]
+    fn ticket_factory_remaining_incoming_channel_stake_should_not_block_on_slow_push() -> anyhow::Result<()> {
+        use std::{
+            sync::{
+                Arc,
+                atomic::{AtomicBool, Ordering},
+            },
+            time::{Duration, Instant},
+        };
+
+        use hopr_api::chain::{ChannelId, RedeemableTicket, VerifiedTicket};
+
+        use crate::{OutgoingIndexStore, TicketQueue, TicketQueueStore, backend::MemoryTicketQueue};
+
+        #[derive(Clone, Default)]
+        struct Slow {
+            slow: Arc<AtomicBool>,
+            in_push: Arc<AtomicBool>,
+        }
+
+        struct SlowQueue(MemoryTicketQueue, Slow);
+
+        impl TicketQueue for SlowQueue {
+            type Error = <MemoryTicketQueue as TicketQueue>::Error;
+
+            fn len(&self) -> Result<usize, Self::Error> {
+                self.0.len()
+            }
+
+            fn push(&mut self, ticket: RedeemableTicket) -> Result<(), Self::Error> {
+                if self.1.slow.load(Ordering::SeqCst) {
+                    self.1.in_push.store(true, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(300));
+                }
+                self.0.push(ticket)
+            }
+
+            fn pop(&mut self) -> Result<Option<RedeemableTicket>, Self::Error> {
+                self.0.pop()
+            }
+
+            fn peek(&self) -> Result<Option<RedeemableTicket>, Self::Error> {
+                self.0.peek()
+            }
+
+            fn iter_unordered(
+                &self,
+            ) -> Result<impl Iterator<Item = Result<RedeemableTicket, Self::Error>>, Self::Error> {
+                self.0.iter_unordered()
+            }
+        }
+
+        struct SlowStore(MemoryStore, Slow);
+
+        impl TicketQueueStore for SlowStore {
+            type Queue = SlowQueue;
+
+            fn open_or_create_queue(
+                &mut self,
+                channel_id: &ChannelId,
+            ) -> Result<SlowQueue, <SlowQueue as TicketQueue>::Error> {
+                Ok(SlowQueue(self.0.open_or_create_queue(channel_id)?, self.1.clone()))
+            }
+
+            fn delete_queue(
+                &mut self,
+                channel_id: &ChannelId,
+            ) -> Result<Vec<VerifiedTicket>, <SlowQueue as TicketQueue>::Error> {
+                self.0.delete_queue(channel_id)
+            }
+
+            fn iter_queues(&self) -> Result<impl Iterator<Item = ChannelId>, <SlowQueue as TicketQueue>::Error> {
+                self.0.iter_queues()
+            }
+        }
+
+        impl OutgoingIndexStore for SlowStore {
+            type Error = <MemoryStore as OutgoingIndexStore>::Error;
+
+            fn load_outgoing_index(&self, c: &ChannelId, e: u32) -> Result<Option<u64>, Self::Error> {
+                self.0.load_outgoing_index(c, e)
+            }
+
+            fn save_outgoing_index(&mut self, c: &ChannelId, e: u32, i: u64) -> Result<(), Self::Error> {
+                self.0.save_outgoing_index(c, e, i)
+            }
+
+            fn delete_outgoing_index(&mut self, c: &ChannelId, e: u32) -> Result<(), Self::Error> {
+                self.0.delete_outgoing_index(c, e)
+            }
+
+            fn iter_outgoing_indices(&self) -> Result<impl Iterator<Item = (ChannelId, u32)>, Self::Error> {
+                self.0.iter_outgoing_indices()
+            }
+        }
+
+        let slow = Slow::default();
+        let (manager, factory) =
+            crate::HoprTicketManager::new_with_factory(SlowStore(MemoryStore::default(), slow.clone()));
+        let manager = Arc::new(manager);
+
+        let src = ChainKeypair::random();
+        let dst = ChainKeypair::random();
+        let tickets = generate_owned_tickets(&src, &dst, 2, 1..=1)?;
+        let value = tickets[0].verified_ticket().amount;
+
+        let channel = ChannelEntry::builder()
+            .between(&src, &dst)
+            .balance(value * 10)
+            .ticket_index(0)
+            .status(ChannelStatus::Open)
+            .epoch(1)
+            .build()?;
+
+        // The first ticket creates the queue (fast), the second one goes through the occupied-channel path
+        manager.insert_incoming_ticket(tickets[0])?;
+        slow.slow.store(true, Ordering::SeqCst);
+
+        let inserter = {
+            let manager = manager.clone();
+            let ticket = tickets[1];
+            std::thread::spawn(move || manager.insert_incoming_ticket(ticket).map(|_| ()))
+        };
+        while !slow.in_push.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+
+        let started = Instant::now();
+        let stake = factory.remaining_incoming_channel_stake(&channel)?;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(30),
+            "stake read blocked for {elapsed:?}"
+        );
+        assert!(stake == channel.balance - value || stake == channel.balance - value - value);
+
+        inserter.join().expect("inserter panicked")?;
+        assert_eq!(
+            channel.balance - value - value,
+            factory.remaining_incoming_channel_stake(&channel)?
+        );
 
         Ok(())
     }
