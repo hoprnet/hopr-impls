@@ -123,6 +123,8 @@ impl<Q: TicketQueue> TicketQueue for ValueCachedQueue<Q> {
                 .entry(ticket.verified_ticket().channel_epoch)
                 .or_default()
                 .sub_assign(ticket.verified_ticket().amount);
+            // Publish before the fallible peek(), so the cell follows the cache even when peek() fails.
+            self.publish();
             // Keep current_epoch consistent with what remains in the queue after the pop.
             // If the queue still has tickets, they share the same epoch; if empty, reset to None.
             self.current_epoch = self.queue.peek()?.map(|t| t.verified_ticket().channel_epoch);
@@ -331,6 +333,77 @@ pub mod tests {
             0,
             "peek called during cached_unrealized_value"
         );
+
+        Ok(())
+    }
+
+    /// A `peek()` that fails after a pop must not leave the cell behind the cache.
+    #[test]
+    fn published_value_follows_the_cache_when_peek_fails_after_a_pop() -> anyhow::Result<()> {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        use hopr_api::chain::RedeemableTicket;
+
+        /// Wraps `MemoryTicketQueue`; `peek()` fails while `fail_peek` is set.
+        struct FailingPeek {
+            inner: memory::MemoryTicketQueue,
+            fail_peek: Arc<AtomicBool>,
+        }
+
+        impl TicketQueue for FailingPeek {
+            type Error = std::io::Error;
+
+            fn len(&self) -> Result<usize, Self::Error> {
+                Ok(self.inner.len().unwrap_or_else(|e| match e {}))
+            }
+
+            fn push(&mut self, t: RedeemableTicket) -> Result<(), Self::Error> {
+                self.inner.push(t).unwrap_or_else(|e| match e {});
+                Ok(())
+            }
+
+            fn pop(&mut self) -> Result<Option<RedeemableTicket>, Self::Error> {
+                Ok(self.inner.pop().unwrap_or_else(|e| match e {}))
+            }
+
+            fn peek(&self) -> Result<Option<RedeemableTicket>, Self::Error> {
+                if self.fail_peek.load(Ordering::Relaxed) {
+                    return Err(std::io::Error::other("peek failed"));
+                }
+                Ok(self.inner.peek().unwrap_or_else(|e| match e {}))
+            }
+
+            fn iter_unordered(
+                &self,
+            ) -> Result<impl Iterator<Item = Result<RedeemableTicket, Self::Error>>, Self::Error> {
+                Ok(self
+                    .inner
+                    .iter_unordered()
+                    .unwrap_or_else(|e| match e {})
+                    .map(|t| Ok::<_, std::io::Error>(t.unwrap_or_else(|e| match e {}))))
+            }
+        }
+
+        let fail_peek = Arc::new(AtomicBool::new(false));
+        let mut queue = ValueCachedQueue::new(FailingPeek {
+            inner: memory::MemoryTicketQueue::default(),
+            fail_peek: fail_peek.clone(),
+        })?;
+        let tickets: Vec<_> = generate_tickets()?
+            .into_iter()
+            .filter(|t| t.verified_ticket().channel_epoch == 2)
+            .collect();
+        fill_queue(&mut queue, tickets.into_iter())?;
+        let cell = queue.published_value();
+        let before = *cell.lock();
+
+        fail_peek.store(true, Ordering::Relaxed);
+        assert!(queue.pop().is_err(), "the pop must report the failed peek");
+        assert_ne!(before, queue.cached_unrealized_value(), "the pop must reduce the cache");
+        assert_eq!(queue.cached_unrealized_value(), *cell.lock());
 
         Ok(())
     }
