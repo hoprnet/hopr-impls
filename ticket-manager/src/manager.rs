@@ -67,16 +67,12 @@ use crate::{
 /// The [`unrealized_value`](HoprTicketManager::unrealized_value) method is designed to be high-performance
 /// and to be called per each incoming packet **before** it is forwarded to a next hop.
 ///
-/// This operation acquires the read-part of an RW lock (per incoming channel). This may block the hot-path only if
-/// one of the following (write) operations is performed at the same moment:
-///     1. A new incoming winning ticket is inserted into the same incoming channel queue.
-///     2. Ticket redemption has just finished in that particular channel, and the redeemed ticket is dropped from the
-///     same incoming channel queue.
-///     3. Ticket neglection has just finished in that particular channel, and the neglected ticket is dropped from the
-///     same incoming channel queue.
-///
-/// All 3 of these operations are not expected to happen very often on a single channel; therefore, high contention
-/// on the RW lock is not expected.
+/// This operation reads the channel's unrealized value from a cell that each queue update
+/// refreshes. It takes no lock on the queue itself, so it does not wait for a winning-ticket insertion, a
+/// redemption or a neglection, whose store I/O runs under the queue's write lock. Only the brief map shard read
+/// and the cell's mutex are taken; the map shard is not held across store I/O, except while the first ticket of a
+/// new channel is inserted. A minimum index (the `min_index` argument of `unrealized_value`) takes the slower path
+/// that reads the queue under its read lock.
 #[derive(Debug)]
 pub struct HoprTicketManager<S, Q> {
     channel_tickets: std::sync::Arc<CachedQueueMap<Q>>,
