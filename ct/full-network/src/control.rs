@@ -9,7 +9,7 @@ use std::{
 use hopr_api::types::{crypto::types::OffchainPublicKey, internal::routing::PathId};
 // Only the `sync` primitives of tokio are used. They need no tokio runtime, so the handle works
 // under any async executor.
-use tokio::sync::{Notify, watch};
+use tokio::sync::watch;
 
 /// A function that values a loopback path the way the component that routes traffic does.
 type PathWeightFn = dyn Fn(&[OffchainPublicKey], PathId) -> Option<f64> + Send + Sync;
@@ -107,7 +107,6 @@ pub(crate) struct ControlState {
 pub struct EgressControl {
     state: Arc<watch::Sender<ControlState>>,
     coverage: Arc<CoverageCounters>,
-    wake: Arc<Notify>,
 }
 
 impl Default for EgressControl {
@@ -115,7 +114,6 @@ impl Default for EgressControl {
         Self {
             state: Arc::new(watch::channel(ControlState::default()).0),
             coverage: Arc::new(CoverageCounters::default()),
-            wake: Arc::new(Notify::new()),
         }
     }
 }
@@ -129,18 +127,16 @@ impl EgressControl {
         self.coverage.clone()
     }
 
-    pub(crate) fn wake_handle(&self) -> Arc<Notify> {
-        self.wake.clone()
-    }
-
-    /// Tells an idle probe stream to re-examine the graph.
+    /// Tells every idle probe stream to re-examine the graph.
     ///
     /// The graph is read through `NetworkGraphView`, which has no change notification and gives
     /// the generator no clock, so an idle stream cannot notice on its own that a neighbour
     /// disconnected or that a recorded outcome dropped its rate. Whoever records those
     /// observations calls this after writing them, and the next pull sees the new state.
     pub fn wake_probing(&self) {
-        self.wake.notify_one();
+        // A watch update reaches every subscriber, including a stream between its graph read
+        // and its wait. No control setting changes, but the watch version advances.
+        self.state.send_modify(|_| {});
     }
 
     /// Caps the loopback best set to `cap` paths, `None` to keep the plain `best_set_size` cap.

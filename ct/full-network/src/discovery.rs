@@ -27,7 +27,7 @@ use hopr_api::{
 };
 use hopr_network_graph::{FocusRelevance, FocusedLoopback, MAX_LOOPBACK_HOPS, MIN_LOOPBACK_HOPS, Observations};
 use hopr_utils::statistics::WeightedCollection;
-use tokio::sync::{Notify, watch};
+use tokio::sync::watch;
 
 use crate::{
     EgressConfig,
@@ -364,6 +364,8 @@ struct NeighborProber<U> {
     cfg: EgressConfig,
     graph: U,
     samples: NeighborSamples,
+    #[cfg(test)]
+    idle_read_hook: Option<Arc<IdleReadHook>>,
 }
 
 impl<U> NeighborProber<U>
@@ -492,6 +494,8 @@ struct LoopbackProber<U> {
     /// therefore starts `LOOPBACK_SAMPLE` paths further in and wraps once the enumeration is
     /// exhausted, so successive cycles reach different paths.
     window: usize,
+    #[cfg(test)]
+    idle_read_hook: Option<Arc<IdleReadHook>>,
 }
 
 impl<U> LoopbackProber<U>
@@ -747,30 +751,30 @@ fn interleave(best: Vec<WeightedRoute>, explore: Vec<WeightedRoute>, explore_sha
 /// makes it immediate for a consumer that knows it just wrote, and `recheck` bounds how stale an
 /// idle stream can get for one that does not. `false` means the control handle is gone and nothing
 /// can steer probing any more.
-async fn wait_for_wake(control: &mut watch::Receiver<ControlState>, wake: &Notify, recheck: Duration) -> bool {
-    let woken = wake.notified();
-    let rechecked = futures_time::task::sleep(recheck.into());
-    let mut changed = std::pin::pin!(control.changed());
-    let mut woken = std::pin::pin!(woken);
-    let mut rechecked = std::pin::pin!(rechecked);
+async fn wait_for_wake(control: &mut watch::Receiver<ControlState>, recheck: Duration) -> bool {
+    let changed = std::pin::pin!(control.changed());
+    let rechecked = std::pin::pin!(futures_time::task::sleep(recheck.into()));
 
-    match futures::future::select(
-        std::future::poll_fn(|cx| changed.as_mut().poll(cx)),
-        std::future::poll_fn(|cx| {
-            if woken.as_mut().poll(cx).is_ready() {
-                return std::task::Poll::Ready(true);
-            }
-            match rechecked.as_mut().poll(cx) {
-                std::task::Poll::Ready(_) => std::task::Poll::Ready(true),
-                std::task::Poll::Pending => std::task::Poll::Pending,
-            }
-        }),
-    )
-    .await
-    {
-        Either::Left((Ok(()), _)) => true,
-        Either::Left((Err(_), _)) => false,
+    match futures::future::select(changed, rechecked).await {
+        Either::Left((result, _)) => result.is_ok(),
         Either::Right(_) => true,
+    }
+}
+
+// Each test supplies its own hook; normal test streams have no hook.
+#[cfg(test)]
+struct IdleReadHook {
+    reached: tokio::sync::mpsc::UnboundedSender<()>,
+    release: tokio::sync::Semaphore,
+}
+
+#[cfg(test)]
+impl IdleReadHook {
+    async fn after_graph_read(&self) {
+        let _ = self.reached.send(());
+        if let Ok(permit) = self.release.acquire().await {
+            permit.forget();
+        }
     }
 }
 
@@ -781,23 +785,28 @@ async fn wait_for_wake(control: &mut watch::Receiver<ControlState>, wake: &Notif
 fn neighbor_probes<U>(
     prober: NeighborProber<U>,
     control: watch::Receiver<ControlState>,
-    wake: Arc<Notify>,
     recheck: Duration,
 ) -> impl futures::Stream<Item = ProbeRouting>
 where
     U: NetworkGraphView<NodeId = OffchainPublicKey, Observed = Observations> + Send + Sync + 'static,
 {
     futures::stream::unfold((prober, control), move |(mut prober, mut control)| {
-        let wake = wake.clone();
-
         async move {
             loop {
+                // Mark the control version before reading the graph. A wake during the read
+                // stays unseen and makes the subsequent wait return immediately.
+                drop(control.borrow_and_update());
                 if let Some(peer) = prober.next().await {
                     return Some((neighbor_routing(peer), (prober, control)));
                 }
 
+                #[cfg(test)]
+                if let Some(hook) = &prober.idle_read_hook {
+                    hook.after_graph_read().await;
+                }
+
                 // Nothing to offer until the peer set or the wake says to look again.
-                if !wait_for_wake(&mut control, &wake, recheck).await {
+                if !wait_for_wake(&mut control, recheck).await {
                     return futures::future::pending().await;
                 }
             }
@@ -812,7 +821,6 @@ where
 fn loopback_probes<U>(
     prober: LoopbackProber<U>,
     control: watch::Receiver<ControlState>,
-    wake: Arc<Notify>,
     recheck: Duration,
 ) -> impl futures::Stream<Item = ProbeRouting>
 where
@@ -824,8 +832,6 @@ where
         + 'static,
 {
     futures::stream::unfold((prober, control), move |(mut prober, mut control)| {
-        let wake = wake.clone();
-
         async move {
             loop {
                 let state = control.borrow_and_update().clone();
@@ -833,8 +839,13 @@ where
                     return Some((probe, (prober, control)));
                 }
 
+                #[cfg(test)]
+                if let Some(hook) = &prober.idle_read_hook {
+                    hook.after_graph_read().await;
+                }
+
                 // Nothing to offer until the graph or the wake says to look again.
-                if !wait_for_wake(&mut control, &wake, recheck).await {
+                if !wait_for_wake(&mut control, recheck).await {
                     return futures::future::pending().await;
                 }
             }
@@ -861,9 +872,10 @@ where
                 cfg: self.cfg,
                 graph: self.graph.clone(),
                 samples: NeighborSamples::default(),
+                #[cfg(test)]
+                idle_read_hook: None,
             },
             self.control.subscribe(),
-            self.control.wake_handle(),
             self.cfg.recheck_interval,
         );
 
@@ -875,9 +887,10 @@ where
                 pass: LoopbackPass::default(),
                 coverage: self.control.coverage_counters(),
                 window: 0,
+                #[cfg(test)]
+                idle_read_hook: None,
             },
             self.control.subscribe(),
-            self.control.wake_handle(),
             self.cfg.recheck_interval,
         );
 
@@ -1814,6 +1827,151 @@ mod tests {
         anyhow::ensure!(
             neighbor_woken && loopback_woken,
             "one explicit wake must wake both streams: neighbor={neighbor_woken}, loopback={loopback_woken}"
+        );
+        Ok(())
+    }
+
+    fn idle_read_hook() -> (Arc<IdleReadHook>, tokio::sync::mpsc::UnboundedReceiver<()>) {
+        let (reached, rx) = tokio::sync::mpsc::unbounded_channel();
+        (
+            Arc::new(IdleReadHook {
+                reached,
+                release: tokio::sync::Semaphore::new(0),
+            }),
+            rx,
+        )
+    }
+
+    async fn single_idle_read_gap(wake: bool) -> anyhow::Result<bool> {
+        let (me, peer) = (random_key(), random_key());
+        let graph = Arc::new(ChannelGraph::new(me));
+        let mut cfg = fast_cfg();
+        cfg.recheck_interval = Duration::from_secs(3600);
+        let control = EgressControl::default();
+        let (hook, mut reached) = idle_read_hook();
+        let stream = neighbor_probes(
+            NeighborProber {
+                me,
+                cfg,
+                graph: graph.clone(),
+                samples: NeighborSamples::default(),
+                idle_read_hook: Some(hook.clone()),
+            },
+            control.subscribe(),
+            cfg.recheck_interval,
+        );
+        pin_mut!(stream);
+
+        // The hook is reached after the empty graph read, before wait_for_wake is called.
+        assert!(futures::poll!(stream.next()).is_pending());
+        reached
+            .try_recv()
+            .context("neighbor did not reach the read-to-wait gap")?;
+        graph.add_node(peer);
+        if wake {
+            control.wake_probing();
+        }
+        hook.release.add_permits(1);
+        Ok(matches!(
+            futures::poll!(stream.next()),
+            std::task::Poll::Ready(Some(ProbeRouting::Neighbor(_)))
+        ))
+    }
+
+    #[tokio::test]
+    async fn explicit_wake_between_read_and_wait_should_resume_one_probe_stream() -> anyhow::Result<()> {
+        assert!(
+            !single_idle_read_gap(false).await?,
+            "without a wake the stream must remain idle"
+        );
+        assert!(single_idle_read_gap(true).await?, "a wake in the gap must be retained");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_wake_between_read_and_wait_should_resume_both_probe_streams() -> anyhow::Result<()> {
+        let (me, a, b) = (random_key(), random_key(), random_key());
+        let graph = Arc::new(ChannelGraph::new(me));
+        let mut cfg = fast_cfg();
+        cfg.recheck_interval = Duration::from_secs(3600);
+        let control = EgressControl::default();
+        let (neighbor_hook, mut neighbor_reached) = idle_read_hook();
+        let (loopback_hook, mut loopback_reached) = idle_read_hook();
+        let neighbors = neighbor_probes(
+            NeighborProber {
+                me,
+                cfg,
+                graph: graph.clone(),
+                samples: NeighborSamples::default(),
+                idle_read_hook: Some(neighbor_hook.clone()),
+            },
+            control.subscribe(),
+            cfg.recheck_interval,
+        );
+        let loopbacks = loopback_probes(
+            LoopbackProber {
+                me,
+                cfg,
+                graph: graph.clone(),
+                pass: LoopbackPass::default(),
+                coverage: control.coverage_counters(),
+                window: 0,
+                idle_read_hook: Some(loopback_hook.clone()),
+            },
+            control.subscribe(),
+            cfg.recheck_interval,
+        );
+        pin_mut!(neighbors, loopbacks);
+
+        assert!(futures::poll!(neighbors.next()).is_pending());
+        assert!(futures::poll!(loopbacks.next()).is_pending());
+        neighbor_reached
+            .try_recv()
+            .context("neighbor did not reach the read-to-wait gap")?;
+        loopback_reached
+            .try_recv()
+            .context("loopback did not reach the read-to-wait gap")?;
+        for node in [a, b] {
+            graph.add_node(node);
+        }
+        for (src, dst) in [(me, a), (a, b), (b, me), (me, b)] {
+            graph.add_edge(&src, &dst).context("adding loop edge")?;
+            mark_edge_ready(&graph, &src, &dst);
+        }
+
+        // Both streams are held before wait registration while this single wake is sent.
+        control.wake_probing();
+        neighbor_hook.release.add_permits(1);
+        loopback_hook.release.add_permits(1);
+        let neighbor_woken = matches!(
+            futures::poll!(neighbors.next()),
+            std::task::Poll::Ready(Some(ProbeRouting::Neighbor(_)))
+        );
+        let loopback_woken = matches!(
+            futures::poll!(loopbacks.next()),
+            std::task::Poll::Ready(Some(ProbeRouting::Looping(_)))
+        );
+
+        // Verify the graph can supply the missing probe after one more wake.
+        control.wake_probing();
+        let neighbor_after_second = neighbor_woken
+            || matches!(
+                futures::poll!(neighbors.next()),
+                std::task::Poll::Ready(Some(ProbeRouting::Neighbor(_)))
+            );
+        let loopback_after_second = loopback_woken
+            || matches!(
+                futures::poll!(loopbacks.next()),
+                std::task::Poll::Ready(Some(ProbeRouting::Looping(_)))
+            );
+        anyhow::ensure!(
+            neighbor_after_second && loopback_after_second,
+            "the fixture must offer both probes"
+        );
+        anyhow::ensure!(
+            neighbor_woken && loopback_woken,
+            "a wake in the read-to-wait gap must reach both streams: neighbor={neighbor_woken}, \
+             loopback={loopback_woken}"
         );
         Ok(())
     }
