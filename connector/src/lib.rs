@@ -11,9 +11,7 @@ pub use hopr_utils::testing::blokli as testing;
 
 pub(crate) mod utils;
 
-#[cfg(any(test, feature = "testing"))]
-pub use backend::InMemoryBackend;
-pub use backend::{Backend, TempDbBackend, TempDbError};
+pub use backend::{Backend, InMemoryBackend, TempDbBackend, TempDbError};
 pub use connector::{BlockchainConnectorConfig, HoprBlockchainConnector};
 pub use hopr_api::{
     chain as api,
@@ -271,6 +269,127 @@ where
         cfg,
         client,
         TempDbBackend::new().map_err(errors::ConnectorError::backend)?,
+        payload_gen,
+    ))
+}
+
+/// Connector to HOPR on-chain contracts that uses a Safe as a signer and [`InMemoryBackend`].
+pub type HoprBlockchainSafeInMemoryConnector<C> = HoprBlockchainConnector<
+    C,
+    InMemoryBackend,
+    SafePayloadGenerator,
+    <SafePayloadGenerator as PayloadGenerator>::TxRequest,
+>;
+
+/// Connector to HOPR on-chain contracts that uses standard EOA as a signer and [`InMemoryBackend`].
+pub type HoprBlockchainBasicInMemoryConnector<C> = HoprBlockchainConnector<
+    C,
+    InMemoryBackend,
+    BasicPayloadGenerator,
+    <BasicPayloadGenerator as PayloadGenerator>::TxRequest,
+>;
+
+/// Same as [`create_trustless_hopr_blokli_connector`], but the returned instance uses [`InMemoryBackend`].
+///
+/// Syncing a large chain state is much faster than with [`TempDbBackend`], at the cost of keeping all
+/// accounts and channels in memory.
+pub fn create_trustless_hopr_blokli_connector_in_memory<C>(
+    chain_key: &ChainKeypair,
+    cfg: BlockchainConnectorConfig,
+    client: C,
+    module_address: Address,
+    contracts: ContractAddresses,
+) -> HoprBlockchainSafeInMemoryConnector<C>
+where
+    C: blokli_client::BlokliSubscriptionClient
+        + blokli_client::BlokliQueryClient
+        + blokli_client::BlokliTransactionClient
+        + Send
+        + Sync
+        + 'static,
+{
+    let payload_gen = SafePayloadGenerator::new(chain_key, contracts, module_address);
+
+    HoprBlockchainConnector::new(chain_key.clone(), cfg, client, InMemoryBackend::new(), payload_gen)
+}
+
+/// Same as [`create_trustless_safeless_hopr_blokli_connector`], but the returned instance uses
+/// [`InMemoryBackend`].
+pub fn create_trustless_safeless_hopr_blokli_connector_in_memory<C>(
+    chain_key: &ChainKeypair,
+    cfg: BlockchainConnectorConfig,
+    client: C,
+    contracts: ContractAddresses,
+) -> HoprBlockchainBasicInMemoryConnector<C>
+where
+    C: blokli_client::BlokliSubscriptionClient
+        + blokli_client::BlokliQueryClient
+        + blokli_client::BlokliTransactionClient
+        + Send
+        + Sync
+        + 'static,
+{
+    let payload_gen = BasicPayloadGenerator::new(chain_key.public().to_address(), contracts);
+
+    HoprBlockchainConnector::new(chain_key.clone(), cfg, client, InMemoryBackend::new(), payload_gen)
+}
+
+/// Same as [`create_trustful_hopr_blokli_connector`], but the returned instance uses [`InMemoryBackend`].
+pub async fn create_trustful_hopr_blokli_connector_in_memory<C>(
+    chain_key: &ChainKeypair,
+    cfg: BlockchainConnectorConfig,
+    client: C,
+    module_address: Address,
+) -> Result<HoprBlockchainSafeInMemoryConnector<C>, errors::ConnectorError>
+where
+    C: blokli_client::BlokliSubscriptionClient
+        + blokli_client::BlokliQueryClient
+        + blokli_client::BlokliTransactionClient
+        + Send
+        + Sync
+        + 'static,
+{
+    let info = client.query_chain_info().await?;
+    let contract_addrs = utils::parse_contract_addresses(&info.contract_addresses.0)
+        .map_err(|e| errors::ConnectorError::TypeConversion(format!("contract addresses not a valid JSON: {e}")))?;
+
+    let payload_gen = SafePayloadGenerator::new(chain_key, contract_addrs, module_address);
+
+    Ok(HoprBlockchainConnector::new(
+        chain_key.clone(),
+        cfg,
+        client,
+        InMemoryBackend::new(),
+        payload_gen,
+    ))
+}
+
+/// Same as [`create_trustful_safeless_hopr_blokli_connector`], but the returned instance uses
+/// [`InMemoryBackend`].
+pub async fn create_trustful_safeless_hopr_blokli_connector_in_memory<C>(
+    chain_key: &ChainKeypair,
+    cfg: BlockchainConnectorConfig,
+    client: C,
+) -> Result<HoprBlockchainBasicInMemoryConnector<C>, errors::ConnectorError>
+where
+    C: blokli_client::BlokliSubscriptionClient
+        + blokli_client::BlokliQueryClient
+        + blokli_client::BlokliTransactionClient
+        + Send
+        + Sync
+        + 'static,
+{
+    let info = client.query_chain_info().await?;
+    let contract_addrs = utils::parse_contract_addresses(&info.contract_addresses.0)
+        .map_err(|e| errors::ConnectorError::TypeConversion(format!("contract addresses not a valid JSON: {e}")))?;
+
+    let payload_gen = BasicPayloadGenerator::new(chain_key.public().to_address(), contract_addrs);
+
+    Ok(HoprBlockchainConnector::new(
+        chain_key.clone(),
+        cfg,
+        client,
+        InMemoryBackend::new(),
         payload_gen,
     ))
 }

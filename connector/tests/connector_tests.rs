@@ -16,7 +16,8 @@ use hopr_api::{
     },
 };
 use hopr_chain_connector::{
-    create_trustful_hopr_blokli_connector, create_trustless_hopr_blokli_connector, testing::BlokliTestStateBuilder,
+    create_trustful_hopr_blokli_connector, create_trustful_hopr_blokli_connector_in_memory,
+    create_trustless_hopr_blokli_connector, testing::BlokliTestStateBuilder,
 };
 
 lazy_static::lazy_static! {
@@ -109,6 +110,37 @@ async fn hopr_block_chain_connector_should_return_channels() -> anyhow::Result<(
 
     assert_eq!(HoprBalance::from(1000_u32), connector.balance(&CHAIN_KEYS[0]).await?);
     assert_eq!(XDaiBalance::from(1_u32), connector.balance(&CHAIN_KEYS[0]).await?);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn in_memory_connector_should_sync_accounts_and_return_balances() -> anyhow::Result<()> {
+    let mock_client = BlokliTestStateBuilder::default()
+        .with_hopr_network_chain_info("anvil-localhost")
+        .with_accounts(
+            ACCOUNTS
+                .iter()
+                .cloned()
+                .map(|a| (a, HoprBalance::zero(), XDaiBalance::zero())),
+        )
+        .with_channels(CHANNELS.iter().cloned())
+        .with_balances::<WxHOPR>([(CHAIN_KEYS[0].public().to_address(), 1000_u32.into())])
+        .build_static_client();
+
+    let me = ChainKeypair::random();
+
+    let mut connector = create_trustful_hopr_blokli_connector_in_memory(
+        &me,
+        Default::default(),
+        mock_client,
+        Address::new(&[2u8; Address::SIZE]),
+    )
+    .await?;
+
+    connector.connect().await?;
+
+    assert_eq!(HoprBalance::from(1000_u32), connector.balance(&CHAIN_KEYS[0]).await?);
 
     Ok(())
 }
