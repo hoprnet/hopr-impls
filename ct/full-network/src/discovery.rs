@@ -1758,6 +1758,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn one_explicit_wake_should_resume_both_idle_probe_streams() -> anyhow::Result<()> {
+        let (me, a, b) = (random_key(), random_key(), random_key());
+        let graph = Arc::new(ChannelGraph::new(me));
+        let mut cfg = fast_cfg();
+        // Only an explicit wake can resume the streams during this test.
+        cfg.recheck_interval = Duration::from_secs(3600);
+        let prober = FullNetworkDiscovery::new(me, cfg, graph.clone());
+        let control = prober.control();
+        let mut stream = ProbingTrafficGeneration::build(&prober);
+
+        // With no candidate, this poll registers both underlying streams as idle waiters.
+        assert!(futures::poll!(stream.next()).is_pending());
+        for node in [a, b] {
+            graph.add_node(node);
+        }
+        for (src, dst) in [(me, a), (a, b), (b, me), (me, b)] {
+            graph.add_edge(&src, &dst).context("adding loop edge")?;
+            mark_edge_ready(&graph, &src, &dst);
+        }
+
+        control.wake_probing();
+        let (mut neighbor_woken, mut loopback_woken) = (false, false);
+        let _ = tokio::time::timeout(Duration::from_millis(200), async {
+            while !(neighbor_woken && loopback_woken) {
+                match stream.next().await {
+                    Some(ProbeRouting::Neighbor(_)) => neighbor_woken = true,
+                    Some(ProbeRouting::Looping(_)) => loopback_woken = true,
+                    None => break,
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+
+        // A second wake is a positive control for whichever stream was left asleep: both
+        // sources can produce from this fixture when individually notified.
+        control.wake_probing();
+        let (mut neighbor_after_second, mut loopback_after_second) = (neighbor_woken, loopback_woken);
+        let _ = tokio::time::timeout(Duration::from_millis(200), async {
+            while !(neighbor_after_second && loopback_after_second) {
+                match stream.next().await {
+                    Some(ProbeRouting::Neighbor(_)) => neighbor_after_second = true,
+                    Some(ProbeRouting::Looping(_)) => loopback_after_second = true,
+                    None => break,
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        anyhow::ensure!(
+            neighbor_after_second && loopback_after_second,
+            "the fixture must offer both probes"
+        );
+        anyhow::ensure!(
+            neighbor_woken && loopback_woken,
+            "one explicit wake must wake both streams: neighbor={neighbor_woken}, loopback={loopback_woken}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn neighbors_should_be_covered_across_passes() -> anyhow::Result<()> {
         let me = random_key();
         let graph = Arc::new(ChannelGraph::new(me));
