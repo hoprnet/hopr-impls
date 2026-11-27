@@ -27,11 +27,11 @@ pub struct EgressConfig {
 
     /// How long an idle probe stream waits before re-reading the graph on its own.
     ///
-    /// A stream with nothing to offer cannot see a disconnect, a dropped rate or a new channel: the
-    /// graph has no change notification and the generator reads no clock. Re-reading after this long
-    /// bounds how stale an idle stream can be, and
-    /// [`EgressControl::wake_probing`](crate::EgressControl::wake_probing) makes it immediate for a
-    /// consumer that knows it just wrote. Must be greater than zero.
+    /// A stream with nothing to offer re-reads after this long, even with no explicit wake. When a
+    /// topology subscription is supplied, topology and funding changes also wake it; changes to
+    /// probe, acknowledgement or SURB measurements alone still depend on this interval. Without a
+    /// subscription, callers may also use [`EgressControl::wake_probing`](crate::EgressControl::wake_probing).
+    /// Must be greater than zero.
     #[default(default_recheck_interval())]
     pub recheck_interval: std::time::Duration,
 

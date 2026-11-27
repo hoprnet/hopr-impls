@@ -39,6 +39,7 @@ pub struct FullNetworkDiscovery<U> {
     cfg: EgressConfig,
     graph: U,
     control: EgressControl,
+    topology: Option<watch::Receiver<()>>,
 }
 
 impl<U> FullNetworkDiscovery<U> {
@@ -48,7 +49,20 @@ impl<U> FullNetworkDiscovery<U> {
             cfg,
             graph,
             control: EgressControl::default(),
+            topology: None,
         }
+    }
+
+    /// Enables topology-driven wakes from the graph used by this generator.
+    ///
+    /// Each built neighbor and loopback stream gets an independent subscription. Pass a receiver
+    /// from that graph before building streams. Without one, idle streams rely on control wakes and
+    /// periodic rechecks. A change invalidates cached candidates on the next pull; a change concurrent
+    /// with selection is observed on a later pull. Probe, acknowledgement and SURB measurement-only
+    /// changes still rely on the recheck interval; a closed topology subscription is ignored.
+    pub fn with_topology_changes(mut self, topology: watch::Receiver<()>) -> Self {
+        self.topology = Some(topology);
+        self
     }
 
     /// Returns a handle that steers the streams built from this prober, including ones already built.
@@ -366,6 +380,8 @@ struct NeighborProber<U> {
     samples: NeighborSamples,
     #[cfg(test)]
     idle_read_hook: Option<Arc<IdleReadHook>>,
+    #[cfg(test)]
+    before_read_hook: Option<Arc<IdleReadHook>>,
 }
 
 impl<U> NeighborProber<U>
@@ -495,7 +511,11 @@ struct LoopbackProber<U> {
     /// exhausted, so successive cycles reach different paths.
     window: usize,
     #[cfg(test)]
+    rebuild_count: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    #[cfg(test)]
     idle_read_hook: Option<Arc<IdleReadHook>>,
+    #[cfg(test)]
+    before_read_hook: Option<Arc<IdleReadHook>>,
 }
 
 impl<U> LoopbackProber<U>
@@ -528,6 +548,10 @@ where
     /// Builds one full pass over the loopback candidates: the best paths first, the exploration
     /// share interleaved among them, and the cursor back at the start of a fresh random order.
     fn rebuild_pass(&mut self, control: &ControlState) {
+        #[cfg(test)]
+        if let Some(count) = &self.rebuild_count {
+            count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let mut all = Vec::new();
         let mut forward = Vec::new();
         let mut returning = Vec::new();
@@ -744,20 +768,41 @@ fn interleave(best: Vec<WeightedRoute>, explore: Vec<WeightedRoute>, explore_sha
     pass
 }
 
-/// Resolves once the control, an explicit wake, or the idle re-read says to look again.
-///
-/// The graph offers no change notification, so a disconnect or a dropped rate is otherwise
-/// invisible to an idle stream. [`EgressControl::wake_probing`](crate::EgressControl::wake_probing)
-/// makes it immediate for a consumer that knows it just wrote, and `recheck` bounds how stale an
-/// idle stream can get for one that does not. `false` means the control handle is gone and nothing
-/// can steer probing any more.
-async fn wait_for_wake(control: &mut watch::Receiver<ControlState>, recheck: Duration) -> bool {
-    let changed = std::pin::pin!(control.changed());
-    let rechecked = std::pin::pin!(futures_time::task::sleep(recheck.into()));
+/// Waits for a topology change, disabling this branch if its sender has gone away.
+async fn topology_changed(topology: &mut Option<watch::Receiver<()>>) {
+    if let Some(receiver) = topology.as_mut() {
+        if receiver.changed().await.is_ok() {
+            return;
+        }
+        *topology = None;
+    }
+    futures::future::pending().await
+}
 
-    match futures::future::select(changed, rechecked).await {
-        Either::Left((result, _)) => result.is_ok(),
-        Either::Right(_) => true,
+#[derive(Debug, PartialEq, Eq)]
+enum ProbeWake {
+    Control,
+    Topology,
+    Timer,
+    ControlClosed,
+}
+
+/// Waits for control, topology or the idle recheck. A closed topology sender is ignored;
+/// a closed control sender retains the existing behavior of leaving the stream pending.
+async fn wait_for_wake(
+    control: &mut watch::Receiver<ControlState>,
+    topology: &mut Option<watch::Receiver<()>>,
+    recheck: Duration,
+) -> ProbeWake {
+    let changed = std::pin::pin!(control.changed());
+    let topology = std::pin::pin!(topology_changed(topology));
+    let rechecked = std::pin::pin!(futures_time::task::sleep(recheck.into()));
+    let topology_or_timer = std::pin::pin!(futures::future::select(topology, rechecked));
+    match futures::future::select(changed, topology_or_timer).await {
+        Either::Left((Ok(()), _)) => ProbeWake::Control,
+        Either::Left((Err(_), _)) => ProbeWake::ControlClosed,
+        Either::Right((Either::Left(_), _)) => ProbeWake::Topology,
+        Either::Right((Either::Right(_), _)) => ProbeWake::Timer,
     }
 }
 
@@ -770,7 +815,7 @@ struct IdleReadHook {
 
 #[cfg(test)]
 impl IdleReadHook {
-    async fn after_graph_read(&self) {
+    async fn pause(&self) {
         let _ = self.reached.send(());
         if let Ok(permit) = self.release.acquire().await {
             permit.forget();
@@ -785,33 +830,60 @@ impl IdleReadHook {
 fn neighbor_probes<U>(
     prober: NeighborProber<U>,
     control: watch::Receiver<ControlState>,
+    topology: Option<watch::Receiver<()>>,
     recheck: Duration,
 ) -> impl futures::Stream<Item = ProbeRouting>
 where
     U: NetworkGraphView<NodeId = OffchainPublicKey, Observed = Observations> + Send + Sync + 'static,
 {
-    futures::stream::unfold((prober, control), move |(mut prober, mut control)| {
-        async move {
-            loop {
-                // Mark the control version before reading the graph. A wake during the read
-                // stays unseen and makes the subsequent wait return immediately.
-                drop(control.borrow_and_update());
-                if let Some(peer) = prober.next().await {
-                    return Some((neighbor_routing(peer), (prober, control)));
-                }
+    let initial_wake = control.borrow().wake_generation;
+    futures::stream::unfold(
+        (prober, control, topology, initial_wake),
+        move |(mut prober, mut control, mut topology, mut seen_wake)| {
+            async move {
+                let mut topology_woke = false;
+                loop {
+                    // Mark the control version before reading the graph. A wake during the read
+                    // stays unseen and makes the subsequent wait return immediately.
+                    let wake = control.borrow_and_update().wake_generation;
+                    let explicitly_woken = wake != seen_wake;
+                    seen_wake = wake;
+                    // Polling changed marks only an observed update seen. An update after this poll
+                    // stays pending for the next graph read, even while a cached sample is in use.
+                    let changed = match topology.as_mut() {
+                        Some(receiver) => {
+                            let changed = std::pin::pin!(receiver.changed());
+                            matches!(futures::poll!(changed), std::task::Poll::Ready(Ok(())))
+                        }
+                        None => false,
+                    };
+                    if topology_woke || changed || explicitly_woken {
+                        prober.samples.sample.clear();
+                        prober.samples.measured.clear();
+                    }
+                    #[cfg(test)]
+                    if let Some(hook) = &prober.before_read_hook {
+                        hook.pause().await;
+                    }
+                    if let Some(peer) = prober.next().await {
+                        return Some((neighbor_routing(peer), (prober, control, topology, seen_wake)));
+                    }
 
-                #[cfg(test)]
-                if let Some(hook) = &prober.idle_read_hook {
-                    hook.after_graph_read().await;
-                }
+                    #[cfg(test)]
+                    if let Some(hook) = &prober.idle_read_hook {
+                        hook.pause().await;
+                    }
 
-                // Nothing to offer until the peer set or the wake says to look again.
-                if !wait_for_wake(&mut control, recheck).await {
-                    return futures::future::pending().await;
+                    // Nothing to offer until the peer set or the wake says to look again.
+                    match wait_for_wake(&mut control, &mut topology, recheck).await {
+                        ProbeWake::ControlClosed => return futures::future::pending().await,
+                        ProbeWake::Topology => topology_woke = true,
+                        ProbeWake::Control | ProbeWake::Timer => topology_woke = false,
+                    }
                 }
             }
-        }
-    })
+        },
+    )
 }
 
 /// Stream of loopback probes, one per pull, driven only by its own state.
@@ -821,6 +893,7 @@ where
 fn loopback_probes<U>(
     prober: LoopbackProber<U>,
     control: watch::Receiver<ControlState>,
+    topology: Option<watch::Receiver<()>>,
     recheck: Duration,
 ) -> impl futures::Stream<Item = ProbeRouting>
 where
@@ -831,26 +904,55 @@ where
         + Sync
         + 'static,
 {
-    futures::stream::unfold((prober, control), move |(mut prober, mut control)| {
-        async move {
-            loop {
-                let state = control.borrow_and_update().clone();
-                if let Some(probe) = prober.next(&state) {
-                    return Some((probe, (prober, control)));
-                }
+    let initial_wake = control.borrow().wake_generation;
+    futures::stream::unfold(
+        (prober, control, topology, initial_wake),
+        move |(mut prober, mut control, mut topology, mut seen_wake)| {
+            async move {
+                let mut topology_woke = false;
+                loop {
+                    let state = control.borrow_and_update().clone();
+                    let explicitly_woken = state.wake_generation != seen_wake;
+                    seen_wake = state.wake_generation;
+                    let changed = match topology.as_mut() {
+                        Some(receiver) => {
+                            let changed = std::pin::pin!(receiver.changed());
+                            matches!(futures::poll!(changed), std::task::Poll::Ready(Ok(())))
+                        }
+                        None => false,
+                    };
+                    if topology_woke || changed || explicitly_woken {
+                        // A partial pass is not a completed coverage cycle. A genuinely completed
+                        // pass still counts even when the topology changes before the next pull.
+                        if prober.pass.is_complete() {
+                            prober.coverage.record_cycle(prober.pass.evidence.len());
+                        }
+                        prober.pass = LoopbackPass::default();
+                        prober.window = 0;
+                    }
+                    #[cfg(test)]
+                    if let Some(hook) = &prober.before_read_hook {
+                        hook.pause().await;
+                    }
+                    if let Some(probe) = prober.next(&state) {
+                        return Some((probe, (prober, control, topology, seen_wake)));
+                    }
 
-                #[cfg(test)]
-                if let Some(hook) = &prober.idle_read_hook {
-                    hook.after_graph_read().await;
-                }
+                    #[cfg(test)]
+                    if let Some(hook) = &prober.idle_read_hook {
+                        hook.pause().await;
+                    }
 
-                // Nothing to offer until the graph or the wake says to look again.
-                if !wait_for_wake(&mut control, recheck).await {
-                    return futures::future::pending().await;
+                    // Nothing to offer until the graph or the wake says to look again.
+                    match wait_for_wake(&mut control, &mut topology, recheck).await {
+                        ProbeWake::ControlClosed => return futures::future::pending().await,
+                        ProbeWake::Topology => topology_woke = true,
+                        ProbeWake::Control | ProbeWake::Timer => topology_woke = false,
+                    }
                 }
             }
-        }
-    })
+        },
+    )
 }
 
 impl<U> ProbingTrafficGeneration for FullNetworkDiscovery<U>
@@ -874,8 +976,11 @@ where
                 samples: NeighborSamples::default(),
                 #[cfg(test)]
                 idle_read_hook: None,
+                #[cfg(test)]
+                before_read_hook: None,
             },
             self.control.subscribe(),
+            self.topology.clone(),
             self.cfg.recheck_interval,
         );
 
@@ -888,9 +993,14 @@ where
                 coverage: self.control.coverage_counters(),
                 window: 0,
                 #[cfg(test)]
+                rebuild_count: None,
+                #[cfg(test)]
                 idle_read_hook: None,
+                #[cfg(test)]
+                before_read_hook: None,
             },
             self.control.subscribe(),
+            self.topology.clone(),
             self.cfg.recheck_interval,
         );
 
@@ -1725,7 +1835,8 @@ mod tests {
         // The production timer uses a separate reactor, so Tokio's paused clock cannot drive it.
         // Keep it well beyond the test timeout: only a topology notification can resume the streams.
         cfg.recheck_interval = Duration::from_secs(3600);
-        let prober = FullNetworkDiscovery::new(me, cfg, graph.clone());
+        let prober =
+            FullNetworkDiscovery::new(me, cfg, graph.clone()).with_topology_changes(graph.subscribe_topology());
         let mut stream = ProbingTrafficGeneration::build(&prober);
 
         // A pending poll makes the merged stream poll both sources against the empty graph.
@@ -1856,8 +1967,11 @@ mod tests {
                 graph: graph.clone(),
                 samples: NeighborSamples::default(),
                 idle_read_hook: Some(hook.clone()),
+                #[cfg(test)]
+                before_read_hook: None,
             },
             control.subscribe(),
+            None,
             cfg.recheck_interval,
         );
         pin_mut!(stream);
@@ -1904,8 +2018,11 @@ mod tests {
                 graph: graph.clone(),
                 samples: NeighborSamples::default(),
                 idle_read_hook: Some(neighbor_hook.clone()),
+                #[cfg(test)]
+                before_read_hook: None,
             },
             control.subscribe(),
+            None,
             cfg.recheck_interval,
         );
         let loopbacks = loopback_probes(
@@ -1916,9 +2033,14 @@ mod tests {
                 pass: LoopbackPass::default(),
                 coverage: control.coverage_counters(),
                 window: 0,
+                #[cfg(test)]
+                rebuild_count: None,
                 idle_read_hook: Some(loopback_hook.clone()),
+                #[cfg(test)]
+                before_read_hook: None,
             },
             control.subscribe(),
+            None,
             cfg.recheck_interval,
         );
         pin_mut!(neighbors, loopbacks);
@@ -1973,6 +2095,494 @@ mod tests {
             "a wake in the read-to-wait gap must reach both streams: neighbor={neighbor_woken}, \
              loopback={loopback_woken}"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn topology_change_between_read_and_wait_should_wake_both_streams() -> anyhow::Result<()> {
+        let (me, a, b) = (random_key(), random_key(), random_key());
+        let graph = Arc::new(ChannelGraph::new(me));
+        let mut cfg = fast_cfg();
+        cfg.recheck_interval = Duration::from_secs(3600);
+        let control = EgressControl::default();
+        let (neighbor_hook, mut neighbor_reached) = idle_read_hook();
+        let (loopback_hook, mut loopback_reached) = idle_read_hook();
+        let neighbors = neighbor_probes(
+            NeighborProber {
+                me,
+                cfg,
+                graph: graph.clone(),
+                samples: NeighborSamples::default(),
+                idle_read_hook: Some(neighbor_hook.clone()),
+                #[cfg(test)]
+                before_read_hook: None,
+            },
+            control.subscribe(),
+            Some(graph.subscribe_topology()),
+            cfg.recheck_interval,
+        );
+        let loopbacks = loopback_probes(
+            LoopbackProber {
+                me,
+                cfg,
+                graph: graph.clone(),
+                pass: LoopbackPass::default(),
+                coverage: control.coverage_counters(),
+                window: 0,
+                #[cfg(test)]
+                rebuild_count: None,
+                idle_read_hook: Some(loopback_hook.clone()),
+                #[cfg(test)]
+                before_read_hook: None,
+            },
+            control.subscribe(),
+            Some(graph.subscribe_topology()),
+            cfg.recheck_interval,
+        );
+        pin_mut!(neighbors, loopbacks);
+        assert!(futures::poll!(neighbors.next()).is_pending());
+        assert!(futures::poll!(loopbacks.next()).is_pending());
+        neighbor_reached
+            .try_recv()
+            .context("neighbor did not reach the read-to-wait gap")?;
+        loopback_reached
+            .try_recv()
+            .context("loopback did not reach the read-to-wait gap")?;
+        for node in [a, b] {
+            graph.add_node(node);
+        }
+        for (src, dst) in [(me, a), (a, b), (b, me), (me, b)] {
+            graph.add_edge(&src, &dst)?;
+            mark_edge_ready(&graph, &src, &dst);
+        }
+        // Both subscriptions saw the burst before either wait was registered.
+        neighbor_hook.release.add_permits(1);
+        loopback_hook.release.add_permits(1);
+        assert!(matches!(
+            futures::poll!(neighbors.next()),
+            std::task::Poll::Ready(Some(ProbeRouting::Neighbor(_)))
+        ));
+        assert!(matches!(
+            futures::poll!(loopbacks.next()),
+            std::task::Poll::Ready(Some(ProbeRouting::Looping(_)))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn graph_without_topology_subscription_should_keep_control_wake_behavior() {
+        let (me, peer) = (random_key(), random_key());
+        let graph = Arc::new(ChannelGraph::new(me));
+        let mut cfg = fast_cfg();
+        cfg.recheck_interval = Duration::from_secs(3600);
+        let prober = FullNetworkDiscovery::new(me, cfg, graph.clone());
+        let mut stream = ProbingTrafficGeneration::build(&prober);
+        assert!(futures::poll!(stream.next()).is_pending());
+        graph.add_node(peer);
+        assert!(futures::poll!(stream.next()).is_pending());
+        prober.control().wake_probing();
+        assert!(matches!(
+            futures::poll!(stream.next()),
+            std::task::Poll::Ready(Some(ProbeRouting::Neighbor(_)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn closed_topology_subscription_should_preserve_control_and_timer_wakes() -> anyhow::Result<()> {
+        let control = EgressControl::default();
+        let mut control_rx = control.subscribe();
+        let (sender, receiver) = watch::channel(());
+        drop(sender);
+        let mut topology = Some(receiver);
+        {
+            let wait = wait_for_wake(&mut control_rx, &mut topology, Duration::from_secs(3600));
+            pin_mut!(wait);
+            assert!(futures::poll!(&mut wait).is_pending());
+        }
+        assert!(topology.is_none(), "a closed topology branch must be disabled");
+        control.wake_probing();
+        assert_eq!(
+            wait_for_wake(&mut control_rx, &mut topology, Duration::from_secs(3600)).await,
+            ProbeWake::Control
+        );
+
+        let (sender, receiver) = watch::channel(());
+        drop(sender);
+        let mut topology = Some(receiver);
+        assert_eq!(
+            timeout(
+                Duration::from_secs(2),
+                wait_for_wake(&mut control_rx, &mut topology, Duration::from_millis(5)),
+            )
+            .await?,
+            ProbeWake::Timer
+        );
+        assert!(topology.is_none());
+        drop(control);
+        assert_eq!(
+            wait_for_wake(&mut control_rx, &mut topology, Duration::from_secs(3600)).await,
+            ProbeWake::ControlClosed
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn measurement_only_change_should_wait_for_periodic_recheck() -> anyhow::Result<()> {
+        let (me, peer) = (random_key(), random_key());
+        let graph = Arc::new(ChannelGraph::new(me));
+        graph.add_node(peer);
+        mark_edge_ready(&graph, &me, &peer);
+        let mut cfg = fast_cfg();
+        cfg.recheck_interval = Duration::from_secs(1);
+        record_probes(&graph, &me, &peer, cfg.stable_samples, 0);
+        let control = EgressControl::default();
+        let observed = graph.subscribe_topology();
+        let stream = neighbor_probes(
+            NeighborProber {
+                me,
+                cfg,
+                graph: graph.clone(),
+                samples: NeighborSamples::default(),
+                idle_read_hook: None,
+                #[cfg(test)]
+                before_read_hook: None,
+            },
+            control.subscribe(),
+            Some(graph.subscribe_topology()),
+            cfg.recheck_interval,
+        );
+        pin_mut!(stream);
+        assert!(futures::poll!(stream.next()).is_pending());
+        record_probes(&graph, &me, &peer, 0, cfg.stable_samples * 2);
+        assert!(!observed.has_changed()?);
+        assert!(
+            futures::poll!(stream.next()).is_pending(),
+            "a measurement alone must not wake probing"
+        );
+        assert!(matches!(
+            timeout(Duration::from_secs(4), stream.next()).await?,
+            Some(ProbeRouting::Neighbor(_))
+        ));
+        Ok(())
+    }
+
+    async fn empty_loopback_pass_rebuilds(timer: bool) -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let me = random_key();
+        let graph = Arc::new(ChannelGraph::new(me));
+        let mut cfg = fast_cfg();
+        cfg.recheck_interval = if timer {
+            Duration::from_millis(50)
+        } else {
+            Duration::from_secs(3600)
+        };
+        let control = EgressControl::default();
+        let rebuild_count = Arc::new(AtomicUsize::new(0));
+        let observed = graph.subscribe_topology();
+        let stream = loopback_probes(
+            LoopbackProber {
+                me,
+                cfg,
+                graph: graph.clone(),
+                pass: LoopbackPass::default(),
+                coverage: control.coverage_counters(),
+                window: 0,
+                rebuild_count: Some(rebuild_count.clone()),
+                idle_read_hook: None,
+                before_read_hook: None,
+            },
+            control.subscribe(),
+            Some(graph.subscribe_topology()),
+            cfg.recheck_interval,
+        );
+        pin_mut!(stream);
+        assert!(futures::poll!(stream.next()).is_pending());
+        assert_eq!(rebuild_count.load(Ordering::Relaxed), 1);
+        assert!(!observed.has_changed()?, "the topology version must remain unchanged");
+        if timer {
+            assert!(timeout(Duration::from_millis(500), stream.next()).await.is_err());
+        } else {
+            control.wake_probing();
+            assert!(futures::poll!(stream.next()).is_pending());
+        }
+        assert!(
+            rebuild_count.load(Ordering::Relaxed) >= 2,
+            "the empty pass must be rebuilt"
+        );
+        assert!(!observed.has_changed()?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_wake_should_rebuild_empty_pass_without_topology_change() -> anyhow::Result<()> {
+        empty_loopback_pass_rebuilds(false).await
+    }
+
+    #[tokio::test]
+    async fn recheck_should_rebuild_empty_pass_without_topology_change() -> anyhow::Result<()> {
+        empty_loopback_pass_rebuilds(true).await
+    }
+
+    #[tokio::test]
+    async fn topology_change_between_pulls_should_discard_partial_loopback_pass() -> anyhow::Result<()> {
+        let (me, head, b, c, graph) = two_loops()?;
+        let cfg = fast_cfg();
+        let control = EgressControl::default();
+        let stream = loopback_probes(
+            LoopbackProber {
+                me,
+                cfg,
+                graph: graph.clone(),
+                pass: LoopbackPass::default(),
+                coverage: control.coverage_counters(),
+                window: 0,
+                #[cfg(test)]
+                rebuild_count: None,
+                idle_read_hook: None,
+                before_read_hook: None,
+            },
+            control.subscribe(),
+            Some(graph.subscribe_topology()),
+            cfg.recheck_interval,
+        );
+        pin_mut!(stream);
+        let first = timeout(TINY_TIMEOUT * 10, stream.next())
+            .await?
+            .context("first loopback missing")?;
+        let first_path = loopback_path(&first).context("expected loopback")?;
+        assert_eq!(first_path[0], head);
+        let removed = if first_path[1] == b { c } else { b };
+        assert!(control.coverage().is_none());
+        // One candidate was offered, so the other path is still in the cached pass.
+        graph.remove_edge(&removed, &me);
+        let next = timeout(TINY_TIMEOUT * 10, stream.next())
+            .await?
+            .context("remaining loopback missing")?;
+        assert_eq!(loopback_path(&next), Some(first_path));
+        assert!(
+            control.coverage().is_none(),
+            "a discarded partial pass must not count as completed"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn topology_change_between_pulls_should_discard_removed_neighbor() -> anyhow::Result<()> {
+        let (me, a, b) = (random_key(), random_key(), random_key());
+        let graph = Arc::new(ChannelGraph::new(me));
+        for peer in [a, b] {
+            graph.add_node(peer);
+            mark_edge_ready(&graph, &me, &peer);
+        }
+        let cfg = fast_cfg();
+        let control = EgressControl::default();
+        let stream = neighbor_probes(
+            NeighborProber {
+                me,
+                cfg,
+                graph: graph.clone(),
+                samples: NeighborSamples::default(),
+                idle_read_hook: None,
+                before_read_hook: None,
+            },
+            control.subscribe(),
+            Some(graph.subscribe_topology()),
+            cfg.recheck_interval,
+        );
+        pin_mut!(stream);
+        let first = timeout(TINY_TIMEOUT * 10, neighbor_destinations(stream.as_mut()).next())
+            .await?
+            .context("first neighbor missing")?;
+        let removed = if first == NodeId::from(a) { b } else { a };
+        graph.remove_node(&removed);
+        let next = timeout(TINY_TIMEOUT * 10, neighbor_destinations(stream.as_mut()).next())
+            .await?
+            .context("remaining neighbor missing")?;
+        assert_eq!(next, first, "removed peers must not be offered from a cached sample");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn topology_change_after_version_check_should_remain_pending_for_next_pull() -> anyhow::Result<()> {
+        let (me, a, b) = (random_key(), random_key(), random_key());
+        let graph = Arc::new(ChannelGraph::new(me));
+        for peer in [a, b] {
+            graph.add_node(peer);
+            mark_edge_ready(&graph, &me, &peer);
+        }
+        let cfg = fast_cfg();
+        let control = EgressControl::default();
+        let (hook, mut reached) = idle_read_hook();
+        hook.release.add_permits(1);
+        let stream = neighbor_probes(
+            NeighborProber {
+                me,
+                cfg,
+                graph: graph.clone(),
+                samples: NeighborSamples::default(),
+                idle_read_hook: None,
+                before_read_hook: Some(hook.clone()),
+            },
+            control.subscribe(),
+            Some(graph.subscribe_topology()),
+            cfg.recheck_interval,
+        );
+        pin_mut!(stream);
+        let first = timeout(TINY_TIMEOUT * 10, neighbor_destinations(stream.as_mut()).next())
+            .await?
+            .context("first neighbor missing")?;
+        reached.try_recv().context("first read did not reach hook")?;
+        // This poll passed the atomic watch check and is held before looking at the cached sample.
+        assert!(futures::poll!(stream.next()).is_pending());
+        reached.try_recv().context("second read did not reach hook")?;
+        let removed = if first == NodeId::from(a) { b } else { a };
+        graph.remove_node(&removed);
+        hook.release.add_permits(2);
+        // The in-flight selection may still use the old sample; its next pull must see the update.
+        assert!(matches!(futures::poll!(stream.next()), std::task::Poll::Ready(Some(_))));
+        let next = timeout(TINY_TIMEOUT * 10, neighbor_destinations(stream.as_mut()).next())
+            .await?
+            .context("neighbor after the topology change missing")?;
+        assert_eq!(
+            next, first,
+            "the notification must not be swallowed after the version check"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_wake_between_pulls_should_rebuild_partial_loopback_pass() -> anyhow::Result<()> {
+        let (me, head, b, c, graph) = two_loops()?;
+        let cfg = fast_cfg();
+        let control = EgressControl::default();
+        let observed = graph.subscribe_topology();
+        let stream = loopback_probes(
+            LoopbackProber {
+                me,
+                cfg,
+                graph: graph.clone(),
+                pass: LoopbackPass::default(),
+                coverage: control.coverage_counters(),
+                window: 0,
+                rebuild_count: None,
+                idle_read_hook: None,
+                before_read_hook: None,
+            },
+            control.subscribe(),
+            Some(graph.subscribe_topology()),
+            cfg.recheck_interval,
+        );
+        pin_mut!(stream);
+        let first = timeout(TINY_TIMEOUT * 10, stream.next())
+            .await?
+            .context("first loopback missing")?;
+        let first_path = loopback_path(&first).context("expected loopback")?;
+        let other = if first_path[1] == b { c } else { b };
+        for (src, dst) in [(me, head), (head, other), (other, me)] {
+            record_surb_evidence(&graph, &src, &dst);
+        }
+        assert!(
+            !observed.has_changed()?,
+            "SURB observations alone do not change topology"
+        );
+        control.wake_probing();
+        let next = timeout(TINY_TIMEOUT * 10, stream.next())
+            .await?
+            .context("remaining loopback missing")?;
+        assert_eq!(loopback_path(&next), Some(first_path));
+        assert!(
+            control.coverage().is_none(),
+            "a discarded partial pass must not count as completed"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_wake_between_pulls_should_refresh_neighbor_sample() -> anyhow::Result<()> {
+        let (me, a, b) = (random_key(), random_key(), random_key());
+        let graph = Arc::new(ChannelGraph::new(me));
+        for peer in [a, b] {
+            graph.add_node(peer);
+            mark_edge_ready(&graph, &me, &peer);
+        }
+        let cfg = fast_cfg();
+        let control = EgressControl::default();
+        let observed = graph.subscribe_topology();
+        let stream = neighbor_probes(
+            NeighborProber {
+                me,
+                cfg,
+                graph: graph.clone(),
+                samples: NeighborSamples::default(),
+                idle_read_hook: None,
+                before_read_hook: None,
+            },
+            control.subscribe(),
+            Some(graph.subscribe_topology()),
+            cfg.recheck_interval,
+        );
+        pin_mut!(stream);
+        let first = timeout(TINY_TIMEOUT * 10, neighbor_destinations(stream.as_mut()).next())
+            .await?
+            .context("first neighbor missing")?;
+        let other = if first == NodeId::from(a) { b } else { a };
+        record_probes(&graph, &me, &other, cfg.stable_samples, 0);
+        assert!(!observed.has_changed()?);
+        control.wake_probing();
+        let next = timeout(TINY_TIMEOUT * 10, neighbor_destinations(stream.as_mut()).next())
+            .await?
+            .context("remaining neighbor missing")?;
+        assert_eq!(
+            next, first,
+            "the measured neighbor must not be offered from the old sample"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_wake_after_version_check_should_remain_pending_for_next_pull() -> anyhow::Result<()> {
+        let (me, a, b) = (random_key(), random_key(), random_key());
+        let graph = Arc::new(ChannelGraph::new(me));
+        for peer in [a, b] {
+            graph.add_node(peer);
+            mark_edge_ready(&graph, &me, &peer);
+        }
+        let cfg = fast_cfg();
+        let control = EgressControl::default();
+        let observed = graph.subscribe_topology();
+        let (hook, mut reached) = idle_read_hook();
+        hook.release.add_permits(1);
+        let stream = neighbor_probes(
+            NeighborProber {
+                me,
+                cfg,
+                graph: graph.clone(),
+                samples: NeighborSamples::default(),
+                idle_read_hook: None,
+                before_read_hook: Some(hook.clone()),
+            },
+            control.subscribe(),
+            Some(graph.subscribe_topology()),
+            cfg.recheck_interval,
+        );
+        pin_mut!(stream);
+        let first = timeout(TINY_TIMEOUT * 10, neighbor_destinations(stream.as_mut()).next())
+            .await?
+            .context("first neighbor missing")?;
+        reached.try_recv().context("first read did not reach hook")?;
+        assert!(futures::poll!(stream.next()).is_pending());
+        reached.try_recv().context("second read did not reach hook")?;
+        let other = if first == NodeId::from(a) { b } else { a };
+        record_probes(&graph, &me, &other, cfg.stable_samples, 0);
+        assert!(!observed.has_changed()?);
+        control.wake_probing();
+        hook.release.add_permits(2);
+        assert!(matches!(futures::poll!(stream.next()), std::task::Poll::Ready(Some(_))));
+        let next = timeout(TINY_TIMEOUT * 10, neighbor_destinations(stream.as_mut()).next())
+            .await?
+            .context("neighbor after explicit wake missing")?;
+        assert_eq!(next, first, "the explicit wake must survive a concurrent read");
         Ok(())
     }
 

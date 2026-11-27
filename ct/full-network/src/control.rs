@@ -97,6 +97,8 @@ pub(crate) struct ControlState {
     pub(crate) focus: Option<Arc<HashSet<OffchainPublicKey>>>,
     /// How the path owner values a loopback path.
     pub(crate) weights: PathWeights,
+    /// Distinguishes an explicit graph re-read request from other control updates.
+    pub(crate) wake_generation: u64,
 }
 
 /// Cloneable handle that steers the traffic a `FullNetworkDiscovery` generates.
@@ -129,14 +131,14 @@ impl EgressControl {
 
     /// Tells every idle probe stream to re-examine the graph.
     ///
-    /// The graph is read through `NetworkGraphView`, which has no change notification and gives
-    /// the generator no clock, so an idle stream cannot notice on its own that a neighbour
-    /// disconnected or that a recorded outcome dropped its rate. Whoever records those
-    /// observations calls this after writing them, and the next pull sees the new state.
+    /// A graph topology subscription, when supplied, wakes streams for topology and funding
+    /// changes. Measurement-only changes are picked up on the periodic recheck; calling this after
+    /// recording them asks all idle streams to re-read immediately.
     pub fn wake_probing(&self) {
-        // A watch update reaches every subscriber, including a stream between its graph read
-        // and its wait. No control setting changes, but the watch version advances.
-        self.state.send_modify(|_| {});
+        // Every subscriber remembers this request independently, including while it is not waiting.
+        self.state.send_modify(|state| {
+            state.wake_generation = state.wake_generation.wrapping_add(1);
+        });
     }
 
     /// Caps the loopback best set to `cap` paths, `None` to keep the plain `best_set_size` cap.
