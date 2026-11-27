@@ -3,18 +3,24 @@ use std::sync::Arc;
 use futures::StreamExt;
 use hopr_api::chain::{ChainReadChannelOperations, ChannelSelector};
 
-use crate::{HoprTicketFactory, HoprTicketManager, OutgoingIndexStore, TicketManagerError, TicketQueueStore};
+use crate::{HoprTicketFactory, OutgoingIndexStore, TicketManagerError};
+#[cfg(feature = "manager")]
+use crate::{HoprTicketManager, TicketQueueStore};
 
 /// Creates a [`HoprTicketFactory`] backed by the given `store` and pre-seeds it
 /// from the node's current outgoing channels.
 ///
 /// To avoid re-issuing ticket indices that were already used before a restart, the `store` must
-/// be durable (e.g. a [`RedbStore`](crate::RedbStore) opened on a file kept between runs), and the
+/// be durable (e.g. a `RedbStore` opened on a file kept between runs), and the
 /// outgoing indices must be [saved](HoprTicketFactory::save_outgoing_indices) to it periodically and on shutdown.
 ///
 /// Use this when building an edge (entry/exit) node that issues tickets but does not
 /// relay them. For relay nodes that also manage incoming tickets, use
-/// [`ticket_manager_from_chain`] instead.
+#[cfg_attr(feature = "manager", doc = "/// [`ticket_manager_from_chain`] instead.")]
+#[cfg_attr(
+    not(feature = "manager"),
+    doc = "/// `ticket_manager_from_chain` (requires the `manager` feature) instead."
+)]
 pub async fn ticket_factory_from_chain<C, S>(
     connector: &C,
     store: S,
@@ -37,6 +43,7 @@ where
     Ok(factory)
 }
 
+#[cfg(feature = "manager")]
 /// Creates a [`HoprTicketManager`] and its companion [`HoprTicketFactory`], both backed
 /// by the given `store`, and pre-seeds them from the node's current channel state.
 ///

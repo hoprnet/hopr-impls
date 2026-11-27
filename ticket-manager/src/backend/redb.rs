@@ -1,16 +1,19 @@
-use std::str::FromStr;
-
-use hopr_api::{
-    chain::{ChannelId, RedeemableTicket, VerifiedTicket},
-    types::primitive::prelude::BytesRepresentable,
+use hopr_api::{chain::ChannelId, types::primitive::prelude::BytesRepresentable};
+use redb::{ReadableDatabase, ReadableTable, TableDefinition};
+#[cfg(feature = "manager")]
+use {
+    crate::{TicketQueue, TicketQueueStore},
+    hopr_api::chain::{RedeemableTicket, VerifiedTicket},
+    redb::{ReadableTableMetadata, TableHandle},
+    std::str::FromStr,
 };
-use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle};
 
-use crate::{OutgoingIndexStore, TicketQueue, TicketQueueStore};
+use crate::OutgoingIndexStore;
 
 const OUT_IDX_TABLE: TableDefinition<([u8; ChannelId::SIZE], u32), u64> = TableDefinition::new("channel_out_index");
 
-/// Implementation of [`OutgoingIndexStore`] and [`TicketQueueStore`] using `redb` database and `postcard` serializer.
+/// Implementation of [`OutgoingIndexStore`] and `TicketQueueStore` (with the `manager` feature) using `redb` database
+/// and `postcard` serializer.
 ///
 /// The store is intentionally not cloneable to allow the owner to have complete ownership of the database.
 #[derive(Debug)]
@@ -86,15 +89,19 @@ impl OutgoingIndexStore for RedbStore {
     }
 }
 
+#[cfg(feature = "manager")]
 const TABLE_QUEUE_NAME_PREFIX: &str = "ctq_";
 
+#[cfg(feature = "manager")]
 type TicketTableDef<'a> = TableDefinition<'a, u128, Vec<u8>>;
 
+#[cfg(feature = "manager")]
 #[inline]
 fn make_index(ticket: &RedeemableTicket) -> u128 {
     ((ticket.verified_ticket().channel_epoch as u128) << 64) | ticket.verified_ticket().index as u128
 }
 
+#[cfg(feature = "manager")]
 impl TicketQueueStore for RedbStore {
     type Queue = RedbTicketQueue;
 
@@ -150,11 +157,13 @@ impl TicketQueueStore for RedbStore {
 
 /// Implementation of [`TicketQueue`] using `redb` database and `postcard` serializer,
 /// associated with the [`RedbStore`].
+#[cfg(feature = "manager")]
 pub struct RedbTicketQueue {
     db: std::sync::Weak<redb::Database>,
     channel_id: ChannelId,
 }
 
+#[cfg(feature = "manager")]
 impl TicketQueue for RedbTicketQueue {
     type Error = RedbStoreError;
 
@@ -312,34 +321,40 @@ mod tests {
     use super::*;
     use crate::traits::tests::*;
 
+    #[cfg(feature = "manager")]
     #[test]
     fn redb_queue_maintains_natural_ticket_order() -> anyhow::Result<()> {
         let file = tempfile::NamedTempFile::new()?;
         queue_maintains_natural_ticket_order(RedbStore::new(file)?.open_or_create_queue(&Default::default())?)
     }
 
+    #[cfg(feature = "manager")]
     #[test]
     fn redb_queue_returns_all_tickets() -> anyhow::Result<()> {
         let file = tempfile::NamedTempFile::new()?;
         queue_returns_all_tickets(RedbStore::new(file)?.open_or_create_queue(&Default::default())?)
     }
+    #[cfg(feature = "manager")]
     #[test]
     fn redb_queue_is_empty_when_drained() -> anyhow::Result<()> {
         let file = tempfile::NamedTempFile::new()?;
         queue_is_empty_when_drained(RedbStore::new(file)?.open_or_create_queue(&Default::default())?)
     }
 
+    #[cfg(feature = "manager")]
     #[test]
     fn redb_queue_returns_empty_iterator_when_drained() -> anyhow::Result<()> {
         let file = tempfile::NamedTempFile::new()?;
         queue_returns_empty_iterator_when_drained(RedbStore::new(file)?.open_or_create_queue(&Default::default())?)
     }
+    #[cfg(feature = "manager")]
     #[test]
     fn redb_queue_returns_correct_total_ticket_value() -> anyhow::Result<()> {
         let file = tempfile::NamedTempFile::new()?;
         queue_returns_correct_total_ticket_value(RedbStore::new(file)?.open_or_create_queue(&Default::default())?)
     }
 
+    #[cfg(feature = "manager")]
     #[test]
     fn redb_queue_returns_correct_total_ticket_value_with_min_index() -> anyhow::Result<()> {
         let file = tempfile::NamedTempFile::new()?;
@@ -384,36 +399,42 @@ mod tests {
         out_index_store_should_iterate_existing_indices_for_channel_epoch(RedbStore::new(file)?)
     }
 
+    #[cfg(feature = "manager")]
     #[test]
     fn redb_ticket_store_should_create_new_queue_for_channel() -> anyhow::Result<()> {
         let file = tempfile::NamedTempFile::new()?;
         ticket_store_should_create_new_queue_for_channel(RedbStore::new(file)?)
     }
 
+    #[cfg(feature = "manager")]
     #[test]
     fn redb_ticket_store_should_open_existing_queue_for_channel() -> anyhow::Result<()> {
         let file = tempfile::NamedTempFile::new()?;
         ticket_store_should_open_existing_queue_for_channel(RedbStore::new(file)?)
     }
 
+    #[cfg(feature = "manager")]
     #[test]
     fn redb_ticket_store_should_delete_existing_queue_for_channel() -> anyhow::Result<()> {
         let file = tempfile::NamedTempFile::new()?;
         ticket_store_should_delete_existing_queue_for_channel(RedbStore::new(file)?)
     }
 
+    #[cfg(feature = "manager")]
     #[test]
     fn redb_ticket_store_should_delete_existing_queue_for_channel_and_return_neglected_tickets() -> anyhow::Result<()> {
         let file = tempfile::NamedTempFile::new()?;
         ticket_store_should_delete_existing_queue_for_channel_and_return_neglected_tickets(RedbStore::new(file)?)
     }
 
+    #[cfg(feature = "manager")]
     #[test]
     fn redb_ticket_store_should_iterate_existing_queues_for_channel() -> anyhow::Result<()> {
         let file = tempfile::NamedTempFile::new()?;
         ticket_store_should_iterate_existing_queues_for_channel(RedbStore::new(file)?)
     }
 
+    #[cfg(feature = "manager")]
     #[test]
     fn redb_ticket_store_should_not_fail_to_delete_non_existing_queue_for_channel() -> anyhow::Result<()> {
         let file = tempfile::NamedTempFile::new()?;

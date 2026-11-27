@@ -1,19 +1,25 @@
-use hopr_api::chain::{ChannelId, RedeemableTicket, VerifiedTicket};
+use hopr_api::chain::ChannelId;
+#[cfg(feature = "manager")]
+use hopr_api::chain::{RedeemableTicket, VerifiedTicket};
 
-use crate::{
-    OutgoingIndexStore,
-    traits::{TicketQueue, TicketQueueStore},
-};
+use crate::OutgoingIndexStore;
+#[cfg(feature = "manager")]
+use crate::traits::{TicketQueue, TicketQueueStore};
 
-/// Simple non-persistent ticket queue store backed by a `HashMap` and [`MemoryTicketQueue`].
-///
+/// Simple non-persistent store for outgoing ticket indices, backed by a `HashMap`.
+#[cfg_attr(
+    feature = "manager",
+    doc = "/// With the `manager` feature, it also stores incoming ticket queues as [`MemoryTicketQueue`]s.\n///"
+)]
 /// Useful for non-persistent and testing scenarios.
 #[derive(Clone, Debug, Default)]
 pub struct MemoryStore {
+    #[cfg(feature = "manager")]
     tickets: std::collections::HashMap<ChannelId, MemoryTicketQueue>,
     out_indices: std::collections::HashMap<(ChannelId, u32), u64>,
 }
 
+#[cfg(feature = "manager")]
 impl TicketQueueStore for MemoryStore {
     type Queue = MemoryTicketQueue;
 
@@ -67,11 +73,13 @@ impl OutgoingIndexStore for MemoryStore {
 /// This is suitable for testing where ticket persistence is not required.
 ///
 /// The implementation might not be particularly efficient for production use.
+#[cfg(feature = "manager")]
 #[derive(Clone, Debug, Default)]
 pub struct MemoryTicketQueue(
     std::sync::Arc<parking_lot::RwLock<std::collections::BinaryHeap<std::cmp::Reverse<RedeemableTicket>>>>,
 );
 
+#[cfg(feature = "manager")]
 impl TicketQueue for MemoryTicketQueue {
     type Error = std::convert::Infallible;
 
@@ -113,29 +121,35 @@ mod tests {
     use super::*;
     use crate::traits::tests::*;
 
+    #[cfg(feature = "manager")]
     #[test]
     fn memory_queue_maintains_natural_ticket_order() -> anyhow::Result<()> {
         queue_maintains_natural_ticket_order(MemoryTicketQueue::default())
     }
 
+    #[cfg(feature = "manager")]
     #[test]
     fn memory_queue_returns_all_tickets() -> anyhow::Result<()> {
         queue_returns_all_tickets(MemoryTicketQueue::default())
     }
+    #[cfg(feature = "manager")]
     #[test]
     fn memory_queue_is_empty_when_drained() -> anyhow::Result<()> {
         queue_is_empty_when_drained(MemoryTicketQueue::default())
     }
 
+    #[cfg(feature = "manager")]
     #[test]
     fn memory_queue_returns_empty_iterator_when_drained() -> anyhow::Result<()> {
         queue_returns_empty_iterator_when_drained(MemoryTicketQueue::default())
     }
+    #[cfg(feature = "manager")]
     #[test]
     fn memory_queue_returns_correct_total_ticket_value() -> anyhow::Result<()> {
         queue_returns_correct_total_ticket_value(MemoryTicketQueue::default())
     }
 
+    #[cfg(feature = "manager")]
     #[test]
     fn memory_queue_returns_correct_total_ticket_value_with_min_index() -> anyhow::Result<()> {
         queue_returns_correct_total_ticket_value_with_min_index(MemoryTicketQueue::default())
@@ -171,32 +185,38 @@ mod tests {
         out_index_store_should_iterate_existing_indices_for_channel_epoch(MemoryStore::default())
     }
 
+    #[cfg(feature = "manager")]
     #[test]
     fn memory_ticket_store_should_create_new_queue_for_channel() -> anyhow::Result<()> {
         ticket_store_should_create_new_queue_for_channel(MemoryStore::default())
     }
 
+    #[cfg(feature = "manager")]
     #[test]
     fn memory_ticket_store_should_open_existing_queue_for_channel() -> anyhow::Result<()> {
         ticket_store_should_open_existing_queue_for_channel(MemoryStore::default())
     }
 
+    #[cfg(feature = "manager")]
     #[test]
     fn memory_ticket_store_should_delete_existing_queue_for_channel() -> anyhow::Result<()> {
         ticket_store_should_delete_existing_queue_for_channel(MemoryStore::default())
     }
 
+    #[cfg(feature = "manager")]
     #[test]
     fn memory_ticket_store_should_delete_existing_queue_for_channel_and_return_neglected_tickets() -> anyhow::Result<()>
     {
         ticket_store_should_delete_existing_queue_for_channel_and_return_neglected_tickets(MemoryStore::default())
     }
 
+    #[cfg(feature = "manager")]
     #[test]
     fn memory_ticket_store_should_iterate_existing_queues_for_channel() -> anyhow::Result<()> {
         ticket_store_should_iterate_existing_queues_for_channel(MemoryStore::default())
     }
 
+    #[cfg(feature = "manager")]
     #[test]
     fn memory_ticket_store_should_not_fail_to_delete_non_existing_queue_for_channel() -> anyhow::Result<()> {
         ticket_store_should_not_fail_to_delete_non_existing_queue_for_channel(MemoryStore::default())
