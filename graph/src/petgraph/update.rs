@@ -181,7 +181,18 @@ fn resolve_round_trip_edges(
 
 impl hopr_api::graph::NetworkGraphUpdate for ChannelGraph {
     fn set_ticket_face_value(&self, ticket_face_value: hopr_api::graph::traits::Balance) {
-        *self.ticket_face_value.write() = Some(ticket_face_value);
+        let changed = {
+            let mut current = self.ticket_face_value.write();
+            if *current == Some(ticket_face_value) {
+                false
+            } else {
+                *current = Some(ticket_face_value);
+                true
+            }
+        };
+        if changed {
+            self.topology_changed();
+        }
     }
 
     fn record_node_health(&self, node: &hopr_api::OffchainPublicKey, health: f64) {
@@ -641,7 +652,9 @@ mod tests {
             forward: [me_i, exit_i, 0, 0, 0],
             reply: [exit_i, relay_i, me_i, 0, 0],
         };
+        let topology = graph.subscribe_topology();
         graph.record_edge::<TestNeighbor, TestPath>(hopr_api::graph::MeasurableEdge::Surb(surb(paths, 4, 3)));
+        assert!(!topology.has_changed()?, "a valid SURB report is measurement only");
 
         for (src, dst) in [(me, exit), (exit, relay), (relay, me)] {
             let obs = graph.edge(&src, &dst).context("edge should exist")?;
@@ -888,6 +901,73 @@ mod tests {
             obs.intermediate_qos().is_none_or(|i| i.surb_delivery_rate().is_none()),
             "a stale path must not be attributed"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn topology_should_signal_chain_and_connection_updates_but_not_measurement_only_probes() -> anyhow::Result<()> {
+        let (me, peer) = (pubkey_from(&SECRET_0), pubkey_from(&SECRET_1));
+        let graph = ChannelGraph::new(me);
+        graph.add_node(peer);
+        graph.add_edge(&me, &peer)?;
+        graph.add_edge(&peer, &me)?;
+        let mut rx = graph.subscribe_topology();
+
+        let record_balance = |amount| {
+            graph.record_edge::<TestNeighbor, TestPath>(hopr_api::graph::MeasurableEdge::Balance(Box::new(
+                hopr_api::graph::EdgeBalanceUpdate {
+                    src: me,
+                    dest: peer,
+                    balance: amount,
+                },
+            )));
+        };
+        record_balance(Some(10u64.into()));
+        assert!(rx.has_changed()?);
+        drop(rx.borrow_and_update());
+        record_balance(Some(11u64.into()));
+        assert!(rx.has_changed()?, "positive-to-positive balance changes affect funding");
+        drop(rx.borrow_and_update());
+        record_balance(Some(11u64.into()));
+        assert!(!rx.has_changed()?);
+
+        graph.record_edge::<TestNeighbor, TestPath>(hopr_api::graph::MeasurableEdge::ConnectionStatus {
+            peer,
+            connected: true,
+        });
+        assert!(rx.has_changed()?);
+        drop(rx.borrow_and_update());
+        graph.record_edge::<TestNeighbor, TestPath>(hopr_api::graph::MeasurableEdge::ConnectionStatus {
+            peer,
+            connected: true,
+        });
+        assert!(!rx.has_changed()?);
+        let result = Ok(EdgeTransportTelemetry::Neighbor(TestNeighbor {
+            peer,
+            rtt: std::time::Duration::from_millis(10),
+        }));
+        graph.record_edge::<TestNeighbor, TestPath>(hopr_api::graph::MeasurableEdge::Probe(result));
+        assert!(
+            !rx.has_changed()?,
+            "a probe with unchanged connectivity is measurement only"
+        );
+        graph.record_edge::<TestNeighbor, TestPath>(hopr_api::graph::MeasurableEdge::Probe(Err(
+            NetworkGraphError::ProbeNeighborTimeout(Box::new(peer)),
+        )));
+        graph.record_node_health(&peer, 0.5);
+        assert!(!rx.has_changed()?);
+        graph.record_edge::<TestNeighbor, TestPath>(hopr_api::graph::MeasurableEdge::ConnectionStatus {
+            peer,
+            connected: false,
+        });
+        assert!(rx.has_changed()?);
+        drop(rx.borrow_and_update());
+        let result = Ok(EdgeTransportTelemetry::Neighbor(TestNeighbor {
+            peer,
+            rtt: std::time::Duration::from_millis(10),
+        }));
+        graph.record_edge::<TestNeighbor, TestPath>(hopr_api::graph::MeasurableEdge::Probe(result));
+        assert!(rx.has_changed()?, "a probe that changes connectivity must signal");
         Ok(())
     }
 

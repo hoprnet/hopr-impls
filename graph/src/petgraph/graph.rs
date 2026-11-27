@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
 use bimap::BiHashMap;
-use hopr_api::OffchainPublicKey;
+use hopr_api::{
+    OffchainPublicKey,
+    graph::traits::{EdgeNetworkObservableRead, EdgeObservableRead, EdgeProtocolObservable},
+};
 use parking_lot::RwLock;
 use petgraph::{graph::NodeIndex, stable_graph::StableDiGraph};
 use validator::{Validate, ValidationError, ValidationErrors};
@@ -85,6 +88,7 @@ pub struct ChannelGraph {
     pub(crate) ticket_face_value: Arc<RwLock<Option<hopr_api::graph::traits::Balance>>>,
     pub(crate) inner: Arc<RwLock<InnerGraph>>,
     pub(crate) searches: Arc<super::search_diagnostics::SearchJournal>,
+    topology_changes: Arc<tokio::sync::watch::Sender<()>>,
     /// Direct StateDump polls share a baseline across cloned handles.
     #[cfg(feature = "serde")]
     pub(crate) dump_previous_empty: Arc<std::sync::atomic::AtomicU64>,
@@ -257,6 +261,7 @@ impl ChannelGraph {
             ticket_face_value: Arc::new(RwLock::new(None)),
             inner: Arc::new(RwLock::new(InnerGraph { graph, indices, slots })),
             searches: Arc::new(Default::default()),
+            topology_changes: Arc::new(tokio::sync::watch::channel(()).0),
             #[cfg(feature = "serde")]
             dump_previous_empty: Arc::new(Default::default()),
         })
@@ -274,6 +279,25 @@ impl ChannelGraph {
         starvation.validate()?;
         self.starvation = starvation;
         Ok(self)
+    }
+
+    /// Subscribes to topology, connection and funding changes shared by all graph clones.
+    ///
+    /// Each receiver observes changes independently; multiple writes may coalesce. Before reading
+    /// the graph, mark the receiver's current version seen with `borrow_and_update`, then drop the
+    /// borrow before acquiring a graph lock. A change after that mark makes `changed()` ready,
+    /// including one made between the read and the wait. Node and edge additions or removals,
+    /// connection changes, channel balance changes and ticket face-value changes are signalled.
+    /// Measurement-only probe, acknowledgement, SURB and health updates are not signalled;
+    /// consumers needing those changes must recheck separately. A probe that creates an edge or
+    /// changes connectivity is a topology change. The receiver closes when the last graph clone drops.
+    pub fn subscribe_topology(&self) -> tokio::sync::watch::Receiver<()> {
+        self.topology_changes.subscribe()
+    }
+
+    /// Publish only after releasing graph and face-value locks to avoid inverting watch lock order.
+    pub(crate) fn topology_changed(&self) {
+        self.topology_changes.send_modify(|_| {});
     }
 
     /// Returns the self-identity key of this graph.
@@ -365,6 +389,8 @@ impl hopr_api::graph::NetworkGraphWrite for ChannelGraph {
             let idx = inner.graph.add_node(key);
             inner.indices.insert(key, idx);
             inner.claim_slot(&key, idx);
+            drop(inner);
+            self.topology_changed();
         }
     }
 
@@ -401,6 +427,8 @@ impl hopr_api::graph::NetworkGraphWrite for ChannelGraph {
             for edge in incident {
                 inner.graph.remove_edge(edge);
             }
+            drop(inner);
+            self.topology_changed();
         }
     }
 
@@ -423,6 +451,8 @@ impl hopr_api::graph::NetworkGraphWrite for ChannelGraph {
                 dest_idx,
                 Observations::with_loopback_params(self.starvation, self.loopback_window),
             );
+            drop(inner);
+            self.topology_changed();
         }
 
         Ok(())
@@ -436,6 +466,8 @@ impl hopr_api::graph::NetworkGraphWrite for ChannelGraph {
         ) && let Some(edge_idx) = inner.graph.find_edge(src_idx, dest_idx)
         {
             inner.graph.remove_edge(edge_idx);
+            drop(inner);
+            self.topology_changed();
         }
     }
 
@@ -450,11 +482,13 @@ impl hopr_api::graph::NetworkGraphWrite for ChannelGraph {
         F: FnOnce(&mut Observations),
     {
         let mut inner = self.inner.write();
+        let mut changed = false;
 
         let src_idx = if let Some(src_idx) = inner.indices.get_by_left(src) {
             *src_idx
         } else {
             // src node missing, add it
+            changed = true;
             let idx = inner.graph.add_node(*src);
             inner.indices.insert(*src, idx);
             inner.claim_slot(src, idx);
@@ -465,6 +499,7 @@ impl hopr_api::graph::NetworkGraphWrite for ChannelGraph {
             *dest_idx
         } else {
             // dest node missing, add it
+            changed = true;
             let idx = inner.graph.add_node(*dest);
             inner.indices.insert(*dest, idx);
             inner.claim_slot(dest, idx);
@@ -472,6 +507,7 @@ impl hopr_api::graph::NetworkGraphWrite for ChannelGraph {
         };
 
         let edge_idx = inner.graph.find_edge(src_idx, dest_idx).unwrap_or_else(|| {
+            changed = true;
             inner.graph.add_edge(
                 src_idx,
                 dest_idx,
@@ -480,8 +516,20 @@ impl hopr_api::graph::NetworkGraphWrite for ChannelGraph {
         });
 
         if let Some(weight) = inner.graph.edge_weight_mut(edge_idx) {
+            let relevant = |obs: &Observations| {
+                (
+                    obs.immediate_qos().and_then(|value| value.is_connected()),
+                    obs.intermediate_qos().and_then(|value| value.balance()),
+                )
+            };
+            let before = relevant(weight);
             f(weight);
+            changed |= relevant(weight) != before;
             tracing::trace!(%src, %dest, ?weight, "updated edge weight with an observation");
+        }
+        drop(inner);
+        if changed {
+            self.topology_changed();
         }
     }
 }
@@ -536,6 +584,7 @@ impl hopr_api::graph::NetworkGraphConnectivity for ChannelGraph {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
     use hex_literal::hex;
     use hopr_api::{
         graph::{
@@ -559,6 +608,155 @@ mod tests {
     /// Creates an OffchainPublicKey from a fixed secret.
     fn pubkey_from(secret: &[u8; 32]) -> OffchainPublicKey {
         *OffchainKeypair::from_secret(secret).expect("valid secret key").public()
+    }
+
+    fn assert_topology_change(rx: &mut tokio::sync::watch::Receiver<()>) {
+        assert!(rx.has_changed().expect("graph sender is alive"));
+        drop(rx.borrow_and_update());
+    }
+
+    fn assert_no_topology_change(rx: &tokio::sync::watch::Receiver<()>) {
+        assert!(!rx.has_changed().expect("graph sender is alive"));
+    }
+
+    #[test]
+    fn topology_should_signal_only_successful_node_and_edge_changes() -> anyhow::Result<()> {
+        let (me, peer, unknown) = (pubkey_from(&SECRET_0), pubkey_from(&SECRET_1), pubkey_from(&SECRET_2));
+        let graph = ChannelGraph::new(me);
+        let mut rx = graph.subscribe_topology();
+        assert_no_topology_change(&rx);
+        graph.add_node(me);
+        assert!(graph.add_edge(&me, &unknown).is_err());
+        graph.remove_node(&unknown);
+        graph.remove_edge(&me, &unknown);
+        assert_no_topology_change(&rx);
+
+        graph.add_node(peer);
+        assert_topology_change(&mut rx);
+        graph.add_node(peer);
+        assert_no_topology_change(&rx);
+        graph.add_edge(&me, &peer)?;
+        assert_topology_change(&mut rx);
+        graph.add_edge(&me, &peer)?;
+        assert_no_topology_change(&rx);
+        graph.remove_edge(&me, &peer);
+        assert_topology_change(&mut rx);
+        graph.remove_edge(&me, &peer);
+        assert_no_topology_change(&rx);
+        graph.upsert_edge(&me, &peer, |_| {});
+        assert_topology_change(&mut rx);
+        graph.upsert_edge(&me, &peer, |_| {});
+        assert_no_topology_change(&rx);
+        graph.remove_node(&peer);
+        assert_topology_change(&mut rx);
+        Ok(())
+    }
+
+    #[test]
+    fn topology_should_signal_upsert_creation_and_relevant_fields_only() {
+        let (me, peer) = (pubkey_from(&SECRET_0), pubkey_from(&SECRET_1));
+        let graph = ChannelGraph::new(me);
+        let mut rx = graph.subscribe_topology();
+        // upsert creates the missing node and edge even when its closure records no change.
+        graph.upsert_edge(&me, &peer, |_| {});
+        assert_topology_change(&mut rx);
+
+        graph.upsert_edge(&me, &peer, |obs| obs.record(EdgeWeightType::Connected(true)));
+        assert_topology_change(&mut rx);
+        graph.upsert_edge(&me, &peer, |obs| obs.record(EdgeWeightType::Connected(true)));
+        assert_no_topology_change(&rx);
+        graph.upsert_edge(&me, &peer, |obs| {
+            obs.record(EdgeWeightType::Balance(Some(100u64.into())))
+        });
+        assert_topology_change(&mut rx);
+        graph.upsert_edge(&me, &peer, |obs| {
+            obs.record(EdgeWeightType::Balance(Some(101u64.into())))
+        });
+        assert_topology_change(&mut rx);
+        graph.upsert_edge(&me, &peer, |obs| {
+            obs.record(EdgeWeightType::Balance(Some(101u64.into())))
+        });
+        assert_no_topology_change(&rx);
+        graph.upsert_edge(&me, &peer, |obs| obs.record(EdgeWeightType::Balance(None)));
+        assert_topology_change(&mut rx);
+        graph.upsert_edge(&me, &peer, |obs| {
+            obs.record(EdgeWeightType::Immediate(Ok(std::time::Duration::from_millis(2))));
+            obs.record(EdgeWeightType::Intermediate(Err(())));
+            obs.record(EdgeWeightType::ImmediateProtocolConformance {
+                num_packets: 2,
+                num_acks: 1,
+            });
+            obs.record(EdgeWeightType::SurbRoundTrips {
+                expected: 2,
+                observed: 1,
+            });
+        });
+        assert_no_topology_change(&rx);
+        graph.upsert_edge(&me, &peer, |obs| obs.record(EdgeWeightType::Connected(false)));
+        assert_topology_change(&mut rx);
+    }
+
+    #[test]
+    fn topology_should_reach_every_subscriber_and_coalesce_bursts() -> anyhow::Result<()> {
+        use hopr_api::graph::NetworkGraphUpdate;
+        let graph = ChannelGraph::new(pubkey_from(&SECRET_0));
+        let clone = graph.clone();
+        let mut first = graph.subscribe_topology();
+        let mut second = clone.subscribe_topology();
+        let peer = pubkey_from(&SECRET_1);
+        // Mark each version before reading; a later write remains visible before either waits.
+        drop(first.borrow_and_update());
+        drop(second.borrow_and_update());
+        assert!(!graph.contains_node(&peer));
+        clone.add_node(peer);
+        assert_topology_change(&mut first);
+        assert_topology_change(&mut second);
+        for i in 1u64..=1000 {
+            graph.set_ticket_face_value(i.into());
+        }
+        assert_topology_change(&mut first);
+        assert_topology_change(&mut second);
+        assert_no_topology_change(&first);
+        assert_no_topology_change(&second);
+        graph.set_ticket_face_value(1000u64.into());
+        assert_no_topology_change(&first);
+        clone.set_ticket_face_value(1001u64.into());
+        assert_topology_change(&mut first);
+        assert_topology_change(&mut second);
+        Ok(())
+    }
+
+    #[test]
+    fn topology_notification_should_not_hold_the_graph_lock() -> anyhow::Result<()> {
+        use std::{
+            sync::mpsc,
+            time::{Duration, Instant},
+        };
+        let (me, peer) = (pubkey_from(&SECRET_0), pubkey_from(&SECRET_1));
+        let graph = ChannelGraph::new(me);
+        let rx = graph.subscribe_topology();
+        // This read borrow blocks a notification; a graph read must still be able to see the write.
+        let borrowed = rx.borrow();
+        let writer_graph = graph.clone();
+        let writer = std::thread::spawn(move || writer_graph.add_node(peer));
+        let reader_graph = graph.clone();
+        let (seen_tx, seen_rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                if reader_graph.contains_node(&peer) {
+                    let _ = seen_tx.send(());
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        let seen = seen_rx.recv_timeout(Duration::from_secs(2));
+        drop(borrowed);
+        writer.join().expect("writer panicked");
+        reader.join().expect("reader panicked");
+        seen.context("graph read blocked behind the notification's watch write lock")?;
+        Ok(())
     }
 
     #[test]
