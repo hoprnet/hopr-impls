@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 mod tempdb;
 
 pub use hopr_api::{
@@ -52,10 +54,10 @@ pub struct InMemoryBackend {
 
 #[derive(Default)]
 struct InMemoryState {
-    accounts: std::collections::HashMap<HoprKeyIdent, AccountEntry, ahash::RandomState>,
-    key_to_id: std::collections::HashMap<OffchainPublicKey, HoprKeyIdent, ahash::RandomState>,
-    address_to_id: std::collections::HashMap<Address, HoprKeyIdent, ahash::RandomState>,
-    channels: std::collections::HashMap<ChannelId, ChannelEntry, ahash::RandomState>,
+    accounts: HashMap<HoprKeyIdent, AccountEntry, ahash::RandomState>,
+    key_to_id: HashMap<OffchainPublicKey, HoprKeyIdent, ahash::RandomState>,
+    address_to_id: HashMap<Address, HoprKeyIdent, ahash::RandomState>,
+    channels: HashMap<ChannelId, ChannelEntry, ahash::RandomState>,
 }
 
 impl InMemoryBackend {
